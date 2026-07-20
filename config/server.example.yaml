@@ -1,0 +1,106 @@
+# nemo-speech combined HTTP server config.
+#
+# Load with:
+#   nemo-speech serve --config config/server.example.yaml
+#
+# ASR, NMT, and TTS are enabled automatically when their required model paths
+# are present. Set `enabled: false` under a section to force that service off.
+http:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  threads: 4
+  max-upload-mb: 512
+  read-timeout: 30
+  write-timeout: 30
+  access-log: false
+  log-format: text              # text | json
+  playground: true
+  # api-key: use NEMO_SPEECH_HTTP_API_KEY instead of storing secrets here
+  # cors-origin: https://trusted-client.example
+  # tls-cert: /run/secrets/server.crt
+  # tls-key: /run/secrets/server.key
+
+asr:
+  enabled: true                 # true | false | auto
+  backend:
+    gpu: 0                      # GPU device index, -1 = CPU
+  model:
+    path: /models/nemotron-speech-streaming-en-0.6b.q8_0.gguf
+  streaming:
+    chunk_size: 0.16
+    ctc_left_padding: 1.92
+    ctc_right_padding: 1.92
+    rnnt_right_context: 1
+  decoder:
+    kind: greedy                # greedy | flashlight
+  vad:
+    model_path:                 # empty = no VAD loaded
+    masker:
+      mask_enable: false
+      onset: 0.5
+      offset: 0.3
+  endpointing:
+    enable: true
+    vad_based: false
+    stop_history_eou_ms: 800
+  postproc:
+    # pnc_model_path: /models/pnc.gguf
+    # itn_model_dir: /models/sparrowhawk_en
+    # profanity_list_path: /models/profanity.txt
+
+tts:
+  enabled: true                 # true | false | auto
+  magpie-model: /models/magpie-tts.gguf
+  codec-model: /models/nano-codec.gguf
+  tokenizer-model-dir: /models/magpie-tts-nemo
+  # tn-model-dir: /models/en_tn_grammars_cased   # written-form -> spoken-form TN
+
+  language-code: en-US
+  speaker: 0
+
+  threads: 4
+  codec-threads: 0              # 0 = use threads
+  seed: -1                      # -1 = current time
+  steps: -1                     # -1 = model default
+  top-k: -1                     # -1 = model default
+
+  chunk-frames: 3
+  codec-queue-depth: 4
+  codec-history-frames: -1
+  codec-future-frames: 1
+  window-ms: 0
+  flush-partial-chunk: true
+
+  use-cfg: true
+  use-local-transformer: true
+  use-kv-cache: true
+  use-stateful-codec: true
+  codec-cpu: false
+
+  lt-backend: auto              # auto | cpu | cuda
+  sampling-backend: auto        # auto | cpu | cuda
+  uma-mode: auto                # auto | off | on
+  longform: auto                # auto | off | on
+
+  benchmark: false
+  verbose: false
+  voice-name:
+  warmup-enabled: true
+  warmup-text: "Hello from Magpie T T S."
+  warmup-steps: 8
+
+# NMT (text translation) is built only when -DNEMO_SPEECH_BUILD_NMT=ON. Like ASR
+# and TTS it is enabled automatically when its model path is present.
+nmt:
+  enabled: true                 # true | false | auto
+  backend:
+    gpu: 0                      # GPU device index, -1 = CPU
+  model:
+    path: /models/riva-translate-4b-instruct-v1.1.q8_0.gguf   # f16 also works
+    n_ctx: 8192
+  generation:
+    max_new_tokens: 256
+  pool:
+    contexts: 1                 # concurrent decode contexts
+  verbose: false

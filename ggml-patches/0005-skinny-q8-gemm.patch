@@ -1,0 +1,610 @@
+diff --git a/src/ggml-cuda/skinny-q8.cu b/src/ggml-cuda/skinny-q8.cu
+new file mode 100644
+index 00000000..88e1e1ec
+--- /dev/null
++++ b/src/ggml-cuda/skinny-q8.cu
+@@ -0,0 +1,580 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++// Skinny-N Q8_0 GEMM for streaming ASR encoders (nemo-speech).
++//
++// This kernel is specialized for 9 <= N <= 64, where the activation tile fits
++// on chip and weight reads dominate memory traffic.
++//
++// It uses int8 tensor cores and a cp.async pipeline:
++//  * mma.sync.m16n8k32.s8 — one MMA spans exactly one q8 block of k, so the
++//    per-block scales (weight d x activation d) apply directly to the s32
++//    MMA result, accumulated in fp32.
++//  * Block tile = 32 rows x 64 cols: 8 warps as 2 row-halves x 4 col-quarters
++//    (each warp: 16x16 = 2 MMAs per k-block). All N tiles are launched in
++//    grid.z so a large outer batch fills the GPU instead of issuing a serial
++//    stream of sub-SM grids.
++//  * A 2-buffer pipeline stages W (32x128B), A (64x128B), and their scales per
++//    128-k step. The next buffer is issued before the current buffer computes,
++//    keeping one cp.async group in flight without paying for a third buffer.
++//  * Weights use aligned planes qs[M][K] + d[M][K/32]. Models can serialize
++//    those planes directly; standard block_q8_0 weights are repacked once on
++//    first use and cached. Activations are quantized to a zero-padded
++//    64-column int8 buffer so staging needs no bounds checks.
++//
++// Bit-accuracy: same q8 activation round-trip as mul_mat_q, but a different
++// summation order — results are not bit-identical to mmq. Dispatch must
++// therefore depend only on the per-sequence matrix shape, never on the outer
++// batch size, so singleton and batched execution cannot select different math.
++
++#include "skinny-q8.cuh"
++#include "mmvq.cuh"  // MMVQ_MAX_BATCH_SIZE: the N range mmvq already covers
++
++#include <algorithm>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++
++#define SKQ8_WARPS 8
++#define SKQ8_ROWS 32    // rows per block (2 warp row-halves x 16); M % 32 == 0
++#define SKQ8_NPAD 64    // max padded cols (4 warp col-quarters x 2 n-tiles x 8)
++#define SKQ8_KSTEP 128  // k bytes staged per pipeline stage; K % KSTEP == 0
++#define SKQ8_KTB (SKQ8_KSTEP / 32)  // q8 blocks per stage
++#define SKQ8_STAGES 2
++#define SKQ8_NMAX SKQ8_NPAD
++
++// Shared-memory strides (bytes). KSTEP + 16 keeps the 16B cp.async stores
++// aligned while breaking the power-of-two bank pattern on fragment loads.
++#define SKQ8_SW (SKQ8_KSTEP + 16)
++#define SKQ8_SA (SKQ8_KSTEP + 16)
++// Per-stage layout: W tile | A tile | W scales (half) | A scales (float).
++// The A tile + A scales are sized for NPAD but only ncols (= n-tiles actually
++// used, host-padded to 8) are staged/consumed.
++#define SKQ8_STAGE_W (SKQ8_ROWS * SKQ8_SW)
++#define SKQ8_STAGE_A (SKQ8_NPAD * SKQ8_SA)
++#define SKQ8_STAGE_DW (SKQ8_ROWS * SKQ8_KTB * 2)
++#define SKQ8_STAGE_DA (SKQ8_NPAD * SKQ8_KTB * 4)
++#define SKQ8_STAGE_BYTES (SKQ8_STAGE_W + SKQ8_STAGE_A + SKQ8_STAGE_DW + SKQ8_STAGE_DA)
++
++// ---------------------------------------------------------------------------
++// Repack block_q8_0[M][K/32] -> qs plane int8[M][K] + d plane half[M][K/32].
++static __global__ void skq8_repack(
++    const void * __restrict__ src, int8_t * __restrict__ qs, half * __restrict__ d,
++    const int64_t M, const int64_t KB) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= M * KB) {
++        return;
++    }
++    const block_q8_0 * b = (const block_q8_0 *) src + i;
++    d[i] = b->d;
++    int8_t * out = qs + i * 32;
++#pragma unroll
++    for (int j = 0; j < 32; j++) {
++        out[j] = b->qs[j];
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Quantize F32 activations [K, N] (col-contiguous) into a zero-padded
++// SKQ8_NPAD-column buffer: int8[NPAD][K] + d float[NPAD][K/32].
++static __global__ void skq8_quantize(
++    const float * __restrict__ X, int8_t * __restrict__ Aq, float * __restrict__ Ad,
++    const int K, const int N) {
++    // One WARP per (col, q8-block): lane j owns element j, so the 32-float
++    // read is one coalesced 128B transaction and the int8 store one 32B
++    // transaction (a thread-per-block version did 32 scalar strided loads and
++    // cost 5x the GEMM quantize budget).
++    const int KB   = K / 32;
++    const int wid  = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++    const int lane = threadIdx.x % 32;
++    const int ncols = (N + 7) / 8 * 8;  // active column tiles only
++    if (wid >= ncols * KB) {
++        return;
++    }
++    const int n = wid / KB, kb = wid % KB;
++    int8_t *  q = Aq + (size_t) n * K + kb * 32;
++    if (n >= N) {
++        // Pad columns: only the scale must be zeroed — the GEMM multiplies the
++        // integer MMA result by da, and int math on stale qs bytes is finite,
++        // so da == 0 makes the contribution exactly 0.
++        if (lane == 0) {
++            Ad[(size_t) n * KB + kb] = 0.0f;
++        }
++        return;
++    }
++    const float x    = X[(size_t) n * K + kb * 32 + lane];
++    float       amax = fabsf(x);
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
++    }
++    const float dv = amax / 127.0f;
++    const float id = dv > 0.0f ? 1.0f / dv : 0.0f;
++    q[lane]        = (int8_t) roundf(x * id);
++    if (lane == 0) {
++        Ad[(size_t) n * KB + kb] = dv;
++    }
++}
++
++// ---------------------------------------------------------------------------
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++static __device__ __forceinline__ void skq8_cp16(void * dst, const void * src) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(src));
++}
++static __device__ __forceinline__ void skq8_cp8(void * dst, const void * src) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(s), "l"(src));
++}
++static __device__ __forceinline__ void skq8_cp4(void * dst, const void * src) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(s), "l"(src));
++}
++static __device__ __forceinline__ void skq8_commit() {
++    asm volatile("cp.async.commit_group;");
++}
++template <int n> static __device__ __forceinline__ void skq8_wait() {
++    asm volatile("cp.async.wait_group %0;" ::"n"(n));
++}
++static __device__ __forceinline__ void skq8_mma(
++    int & d0, int & d1, int & d2, int & d3, int a0, int a1, int a2, int a3, int b0, int b1) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
++        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
++        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++#endif
++
++// C[M,N] (F32, col stride M) = Wq8 x A. Small-M GEMMs split K over
++// blockIdx.y (gridDim.y k-ranges, scales already folded per range) and
++// combine partials with float atomicAdd into a pre-zeroed C.
++static __global__ __launch_bounds__(SKQ8_WARPS * 32, 5) void skq8_gemm(
++    const int8_t * __restrict__ Wq, const half * __restrict__ Wd, const int8_t * __restrict__ Aq,
++    const float * __restrict__ Ad, const float * __restrict__ bias, float * __restrict__ C,
++    const int M, const int N_total, const int K, const int ncols_total /* N padded to 8 */) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    const int KB   = K / 32;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int gid  = lane >> 2;  // mma group id (0..7)
++    const int tid4 = lane & 3;   // mma thread-in-group (0..3)
++
++    const int k_len = K / gridDim.y;       // multiple of SKQ8_KSTEP (host-enforced)
++    const int k0    = blockIdx.y * k_len;
++
++    // grid.z carries independent 64-column output tiles. Keeping them in one
++    // launch is essential on high-SM-count GPUs: a typical encoder projection
++    // has only 128 row/K-split CTAs and can underfill the device. The old host
++    // loop repeated that underfilled launch per tile and serialized the
++    // entire outer batch. Pointer rebasing keeps all inner indexing unchanged,
++    // including the per-q8-block FP32 accumulation order.
++    const int cbase = (int) blockIdx.z * SKQ8_NPAD;
++    const int ncols = min(SKQ8_NPAD, ncols_total - cbase);
++    const int N     = min(SKQ8_NPAD, N_total - cbase);
++    Aq += (size_t) cbase * K;
++    Ad += (size_t) cbase * KB;
++    C += (size_t) cbase * M;
++
++    const int row_blk = blockIdx.x * SKQ8_ROWS;
++    const int mhalf   = warp / 4;        // which 16-row half
++    const int nt0     = (warp % 4) * 2;  // first of this warp's two 8-col n-tiles
++
++    extern __shared__ char smem[];
++    char * stage[SKQ8_STAGES];
++#pragma unroll
++    for (int s = 0; s < SKQ8_STAGES; s++) {
++        stage[s] = smem + (size_t) s * SKQ8_STAGE_BYTES;
++    }
++
++    const int nsteps = k_len / SKQ8_KSTEP;
++
++    // Stage `ks` of this block's k-range into buffer ks % STAGES.
++    auto issue = [&](int ks) {
++        char * buf  = stage[ks % SKQ8_STAGES];
++        char * s_w  = buf;
++        char * s_a  = buf + SKQ8_STAGE_W;
++        char * s_dw = s_a + SKQ8_STAGE_A;
++        char * s_da = s_dw + SKQ8_STAGE_DW;
++        const int kbyte = k0 + ks * SKQ8_KSTEP;   // k offset in elements (== bytes for s8)
++        const int kbb   = kbyte / 32;             // k offset in q8 blocks
++        constexpr int vw = SKQ8_KSTEP / 16;       // 16B vectors per row per stage
++        // W tile: ROWS x vw x 16B
++        for (int it = threadIdx.x; it < SKQ8_ROWS * vw; it += blockDim.x) {
++            const int r = it / vw, v = it % vw;
++            skq8_cp16(
++                s_w + r * SKQ8_SW + v * 16, Wq + (size_t) (row_blk + r) * K + kbyte + v * 16);
++        }
++        // A tile: ncols x vw x 16B (only the active column tiles)
++        for (int it = threadIdx.x; it < ncols * vw; it += blockDim.x) {
++            const int c = it / vw, v = it % vw;
++            skq8_cp16(s_a + c * SKQ8_SA + v * 16, Aq + (size_t) c * K + kbyte + v * 16);
++        }
++        // scales: dw ROWS x KTB half (KTB*2 bytes/row), da ncols x KTB float
++        // (KTB*4 bytes/col); copy width follows KTB.
++        if (threadIdx.x < SKQ8_ROWS) {
++            if (SKQ8_KTB * 2 == 16) {
++                skq8_cp16(
++                    s_dw + threadIdx.x * (SKQ8_KTB * 2),
++                    Wd + (size_t) (row_blk + threadIdx.x) * KB + kbb);
++            } else if (SKQ8_KTB * 2 == 8) {
++                skq8_cp8(
++                    s_dw + threadIdx.x * (SKQ8_KTB * 2),
++                    Wd + (size_t) (row_blk + threadIdx.x) * KB + kbb);
++            } else {
++                skq8_cp4(
++                    s_dw + threadIdx.x * (SKQ8_KTB * 2),
++                    Wd + (size_t) (row_blk + threadIdx.x) * KB + kbb);
++            }
++        }
++        constexpr int da_vec = SKQ8_KTB * 4 / 16;  // 16B vectors per col
++        if constexpr (da_vec > 0) {
++            for (int it = threadIdx.x; it < ncols * da_vec; it += blockDim.x) {
++                const int c = it / da_vec, h = it % da_vec;
++                skq8_cp16(
++                    s_da + c * (SKQ8_KTB * 4) + h * 16, Ad + (size_t) c * KB + kbb + h * 4);
++            }
++        } else if (threadIdx.x < ncols) {
++            skq8_cp8(
++                s_da + threadIdx.x * (SKQ8_KTB * 4),
++                Ad + (size_t) threadIdx.x * KB + kbb);
++        }
++        skq8_commit();
++    };
++
++    float facc[2][4] = { { 0.0f } };
++
++    issue(0);
++
++    for (int ks = 0; ks < nsteps; ks++) {
++        // The next stage is issued after the current buffer is ready and before
++        // its MMA loop. This preserves compute/copy overlap with two buffers;
++        // the trailing barrier makes reusing the just-consumed buffer safe.
++        skq8_wait<0>();
++        __syncthreads();
++
++        if (ks + 1 < nsteps) {
++            issue(ks + 1);
++        }
++
++        const char * buf  = stage[ks % SKQ8_STAGES];
++        const char * s_w  = buf;
++        const char * s_a  = buf + SKQ8_STAGE_W;
++        const half * s_dw = (const half *) (buf + SKQ8_STAGE_W + SKQ8_STAGE_A);
++        const float * s_da =
++            (const float *) (buf + SKQ8_STAGE_W + SKQ8_STAGE_A + SKQ8_STAGE_DW);
++
++#pragma unroll
++        for (int kb = 0; kb < SKQ8_KSTEP / 32; kb++) {
++            // W fragment for this warp's 16 rows (rows mhalf*16 + gid, +8).
++            const char * wbase = s_w + (mhalf * 16 + gid) * SKQ8_SW + kb * 32 + tid4 * 4;
++            const int    a0    = *(const int *) (wbase);
++            const int    a1    = *(const int *) (wbase + 8 * SKQ8_SW);
++            const int    a2    = *(const int *) (wbase + 16);
++            const int    a3    = *(const int *) (wbase + 8 * SKQ8_SW + 16);
++            const float  dw0   = __half2float(s_dw[(mhalf * 16 + gid) * SKQ8_KTB + kb]);
++            const float  dw1   = __half2float(s_dw[(mhalf * 16 + gid + 8) * SKQ8_KTB + kb]);
++#pragma unroll
++            for (int t = 0; t < 2; t++) {
++                const int nt = nt0 + t;
++                if (nt * 8 >= ncols) {
++                    continue;  // dead column tile (N padded to ncols < NPAD)
++                }
++                const char * bbase = s_a + (nt * 8 + gid) * SKQ8_SA + kb * 32 + tid4 * 4;
++                const int    b0    = *(const int *) (bbase);
++                const int    b1    = *(const int *) (bbase + 16);
++                int          d0 = 0, d1 = 0, d2 = 0, d3 = 0;
++                skq8_mma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
++                const int   c0  = nt * 8 + tid4 * 2;
++                const float da0 = s_da[c0 * SKQ8_KTB + kb];
++                const float da1 = s_da[(c0 + 1) * SKQ8_KTB + kb];
++                facc[t][0] += dw0 * da0 * (float) d0;
++                facc[t][1] += dw0 * da1 * (float) d1;
++                facc[t][2] += dw1 * da0 * (float) d2;
++                facc[t][3] += dw1 * da1 * (float) d3;
++            }
++        }
++        __syncthreads();
++    }
++
++    // Write back: C rows mhalf*16 + gid (+8), cols nt*8 + tid4*2 (+1).
++    // With a K-split grid, C was pre-zeroed and partials combine via atomics
++    // (the fused bias is contributed by the blockIdx.y == 0 split only).
++    const int   row0 = row_blk + mhalf * 16 + gid;
++    const float b0   = (bias != nullptr && blockIdx.y == 0) ? bias[row0] : 0.0f;
++    const float b1   = (bias != nullptr && blockIdx.y == 0) ? bias[row0 + 8] : 0.0f;
++#pragma unroll
++    for (int t = 0; t < 2; t++) {
++        facc[t][0] += b0;
++        facc[t][1] += b0;
++        facc[t][2] += b1;
++        facc[t][3] += b1;
++    }
++#pragma unroll
++    for (int t = 0; t < 2; t++) {
++        const int c0 = (nt0 + t) * 8 + tid4 * 2;
++        if (gridDim.y > 1) {
++            if (c0 < N) {
++                atomicAdd(&C[row0 + (size_t) c0 * M], facc[t][0]);
++                atomicAdd(&C[row0 + 8 + (size_t) c0 * M], facc[t][2]);
++            }
++            if (c0 + 1 < N) {
++                atomicAdd(&C[row0 + (size_t) (c0 + 1) * M], facc[t][1]);
++                atomicAdd(&C[row0 + 8 + (size_t) (c0 + 1) * M], facc[t][3]);
++            }
++        } else {
++            if (c0 < N) {
++                C[row0 + (size_t) c0 * M]     = facc[t][0];
++                C[row0 + 8 + (size_t) c0 * M] = facc[t][2];
++            }
++            if (c0 + 1 < N) {
++                C[row0 + (size_t) (c0 + 1) * M]     = facc[t][1];
++                C[row0 + 8 + (size_t) (c0 + 1) * M] = facc[t][3];
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Wq, Wd, Aq, Ad, bias, C, M, N_total, K, ncols_total);
++    NO_DEVICE_CODE;
++#endif
++}
++
++// Repacked-weight cache. Keyed by the weight tensor's device pointer; entries
++// live for the process lifetime (model weights are loaded once). Repacking
++// happens on first (eager/warmup) use, before any CUDA-graph capture.
++namespace {
++struct skq8_planes {
++    int8_t * qs;
++    half *   d;
++};
++std::unordered_map<const void *, skq8_planes> g_skq8_cache;
++std::mutex                                    g_skq8_mutex;
++}  // namespace
++
++bool ggml_cuda_skinny_q8_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    static const bool disabled = []() {
++        const char * e = getenv("GGML_SKINNY_Q8");
++        return e != nullptr && e[0] == '0';
++    }();
++    if (disabled) {
++        return false;
++    }
++    // Resolve views before checking the persistent model-weight marker. A
++    // serialized planar tensor is accepted only through its full allocation,
++    // since a normal ggml byte-offset view cannot describe two separate
++    // tensor-wide planes.
++    const ggml_tensor * root = src0;
++    while (root->view_src != nullptr) {
++        root = root->view_src;
++    }
++    const bool planar_q8 = (root->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
++    // This specialization is for FastConformer encoder matrices. Keeping the
++    // domain explicit also prevents a decoder's request batch (which commonly
++    // occupies ne[1]) from being mistaken for a skinny time dimension.
++    if (strncmp(root->name, "encoder.", 8) != 0) {
++        return false;
++    }
++    if (!planar_q8 && strstr(root->name, ".linear_qkv.weight") != nullptr) {
++        return false;
++    }
++    // Tensor-wide planes cannot be addressed through a stock block-row view.
++    // Current encoder graphs use the full fused QKV tensor, never a weight
++    // view; reject defensively if that changes.
++    if (planar_q8 && src0 != root) {
++        return false;
++    }
++    // The repack cache is keyed by src0->data and assumes the bytes are
++    // immutable from the outside: only accept long-lived weight buffers, never
++    // transient compute-pool tensors (whose addresses get reused).
++    if (src0->buffer == nullptr ||
++        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        return false;
++    }
++
++    // Weight-side (per-tensor, call-invariant) conditions.
++    const bool tensor_ok = src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) &&
++                           src0->ne[2] == 1 && src0->ne[3] == 1 &&
++                           src0->ne[0] % SKQ8_KSTEP == 0 && src0->ne[1] % SKQ8_ROWS == 0;
++    // Call-side conditions.
++    // A dense batched RHS [K,N,B...] is byte-identical to [K,N*B...].  Treat
++    // all outer columns as one logical N so a weight repacked by a scalar
++    // graph remains usable by a later true-batch graph.
++    const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
++    const bool call_ok = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++                         ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++                         src1->ne[0] == src0->ne[0] &&
++                         ggml_nelements(dst) == src0->ne[1] * total_n;
++
++    if (planar_q8) {
++        // N<=8 is handled by planar MMVQ. Wider calls must stay on this path
++        // because stock MMQ cannot interpret tensor-wide planes; skq8_gemm
++        // tiles arbitrary N in 64-column chunks.
++        GGML_ASSERT(tensor_ok && call_ok && "planar Q8 weight used in unsupported mul_mat shape");
++        return total_n > MMVQ_MAX_BATCH_SIZE;
++    }
++
++    const bool repacked = [&]() {
++        std::lock_guard<std::mutex> lock(g_skq8_mutex);
++        return g_skq8_cache.find(src0->data) != g_skq8_cache.end();
++    }();
++    if (repacked) {
++        // The weight was converted IN PLACE to the plane layout — the
++        // block_q8_0 bytes no longer exist, so every mul_mat on this tensor
++        // must come through here (the >64-col path tiles, small N pads).
++        // Falling back to mmq/mmvq would silently read garbage: abort loudly
++        // instead if a call shape we cannot serve ever appears.
++        GGML_ASSERT(call_ok && "skinny-q8: repacked weight used in an unsupported mul_mat shape");
++        return true;
++    }
++    // By default, select only on logical width so outer batch size cannot
++    // change the accumulation path. The opt-in mode is an end-to-end ASR
++    // experiment for streaming shapes such as [K,2,B]: it flattens the dense
++    // outer batch and lets the tensor-core kernel tile N beyond 64. It is not
++    // the default because skinny-Q8 has a different accumulation order from
++    // MMVQ; callers must validate transcript/accuracy parity. Use a separate
++    // repack allocation (GGML_SKINNY_Q8_INPLACE=0) with multi-stream schedulers.
++    static const bool outer_batch_dispatch = []() {
++        const char * e = getenv("GGML_SKINNY_Q8_OUTER_BATCH");
++        return e != nullptr && e[0] != '0';
++    }();
++    const int64_t logical_n = src1->ne[1];
++    const bool logical_eligible = logical_n > MMVQ_MAX_BATCH_SIZE && logical_n <= SKQ8_NMAX;
++    const bool outer_eligible = total_n > MMVQ_MAX_BATCH_SIZE;
++    const bool eligible =
++        tensor_ok && call_ok && (outer_batch_dispatch ? outer_eligible : logical_eligible);
++    return eligible;
++}
++
++static void skq8_run(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst) {
++    const int64_t M  = src0->ne[1];
++    const int64_t K  = src0->ne[0];
++    const int64_t N  = ggml_nelements(src1) / src1->ne[0];
++    const int64_t KB = K / 32;
++
++    cudaStream_t stream = ctx.stream();
++
++    // Repacked weight planes (create on first use). Default: IN PLACE. The plane
++    // layout (qs M*K + d M*KB*2) is byte-for-byte the same total size as
++    // block_q8_0 (M*KB*34), so it repacks through a transient pool staging buffer
++    // and copies back over the original allocation: zero extra weight memory (the
++    // cudaMalloc'd duplicate cost ~1.07 GB on parakeet-xxl). After this the
++    // tensor's block_q8_0 layout is GONE; the dispatch in
++    // ggml_cuda_skinny_q8_supported() therefore claims every mul_mat on a
++    // repacked tensor.
++    //
++    // GGML_SKINNY_Q8_INPLACE=0 forces the separate-buffer (cudaMalloc) layout.
++    // The in-place D2D memcpy is a stream-ordering hazard under multi-stream
++    // graph-split scheduling (llama.cpp's NMT decoder): it corrupts the GEMM even
++    // though the repacked bytes are correct. Callers that share the process with
++    // such a scheduler set GGML_SKINNY_Q8_INPLACE=0 (the NMT pipeline does this
++    // when enabled). The streaming-ASR encoder runtime has no such hazard.
++    skq8_planes planes;
++    {
++        std::lock_guard<std::mutex> lock(g_skq8_mutex);
++        auto                        it = g_skq8_cache.find(src0->data);
++        if (it != g_skq8_cache.end()) {
++            planes = it->second;
++        } else {
++            const size_t qs_bytes = (size_t) M * K;
++            const size_t d_bytes  = (size_t) M * KB * sizeof(half);
++            GGML_ASSERT(qs_bytes + d_bytes == ggml_nbytes(src0));
++            if ((src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0) {
++                planes.qs = (int8_t *) src0->data;
++                planes.d  = (half *) ((char *) src0->data + qs_bytes);
++                g_skq8_cache.emplace(src0->data, planes);
++            } else {
++                static const bool inplace = []() {
++                    const char * e = getenv("GGML_SKINNY_Q8_INPLACE");
++                    return e == nullptr || e[0] != '0';
++                }();
++                const int64_t total  = M * KB;
++                const int     blocks = (int) ((total + 255) / 256);
++                size_t        extra  = 0;
++                if (inplace) {
++                    ggml_cuda_pool_alloc<int8_t> staging(ctx.pool(), qs_bytes + d_bytes);
++                    skq8_repack<<<blocks, 256, 0, stream>>>(
++                        src0->data, staging.get(), (half *) (staging.get() + qs_bytes), M, KB);
++                    CUDA_CHECK(cudaMemcpyAsync(
++                        src0->data, staging.get(), qs_bytes + d_bytes, cudaMemcpyDeviceToDevice,
++                        stream));
++                    planes.qs = (int8_t *) src0->data;
++                    planes.d  = (half *) ((char *) src0->data + qs_bytes);
++                    // staging returns to the pool at scope exit; the copy is
++                    // stream-ordered before any later reuse on this stream.
++                } else {
++                    CUDA_CHECK(cudaMalloc(&planes.qs, qs_bytes));
++                    CUDA_CHECK(cudaMalloc(&planes.d, d_bytes));
++                    skq8_repack<<<blocks, 256, 0, stream>>>(
++                        src0->data, planes.qs, planes.d, M, KB);
++                    extra = qs_bytes + d_bytes;
++                }
++                g_skq8_cache.emplace(src0->data, planes);
++                static const bool memstats = getenv("NEMO_SPEECH_MEMSTATS") != nullptr;
++                if (memstats) {
++                    static size_t g_repack_total = 0;
++                    g_repack_total += extra;
++                    fprintf(
++                        stderr,
++                        "[memstats] skinny-q8 repack %s +%.1f MB (cache extra total %.1f MB, "
++                        "%zu tensors)\n",
++                        inplace ? "in-place" : "alloc", extra / 1048576.0,
++                        g_repack_total / 1048576.0, g_skq8_cache.size());
++                }
++            }
++        }
++    }
++    // Quantize activations into the zero-padded buffer (all columns, once —
++    // ntot may exceed NPAD; the GEMM below tiles over 64-col chunks).
++    const int ntot = (int) ((N + SKQ8_NPAD - 1) / SKQ8_NPAD * SKQ8_NPAD);
++    ggml_cuda_pool_alloc<int8_t> aq_alloc(ctx.pool(), (size_t) ntot * K);
++    ggml_cuda_pool_alloc<float>  ad_alloc(ctx.pool(), (size_t) ntot * KB);
++    {
++        const int64_t warps  = (int64_t) ntot * KB;  // one warp per (col, q8 block)
++        const int     blocks = (int) ((warps * 32 + 255) / 256);
++        skq8_quantize<<<blocks, 256, 0, stream>>>(
++            (const float *) src1->data, aq_alloc.get(), ad_alloc.get(), (int) K, (int) N);
++    }
++
++    // Split K for small-M shapes until there is enough block-level parallelism,
++    // combining partial results with atomicAdd.
++    // 1-step splits are allowed: no pipeline, but block-level K-parallelism.
++    // N > NPAD is mapped into grid.z. Weights are still read once per 64-column
++    // tile, but all tiles are visible to the scheduler in a single launch.
++    {
++        const int row_blocks = (int) (M / SKQ8_ROWS);
++        int       ksplit     = 1;
++        while (ksplit < 4 && row_blocks * ksplit < 128 &&
++               K % ((int64_t) SKQ8_KSTEP * ksplit * 2) == 0) {
++            ksplit *= 2;
++        }
++        if (ksplit > 1) {
++            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, (size_t) M * N * sizeof(float), stream));
++        }
++        const size_t smem = (size_t) SKQ8_STAGES * SKQ8_STAGE_BYTES;
++        static std::once_flag attr_set_flag;
++        std::call_once(attr_set_flag, [&]() {
++            CUDA_CHECK(cudaFuncSetAttribute(
++                skq8_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++        });
++        const int  ntiles = (ntot + SKQ8_NPAD - 1) / SKQ8_NPAD;
++        const dim3 grid(row_blocks, ksplit, ntiles);
++        skq8_gemm<<<grid, SKQ8_WARPS * 32, smem, stream>>>(
++            planes.qs, planes.d, aq_alloc.get(), ad_alloc.get(),
++            bias != nullptr ? (const float *) bias->data : nullptr, (float *) dst->data,
++            (int) M, (int) N, (int) K, ntot);
++    }
++}
++
++void ggml_cuda_mul_mat_skinny_q8(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    ggml_tensor * dst) {
++    skq8_run(ctx, src0, src1, nullptr, dst);
++}
++
++void ggml_cuda_mul_mat_skinny_q8_bias(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst) {
++    skq8_run(ctx, src0, src1, bias, dst);
++}
+diff --git a/src/ggml-cuda/skinny-q8.cuh b/src/ggml-cuda/skinny-q8.cuh
+new file mode 100644
+index 00000000..ec4cd506
+--- /dev/null
++++ b/src/ggml-cuda/skinny-q8.cuh
+@@ -0,0 +1,18 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++#include "common.cuh"
++
++// Skinny-N (9..64 cols) Q8_0 x F32 GEMM specialized for streaming encoders.
++// See skinny-q8.cu for the design notes.
++bool ggml_cuda_skinny_q8_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++
++void ggml_cuda_mul_mat_skinny_q8(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    ggml_tensor * dst);
++
++// Fused variant: adds a row-vector bias ([M], F32) in the GEMM epilogue and
++// writes the result to `dst` (the bias-add node's buffer).
++void ggml_cuda_mul_mat_skinny_q8_bias(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst);

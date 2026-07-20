@@ -1,0 +1,18 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+libcublas.so.13 {
+  global:
+    cublasCreate_v2;
+    cublasDestroy_v2;
+    cublasSetStream_v2;
+    cublasSetMathMode;
+    cublasGetStatusString;
+    cublasGemmEx;
+    cublasGemmStridedBatchedEx;
+    cublasGemmBatchedEx;
+    cublasSgemm_v2;
+    cublasSgemmStridedBatched;
+    cublasStrsmBatched;
+  local: *;
+};

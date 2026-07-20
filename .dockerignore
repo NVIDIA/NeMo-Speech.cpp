@@ -1,0 +1,17 @@
+.git
+# Nested submodule .git files (ggml, llama.cpp, third_party/*) become broken
+# pointers once copied; exclude them so apply-ggml-patches.sh runs git-apply
+# on a plain tree and the build context stays small.
+**/.git
+.gitignore
+.gitmodules
+.cache
+.claude
+build
+build-*
+core.*
+**/__pycache__
+**/*.pyc
+# *.wav / *.gguf are intentionally NOT excluded because test fixtures may use
+# them. The pre-commit large-file check guards against accidentally adding a
+# model artifact to the repository.

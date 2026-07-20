@@ -1,154 +1,131 @@
-# __NVIDIA_OSS__ Standard Repo Template
+# NeMo-Speech.cpp
 
-This README file is from the NVIDIA_OSS standard repo template of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file). It provides a list of files in the PLC-OSS-Template and guidelines on how to use (clone and customize) them.
+A lightweight native C++ runtime for NVIDIA Nemotron Speech models built on ggml. Runs speech models in realtime and in batch mode across platforms/backends.
 
-**Upon completing the customization for the project repo, the repo admin should replace this README template with the project specific README file.**
+## Contents
 
-- Files (org-wide templates in the NVIDIA .github org repo; per-repo overrides allowed) in [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Command line](#command-line)
+- [Local server and playground](#local-server-and-playground)
+- [Native SDK](#native-sdk)
+- [Build from source](#build-from-source)
+- [Documentation](#documentation)
+- [License](#license)
+- [Contributing](#contributing)
 
-   - Root 
-     - README.md skeleton (CTA + Quickstart + Support/Security/Governance links) 
-     - LICENSE (Apache 2.0 by default)
-        - For other licenses, see the [Confluence page](https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816) for other licenses
-        - CLA.md file (delete if not using MIT or BSD licenses)
-     - CODE_OF_CONDUCT.md 
-     - SECURITY.md (vuln reporting path) 
-     - CONTRIBUTING.md (base; repo can add specifics)
-     - SUPPORT.md (Support levels/channels)
-     - GOVERNANCE.md (baseline; repo may extend)
-     - CITATION.md (for projects that need citation)
+## Installation
 
-   - .github/ 
-     - ISSUE_TEMPLATE/ (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository>)
-       - bug.yml, feature.yml, task.yml, config.yml 
-     - PULL_REQUEST_TEMPLATE.md (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/creating-a-pull-request-template-for-your-repository>)
-     - workflows/
-     - Note: workflow-templates/ for starter workflows should live in the org-level .github repo, not per-repo
+From a source checkout, install the CLI, HTTP API, and browser playground for
+the detected platform and backend:
 
-   - Repo-specific (not org-template, maintained by the team)
-     - CODEOWNERS (place at .github/CODEOWNERS or repo root)
-     - CHANGELOG.md (or RELEASE.md) 
-     - ROADMAP.md 
-     - MAINTAINERS.md 
-     - NOTICE or THIRD_PARTY_NOTICES / THIRD_PARTY_LICENSES (dependency specific)
-     - Build/package files (CMake, pyproject, Dockerfile, etc.)
-
-   - Recommended structure and hygiene
-     - docs/
-     - examples/
-     - tests/
-     - scripts/
-     - Container/dev env: Dockerfile, docker/, .devcontainer/ (optional)
-     - Build/package (language-specific):
-       - Python: pyproject.toml, setup.cfg/setup.py, requirements.txt, environment.yml
-       - C++: CMakeLists.txt, cmake/, vcpkg.json
-     - Repo hygiene: .gitignore, .gitattributes, .editorconfig, .pre-commit-config.yaml, .clang-format
-
-
-## Usage of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file) for NEW NVIDIA OSS repos
-
-1. Clone the [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
-2. Find/replace all in the clone of `___PROJECT___` and `__PROJECT_NAME__` with the name of the specific project.
-3. Inspect all files to make sure all replacements work and update text as needed
-
-
-**What you can reuse immediately**
-- CODE_OF_CONDUCT.md
-- SECURITY.md
-- CONTRIBUTING.md (base)
-- .github/ISSUE_TEMPLATE/.yml (bug/feature/task + config.yml)
-- .github/PULL_REQUEST_TEMPLATE.md
-- Reusable workflows 
-
-**What you must customize per repo**
-- README.md: copy the skeleton and fill in product-specific details (Quickstart, Requirements, Usage, Support level, links)
-- LICENSE: check file is correct, update year, consult Confluence for alternatives https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816, add CLA.md only if your license/process requires it
-- CODEOWNERS: replace <TEAM> with your GitHub team handle(s). Place at .github/CODEOWNERS (or repo root)
-- MAINTAINERS.md: list maintainers names/roles, escalation path
-- CHANGELOG.md (or RELEASE.md): track releases/changes
-- SUPPORT.md: Update for your project
-- ROADMAP.md (optional): upcoming milestones
-- NOTICE / THIRD_PARTY_NOTICES (if you ship third‑party content)
-- Build/package files (CMake/pyproject/Dockerfile/etc.), tests/, docs/, examples/, scripts/ as appropriate
-- Workflows: Edit if you need custom behavior 
-
-
-4. Change git origin to point to new repo and push
-5. Remove the line break below and everything above it
-
-## Usage for existing NVIDIA OSS repos
-
-1. Follow the steps above, but add the files to your existing repo and merge
-
-<!-- REMOVE THE LINE BELOW AND EVERYTHING ABOVE -->
------------------------------------------
-# [Project Title]
-One-sentence value proposition for users. Who is it for, and why it matters. 
-
-# Overview
-What the project does? Why the project is useful?
-Provide a brief overview, highlighting key features or problem-solving capabilities.
-
-# Getting Started
-Guide users on how they can get started with the project. This should include basic installation step, quick-start examples 
 ```bash
-# Option A: Package manager (pip/conda/npm/etc.)
-<copy-paste install>
-
-# Option B: Container
-docker run <image> <args>
-
-# Verify (hello world)
-<one-liner or ~10-line example>
+scripts/install.sh --source
+export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
 ```
-# Requirements
-Include a list of pre-requisites. 
-- OS/Arch: <summary or link to full matrix>
-- Runtime/Compiler: <versions>
-- GPU/Drivers (if applicable): CUDA <ver>, driver <ver>, etc.
 
-# Usage
+The source build requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
+and the toolkit for the selected GPU backend. See
+[Installation](docs/install.md) for platform-specific prerequisites and
+options. The same installer will support native release archives once their
+public URL is configured.
+
+## Quick start
+
+The runtime consumes GGUF models. Until the preconverted GGUF is published,
+use the included converter to download the public `.nemo` checkpoint and
+produce a portable Q8 model. Complete the one-time
+[conversion setup](docs/model-conversion.md) first; it does not install NeMo.
+
 ```bash
-# Minimal runnable snippet (≤20 lines)
-<code>
+python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
+  --outfile nemotron-speech-streaming-en-0.6b.q8_0.gguf
+
+nemo-speech transcribe test_files/asr/wav/test/jfk.wav \
+  --model nemotron-speech-streaming-en-0.6b.q8_0.gguf
 ```
-- More examples/tutorials: <link>
-- API reference: <link>
 
-# Performance (Optional)
-Summary of benchmarks; link to detailed results and hardware used.
+The converter downloads only the `.nemo` checkpoint through the standard
+Hugging Face cache. The CLI selects an available backend and handles common
+mono or stereo PCM WAV sample rates automatically. Substitute your own WAV
+file after verifying the bundled sample.
 
-## Releases & Roadmap 
-- Releases/Changelog: <link>
-- (Optional) Next milestones or link to `ROADMAP.md`.
-  
-# Contribution Guidelines
-- Start here: `CONTRIBUTING.md`
-- Code of Conduct: `CODE_OF_CONDUCT.md`
-- Development quickstart (build/test):
+## Command line
+
+The CLI is the primary interface. Run `nemo-speech --help` to see the
+capabilities included in your build. The [CLI guide](docs/cli.md) covers model
+selection, GPU controls, directory transcription, subtitles, diarization,
+translation, synthesis, structured output, and benchmarking when you need them.
+
+## Local server and playground
+
+Start the same runtime as a local HTTP service and open the playground:
+
 ```bash
-<clone> && <deps> && <build/test>
+nemo-speech serve \
+  --asr-model nemotron-speech-streaming-en-0.6b.q8_0.gguf \
+  --open
 ```
-## Governance & Maintainers
-- Governance: `GOVERNANCE.md`
-- Maintainers: <team/handles>
-- Labeling/triage policy: <link>
 
-## Security
-- Vulnerability disclosure: `SECURITY.md`
-- Do not file public issues for security reports.
+The server binds to <http://127.0.0.1:8080> by default and also provides a
+documented OpenAI-compatible audio API subset and realtime WebSocket
+transcription. A separately built `riva_server` binary provides the
+Riva-compatible gRPC interface. See the [server guide](docs/server.md) when you
+are ready to integrate either interface.
 
-## Support
-- Level: <Experimental | Maintained | Stable>
-- How to get help: Issues/Discussions/<channel link>
-- Response expectations (if any).
+## Native SDK
 
-# Community
-Provide the channel for community communications.
+Release archives include stable C headers, shared libraries, and an exported
+CMake package. An installed application can link only the capability it uses:
 
-# References
-Provide a list of related references
+```cmake
+find_package(NeMoSpeech REQUIRED COMPONENTS ASR)
+target_link_libraries(my_app PRIVATE NeMoSpeech::ASR)
+```
 
-# License
-This project is licensed under the [NAME HERE] License - see the LICENSE.md file for details
-- License: <link>
+See [native SDK integration](docs/sdk.md) for in-process C/C++ usage, or
+[client integration](docs/clients.md) for OpenAI SDK, curl, and Riva-compatible
+gRPC usage.
+
+## Build from source
+
+For a CUDA ASR and TTS server with the playground from an initialized checkout:
+
+Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, and a supported CUDA
+toolkit.
+
+```bash
+git submodule update --init ggml third_party/cpp-httplib
+scripts/configure.sh cuda-server
+cmake --build --preset cuda-server
+```
+
+The configuration helper validates required submodules and applies the pinned
+ggml patch series for CUDA builds. CPU, Metal, Vulkan, server, component,
+Windows, and container instructions are in
+[Build from source](docs/build.md).
+
+## Documentation
+
+| Start here | What it covers |
+|---|---|
+| [Installation](docs/install.md) | Native releases, Windows, upgrades, and manual verification |
+| [CLI guide](docs/cli.md) | Transcription, subtitles, directories, diarization, NMT, TTS, and tooling |
+| [Model conversion](docs/model-conversion.md) | Convert NeMo and Hugging Face checkpoints to runtime GGUF files |
+| [Servers](docs/server.md) | HTTP playground/realtime serving and the separate Riva-compatible gRPC server |
+| [Native SDK](docs/sdk.md) | CMake components, C ABI lifetimes, threading, and examples |
+| [Client integration](docs/clients.md) | OpenAI SDKs, curl, and Riva gRPC clients |
+| [Troubleshooting](docs/troubleshooting.md) | `doctor` output and common runtime failures |
+| [Build from source](docs/build.md) | Presets, optional components, dependencies, containers, and artifacts |
+| [All documentation](docs/README.md) | ASR, TTS, NMT, configuration, and developer references |
+
+## License
+
+NVIDIA-authored code is released under the [Apache License 2.0](LICENSE), with
+the project copyright notice in [NOTICE](NOTICE). Third-party components retain
+their respective terms; see [Third-Party Notices](THIRD_PARTY_NOTICES.md).
+
+## Contributing
+
+External contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the contribution terms and Developer Certificate of Origin sign-off process.

@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+@PACKAGE_INIT@
+
+set(NeMoSpeech_ASR_FOUND FALSE)
+set(NeMoSpeech_Diarization_FOUND FALSE)
+set(NeMoSpeech_NMT_FOUND FALSE)
+set(NeMoSpeech_TTS_FOUND FALSE)
+
+function(_nemo_speech_import _component _library)
+    find_library(_nemo_speech_${_component}_library
+        NAMES ${_library}
+        PATHS "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@"
+              "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@"
+        NO_DEFAULT_PATH)
+    if(_nemo_speech_${_component}_library)
+        add_library(NeMoSpeech::${_component} UNKNOWN IMPORTED)
+        set_target_properties(NeMoSpeech::${_component} PROPERTIES
+            IMPORTED_LOCATION "${_nemo_speech_${_component}_library}"
+            INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+        set(NeMoSpeech_${_component}_FOUND TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
+if(@NEMO_SPEECH_BUILD_ASR@)
+    _nemo_speech_import(ASR nemo_speech_asr_c)
+endif()
+if(@NEMO_SPEECH_BUILD_DIAR@)
+    if(NeMoSpeech_ASR_FOUND)
+        add_library(NeMoSpeech::Diarization INTERFACE IMPORTED)
+        set_target_properties(NeMoSpeech::Diarization PROPERTIES
+            INTERFACE_LINK_LIBRARIES NeMoSpeech::ASR
+            INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+        set(NeMoSpeech_Diarization_FOUND TRUE)
+    else()
+        _nemo_speech_import(Diarization nemo_speech_asr_c)
+    endif()
+endif()
+if(@NEMO_SPEECH_BUILD_NMT@)
+    _nemo_speech_import(NMT nemo_speech_nmt_c)
+endif()
+if(@NEMO_SPEECH_BUILD_TTS@)
+    _nemo_speech_import(TTS nemo_speech_tts)
+endif()
+
+check_required_components(NeMoSpeech)

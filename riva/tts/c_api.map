@@ -1,0 +1,12 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* The nemo_speech_tts_* symbols are the stable ABI. The nemo_speech::tts C++ symbols
+   remain exported for in-tree consumers but are not a stable binary contract. */
+{
+    global:
+        nemo_speech_tts_*;
+        *nemo_speech3tts*;
+    local:
+        *;
+};

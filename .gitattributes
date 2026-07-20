@@ -1,0 +1,6 @@
+# Keep ggml patch files LF on every platform. On Windows with core.autocrlf=true
+# they would otherwise check out CRLF, and `git apply` rejects some hunks as
+# "corrupt patch" on mixed endings (notably 0007-magpietts-nanocodec.patch).
+ggml-patches/*.patch text eol=lf
+# Shell scripts must stay LF so they run under bash / Git Bash on Windows.
+*.sh text eol=lf

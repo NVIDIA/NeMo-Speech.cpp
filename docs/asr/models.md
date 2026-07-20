@@ -1,0 +1,169 @@
+# ASR models and conversion
+
+The runtime loads a single **GGUF** file per model. The root
+[`convert_model.py`](../../convert_model.py) converter ingests a NeMo checkpoint
+and emits the unified `asr.*` metadata this SDK expects.
+
+The source checkpoint can be either:
+
+- a **public model repository on Hugging Face**; the converter downloads its
+  `.nemo` checkpoint directly, or
+- a **local NeMo checkpoint** - any compatible `.nemo` archive, including a
+  fine-tune, can be passed directly to the converter.
+
+The converter accepts a local `.nemo` archive **or** a Hugging Face repo id, and
+auto-detects head type (CTC vs RNNT) from the NeMo `model_config.yaml` (override
+with `--head-type {ctc,rnnt}`).
+
+Create an isolated conversion environment:
+
+```bash
+pip install -r requirements.txt
+```
+
+The converters read `.nemo` archives directly and do not require
+`nemo_toolkit`. Remote checkpoints use the standard Hugging Face cache.
+
+## Parakeet CTC (1.1B, offline / buffered streaming)
+
+Hugging Face: [nvidia/parakeet-ctc-1.1b](https://huggingface.co/nvidia/parakeet-ctc-1.1b)
+
+```bash
+python3 convert_model.py nvidia/parakeet-ctc-1.1b \
+    --outfile ./parakeet-ctc-1.1b.gguf
+```
+
+## Nemotron-Speech Streaming (0.6B, cache-aware RNNT)
+
+Hugging Face: [nvidia/nemotron-speech-streaming-en-0.6b](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
+
+```bash
+python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
+    --outfile ./nemotron-speech-streaming-en-0.6b.q8_0.gguf
+```
+
+## Nemotron-3.5 (0.6B, multilingual, prompt-conditioned RNNT)
+
+The same cache-aware FastConformer-RNNT plus **language-ID prompt conditioning**
+across 40+ language-locales (`EncDecRNNTBPEModelWithPrompt`). Hugging Face:
+[nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
+
+```bash
+python3 convert_model.py nvidia/nemotron-3.5-asr-streaming-0.6b \
+    --outfile ./nemotron-3.5-asr-streaming-0.6b.q8_0.gguf --outtype q8_0
+```
+
+The converter emits the prompt metadata (`asr.rnnt.num_prompts`,
+`asr.rnnt.prompt_dictionary`) and the runtime applies the model's `prompt_kernel`
+language fusion ahead of the RNNT joint. Select the language via the request's
+`language_code` (`en-US`, `es-ES`, ...) or `auto`; the `<lang>` tag is stripped
+from the transcript and the detected language is returned on
+`SpeechRecognitionAlternative.language_code` and per-word `WordInfo.language_code`:
+
+```bash
+riva_streaming_asr_client --riva_uri=localhost:50051 \
+    --audio_file=audio.wav --language_code=auto \
+    --interim_results=false --word_time_offsets=true
+```
+
+When ITN is configured with a parent grammar directory (`en/`, `es/`, ...),
+the same explicit or auto-detected language code selects the grammar used for
+the final transcript. Unsupported languages remain unchanged.
+
+## Quantization (`--outtype`)
+
+```bash
+python3 convert_model.py model.nemo --outfile model.gguf --outtype q8_0
+```
+
+Applied to Linear weights (encoder MHA + FFN, RNNT LSTM predictor, joint
+projections) and the ConformerConv pointwise convs. Conv weights and embeddings
+default to F16; norms / biases / positional encodings stay F32.
+
+| `--outtype` | format | bytes/elem | use case |
+| --- | --- | --- | --- |
+| `q8_0` (default) | Q8_0 | 1.062 | compact, high-quality default |
+| `bf16` | BF16 | 2.000 | modern NVIDIA / ARM v9 |
+| `fp16` | F16 | 2.000 | Apple Silicon, older GPUs |
+| `q6_k` | Q6_K | 0.820 | smaller artifact, more quantization |
+| `q5_k` | Q5_K | 0.696 | smaller artifact, more quantization |
+| `q4_k` | Q4_K | 0.572 | smallest listed artifact, most quantization |
+
+`q8_0` is the portable default; pass `--outtype` to choose a different
+size/precision tradeoff. K-quants
+(`q4_k`/`q5_k`/`q6_k`) require inner dim divisible by 256; any tensor that fails
+alignment falls back to F16 and is reported by the converter.
+
+### CUDA batching: planar Q8 layout
+
+The converter's default Q8 layout is the portable block-interleaved format. A
+patched CUDA runtime can instead store all encoder Q8 values and scales in
+tensor-wide planes so high-concurrency FastConformer projections enter the
+batched skinny-Q8 tensor-core path without a runtime repack:
+
+```bash
+python3 convert_model.py model.nemo --outfile model.planar.q8_0.gguf \
+    --outtype q8_0 --q8-layout planar
+```
+
+The layout flag covers ordinary encoder projections and fused attention QKV.
+Planar Q8 is CUDA-only and requires the patched ggml build. Keep a block-layout
+artifact for other backends.
+
+## Companion models (optional)
+
+These are separate GGUFs the server loads alongside the ASR model - each is its
+own file (own `general.architecture`), not bundled into the ASR GGUF, so they can
+be swapped without re-converting the ASR model. Enable them at runtime via their
+server flags; see [configuration](configuration.md).
+
+### Silero VAD
+
+Used for [VAD feature masking](configuration.md#vad-feature-masking) and
+VAD-driven [endpointing](configuration.md#endpointing). Converted from the public
+Silero-VAD package (`general.architecture="vad"`):
+
+```bash
+pip install "silero-vad==6.2.0"
+python3 convert_model.py silero --outfile models/silero-v6.2.0.gguf
+# offline alternative, using an existing whisper.cpp Silero checkpoint:
+#   python3 convert_model.py silero --outfile models/silero-v6.2.0.gguf \
+#       --from-whisper-ggml /path/to/for-tests-silero-v6.2.0-ggml.bin
+```
+
+Source: [snakers4/silero-vad](https://github.com/snakers4/silero-vad) (the pip
+package), or whisper.cpp's bundled checkpoint for the offline path.
+
+### Sortformer speaker diarization
+
+Used for word-level speaker tags (`WordInfo.speaker_tag`, requested via
+`diarization_config.enable_speaker_diarization`) and standalone diarization
+(`examples/diarize_file` over the `nemo_speech_diar_*` C ABI, streaming or `--offline`).
+Converted
+from the public streaming Sortformer v2 checkpoint
+(`general.architecture="sortformer"`):
+
+```bash
+python3 convert_model.py nvidia/diar_streaming_sortformer_4spk-v2 \
+    --outfile models/sortformer-v2-f32.gguf
+# --outtype f32 is the default; f16 and q8_0 produce smaller artifacts.
+```
+
+Enable with `--diar-model models/sortformer-v2-f32.gguf`; streaming geometry
+comes from `--diar-preset` (see [configuration](configuration.md)). Segment
+postprocessing defaults are NeMo's callhome-tuned values and are
+dataset-sensitive.
+
+Source: [nvidia/diar_streaming_sortformer_4spk-v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2).
+
+### PnC (punctuation + capitalization)
+
+Used for [automatic punctuation](configuration.md#postprocessing-profanity-itn-pnc)
+- restores casing and `. , ?` for models that emit lowercase unpunctuated text
+(e.g. Parakeet CTC). Use a compatible PnC GGUF, or convert a local NeMo BERT
+punctuation-and-capitalization `.nemo` checkpoint directly
+(`general.architecture="pnc"`):
+
+```bash
+python3 convert_model.py pnc.nemo --outfile pnc-bert.q8_0.gguf --outtype q8_0
+```

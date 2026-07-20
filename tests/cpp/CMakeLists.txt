@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+add_library(tests_cpp_wer STATIC
+    utils/wer.cpp
+)
+target_include_directories(tests_cpp_wer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(test_shared_utilities
+    ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_shared_utilities.cpp
+    ${CMAKE_SOURCE_DIR}/app/cli_util.cpp)
+target_include_directories(test_shared_utilities PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(test_shared_utilities PRIVATE
+    nemo_speech_common nemo_speech_engine_registry)
+add_test(NAME shared_utilities COMMAND test_shared_utilities)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND
+   (NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR OR
+    NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_TTS))
+    add_test(
+        NAME installed_sdk_consumer
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install/sdk_consumer_test.py
+                ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_COMMAND})
+    set_tests_properties(installed_sdk_consumer PROPERTIES TIMEOUT 180)
+endif()
+
+if(TARGET nemo_speech_cli)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME cli_contract
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cli/cli_contract_test.py
+                    $<TARGET_FILE:nemo_speech_cli>)
+        if(UNIX AND NOT APPLE)
+            add_test(
+                NAME cli_install_linux
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install/install_sh_test.py)
+        endif()
+        if(WIN32)
+            find_program(NEMO_SPEECH_POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
+            add_test(
+                NAME cli_install_windows
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install/install_ps1_test.py
+                        ${NEMO_SPEECH_POWERSHELL_EXECUTABLE}
+                        $<TARGET_FILE:nemo_speech_cli>)
+            set_tests_properties(cli_install_windows PROPERTIES TIMEOUT 300)
+        endif()
+        if(NEMO_SPEECH_BUILD_HTTP AND NEMO_SPEECH_BUILD_ASR AND
+           DEFINED ENV{NEMO_SPEECH_TEST_ASR_MODEL} AND
+           DEFINED ENV{NEMO_SPEECH_TEST_AUDIO})
+            set(http_conformance_args
+                --binary $<TARGET_FILE:nemo_speech_cli>
+                --asr-model $ENV{NEMO_SPEECH_TEST_ASR_MODEL}
+                --audio $ENV{NEMO_SPEECH_TEST_AUDIO})
+            find_program(NEMO_SPEECH_NODE_EXECUTABLE NAMES node nodejs)
+            if(NEMO_SPEECH_NODE_EXECUTABLE AND
+               DEFINED ENV{NEMO_SPEECH_TEST_OPENAI_JS_PACKAGE})
+                list(APPEND http_conformance_args
+                    --node ${NEMO_SPEECH_NODE_EXECUTABLE}
+                    --openai-js-package $ENV{NEMO_SPEECH_TEST_OPENAI_JS_PACKAGE}
+                    --openai-js-example
+                    ${CMAKE_SOURCE_DIR}/tests/integration/clients/openai_client.mjs)
+            endif()
+            add_test(
+                NAME http_openai_conformance
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_SOURCE_DIR}/tests/integration/http_conformance_test.py
+                        ${http_conformance_args})
+            set_tests_properties(http_openai_conformance PROPERTIES TIMEOUT 600)
+        endif()
+    endif()
+endif()
+
+if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR)
+    add_subdirectory(asr)
+endif()
+if(NEMO_SPEECH_BUILD_TTS)
+    add_subdirectory(tts)
+endif()
+if(NEMO_SPEECH_BUILD_NMT)
+    add_subdirectory(nmt)
+endif()
+
+if(TARGET nemo_speech_cublas_shim)
+    add_executable(test_cublas_shim_numerics test_cublas_shim_numerics.cu)
+    target_link_libraries(test_cublas_shim_numerics PRIVATE nemo_speech_cublas_shim CUDA::cudart)
+    set_target_properties(test_cublas_shim_numerics PROPERTIES
+        CUDA_ARCHITECTURES "${NEMO_SPEECH_CUBLAS_SHIM_ARCHITECTURES}")
+endif()

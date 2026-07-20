@@ -1,0 +1,56 @@
+# nemo-speech ASR config. Load with: nemo-speech serve --config this.yaml
+#
+# The nested maps mirror the dotted keys exactly: `asr.vad.masker.onset` below
+# is the same setting as `--asr.vad.masker.onset` on the command line. The tree
+# is generated from the config structs (RecognizerConfig::Register), so it stays
+# in sync automatically; `nemo-speech serve --help` lists common options.
+#
+# Precedence is: this file < NEMO_SPEECH_* env vars < CLI flags.
+# Every key is optional - omitted keys keep their built-in defaults. An UNKNOWN
+# key is a hard error (so typos are caught, not silently ignored). The values
+# shown here are the defaults unless noted; paths are placeholders to fill in.
+asr:
+  backend:
+    gpu: 0                       # GPU device index, -1 = CPU
+
+  model:
+    path: /models/nemotron-speech-streaming-en-0.6b.q8_0.gguf
+    # name:                      # display name; default is derived from the model
+
+  streaming:
+    chunk_size: 0.16             # CTC buffered window (seconds)
+    ctc_left_padding: 1.92       # CTC left context (seconds)
+    ctc_right_padding: 1.92      # CTC right context (seconds)
+    rnnt_right_context: 1        # cache-aware R: 1 = low-latency preset, -1 = model max
+
+  decoder:
+    kind: greedy                 # greedy | flashlight
+    # Flashlight LM beam (set kind: flashlight, or just lm_path which implies it):
+    # lm_path: /models/lm.bin
+    # lexicon_path: /models/lexicon.txt
+    # tokenizer_path: /models/tokenizer.model   # for OOV word boosting
+    # beam_size: 32
+    # beam_size_token: 16
+    # beam_threshold: 20.0
+    # lm_weight: 0.8
+    # word_insertion_score: 1.0
+
+  vad:
+    model_path: /models/silero-v6.2.0.gguf      # empty = no VAD loaded
+    masker:
+      mask_enable: false         # zero silent mel frames before the encoder
+      onset: 0.5                 # prob > onset  -> enter speech
+      offset: 0.3                # prob < offset -> leave speech
+      # pad_onset_ms: 200
+      # pad_offset_ms: 200
+      # min_duration_off_ms: 500
+
+  endpointing:
+    enable: true                 # mid-stream end-of-utterance
+    vad_based: true              # ride the VAD timeline (needs vad.model_path); else token-silence
+    stop_history_eou_ms: 800     # trailing silence before EOU (ms)
+
+  postproc:
+    # pnc_model_path: /models/pnc.gguf           # punctuation + capitalization
+    # itn_model_dir: /models/sparrowhawk_en      # inverse text normalization
+    # profanity_list_path: /models/profanity.txt

@@ -1,0 +1,671 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 0b6945ac..b32d0432 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -648,6 +648,10 @@ extern "C" {
+         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
++        // Model weight uses Q8_0 bytes serialized as one tensor-wide int8
++        // plane followed by one FP16 scale plane. CUDA-only storage hint;
++        // logical type, element count, and allocation size remain Q8_0.
++        GGML_TENSOR_FLAG_Q8_PLANAR = 32,
+     };
+ 
+     enum ggml_tri_type {
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 10817505..9bd40faa 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1479,11 +1479,18 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_bias = nullptr;
+     const ggml_tensor * gate = nullptr;
+     const ggml_tensor * gate_bias = nullptr;
++    bool silu = false;
+     ggml_glu_op glu_op;
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+     const void * gate = nullptr;
+     const void * gate_bias = nullptr;
++    // A Linear bias has shape [M, 1, 1, 1] and is broadcast across the
++    // destination columns/channels. Keep this explicit because the legacy
++    // fusion path also accepts a full-shape elementwise bias.
++    bool x_bias_broadcast = false;
++    bool gate_bias_broadcast = false;
++    bool silu = false;
+     ggml_glu_op glu_op;
+ };
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index e25be359..6f3e1c42 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -16,6 +16,7 @@
+ #include "ggml-cuda/conv2d.cuh"
+ #include "ggml-cuda/conv2d-dw.cuh"
+ #include "ggml-cuda/conv2d-transpose.cuh"
++#include "ggml-cuda/skinny-q8.cuh"
+ #include "ggml-cuda/convert.cuh"
+ #include "ggml-cuda/count-equal.cuh"
+ #include "ggml-cuda/cpy.cuh"
+@@ -24,6 +25,7 @@
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
++#include "ggml-cuda/fused-relpos-attn.cuh"
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+@@ -2505,16 +2507,20 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+ 
++    const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
+     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
++                             dst->type == GGML_TYPE_F32 && total_n <= MMVQ_MAX_BATCH_SIZE;
+ 
+     // fusion is not universally faster on Pascal
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    // MMVQ's narrow epilogue supports the two-frame streaming chunk used by
++    // NeMo-Speech.cpp. Outer request-batch columns are included in
++    // total_n above so [K,2,B] stays on skinny-Q8 when B makes it wider than
++    // MMVQ_MAX_BATCH_SIZE.
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > 2) {
+         return false;
+     }
+ 
+@@ -2534,6 +2540,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_q;
+ }
+ 
++static bool ggml_cuda_q8_narrow_epilogue_enabled() {
++    static const bool enabled = [] {
++        const char * value = getenv("GGML_CUDA_Q8_NARROW_EPILOGUE");
++        // Preserve the experimental spelling so the recorded A/B commands
++        // remain reproducible.
++        if (value == nullptr) {
++            value = getenv("GGML_CUDA_Q8_NARROW_BIAS_FUSION");
++        }
++        return value == nullptr || value[0] != '0';
++    }();
++    return enabled;
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+ 
+@@ -2594,7 +2613,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
+     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+ 
+-    if (!split && use_mul_mat_vec_f) {
++    if (!split && !bad_padding_clear && ggml_cuda_skinny_q8_supported(src0, src1, dst)) {
++        // streaming-ASR specialization: Q8_0 weights x skinny (9..64 col)
++        // activations — beats mul_mat_q's LLM-batch tiling at these shapes
++        ggml_cuda_mul_mat_skinny_q8(ctx, src0, src1, dst);
++    } else if (!split && use_mul_mat_vec_f) {
+         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
+         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+@@ -3071,6 +3094,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_FLASH_ATTN_EXT:
+             ggml_cuda_flash_attn_ext(ctx, dst);
+             break;
++        case GGML_OP_FUSED_RELPOS_ATTN:
++            ggml_cuda_op_fused_relpos_attn(ctx, dst);
++            break;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             ggml_cuda_cross_entropy_loss(ctx, dst);
+             break;
+@@ -3662,6 +3688,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return false;
+     }
+ 
++    // Standard LayerNorm (GGML_OP_NORM) + row-vector gamma (+ row-vector beta).
++    // Restricted to the classic affine pattern: the mul/add operands must be
++    // contiguous ne0-length vectors broadcast over rows — that is what the
++    // fused norm_mul_add_f32 kernel implements (see norm.cu).
++    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
++        const ggml_tensor * norm = cgraph->nodes[node_idx];
++        const ggml_tensor * mul  = cgraph->nodes[node_idx+1];
++        const ggml_tensor * add  = nullptr;
++
++        if (ops.size() == 3) {
++            if (ops.begin()[2] != GGML_OP_ADD) {
++                return false;
++            }
++            add = cgraph->nodes[node_idx+2];
++        }
++
++        if (norm->src[0]->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
++            mul->type != GGML_TYPE_F32 || (add && add->type != GGML_TYPE_F32)) {
++            return false;
++        }
++
++        const ggml_tensor * gamma =
++            mul->src[0] == norm ? mul->src[1] : (mul->src[1] == norm ? mul->src[0] : nullptr);
++        if (gamma == nullptr || gamma->type != GGML_TYPE_F32 ||
++            ggml_nelements(gamma) != norm->ne[0] || !ggml_is_contiguous(gamma)) {
++            return false;
++        }
++
++        if (add) {
++            const ggml_tensor * beta =
++                add->src[0] == mul ? add->src[1] : (add->src[1] == mul ? add->src[0] : nullptr);
++            if (beta == nullptr || beta->type != GGML_TYPE_F32 ||
++                ggml_nelements(beta) != norm->ne[0] || !ggml_is_contiguous(beta)) {
++                return false;
++            }
++        }
++
++        // the fused kernel writes dst rows contiguously
++        if (!ggml_is_contiguous(mul) || (add && !ggml_is_contiguous(add))) {
++            return false;
++        }
++
++        return true;
++    }
++
+     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
+@@ -4119,6 +4190,66 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     fused_mul_mat_vec = false;
+     fused_node_count  = 0;
+ 
++    // Q8 narrow projection + SiLU. NeMo-Speech.cpp's Conformer FF1
++    // layers are bias-free, so this is their actual hot graph sequence.
++    if (ggml_cuda_q8_narrow_epilogue_enabled() &&
++        ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
++        ggml_tensor * mm_node   = cgraph->nodes[i];
++        ggml_tensor * silu_node = cgraph->nodes[i + 1];
++        if (ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
++            silu_node->src[0] == mm_node && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++            ggml_cuda_mm_fusion_args_host fusion_data{};
++            fusion_data.silu = true;
++            ggml_cuda_mul_mat_vec_q(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr, silu_node, &fusion_data);
++            return 1;
++        }
++    }
++
++    // Q8 narrow projection + broadcast Linear bias + SiLU. This is the hot
++    // Conformer FF1 sequence at the two-frame streaming chunk size. Folding
++    // both epilogues avoids two launches and two full output round trips.
++    if (ggml_cuda_q8_narrow_epilogue_enabled() &&
++        ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY })) {
++        ggml_tensor * mm_node   = cgraph->nodes[i];
++        ggml_tensor * bias_node = cgraph->nodes[i + 1];
++        ggml_tensor * silu_node = cgraph->nodes[i + 2];
++        const ggml_tensor * bias = bias_node->src[0] == mm_node ? bias_node->src[1] :
++                                   bias_node->src[1] == mm_node ? bias_node->src[0] :
++                                                                  nullptr;
++        if (ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
++            silu_node->src[0] == bias_node && bias != nullptr &&
++            bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
++            ggml_nelements(bias) == mm_node->ne[0] &&
++            ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++            ggml_cuda_mm_fusion_args_host fusion_data{};
++            fusion_data.x_bias = bias;
++            fusion_data.silu   = true;
++            ggml_cuda_mul_mat_vec_q(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr, silu_node, &fusion_data);
++            return 2;
++        }
++    }
++
++    // skinny-q8 GEMM + row-vector bias: the upstream MUL_MAT+ADD fusion below
++    // requires a same-shape add, so the classic broadcast Linear bias
++    // ([M] over [M,N]) never qualifies — fold it into the skinny GEMM's
++    // epilogue instead.
++    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
++        ggml_tensor *       mm_node   = cgraph->nodes[i];
++        ggml_tensor *       bias_node = cgraph->nodes[i + 1];
++        const ggml_tensor * bias      = bias_node->src[0] == mm_node ? bias_node->src[1] :
++                                        bias_node->src[1] == mm_node ? bias_node->src[0] :
++                                                                       nullptr;
++        if (bias != nullptr && bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
++            ggml_nelements(bias) == mm_node->ne[0] && ggml_is_contiguous(bias_node) &&
++            ggml_cuda_skinny_q8_supported(mm_node->src[0], mm_node->src[1], mm_node)) {
++            ggml_cuda_mul_mat_skinny_q8_bias(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], bias, bias_node);
++            return 1;
++        }
++    }
++
+     // gate + add + glu + up + add
+     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+@@ -4154,14 +4285,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             continue;
+         }
+ 
+-        if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
++        const bool same_shape_bias = bias_op != GGML_OP_ADD ||
++                                     ggml_are_same_shape(bias_node->src[0], bias_node->src[1]);
++        const bool broadcast_q_bias = ggml_cuda_q8_narrow_epilogue_enabled() &&
++                                      bias_op == GGML_OP_ADD &&
++                                      bias_tensor->type == GGML_TYPE_F32 &&
++                                      ggml_is_contiguous(bias_tensor) &&
++                                      ggml_nelements(bias_tensor) == mm_node->ne[0];
++        if (!same_shape_bias && !broadcast_q_bias) {
+             continue;
+         }
+ 
+         ggml_cuda_mm_fusion_args_host fusion_data{};
+         fusion_data.x_bias = bias_tensor;
+ 
+-        if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
++        if (same_shape_bias && ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+             fused_mul_mat_vec = true;
+             fused_node_count  = 2;
+@@ -4190,6 +4328,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
++        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
++        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
++        return 1;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+@@ -5402,6 +5550,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+ #endif // GGML_USE_MUSA
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
++        case GGML_OP_FUSED_RELPOS_ATTN:
++            return (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0;  // d_k power of two
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+         case GGML_OP_OPT_STEP_ADAMW:
+diff --git a/src/ggml-cuda/mmvq.cu b/src/ggml-cuda/mmvq.cu
+index da48f313..03668cb8 100644
+--- a/src/ggml-cuda/mmvq.cu
++++ b/src/ggml-cuda/mmvq.cu
+@@ -391,7 +391,17 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     return 1;
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
++template <int vdr>
++static __device__ __forceinline__ float vec_dot_q8_0_q8_1_planar(
++        const void * __restrict__ vx, const block_q8_1 * __restrict__ y,
++        int block_idx, int iqs, size_t scale_plane_offset) {
++    const int * v = (const int *) vx + (size_t) block_idx * (QK8_0 / 4) + iqs;
++    const int * u = (const int *) y->qs + iqs;
++    const half * d = (const half *) ((const char *) vx + scale_plane_offset);
++    return vec_dot_q8_0_q8_1_impl<float, vdr>(v, u, d[block_idx], __low2half(y->ds));
++}
++
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool q8_planar = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+@@ -415,6 +425,10 @@ static __global__ void mul_mat_vec_q(
+     const     int row0 = rows_per_cuda_block*blockIdx.x;
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
++    // Serialized planar weights are restricted to contiguous 2-D matrices.
++    // stride_col_dst is therefore the source row count, and one int8 byte is
++    // stored per logical weight before the FP16 scale plane.
++    const size_t q8_scale_plane_offset = (size_t) ncols_x * stride_col_dst;
+ 
+     const uint32_t channel_dst = blockIdx.y;
+ 
+@@ -432,6 +446,7 @@ static __global__ void mul_mat_vec_q(
+     bool use_gate = false;
+     bool use_bias = false;
+     bool use_gate_bias = false;
++    bool use_silu = false;
+     const void * vgate = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
+@@ -441,6 +456,7 @@ static __global__ void mul_mat_vec_q(
+         use_gate      = fusion.gate      != nullptr;
+         use_bias      = fusion.x_bias    != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
++        use_silu      = fusion.silu;
+         vgate         = fusion.gate;
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
+@@ -453,24 +469,26 @@ static __global__ void mul_mat_vec_q(
+     if constexpr (has_fusion) {
+         const uint32_t channel_bias = ids ? channel_x : channel_dst;
+         if (use_bias) {
+-            x_bias = x_bias + sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0;
++            x_bias = x_bias + (fusion.x_bias_broadcast ? row0 :
++                sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0);
+             // 1. Hide latency by prefetching bias and gate here
+             // 2. load only on threads that won't die after partial sum calculation
+             if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+ #pragma unroll
+                 for (int j = 0; j < ncols_dst; ++j) {
+-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
++                    x_biases[j] = x_bias[(fusion.x_bias_broadcast ? 0 : j * stride_col_dst) + threadIdx.x];
+                 }
+             }
+         }
+         if (use_gate_bias) {
+-            gate_bias = gate_bias + sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0;
++            gate_bias = gate_bias + (fusion.gate_bias_broadcast ? row0 :
++                sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0);
+             if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+ #pragma unroll
+                 for (int j = 0; j < ncols_dst; ++j) {
+-                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
++                    gate_biases[j] = gate_bias[(fusion.gate_bias_broadcast ? 0 : j * stride_col_dst) + threadIdx.x];
+                 }
+             }
+         }
+@@ -493,12 +511,26 @@ static __global__ void mul_mat_vec_q(
+         for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                tmp[j][i] += vec_dot_q_cuda(
+-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                if constexpr (q8_planar) {
++                    static_assert(type == GGML_TYPE_Q8_0, "planar MMVQ is Q8_0-only");
++                    tmp[j][i] += vec_dot_q8_0_q8_1_planar<vdr>(
++                        vx, &y[j*stride_col_y + kby],
++                        kbx_offset + i*stride_row_x + kbx, kqs, q8_scale_plane_offset);
++                } else {
++                    tmp[j][i] += vec_dot_q_cuda(
++                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                }
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+-                        tmp_gate[j][i] += vec_dot_q_cuda(
+-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                        if constexpr (q8_planar) {
++                            tmp_gate[j][i] += vec_dot_q8_0_q8_1_planar<vdr>(
++                                vgate, &y[j*stride_col_y + kby],
++                                kbx_offset + i*stride_row_x + kbx, kqs, q8_scale_plane_offset);
++                        } else {
++                            tmp_gate[j][i] += vec_dot_q_cuda(
++                                vgate, &y[j*stride_col_y + kby],
++                                kbx_offset + i*stride_row_x + kbx, kqs);
++                        }
+                     }
+                 }
+             }
+@@ -583,13 +615,16 @@ static __global__ void mul_mat_vec_q(
+                             break;
+                     }
+                 }
++                if (use_silu) {
++                    result = ggml_cuda_op_silu_single(result);
++                }
+             }
+             dst[j*stride_col_dst + threadIdx.x] = result;
+         }
+     }
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, active_glu, gate_bias, x_bias, tmp_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_silu, active_glu, gate_bias, x_bias, tmp_gate);
+     }
+ }
+ 
+@@ -668,7 +703,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+     return {block_nums, block_dims};
+ }
+ 
+-template<ggml_type type, int c_ncols_dst, bool small_k = false>
++template<ggml_type type, int c_ncols_dst, bool small_k = false, bool q8_planar = false>
+ static void mul_mat_vec_q_switch_fusion(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -678,10 +713,11 @@ static void mul_mat_vec_q_switch_fusion(
+         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
+         const uint32_t ids_stride, cudaStream_t stream) {
+ 
+-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+-    if constexpr (c_ncols_dst == 1) {
++    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr ||
++                            fusion.gate_bias != nullptr || fusion.silu;
++    if constexpr (c_ncols_dst <= 2) {
+         if (has_fusion) {
+-            mul_mat_vec_q<type, c_ncols_dst, true, small_k><<<block_nums, block_dims, nbytes_shared, stream>>>
++            mul_mat_vec_q<type, c_ncols_dst, true, small_k, q8_planar><<<block_nums, block_dims, nbytes_shared, stream>>>
+                 (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -689,9 +725,9 @@ static void mul_mat_vec_q_switch_fusion(
+         }
+     }
+ 
+-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
++    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=2");
+ 
+-    mul_mat_vec_q<type, c_ncols_dst, false, small_k><<<block_nums, block_dims, nbytes_shared, stream>>>
++    mul_mat_vec_q<type, c_ncols_dst, false, small_k, q8_planar><<<block_nums, block_dims, nbytes_shared, stream>>>
+         (vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -718,7 +754,7 @@ static void mul_mat_vec_q_moe_launch(
+         ncols_dst, ids_stride);
+ }
+ 
+-template <ggml_type type>
++template <ggml_type type, bool q8_planar = false>
+ static void mul_mat_vec_q_switch_ncols_dst(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const int ncols_x, const int nrows_x, const int ncols_dst,
+@@ -730,6 +766,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+ 
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
++    static_assert(!q8_planar || type == GGML_TYPE_Q8_0, "planar MMVQ is Q8_0-only");
+ 
+     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+@@ -786,6 +823,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+     };
+ 
+     if (has_ids && ncols_dst > 1) {
++        GGML_ASSERT(!q8_planar && "planar Q8 does not support MUL_MAT_ID");
+         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+         mul_mat_vec_q_moe_launch<type>(
+             vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+@@ -804,7 +842,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             if (use_small_k) {
+                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                         nsamples_dst, warp_size, table_id, true);
+-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true>(
++                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true, q8_planar>(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+@@ -812,7 +850,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             } else {
+                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                         nsamples_dst, warp_size, table_id);
+-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(
++                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+@@ -822,7 +860,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 2: {
+             constexpr int c_ncols_dst = 2;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -830,7 +868,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 3: {
+             constexpr int c_ncols_dst = 3;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -838,7 +876,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 4: {
+             constexpr int c_ncols_dst = 4;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -846,7 +884,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 5: {
+             constexpr int c_ncols_dst = 5;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -854,7 +892,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 6: {
+             constexpr int c_ncols_dst = 6;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -862,7 +900,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 7: {
+             constexpr int c_ncols_dst = 7;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -870,7 +908,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 8: {
+             constexpr int c_ncols_dst = 8;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -889,7 +927,8 @@ static void mul_mat_vec_q_switch_type(
+         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
+         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const int ids_stride, cudaStream_t stream) {
++        const int ids_stride, const bool q8_planar, cudaStream_t stream) {
++    GGML_ASSERT(!q8_planar || type_x == GGML_TYPE_Q8_0);
+     switch (type_x) {
+         case GGML_TYPE_Q1_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
+@@ -922,10 +961,17 @@ static void mul_mat_vec_q_switch_type(
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
+         case GGML_TYPE_Q8_0:
+-            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
+-                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+-                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            if (q8_planar) {
++                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0, true>
++                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            } else {
++                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
++                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            }
+             break;
+         case GGML_TYPE_MXFP4:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
+@@ -1059,13 +1105,14 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     if (fusion) {
+         GGML_ASSERT( !ids || dst->ne[2] == 1);
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] <= 2);
+ 
+         if (fusion->x_bias) {
+             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
+             fusion_local.x_bias = fusion->x_bias->data;
++            fusion_local.x_bias_broadcast = ggml_nelements(fusion->x_bias) == dst->ne[0];
+         }
+         if (fusion->gate) {
+             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+@@ -1076,8 +1123,10 @@ void ggml_cuda_mul_mat_vec_q(
+             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
+             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+             fusion_local.gate_bias = fusion->gate_bias->data;
++            fusion_local.gate_bias_broadcast = ggml_nelements(fusion->gate_bias) == dst->ne[0];
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        fusion_local.silu = fusion->silu;
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+@@ -1121,12 +1170,18 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t stride_channel_y   = ids ? s11  : s12;
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
++    const bool q8_planar = (src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
++    if (q8_planar) {
++        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && ids == nullptr);
++        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0));
++    }
+ 
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
++        ne03,              ne3,           s03, s13,              s3,               ids_stride,
++        q8_planar, stream);
+ }
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1153,9 +1208,11 @@ void ggml_cuda_op_mul_mat_vec_q(
+     const int stride_col_y = src1_padded_row_size / QK8_1;
+ 
+     ggml_cuda_mm_fusion_args_device fusion_local{};
++    GGML_ASSERT((src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) == 0 &&
++                "planar Q8 does not support split-buffer MMVQ");
+     mul_mat_vec_q_switch_type(
+         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
+-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
++        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, false, stream);
+ 
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
+diff --git a/src/ggml-cuda/vecdotq.cuh b/src/ggml-cuda/vecdotq.cuh
+index d1741cc8..33b54ab3 100644
+--- a/src/ggml-cuda/vecdotq.cuh
++++ b/src/ggml-cuda/vecdotq.cuh
+@@ -237,7 +237,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
+     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
+ }
+ 
+-#define VDR_Q8_0_Q8_1_MMVQ 2
++#define VDR_Q8_0_Q8_1_MMVQ 4
+ #define VDR_Q8_0_Q8_1_MMQ 8
+ 
+ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(

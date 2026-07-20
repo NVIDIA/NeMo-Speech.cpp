@@ -1,0 +1,54 @@
+# nemo-speech TTS config.
+#
+# Load with:
+#   nemo-speech serve --config config/tts.example.yaml
+#
+# The nested maps mirror dotted config keys. For example, `tts.magpie-model`
+# can also be set by env as `NEMO_SPEECH_TTS_MAGPIE_MODEL`.
+#
+# Precedence is: this file < NEMO_SPEECH_* env vars < CLI flags.
+# Every key is optional, and omitted keys keep their built-in defaults. Unknown
+# keys are a hard error so typos are not silently ignored.
+tts:
+  magpie-model: /models/magpie-tts.gguf
+  codec-model: /models/nano-codec.gguf
+  tokenizer-model-dir: /models/magpie-tts-nemo
+  # tn-model-dir: /models/en_tn_grammars_cased   # written-form -> spoken-form TN
+
+  language-code: en-US
+  speaker: 0
+
+  threads: 4
+  codec-threads: 0              # 0 = use threads
+  seed: -1                      # -1 = current time
+  steps: -1                     # -1 = model default
+  top-k: -1                     # -1 = model default
+  # temperature: 0.6            # omitted = model default
+  # cfg-scale: 2.5              # omitted = model default
+
+  chunk-frames: 3
+  codec-queue-depth: 4
+  codec-history-frames: -1
+  codec-future-frames: 1
+  window-ms: 0
+  flush-partial-chunk: true
+
+  use-cfg: true
+  use-local-transformer: true
+  use-kv-cache: true
+  use-stateful-codec: true
+  codec-cpu: false
+
+  lt-backend: auto              # auto | cpu | cuda
+  sampling-backend: auto        # auto | cpu | cuda
+  uma-mode: auto                # auto | off | on
+  longform: auto                # auto | off | on
+
+  benchmark: false
+  verbose: false
+
+  # Server defaults and startup warmup:
+  # voice-name: John
+  # warmup-enabled: true
+  # warmup-text: "Hello from Magpie T T S."
+  # warmup-steps: 8

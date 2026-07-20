@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+add_library(nemo_speech_engine_registry STATIC engine_registry.cpp)
+target_include_directories(nemo_speech_engine_registry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_common)
+
+if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR)
+    target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_asr)
+endif()
+if(NEMO_SPEECH_BUILD_ASR)
+    target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_ASR=1)
+endif()
+if(NEMO_SPEECH_BUILD_DIAR)
+    target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_DIAR=1)
+endif()
+if(NEMO_SPEECH_BUILD_TTS)
+    target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_TTS=1)
+    target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_tts_magpietts)
+endif()
+if(NEMO_SPEECH_BUILD_NMT)
+    target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_NMT=1)
+    target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_nmt)
+endif()
+if(TARGET nemo_speech_speech)
+    target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_SPEECH=1)
+    target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_speech)
+endif()

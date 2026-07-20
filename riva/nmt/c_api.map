@@ -1,0 +1,11 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/* Linker version script for the C ABI shared library: export only the public
+   nemo_speech_nmt_* symbols; hide everything else (the linked-in C++ implementation). */
+{
+    global:
+        nemo_speech_nmt_*;
+    local:
+        *;
+};

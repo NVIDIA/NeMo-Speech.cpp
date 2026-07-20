@@ -1,0 +1,9 @@
+build/
+build-*/
+*.pyc
+__pycache__/
+.cache/
+.deps/
+core.*
+client_logs/
+.venv/

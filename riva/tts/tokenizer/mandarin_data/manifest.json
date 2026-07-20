@@ -1,0 +1,14 @@
+{
+  "files": {
+    "hmm_model.utf8": "6be21b9135e8b63b1a3a306492ad0bd1cc2fe5c97d250e17b9f2c9bf52d1b49e",
+    "jieba.dict.utf8": "7197c3211ddd98962b036cdf40324d1ea2bfaa12bd028e68faa70111a88e12a8",
+    "pinyin_chars.tsv": "4fcf1a6af6f5054829de6636834d31f5abfcd8c016ee894a414fd369be3d4741",
+    "pinyin_phrases.tsv": "b3d1ee5d19f2e32d85bd52f5a0480a2a6727072ace7a76cfde48d16b498084d3"
+  },
+  "format": 1,
+  "sources": {
+    "jieba": "0.42.1",
+    "pypinyin": "0.55.0",
+    "pypinyin-dict": "0.9.0"
+  }
+}

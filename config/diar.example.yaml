@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Pull the published diarization model first, then use this file with either:
+#   nemo-speech diarize meeting.wav --config config/diar.example.yaml
+#   nemo-speech serve --config config/diar.example.yaml
+diar:
+  model_path: nvidia/diar-streaming-sortformer-4spk-v2
+  preset: streaming              # streaming | offline

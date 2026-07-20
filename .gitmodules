@@ -1,0 +1,24 @@
+[submodule "ggml"]
+	path = ggml
+	url = https://github.com/ggml-org/ggml.git
+[submodule "proto/riva-common"]
+	path = proto/riva-common
+	url = https://github.com/nvidia-riva/common.git
+[submodule "flashlight-text"]
+	path = third_party/flashlight-text
+	url = https://github.com/flashlight/text.git
+[submodule "kenlm"]
+	path = third_party/kenlm
+	url = https://github.com/kpu/kenlm.git
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "open_jtalk"]
+	path = third_party/open_jtalk
+	url = https://github.com/r9y9/open_jtalk.git
+[submodule "cppjieba"]
+	path = third_party/cppjieba
+	url = https://github.com/yanyiwu/cppjieba.git
+[submodule "third_party/cpp-httplib"]
+	path = third_party/cpp-httplib
+	url = https://github.com/yhirose/cpp-httplib.git

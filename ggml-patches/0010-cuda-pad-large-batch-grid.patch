@@ -1,0 +1,46 @@
+diff --git a/src/ggml-cuda/pad.cu b/src/ggml-cuda/pad.cu
+--- a/src/ggml-cuda/pad.cu
++++ b/src/ggml-cuda/pad.cu
+@@ -12,14 +12,19 @@ static __global__ void pad_f32(const float * src, size_t s00, size_t s01, size_t
+                                const int ne0, const int ne1, const int ne2, const int ne3,
+                                const bool circular) {
+-    // blockIdx.z: i3*ne2+i2
+-    // blockIdx.y: i1
+-    // blockIDx.x: i0 / CUDA_PAD_BLOCK_SIZE
+-    // gridDim.y:  ne1
+-    int i0 = threadIdx.x + blockIdx.x * blockDim.x;
+-    int i1 = blockIdx.y;
+-    int i2 = blockIdx.z % ne2;
+-    int i3 = blockIdx.z / ne2;
++    // Flatten the tensor-slice coordinates into grid.x. The previous 3-D
++    // launch put ne2*ne3 in grid.z, whose architectural limit is 65535.
++    // Large speech batches legitimately exceed that limit even though the
++    // total launch is small enough for grid.x (up to 2^31-1 blocks).
++    const uint64_t blocks_per_row = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
++    const uint64_t linear_block = blockIdx.x;
++    const uint64_t row_block = linear_block % blocks_per_row;
++    uint64_t slice = linear_block / blocks_per_row;
++    const int i1 = slice % ne1;
++    slice /= ne1;
++    const int i2 = slice % ne2;
++    const int i3 = slice / ne2;
++    const int i0 = threadIdx.x + row_block * blockDim.x;
+ 
+     if (i0 >= ne0 || i1 >= ne1 || i2 >= ne2 || i3 >= ne3) {
+         return;
+     }
+@@ -66,9 +71,11 @@ static void pad_f32_cuda(const float * src, size_t s00, size_t s01, size_t s02,
+     const int lp2, const int rp2, const int lp3, const int rp3,
+     const int ne0, const int ne1, const int ne2, const int ne3,
+     const bool circular, cudaStream_t stream) {
+-    int  num_blocks = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
+-    dim3 gridDim(num_blocks, ne1, ne2 * ne3);
+-    pad_f32<<<gridDim, CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
++    const uint64_t blocks_per_row = (ne0 + CUDA_PAD_BLOCK_SIZE - 1) / CUDA_PAD_BLOCK_SIZE;
++    const uint64_t num_blocks =
++        blocks_per_row * (uint64_t) ne1 * (uint64_t) ne2 * (uint64_t) ne3;
++    GGML_ASSERT(num_blocks <= 0x7fffffffULL);
++    pad_f32<<<dim3(num_blocks), CUDA_PAD_BLOCK_SIZE, 0, stream>>>(src, s00, s01, s02, s03, dst,
+                                                          lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3,
+                                                          ne0, ne1, ne2, ne3, circular);
+ }

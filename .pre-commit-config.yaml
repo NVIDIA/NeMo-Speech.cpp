@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# See https://pre-commit.com for more information.
+# Run locally:  pre-commit install && pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license headers
+        entry: python3 scripts/check_license_headers.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=512']
+        exclude: '^(test_files/|riva/tts/tokenizer/mandarin_data/)'
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+      - id: trailing-whitespace
+        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c++, c, cuda]
+        # ggml + vendored riva protos are upstream code — don't reformat.
+        exclude: '^(ggml/|ggml-patches/|proto/riva-common/|build/|build-.*/).*'
+
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        args: ['--skip-string-normalization', '--line-length=100']
+        exclude: '^(ggml/|proto/riva-common/|build/).*'
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        name: isort (python)
+        args:
+          - '--profile=black'
+          - '--line-length=100'
+          - '--skip=ggml'
+          - '--skip=proto/riva-common'
+          - '--skip=build'
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: ['--severity=warning']
+        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'

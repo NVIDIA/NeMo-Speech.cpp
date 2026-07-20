@@ -1,0 +1,311 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 26,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NEMO_SPEECH_BUILD_EXAMPLES": "OFF",
+        "NEMO_SPEECH_BUILD_TESTS": "OFF",
+        "NEMO_SPEECH_BUILD_TOOLS": "OFF"
+      }
+    },
+    {
+      "name": "cpu-asr",
+      "inherits": "base",
+      "displayName": "CPU ASR and diarization",
+      "cacheVariables": {
+        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_BUILD_ASR": "ON",
+        "NEMO_SPEECH_BUILD_DIAR": "ON",
+        "NEMO_SPEECH_BUILD_TTS": "OFF",
+        "NEMO_SPEECH_BUILD_NMT": "OFF"
+      }
+    },
+    {
+      "name": "cpu-diar",
+      "inherits": "base",
+      "displayName": "CPU standalone diarization",
+      "cacheVariables": {
+        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_BUILD_ASR": "OFF",
+        "NEMO_SPEECH_BUILD_DIAR": "ON",
+        "NEMO_SPEECH_BUILD_TTS": "OFF",
+        "NEMO_SPEECH_BUILD_NMT": "OFF"
+      }
+    },
+    {
+      "name": "cpu-tts",
+      "inherits": "base",
+      "displayName": "CPU text-to-speech",
+      "cacheVariables": {
+        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_BUILD_ASR": "OFF",
+        "NEMO_SPEECH_BUILD_DIAR": "OFF",
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "OFF"
+      }
+    },
+    {
+      "name": "cpu-nmt",
+      "inherits": "base",
+      "displayName": "CPU text translation",
+      "cacheVariables": {
+        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_BUILD_ASR": "OFF",
+        "NEMO_SPEECH_BUILD_DIAR": "OFF",
+        "NEMO_SPEECH_BUILD_TTS": "OFF",
+        "NEMO_SPEECH_BUILD_NMT": "ON"
+      }
+    },
+    {
+      "name": "cpu-speech",
+      "inherits": "base",
+      "displayName": "CPU ASR, diarization, NMT, and TTS",
+      "cacheVariables": {
+        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_BUILD_ASR": "ON",
+        "NEMO_SPEECH_BUILD_DIAR": "ON",
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "ON"
+      }
+    },
+    {
+      "name": "cuda-asr",
+      "inherits": "cpu-asr",
+      "displayName": "CUDA ASR and diarization",
+      "cacheVariables": {
+        "GGML_CUDA": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "ON"
+      }
+    },
+    {
+      "name": "cuda-diar",
+      "inherits": "cpu-diar",
+      "displayName": "CUDA standalone diarization",
+      "cacheVariables": {
+        "GGML_CUDA": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "ON"
+      }
+    },
+    {
+      "name": "cuda-tts",
+      "inherits": "cpu-tts",
+      "displayName": "CUDA text-to-speech",
+      "cacheVariables": {
+        "GGML_CUDA": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "ON"
+      }
+    },
+    {
+      "name": "cuda-nmt",
+      "inherits": "cpu-nmt",
+      "displayName": "CUDA text translation",
+      "cacheVariables": {
+        "GGML_CUDA": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "ON"
+      }
+    },
+    {
+      "name": "cuda-speech",
+      "inherits": "cpu-speech",
+      "displayName": "CUDA ASR, diarization, NMT, and TTS",
+      "cacheVariables": {
+        "GGML_CUDA": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "ON"
+      }
+    },
+    {
+      "name": "metal-asr",
+      "inherits": "cpu-asr",
+      "displayName": "Metal ASR and diarization",
+      "cacheVariables": {
+        "GGML_METAL": "ON"
+      }
+    },
+    {
+      "name": "metal-diar",
+      "inherits": "cpu-diar",
+      "displayName": "Metal standalone diarization",
+      "cacheVariables": {
+        "GGML_METAL": "ON"
+      }
+    },
+    {
+      "name": "metal-tts",
+      "inherits": "cpu-tts",
+      "displayName": "Metal text-to-speech",
+      "cacheVariables": {
+        "GGML_METAL": "ON"
+      }
+    },
+    {
+      "name": "metal-nmt",
+      "inherits": "cpu-nmt",
+      "displayName": "Metal text translation",
+      "cacheVariables": {
+        "GGML_METAL": "ON"
+      }
+    },
+    {
+      "name": "metal-speech",
+      "inherits": "cpu-speech",
+      "displayName": "Metal ASR, diarization, NMT, and TTS",
+      "cacheVariables": {
+        "GGML_METAL": "ON"
+      }
+    },
+    {
+      "name": "vulkan-asr",
+      "inherits": "cpu-asr",
+      "displayName": "Vulkan ASR and diarization",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "vulkan-diar",
+      "inherits": "cpu-diar",
+      "displayName": "Vulkan standalone diarization",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "vulkan-tts",
+      "inherits": "cpu-tts",
+      "displayName": "Vulkan text-to-speech",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "vulkan-nmt",
+      "inherits": "cpu-nmt",
+      "displayName": "Vulkan text translation",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "vulkan-speech",
+      "inherits": "cpu-speech",
+      "displayName": "Vulkan ASR, diarization, NMT, and TTS",
+      "cacheVariables": {
+        "GGML_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "cpu-server",
+      "inherits": "cpu-asr",
+      "displayName": "CPU ASR and TTS HTTP server and playground",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_HTTP": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_NMT": "OFF"
+      }
+    },
+    {
+      "name": "cuda-server",
+      "inherits": "cuda-asr",
+      "displayName": "CUDA ASR and TTS HTTP server and playground",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_HTTP": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_NMT": "OFF"
+      }
+    },
+    {
+      "name": "metal-server",
+      "inherits": "metal-asr",
+      "displayName": "Metal ASR and TTS HTTP server and playground",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_HTTP": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_NMT": "OFF"
+      }
+    },
+    {
+      "name": "vulkan-server",
+      "inherits": "vulkan-asr",
+      "displayName": "Vulkan ASR and TTS HTTP server and playground",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_HTTP": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_NMT": "OFF"
+      }
+    },
+    {
+      "name": "cuda-full",
+      "inherits": "cuda-server",
+      "displayName": "CUDA full feature build",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "ON",
+        "NEMO_SPEECH_WITH_NMT": "ON",
+        "NEMO_SPEECH_WITH_GRPC": "ON",
+        "NEMO_SPEECH_WITH_FLASHLIGHT": "ON",
+        "NEMO_SPEECH_WITH_NORM": "ON",
+        "NEMO_SPEECH_TTS_WITH_JA": "ON",
+        "NEMO_SPEECH_TTS_WITH_ZH": "ON"
+      }
+    },
+    {
+      "name": "developer",
+      "inherits": "cpu-speech",
+      "displayName": "CPU developer build",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_HTTP": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "ON",
+        "NEMO_SPEECH_BUILD_TESTS": "ON",
+        "NEMO_SPEECH_BUILD_EXAMPLES": "ON",
+        "NEMO_SPEECH_BUILD_TOOLS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "cpu-asr", "configurePreset": "cpu-asr" },
+    { "name": "cpu-diar", "configurePreset": "cpu-diar" },
+    { "name": "cpu-tts", "configurePreset": "cpu-tts" },
+    { "name": "cpu-nmt", "configurePreset": "cpu-nmt" },
+    { "name": "cpu-speech", "configurePreset": "cpu-speech" },
+    { "name": "cuda-asr", "configurePreset": "cuda-asr" },
+    { "name": "cuda-diar", "configurePreset": "cuda-diar" },
+    { "name": "cuda-tts", "configurePreset": "cuda-tts" },
+    { "name": "cuda-nmt", "configurePreset": "cuda-nmt" },
+    { "name": "cuda-speech", "configurePreset": "cuda-speech" },
+    { "name": "metal-asr", "configurePreset": "metal-asr" },
+    { "name": "metal-diar", "configurePreset": "metal-diar" },
+    { "name": "metal-tts", "configurePreset": "metal-tts" },
+    { "name": "metal-nmt", "configurePreset": "metal-nmt" },
+    { "name": "metal-speech", "configurePreset": "metal-speech" },
+    { "name": "vulkan-asr", "configurePreset": "vulkan-asr" },
+    { "name": "vulkan-diar", "configurePreset": "vulkan-diar" },
+    { "name": "vulkan-tts", "configurePreset": "vulkan-tts" },
+    { "name": "vulkan-nmt", "configurePreset": "vulkan-nmt" },
+    { "name": "vulkan-speech", "configurePreset": "vulkan-speech" },
+    { "name": "cpu-server", "configurePreset": "cpu-server" },
+    { "name": "cuda-server", "configurePreset": "cuda-server" },
+    { "name": "metal-server", "configurePreset": "metal-server" },
+    { "name": "vulkan-server", "configurePreset": "vulkan-server" },
+    { "name": "cuda-full", "configurePreset": "cuda-full" },
+    { "name": "developer", "configurePreset": "developer" }
+  ]
+}

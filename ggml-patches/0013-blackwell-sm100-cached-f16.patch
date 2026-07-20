@@ -1,0 +1,198 @@
+diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
+index 07a94052..9d45a7cf 100644
+--- a/src/ggml-cuda/CMakeLists.txt
++++ b/src/ggml-cuda/CMakeLists.txt
+@@ -77,15 +77,15 @@ if (CUDAToolkit_FOUND)
+     endif()
+ 
+     # Replace plain Blackwell CUDA architectures with their "architecture-specific" equivalents.
+-    # 11X/12X are forwards-compatible, 11Xa/12Xa are not.
++    # 10X/11X/12X are forwards-compatible, 10Xa/11Xa/12Xa are not.
+     # Notably the Blackwell tensor core instructions are not forwards compatible and therefore need architecture-specific targets.
+     # But while 12X vs. 12Xa can be checked in device code there is (to my knowledge) no easy way to do the same check in host code.
+     # So for now just replace the supported plain Blackwell targets with architecture-specific targets.
+     foreach(ARCHS IN ITEMS CMAKE_CUDA_ARCHITECTURES CMAKE_CUDA_ARCHITECTURES_NATIVE)
+         set(FIXED_ARCHS "")
+         foreach(ARCH IN LISTS ${ARCHS})
+-            if (ARCH MATCHES "^(110|12[0-9])(-real|-virtual)?$")
+-                string(REGEX REPLACE "^(110|12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
++            if (ARCH MATCHES "^(100|110|12[0-9])(-real|-virtual)?$")
++                string(REGEX REPLACE "^(100|110|12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
+                 message(STATUS "Replacing ${ARCH} in ${ARCHS} with ${FIXED_ARCH}")
+                 list(APPEND FIXED_ARCHS "${FIXED_ARCH}")
+             else()
+@@ -133,6 +133,14 @@ if (CUDAToolkit_FOUND)
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    # Keep the cached-F16/cuBLAS path out of non-SM100 builds entirely.
++    # A fat binary that explicitly contains SM100a may still contain other SMs;
++    # skinny-q8 also checks the active device CC before dispatching at runtime.
++    if (CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)100a(-real|-virtual)?($|;)")
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_SKINNY_Q8_SM100=1)
++        message(STATUS "Blackwell SM100 cached-F16 skinny-Q8 path compiled in")
++    endif()
++
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+ 
+     if (GGML_CUDA_GRAPHS)
+diff --git a/src/ggml-cuda/skinny-q8.cu b/src/ggml-cuda/skinny-q8.cu
+index 8c944599..1281e4e5 100644
+--- a/src/ggml-cuda/skinny-q8.cu
++++ b/src/ggml-cuda/skinny-q8.cu
+@@ -25,6 +25,9 @@
+ // batch size, so singleton and batched execution cannot select different math.
+ 
+ #include "skinny-q8.cuh"
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++#include "convert.cuh"
++#endif
+ #include "mmvq.cuh"  // MMVQ_MAX_BATCH_SIZE: the N range mmvq already covers
+ 
+ #include <algorithm>
+@@ -39,6 +42,9 @@
+ #define SKQ8_KTB (SKQ8_KSTEP / 32)  // q8 blocks per stage
+ #define SKQ8_STAGES 2
+ #define SKQ8_NMAX SKQ8_NPAD
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++#define SKQ8_SM100 1000
++#endif
+ 
+ // Shared-memory strides (bytes). KSTEP + 16 keeps the 16B cp.async stores
+ // aligned while breaking the power-of-two bank pattern on fragment loads.
+@@ -71,6 +77,35 @@ static __global__ void skq8_repack(
+     }
+ }
+ 
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++// One-time expansion of a planar Q8 weight into F16. On SM100, cuBLAS uses
++// tcgen05 for the ensuing F16 GEMM; caching removes weight dequantization from
++// every streaming chunk while retaining the compact Q8 model on disk.
++static __global__ void skq8_dequantize_weight_f16(
++    const int8_t * __restrict__ qs, const half * __restrict__ d,
++    half * __restrict__ out, const int M, const int K) {
++    const size_t i2 = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const size_t i = i2 * 2;
++    if (i >= (size_t) M * K) {
++        return;
++    }
++    const int col = (int) (i % K);
++    const int row = (int) (i / K);
++    const float scale = __half2float(d[(size_t) row * (K / 32) + col / 32]);
++    const char2 q = *(const char2 *) (qs + i);
++    *(half2 *) (out + i) = __floats2half2_rn((float) q.x * scale, (float) q.y * scale);
++}
++
++static __global__ void skq8_add_bias_f32(
++    float * __restrict__ dst, const float * __restrict__ bias,
++    const int M, const int64_t count) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < count) {
++        dst[i] += bias[i % M];
++    }
++}
++#endif
++
+ // ---------------------------------------------------------------------------
+ // Quantize F32 activations [K, N] (col-contiguous) into a zero-padded
+ // SKQ8_NPAD-column buffer: int8[NPAD][K] + d float[NPAD][K/32].
+@@ -343,6 +378,9 @@ namespace {
+ struct skq8_planes {
+     int8_t * qs;
+     half *   d;
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++    half *   f16;
++#endif
+ };
+ std::unordered_map<const void *, skq8_planes> g_skq8_cache;
+ std::mutex                                    g_skq8_mutex;
+@@ -452,6 +490,20 @@ static void skq8_run(
+     const int64_t KB = K / 32;
+ 
+     cudaStream_t stream = ctx.stream();
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++    static const bool cublas_f16_enabled = []() {
++        const char * e = getenv("GGML_SKINNY_Q8_CUBLAS_F16");
++        return e != nullptr && e[0] != '0';
++    }();
++    static const int cublas_f16_min_n = []() {
++        const char * e = getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
++        const int value = e != nullptr ? atoi(e) : 128;
++        return value > 0 ? value : 1;
++    }();
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    const bool use_cublas_f16 =
++        cublas_f16_enabled && cc == SKQ8_SM100 && N >= cublas_f16_min_n;
++#endif
+ 
+     // Repacked weight planes (create on first use). Default: IN PLACE. The plane
+     // layout (qs M*K + d M*KB*2) is byte-for-byte the same total size as
+@@ -468,7 +520,7 @@ static void skq8_run(
+     // though the repacked bytes are correct. Callers that share the process with
+     // such a scheduler set GGML_SKINNY_Q8_INPLACE=0 (the NMT pipeline does this
+     // when enabled). The streaming-ASR encoder runtime has no such hazard.
+-    skq8_planes planes;
++    skq8_planes planes = {};
+     {
+         std::lock_guard<std::mutex> lock(g_skq8_mutex);
+         auto                        it = g_skq8_cache.find(src0->data);
+@@ -522,10 +574,59 @@ static void skq8_run(
+                 }
+             }
+         }
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++        if (use_cublas_f16 && planes.f16 == nullptr) {
++            const size_t elements = (size_t) M * K;
++            CUDA_CHECK(cudaMalloc(&planes.f16, elements * sizeof(half)));
++            const int blocks = (int) (((elements + 1) / 2 + 255) / 256);
++            skq8_dequantize_weight_f16<<<blocks, 256, 0, stream>>>(
++                planes.qs, planes.d, planes.f16, (int) M, (int) K);
++            g_skq8_cache.at(src0->data).f16 = planes.f16;
++            static const bool memstats = getenv("NEMO_SPEECH_MEMSTATS") != nullptr;
++            if (memstats) {
++                fprintf(stderr,
++                    "[memstats] skinny-q8 SM100 F16 cache +%.1f MB (%s)\n",
++                    elements * sizeof(half) / 1048576.0, src0->name);
++            }
++        }
++#endif
++    }
++
++#if defined(GGML_CUDA_SKINNY_Q8_SM100)
++    // SM100's library F16 GEMM is a native tcgen05/TMEM kernel and is much
++    // faster than applying Q8_0's two independent K32 scales after every INT8
++    // MMA. Keep the model artifact Q8, expand immutable weights once, convert
++    // only the live activation, and retain FP32 accumulation/output.
++    if (use_cublas_f16) {
++        GGML_ASSERT(planes.f16 != nullptr);
++        ggml_cuda_pool_alloc<half> a_f16(ctx.pool(), (size_t) N * K);
++        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
++        GGML_ASSERT(to_fp16 != nullptr);
++        to_fp16(src1->data, a_f16.get(), N * K, stream);
++
++        const float alpha = 1.0f;
++        const float beta = 0.0f;
++        cublasHandle_t handle = ctx.cublas_handle();
++        CUBLAS_CHECK(cublasSetStream(handle, stream));
++        CUBLAS_CHECK(cublasGemmEx(
++            handle, CUBLAS_OP_T, CUBLAS_OP_N,
++            (int) M, (int) N, (int) K,
++            &alpha, planes.f16, CUDA_R_16F, (int) K,
++            a_f16.get(), CUDA_R_16F, (int) K,
++            &beta, dst->data, CUDA_R_32F, (int) M,
++            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++        if (bias != nullptr) {
++            const int64_t count = M * N;
++            skq8_add_bias_f32<<<(count + 255) / 256, 256, 0, stream>>>(
++                (float *) dst->data, (const float *) bias->data, (int) M, count);
++        }
++        return;
+     }
++#endif
++
+     // Quantize activations into the zero-padded buffer (all columns, once —
+     // ntot may exceed NPAD; the GEMM below tiles over 64-col chunks).
+     const int ntot = (int) ((N + SKQ8_NPAD - 1) / SKQ8_NPAD * SKQ8_NPAD);
+     ggml_cuda_pool_alloc<int8_t> aq_alloc(ctx.pool(), (size_t) ntot * K);
+     ggml_cuda_pool_alloc<float>  ad_alloc(ctx.pool(), (size_t) ntot * KB);
+     {

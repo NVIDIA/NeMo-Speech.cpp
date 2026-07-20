@@ -1,0 +1,164 @@
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index ef98f675..d77e1a61 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -37,6 +37,50 @@ static __global__ void norm_f32(
+     }
+ }
+ 
++// LayerNorm fused with a row-vector scale (gamma) and optional row-vector
++// shift (beta): dst = norm(x) * mul[col] (+ add[col]). Deliberately restricted
++// to ne0-length vectors broadcast over rows/channels/samples (the standard
++// LayerNorm affine), enforced by ggml_cuda_can_fuse — this keeps indexing
++// trivial instead of replicating rms_norm's general broadcast machinery.
++template <int block_size, bool do_add>
++static __global__ void norm_mul_add_f32(
++        const float * x, const float * mul, const float * add, float * dst, const int ncols,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
++    const int nrows     = gridDim.x;
++    const int nchannels = gridDim.y;
++
++    const int row       = blockIdx.x;
++    const int channel   = blockIdx.y;
++    const int sample    = blockIdx.z;
++    const int tid       = threadIdx.x;
++
++    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
++    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
++
++    float2 mean_var = make_float2(0.0f, 0.0f);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = x[col];
++        mean_var.x += xi;
++        mean_var.y += xi * xi;
++    }
++
++    extern __shared__ float2 s_sum2[];
++    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
++
++    const float mean = mean_var.x / ncols;
++    const float var = mean_var.y / ncols - mean * mean;
++    const float inv_std = rsqrtf(var + eps);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        float v = (x[col] - mean) * inv_std * mul[col];
++        if constexpr (do_add) {
++            v += add[col];
++        }
++        dst[col] = v;
++    }
++}
++
+ template <int block_size>
+ static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
+     // blockIdx.x: num_groups idx
+@@ -283,6 +327,32 @@ static void norm_f32_cuda(
+     }
+ }
+ 
++static void norm_mul_add_f32_cuda(
++        const float * x, const float * mul, const float * add, float * dst, const int ncols, const int nrows,
++        const int nchannels, const int nsamples, const int64_t stride_row, const int64_t stride_channel,
++        const int64_t stride_sample, const float eps, cudaStream_t stream) {
++    const dim3 blocks_num(nrows, nchannels, nsamples);
++    if (ncols < 1024) {
++        const dim3 block_dims(WARP_SIZE, 1, 1);
++        if (add) {
++            norm_mul_add_f32<WARP_SIZE, true><<<blocks_num, block_dims, 0, stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        } else {
++            norm_mul_add_f32<WARP_SIZE, false><<<blocks_num, block_dims, 0, stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        }
++    } else {
++        const dim3 block_dims(1024, 1, 1);
++        if (add) {
++            norm_mul_add_f32<1024, true><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        } else {
++            norm_mul_add_f32<1024, false><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        }
++    }
++}
++
+ static void group_norm_f32_cuda(
+         const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
+     if (group_size < 1024) {
+@@ -430,6 +500,59 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
+ 
++// Fused LayerNorm (+ row-vector gamma, optional row-vector beta). `dst` is the
++// NORM node; the result is written to the LAST fused node's buffer (mul_tensor
++// or add_tensor), mirroring ggml_cuda_op_rms_norm_fused(_add). Eligibility
++// (row-vector operands, F32, contiguity) is enforced in ggml_cuda_can_fuse.
++void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
++                             ggml_tensor * add_tensor) {
++    const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
++    float eps = 0.0f;
++    memcpy(&eps, dst->op_params, sizeof(float));
++
++    const float * src0_d = (const float *) norm_src->data;
++    const float * mul_d  = nullptr;
++
++    if (mul_tensor->src[0] == dst) {
++        mul_d = (const float *) mul_tensor->src[1]->data;
++    } else if (mul_tensor->src[1] == dst) {
++        mul_d = (const float *) mul_tensor->src[0]->data;
++    } else {
++        GGML_ASSERT(false);
++    }
++
++    const float * add_d = nullptr;
++    float *       dst_d = (float *) mul_tensor->data;
++    if (add_tensor) {
++        if (add_tensor->src[0] == mul_tensor) {
++            add_d = (const float *) add_tensor->src[1]->data;
++        } else if (add_tensor->src[1] == mul_tensor) {
++            add_d = (const float *) add_tensor->src[0]->data;
++        } else {
++            GGML_ASSERT(false);
++        }
++        dst_d = (float *) add_tensor->data;
++    }
++
++    GGML_ASSERT(norm_src->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(eps >= 0.0f);
++
++    const int64_t ne00 = norm_src->ne[0];
++    const int64_t ne01 = norm_src->ne[1];
++    const int64_t ne02 = norm_src->ne[2];
++    const int64_t ne03 = norm_src->ne[3];
++
++    const size_t ts0 = ggml_type_size(norm_src->type);
++    GGML_ASSERT(norm_src->nb[0] == ts0);
++    const int64_t s01 = norm_src->nb[1] / ts0;
++    const int64_t s02 = norm_src->nb[2] / ts0;
++    const int64_t s03 = norm_src->nb[3] / ts0;
++
++    norm_mul_add_f32_cuda(
++        src0_d, mul_d, add_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++}
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const float * src0_d = (const float *)src0->data;
+diff --git a/src/ggml-cuda/norm.cuh b/src/ggml-cuda/norm.cuh
+index a74f6376..20ecaa2d 100644
+--- a/src/ggml-cuda/norm.cuh
++++ b/src/ggml-cuda/norm.cuh
+@@ -2,6 +2,11 @@
+ 
+ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// Fused LayerNorm + row-vector mul (gamma) + optional row-vector add (beta).
++// add_tensor may be nullptr (norm+mul only).
++void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
++                             ggml_tensor * add_tensor);
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
