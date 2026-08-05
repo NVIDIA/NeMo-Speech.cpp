@@ -1,9 +1,9 @@
 diff --git a/src/ggml-cuda/skinny-q8.cu b/src/ggml-cuda/skinny-q8.cu
 new file mode 100644
-index 00000000..88e1e1ec
+index 00000000..60147ff1
 --- /dev/null
 +++ b/src/ggml-cuda/skinny-q8.cu
-@@ -0,0 +1,580 @@
+@@ -0,0 +1,608 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +// Skinny-N Q8_0 GEMM for streaming ASR encoders (nemo-speech).
@@ -152,8 +152,8 @@ index 00000000..88e1e1ec
 +#endif
 +
 +// C[M,N] (F32, col stride M) = Wq8 x A. Small-M GEMMs split K over
-+// blockIdx.y (gridDim.y k-ranges, scales already folded per range) and
-+// combine partials with float atomicAdd into a pre-zeroed C.
++// blockIdx.y (gridDim.y k-ranges, scales already folded per range); each
++// split writes a private plane for deterministic reduction afterward.
 +static __global__ __launch_bounds__(SKQ8_WARPS * 32, 5) void skq8_gemm(
 +    const int8_t * __restrict__ Wq, const half * __restrict__ Wd, const int8_t * __restrict__ Aq,
 +    const float * __restrict__ Ad, const float * __restrict__ bias, float * __restrict__ C,
@@ -303,8 +303,9 @@ index 00000000..88e1e1ec
 +    }
 +
 +    // Write back: C rows mhalf*16 + gid (+8), cols nt*8 + tid4*2 (+1).
-+    // With a K-split grid, C was pre-zeroed and partials combine via atomics
-+    // (the fused bias is contributed by the blockIdx.y == 0 split only).
++    // With a K-split grid, each split writes a private output plane. A
++    // follow-up kernel reduces those planes in a fixed order, avoiding the
++    // run-to-run numerical drift caused by unordered FP32 atomic additions.
 +    const int   row0 = row_blk + mhalf * 16 + gid;
 +    const float b0   = (bias != nullptr && blockIdx.y == 0) ? bias[row0] : 0.0f;
 +    const float b1   = (bias != nullptr && blockIdx.y == 0) ? bias[row0 + 8] : 0.0f;
@@ -319,13 +320,17 @@ index 00000000..88e1e1ec
 +    for (int t = 0; t < 2; t++) {
 +        const int c0 = (nt0 + t) * 8 + tid4 * 2;
 +        if (gridDim.y > 1) {
++            // Plane stride covers the full logical output. `N` is only this
++            // grid.z tile's width (<= SKQ8_NPAD), so using it here aliases the
++            // next tile whenever N_total > SKQ8_NPAD.
++            const size_t split_base = (size_t) blockIdx.y * M * N_total;
 +            if (c0 < N) {
-+                atomicAdd(&C[row0 + (size_t) c0 * M], facc[t][0]);
-+                atomicAdd(&C[row0 + 8 + (size_t) c0 * M], facc[t][2]);
++                C[split_base + row0 + (size_t) c0 * M]     = facc[t][0];
++                C[split_base + row0 + 8 + (size_t) c0 * M] = facc[t][2];
 +            }
 +            if (c0 + 1 < N) {
-+                atomicAdd(&C[row0 + (size_t) (c0 + 1) * M], facc[t][1]);
-+                atomicAdd(&C[row0 + 8 + (size_t) (c0 + 1) * M], facc[t][3]);
++                C[split_base + row0 + (size_t) (c0 + 1) * M]     = facc[t][1];
++                C[split_base + row0 + 8 + (size_t) (c0 + 1) * M] = facc[t][3];
 +            }
 +        } else {
 +            if (c0 < N) {
@@ -342,6 +347,20 @@ index 00000000..88e1e1ec
 +    GGML_UNUSED_VARS(Wq, Wd, Aq, Ad, bias, C, M, N_total, K, ncols_total);
 +    NO_DEVICE_CODE;
 +#endif
++}
++
++static __global__ void skq8_reduce_splitk(
++    const float * __restrict__ partials, float * __restrict__ dst,
++    const int64_t count, const int ksplit) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= count) {
++        return;
++    }
++    float sum = partials[i];
++    for (int split = 1; split < ksplit; ++split) {
++        sum += partials[(int64_t) split * count + i];
++    }
++    dst[i] = sum;
 +}
 +
 +// Repacked-weight cache. Keyed by the weight tensor's device pointer; entries
@@ -543,8 +562,10 @@ index 00000000..88e1e1ec
 +            (const float *) src1->data, aq_alloc.get(), ad_alloc.get(), (int) K, (int) N);
 +    }
 +
-+    // Split K for small-M shapes until there is enough block-level parallelism,
-+    // combining partial results with atomicAdd.
++    // Split K for small-M shapes until there is enough block-level parallelism.
++    // Each split writes a private plane and a deterministic reduction combines
++    // the planes afterward; unordered atomics can amplify into visible
++    // B=1-versus-batched drift across a deep encoder.
 +    // 1-step splits are allowed: no pipeline, but block-level K-parallelism.
 +    // N > NPAD is mapped into grid.z. Weights are still read once per 64-column
 +    // tile, but all tiles are visible to the scheduler in a single launch.
@@ -555,9 +576,6 @@ index 00000000..88e1e1ec
 +               K % ((int64_t) SKQ8_KSTEP * ksplit * 2) == 0) {
 +            ksplit *= 2;
 +        }
-+        if (ksplit > 1) {
-+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, (size_t) M * N * sizeof(float), stream));
-+        }
 +        const size_t smem = (size_t) SKQ8_STAGES * SKQ8_STAGE_BYTES;
 +        static std::once_flag attr_set_flag;
 +        std::call_once(attr_set_flag, [&]() {
@@ -566,10 +584,20 @@ index 00000000..88e1e1ec
 +        });
 +        const int  ntiles = (ntot + SKQ8_NPAD - 1) / SKQ8_NPAD;
 +        const dim3 grid(row_blocks, ksplit, ntiles);
-+        skq8_gemm<<<grid, SKQ8_WARPS * 32, smem, stream>>>(
-+            planes.qs, planes.d, aq_alloc.get(), ad_alloc.get(),
-+            bias != nullptr ? (const float *) bias->data : nullptr, (float *) dst->data,
-+            (int) M, (int) N, (int) K, ntot);
++        const float * bias_data = bias != nullptr ? (const float *) bias->data : nullptr;
++        if (ksplit > 1) {
++            const int64_t count = M * N;
++            ggml_cuda_pool_alloc<float> partials(ctx.pool(), (size_t) ksplit * count);
++            skq8_gemm<<<grid, SKQ8_WARPS * 32, smem, stream>>>(
++                planes.qs, planes.d, aq_alloc.get(), ad_alloc.get(), bias_data, partials.get(),
++                (int) M, (int) N, (int) K, ntot);
++            skq8_reduce_splitk<<<(count + 255) / 256, 256, 0, stream>>>(
++                partials.get(), (float *) dst->data, count, ksplit);
++        } else {
++            skq8_gemm<<<grid, SKQ8_WARPS * 32, smem, stream>>>(
++                planes.qs, planes.d, aq_alloc.get(), ad_alloc.get(), bias_data,
++                (float *) dst->data, (int) M, (int) N, (int) K, ntot);
++        }
 +    }
 +}
 +
@@ -586,7 +614,7 @@ index 00000000..88e1e1ec
 +}
 diff --git a/src/ggml-cuda/skinny-q8.cuh b/src/ggml-cuda/skinny-q8.cuh
 new file mode 100644
-index 00000000..ec4cd506
+index 00000000..17175bbb
 --- /dev/null
 +++ b/src/ggml-cuda/skinny-q8.cuh
 @@ -0,0 +1,18 @@

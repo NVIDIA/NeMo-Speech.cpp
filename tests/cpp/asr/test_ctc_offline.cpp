@@ -160,12 +160,16 @@ main(int argc, char** argv) {
 
     if (verify_offline_fe) {
         std::vector<float> cpu_mel, cpu_lp, gpu_lp;
+        std::vector<float> compact_probs;
+        std::vector<int32_t> compact_ids;
         int n_mel = 0, cpu_T = 0, cpu_C = 0, gpu_T = 0, gpu_C = 0;
+        int compact_T = 0;
         // With batching disabled, the shared streaming frontend is the CPU
         // radix-2 reference while infer_ctc() selects the offline GPU frontend.
         ctc->fe().compute(audio.data(), audio.size(), cpu_mel, n_mel);
         ctc->infer_ctc_from_mel(cpu_mel.data(), n_mel, cpu_lp, cpu_T, cpu_C);
         ctc->infer_ctc(audio.data(), audio.size(), gpu_lp, gpu_T, gpu_C);
+        ctc->infer_ctc_greedy(audio.data(), audio.size(), compact_ids, compact_probs, compact_T);
         const auto cpu_ids = collapsed_argmax(cpu_lp, cpu_T, cpu_C, ctc->ctc_config().blank_id);
         const auto gpu_ids = collapsed_argmax(gpu_lp, gpu_T, gpu_C, ctc->ctc_config().blank_id);
         if (cpu_ids != gpu_ids) {
@@ -173,6 +177,18 @@ main(int argc, char** argv) {
                 stderr, "[offline-fe] CPU/GPU collapsed-token mismatch (%zu vs %zu)\n",
                 cpu_ids.size(), gpu_ids.size());
             return 5;
+        }
+        if (compact_T != gpu_T || compact_ids != frame_argmax(gpu_lp, gpu_T, gpu_C)) {
+            std::fprintf(stderr, "[offline-fe] compact/full token mismatch\n");
+            return 5;
+        }
+        for (int t = 0; t < compact_T; ++t) {
+            const int id = compact_ids[static_cast<size_t>(t)];
+            const float expected = std::exp(gpu_lp[static_cast<size_t>(t) * gpu_C + id]);
+            if (std::fabs(compact_probs[static_cast<size_t>(t)] - expected) > 1e-5f) {
+                std::fprintf(stderr, "[offline-fe] compact/full probability mismatch\n");
+                return 5;
+            }
         }
         if (gpu >= 0 && !ctc->offline_frontend_uses_gpu()) {
             std::fprintf(stderr, "[offline-fe] CUDA run did not select GPU frontend\n");

@@ -25,8 +25,9 @@ make_fe_cfg(const SortformerModelConfig& c) {
     return fe;
 }
 
-DiarModel::DiarModel(ggml_runtime::BackendManager& bm, const std::string& gguf_path)
-    : model_(bm, gguf_path), fe_cfg_(make_fe_cfg(model_.cfg())),
+DiarModel::DiarModel(
+    ggml_runtime::BackendManager& bm, const std::string& gguf_path, const BatchingConfig& batching)
+    : model_(bm, gguf_path, batching), fe_cfg_(make_fe_cfg(model_.cfg())),
       fe_(fe_cfg_, /*bm=*/nullptr) {  // CPU FFT path, same choice as AsrModel
     const int n_bins = fe_cfg_.n_fft / 2 + 1;
     fe_.set_mel_basis(model_.mel_basis().data(), fe_cfg_.n_mels, n_bins);

@@ -15,7 +15,7 @@ Transcribe one WAV file:
 nemo-speech transcribe recording.wav --model ./models/asr.q8_0.gguf
 ```
 
-The file CLI accepts mono or stereo PCM16 and float32 WAV input from 8–96 kHz.
+The file CLI accepts mono or stereo PCM16 and float32 WAV input from 8-96 kHz.
 It downmixes and resamples to the model rate. Unsupported containers or codecs
 produce an error with a conversion command.
 
@@ -121,7 +121,8 @@ The converter downloads the published `.nemo` checkpoint through the standard
 Hugging Face cache and writes the GGUF consumed by the runtime. See
 [model conversion](model-conversion.md) for the isolated Python environment and
 other model families. Model files remain local; pass their paths explicitly or
-record a reusable multi-model setup in a YAML configuration file.
+record a reusable multi-model setup in a
+[YAML configuration file](server.md#engine-and-listener-configuration).
 
 ## Benchmark
 

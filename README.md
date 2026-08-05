@@ -26,9 +26,8 @@ export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
 
 The source build requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
 and the toolkit for the selected GPU backend. See
-[Installation](docs/install.md) for platform-specific prerequisites and
-options. The same installer will support native release archives once their
-public URL is configured.
+[Installation](docs/install.md) for platform-specific prerequisites, options,
+and the native release-archive flow.
 
 ## Quick start
 
@@ -89,10 +88,8 @@ gRPC usage.
 
 ## Build from source
 
-For a CUDA ASR and TTS server with the playground from an initialized checkout:
-
-Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, and a supported CUDA
-toolkit.
+Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, and a supported
+CUDA toolkit. For a CUDA ASR and TTS server with the playground:
 
 ```bash
 git submodule update --init ggml third_party/cpp-httplib
@@ -113,6 +110,7 @@ Windows, and container instructions are in
 | [CLI guide](docs/cli.md) | Transcription, subtitles, directories, diarization, NMT, TTS, and tooling |
 | [Model conversion](docs/model-conversion.md) | Convert NeMo and Hugging Face checkpoints to runtime GGUF files |
 | [Servers](docs/server.md) | HTTP playground/realtime serving and the separate Riva-compatible gRPC server |
+| [HTTP API reference](docs/api.md) | Every endpoint's request fields, responses, and the realtime protocol |
 | [Native SDK](docs/sdk.md) | CMake components, C ABI lifetimes, threading, and examples |
 | [Client integration](docs/clients.md) | OpenAI SDKs, curl, and Riva gRPC clients |
 | [Troubleshooting](docs/troubleshooting.md) | `doctor` output and common runtime failures |

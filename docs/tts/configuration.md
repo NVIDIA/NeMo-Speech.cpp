@@ -2,7 +2,7 @@
 
 Configuration for MagpieTTS + NanoCodec. `nemo-speech serve` hosts HTTP; the
 separate `riva_server` hosts Riva-compatible gRPC.
-Either process can load ASR and TTS together. For how keys are set (YAML,
+Either process can load ASR, TTS, and NMT together. For how keys are set (YAML,
 environment, and CLI precedence), see
 [Server configuration](../server.md#engine-and-listener-configuration). To
 obtain and convert the models, see [TTS models](models.md).
@@ -40,9 +40,9 @@ when present. The older split layout (`classify/tokenize_and_classify.far`,
 `verbalize/verbalize.far`) remains supported.
 
 The optional `riva_server` adapter implements `RivaSpeechSynthesis.Synthesize`,
-`SynthesizeOnline`, and `GetRivaSynthesisConfig`; accept
-`SynthesizeSpeechRequest.text` as real text; support native Magpie tokenizers for
-`en`, `es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, and `ja`; and return `LINEAR_PCM`
+`SynthesizeOnline`, and `GetRivaSynthesisConfig`. It takes plain text in
+`SynthesizeSpeechRequest.text`, supports native Magpie tokenizers for `en`,
+`es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, and `ja`, and returns `LINEAR_PCM`
 s16le at the NanoCodec sample rate. Japanese and Mandarin are included when
 `NEMO_SPEECH_TTS_WITH_JA` and `NEMO_SPEECH_TTS_WITH_ZH`, respectively, are
 enabled at build time; both default to `OFF`. Native tokenizers are cached by
@@ -127,7 +127,7 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.magpie-model` | - | - | MagpieTTS GGUF token generator (required) |
 | `tts.codec-model` | - | - | NanoCodec decoder GGUF (required) |
 | `tts.tokenizer-model-dir` | - | - | extracted Magpie `.nemo` dir (required) |
-| `tts.tokenizer.sentence-limit.*` | - | language-specific | per-sentence token limit for the MagpieTTS tokenizer (integer, tunable) |
+| `tts.tokenizer.sentence-limit.<lang>` | - | per language (`en` 45 ... `ja` 40) | sentence-chunking threshold in words (characters for `zh`/`ja`); subkeys `en`, `es`, `fr`, `vi`, `it`, `de`, `zh`, `hi`, `ja` |
 | `tts.tn-model-dir` | - | - | enables Sparrowhawk TN with this grammar dir; requires `NEMO_SPEECH_WITH_NORM=ON` |
 | `tts.language-code` | - | `en-US` | default Riva language code |
 | `tts.voice-name` | - | - | default voice name or speaker index |
@@ -166,6 +166,7 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.threads` | `--threads` | `4` | CPU threads for Magpie + codec |
 | `tts.codec-threads` | - | `0` | codec CPU threads; `0` = use `threads` |
 | `tts.lt-backend` | - | `auto` | local-transformer backend: `auto`/`cpu`/`cuda` |
+| `tts.lt-fp32` | `--tts.local-transformer-fp32` | `false` | run the local transformer in FP32 |
 | `tts.sampling-backend` | - | `auto` | sampling backend: `auto`/`cpu`/`cuda` |
 | `tts.uma-mode` | - | `auto` | CUDA managed memory: `auto`/`off`/`on` |
 | `tts.longform` | - | `auto` | sentence-chunk longform mode: `auto`/`off`/`on` |

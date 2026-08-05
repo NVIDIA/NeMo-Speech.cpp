@@ -1,0 +1,1480 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index fb823571..5cfa65e0 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2436,8 +2436,9 @@ extern "C" {
+     //                                        pos_len >= kv_len + q_len - 1
+     //   bias_u [d_k, n_head]                 pos_bias_u (content term)
+     //   bias_v [d_k, n_head]                 pos_bias_v (position term)
+-    //   mask   [kv_len] or [kv_len, batch]   additive (0 / -inf) key mask,
+-    //          or NULL                        shared or per-stream columns
++    //   mask   [kv_len], [kv_len, q_len],    additive (0 / -inf) mask,
++    //          or [kv_len, batch], or NULL    offline per-query or streaming
++    //                                         per-stream columns
+     // Q/K/V/P may be non-contiguous views as long as each d_k row is
+     // contiguous — e.g. Q sliced from a fused-QKV projection and K/V read
+     // head-split from a feat-major [n_feat, kv] window (the CUDA op derives
+@@ -2460,6 +2461,27 @@ extern "C" {
+             float                 scale,
+             bool                  merge_heads);
+ 
++    // Streaming CUDA variant. K/V contain only the current chunk; cached K/V
++    // are read directly from a persistent [n_feat*cache_len, slots, 2] F32
++    // arena using one I32 slot id and circular-cache head per batch item. The
++    // op appends the current chunk at the head and leaves advancing that head
++    // to the caller after the graph run succeeds.
++    GGML_API struct ggml_tensor * ggml_fused_relpos_attn_cached(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * p,
++            struct ggml_tensor  * bias_u,
++            struct ggml_tensor  * bias_v,
++            struct ggml_tensor  * mask,
++            struct ggml_tensor  * kv_cache,
++            struct ggml_tensor  * slot_ids,
++            struct ggml_tensor  * ring_heads,
++            int64_t               cache_len,
++            float                 scale,
++            bool                  merge_heads);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+            struct ggml_context * ctx,
+diff --git a/src/ggml-cuda/fused-relpos-attn.cu b/src/ggml-cuda/fused-relpos-attn.cu
+index f3c4836a..d5640439 100644
+--- a/src/ggml-cuda/fused-relpos-attn.cu
++++ b/src/ggml-cuda/fused-relpos-attn.cu
+@@ -3,6 +3,8 @@
+ #include "fused-relpos-attn.cuh"
+ 
+ #include <atomic>
++#include <cstdlib>
++#include <type_traits>
+ 
+ // Fused FastConformer relative-position multi-head attention.
+ //
+@@ -17,7 +19,8 @@
+ // K/V window — as long as d_k stays innermost-contiguous (asserted by the op
+ // constructor; the vectorized loads rely on it). P is [d_k, pos_len, n_head]
+ // with pos_len = kv + q - 1 rows addressable; bu/bv are [d_k, n_head];
+-// mask is [kv] (shared) or [kv, batch] (per-stream) additive (0 / -inf), or NULL.
++// mask is [kv] (shared), [kv, q] (offline per-query), or [kv, batch]
++// (streaming per-stream) additive (0 / -inf), or NULL.
+ // Output ctx is [d_k, q, n_head, batch] logical; with the merge_heads op flag
+ // its memory layout is head-merged ([d_k+h*d_k] innermost, i.e. a plain
+ // (n_feat, q, batch) matrix), so the output projection consumes it without a
+@@ -41,6 +44,17 @@ static __device__ __forceinline__ float relpos_warp_sum(float value) {
+     return value;
+ }
+ 
++// Unlike relpos_warp_sum(), return the complete sum to every lane. The
++// register-resident Q=2 kernel needs each lane to retain the softmax weight
++// for the four V features it accumulates.
++static __device__ __forceinline__ float relpos_warp_all_sum(float value) {
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        value += __shfl_xor_sync(0xffffffff, value, offset);
++    }
++    return value;
++}
++
+ static __device__ __forceinline__ float4 relpos_load4(const float * ptr) {
+     return *reinterpret_cast<const float4 *>(ptr);
+ }
+@@ -53,21 +67,98 @@ static __device__ __forceinline__ float4 relpos_load4(const half * ptr) {
+         __low2float(values[1]), __high2float(values[1]));
+ }
+ 
++template <typename T, bool Cached>
++static __device__ __forceinline__ float4 relpos_load_kv4(
++        const T * chunk_head, const float * cache_head, int j, int cache_len,
++        int ring_head, long chunk_sj, long cache_sj, int d4) {
++    if constexpr (Cached) {
++        if (j < cache_len) {
++            int physical_j = ring_head + j;
++            if (physical_j >= cache_len) {
++                physical_j -= cache_len;
++            }
++            return relpos_load4(cache_head + (size_t) physical_j * cache_sj + d4);
++        }
++        return relpos_load4(chunk_head + (size_t) (j - cache_len) * chunk_sj + d4);
++    }
++    return relpos_load4(chunk_head + (size_t) j * chunk_sj + d4);
++}
++
++template <typename T, bool Cached>
++static __device__ __forceinline__ float relpos_load_kv(
++        const T * chunk_head, const float * cache_head, int j, int cache_len,
++        int ring_head, long chunk_sj, long cache_sj, int d) {
++    if constexpr (Cached) {
++        if (j < cache_len) {
++            int physical_j = ring_head + j;
++            if (physical_j >= cache_len) {
++                physical_j -= cache_len;
++            }
++            return cache_head[(size_t) physical_j * cache_sj + d];
++        }
++        return (float) chunk_head[(size_t) (j - cache_len) * chunk_sj + d];
++    }
++    return (float) chunk_head[(size_t) j * chunk_sj + d];
++}
++
++// Each thread owns one feature and appends only the current chunk to its
++// circular cache. ring_heads[b] is the oldest physical row before this step,
++// so those rows are exactly the ones the new chunk replaces. K and V use
++// separate planes of the same persistent arena.
++template <typename T>
++static __global__ void fused_relpos_attn_update_cache_kernel(
++        float * __restrict__ arena, const T * __restrict__ K,
++        const T * __restrict__ V, const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        int cache_len, int chunk_len, int n_feat, int d_k,
++        long cache_ss, long cache_sp,
++        long k_sj, long k_sh, long k_sb, long v_sj, long v_sh, long v_sb) {
++    const int feature = (int) blockIdx.x * blockDim.x + threadIdx.x;
++    const int b = blockIdx.y;
++    const int plane = blockIdx.z;
++    if (feature >= n_feat) {
++        return;
++    }
++
++    const int slot = slot_ids[b];
++    const int ring_head = ring_heads[b];
++    float * dst = arena + (size_t) plane * cache_sp + (size_t) slot * cache_ss + feature;
++    const int h = feature / d_k;
++    const int d = feature - h * d_k;
++    const T * src = (plane == 0 ? K : V) +
++        (size_t) b * (plane == 0 ? k_sb : v_sb) +
++        (size_t) h * (plane == 0 ? k_sh : v_sh) + d;
++    const long src_sj = plane == 0 ? k_sj : v_sj;
++    const int append = min(cache_len, chunk_len);
++    for (int j = 0; j < append; ++j) {
++        const int src_j = chunk_len - append + j;
++        int physical_j = ring_head + j;
++        if (physical_j >= cache_len) {
++            physical_j -= cache_len;
++        }
++        dst[(size_t) physical_j * n_feat] = (float) src[(size_t) src_j * src_sj];
++    }
++}
++
+ // SM100 streaming specialization for d_k=128 and q=2. Keeping one block per
+ // query preserves the two rows' parallelism while the complete grid fits in a
+ // resident wave. Compared with the generic shared-memory reduction tree, the
+ // score-producing warps retain their local maxima and max/sum use only four
+ // warp partials. This removes fourteen block barriers and 124 scratch floats.
+-template <typename T>
++template <typename T, bool Cached>
+ static __global__ void fused_relpos_attn_warp_128_kernel(
+         const float * __restrict__ Q, const T * __restrict__ K,
+         const T * __restrict__ V, const T * __restrict__ Ppos,
+         const float * __restrict__ bu, const float * __restrict__ bv,
+         const float * __restrict__ mask, float * __restrict__ ctx,
+-        int kv, float scale,
++        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
++        const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        int kv, int cache_len, float scale,
+         long q_sq, long q_sh, long q_sb,
+         long k_sj, long k_sh, long k_sb,
+         long v_sj, long v_sh, long v_sb,
++        long cache_sj, long cache_ss,
+         long p_sr, long p_sh,
+         long o_si, long o_sh, long o_sb, long m_sb) {
+     extern __shared__ float sh[];
+@@ -86,6 +177,14 @@ static __global__ void fused_relpos_attn_warp_128_kernel(
+     const float * Qhi = Q + (size_t) b * q_sb + (size_t) h * q_sh + (size_t) i * q_sq;
+     const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
+     const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const int slot = Cached ? slot_ids[b] : 0;
++    const int ring_head = Cached ? ring_heads[b] : 0;
++    const float * Kch = Cached
++        ? Kcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128
++        : nullptr;
++    const float * Vch = Cached
++        ? Vcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128
++        : nullptr;
+     const T * Ph = Ppos + (size_t) h * p_sh;
+     const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
+ 
+@@ -98,7 +197,8 @@ static __global__ void fused_relpos_attn_warp_128_kernel(
+     const float4 qv4 = *reinterpret_cast<const float4 *>(Qv + d4);
+     float produced_max = -INFINITY;
+     for (int j = warp; j < kv; j += RELPOS_ATTN_WARPS_128) {
+-        const float4 k4 = relpos_load4(Kh + (size_t) j * k_sj + d4);
++        const float4 k4 = relpos_load_kv4<T, Cached>(
++            Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d4);
+         const int row = 1 + j - i;
+         const float4 p4 = relpos_load4(Ph + (size_t) row * p_sr + d4);
+         float score =
+@@ -154,7 +254,9 @@ static __global__ void fused_relpos_attn_warp_128_kernel(
+ 
+     float context = 0.0f;
+     for (int j = 0; j < kv; ++j) {
+-        context += sc[j] * (float) Vh[(size_t) j * v_sj + d];
++        context +=
++            sc[j] * relpos_load_kv<T, Cached>(
++                        Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d);
+     }
+     ctx[(size_t) b * o_sb + (size_t) i * o_si + (size_t) h * o_sh + d] = context / red[0];
+ }
+@@ -163,16 +265,20 @@ static __global__ void fused_relpos_attn_warp_128_kernel(
+ // block computes both query rows. K and V are then loaded once and reused;
+ // only the two relative-position rows differ. The reduction order matches the
+ // one-query specialization so changing batch size does not change numerics.
+-template <typename T>
++template <typename T, bool Cached>
+ static __global__ void fused_relpos_attn_q2_warp_128_kernel(
+         const float * __restrict__ Q, const T * __restrict__ K,
+         const T * __restrict__ V, const T * __restrict__ Ppos,
+         const float * __restrict__ bu, const float * __restrict__ bv,
+         const float * __restrict__ mask, float * __restrict__ ctx,
+-        int kv, float scale,
++        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
++        const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        int kv, int cache_len, float scale,
+         long q_sq, long q_sh, long q_sb,
+         long k_sj, long k_sh, long k_sb,
+         long v_sj, long v_sh, long v_sb,
++        long cache_sj, long cache_ss,
+         long p_sr, long p_sh,
+         long o_si, long o_sh, long o_sb, long m_sb) {
+     extern __shared__ float sh[];
+@@ -195,6 +301,14 @@ static __global__ void fused_relpos_attn_q2_warp_128_kernel(
+     const float * Qh1 = Qh0 + q_sq;
+     const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
+     const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const int slot = Cached ? slot_ids[b] : 0;
++    const int ring_head = Cached ? ring_heads[b] : 0;
++    const float * Kch = Cached
++        ? Kcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128
++        : nullptr;
++    const float * Vch = Cached
++        ? Vcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128
++        : nullptr;
+     const T * Ph = Ppos + (size_t) h * p_sh;
+     const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
+ 
+@@ -214,7 +328,8 @@ static __global__ void fused_relpos_attn_q2_warp_128_kernel(
+     float produced_max0 = -INFINITY;
+     float produced_max1 = -INFINITY;
+     for (int j = warp; j < kv; j += RELPOS_ATTN_WARPS_128) {
+-        const float4 k4  = relpos_load4(Kh + (size_t) j * k_sj + d4);
++        const float4 k4 = relpos_load_kv4<T, Cached>(
++            Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d4);
+         const float4 p04 = relpos_load4(Ph + (size_t) (j + 1) * p_sr + d4);
+         const float4 p14 = relpos_load4(Ph + (size_t) j * p_sr + d4);
+         float score0 =
+@@ -292,7 +407,9 @@ static __global__ void fused_relpos_attn_q2_warp_128_kernel(
+     float context0 = 0.0f;
+     float context1 = 0.0f;
+     for (int j = 0; j < kv; ++j) {
+-        const float value = (float) Vh[(size_t) j * v_sj + d];
++        const float value =
++            relpos_load_kv<T, Cached>(
++                Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d);
+         context0 += sc0[j] * value;
+         context1 += sc1[j] * value;
+     }
+@@ -301,7 +418,573 @@ static __global__ void fused_relpos_attn_q2_warp_128_kernel(
+     ctx[out + o_si] = context1 / red1[0];
+ }
+ 
++// Portable NVIDIA SM80+ exact-shape Q=2/KV=72 specialization. One
++// 256-thread CTA owns a (batch, head) pair and each of its eight warps owns
++// nine consecutive KV columns through
++// both scoring and value accumulation. The two sets of nine softmax weights
++// remain in registers instead of making a score/weight round trip through
++// shared memory. Only per-warp denominators and partial context vectors cross
++// warps. __launch_bounds__ requests four resident blocks per multiprocessor.
++//
++// Max subtraction keeps exponent evaluation stable for the model's score range;
++// the per-warp maxima cross through one small shared-memory exchange.
+ template <typename T>
++__global__ __launch_bounds__(256, 4) void fused_relpos_attn_q2_register_kernel(
++        const float * __restrict__ Q, const T * __restrict__ K,
++        const T * __restrict__ V, const T * __restrict__ Ppos,
++        const float * __restrict__ bu, const float * __restrict__ bv,
++        const float * __restrict__ mask, float * __restrict__ ctx,
++        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
++        const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        float scale,
++        long q_sq, long q_sh, long q_sb,
++        long k_sj, long k_sh, long k_sb,
++        long v_sj, long v_sh, long v_sb,
++        long cache_sj, long cache_ss,
++        long p_sr, long p_sh,
++        long o_si, long o_sh, long o_sb, long m_sb) {
++    constexpr int warps = 8;
++    constexpr int keys_per_warp = 9;
++    constexpr int cache_len = 70;
++
++    extern __shared__ float sh[];
++    float * den = sh;                         // [warp, query]
++    float * part = den + warps * 2;           // [warp, query, d]
++
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int h = blockIdx.x;
++    const int b = blockIdx.y;
++    const int d4 = lane * 4;
++    const int j0 = warp * keys_per_warp;
++
++    const float * Qh0 = Q + (size_t) b * q_sb + (size_t) h * q_sh;
++    const float * Qh1 = Qh0 + q_sq;
++    const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
++    const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const int slot = slot_ids[b];
++    const int ring_head = ring_heads[b];
++    const float * Kch =
++        Kcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128;
++    const float * Vch =
++        Vcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128;
++    const T * Ph = Ppos + (size_t) h * p_sh;
++    const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
++
++    const float4 q04 = relpos_load4(Qh0 + d4);
++    const float4 q14 = relpos_load4(Qh1 + d4);
++    const float4 bu4 = relpos_load4(bu + (size_t) h * RELPOS_ATTN_DK_128 + d4);
++    const float4 bv4 = relpos_load4(bv + (size_t) h * RELPOS_ATTN_DK_128 + d4);
++    const float4 qc0 = make_float4(
++        q04.x + bu4.x, q04.y + bu4.y, q04.z + bu4.z, q04.w + bu4.w);
++    const float4 qc1 = make_float4(
++        q14.x + bu4.x, q14.y + bu4.y, q14.z + bu4.z, q14.w + bu4.w);
++    const float4 qp0 = make_float4(
++        q04.x + bv4.x, q04.y + bv4.y, q04.z + bv4.z, q04.w + bv4.w);
++    const float4 qp1 = make_float4(
++        q14.x + bv4.x, q14.y + bv4.y, q14.z + bv4.z, q14.w + bv4.w);
++
++    float scores0[keys_per_warp];
++    float scores1[keys_per_warp];
++    float local_max0 = -INFINITY;
++    float local_max1 = -INFINITY;
++    float4 p14 = relpos_load4(Ph + (size_t) j0 * p_sr + d4);
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        const float4 p04 = relpos_load4(Ph + (size_t) (j + 1) * p_sr + d4);
++        float4 k4;
++        if (c < 7 || j < cache_len) {
++            int physical_j = ring_head + j;
++            if (physical_j >= cache_len) {
++                physical_j -= cache_len;
++            }
++            k4 = relpos_load4(Kch + (size_t) physical_j * cache_sj + d4);
++        } else {
++            k4 = relpos_load4(Kh + (size_t) (j - cache_len) * k_sj + d4);
++        }
++        float score0 =
++            k4.x * qc0.x + p04.x * qp0.x +
++            k4.y * qc0.y + p04.y * qp0.y +
++            k4.z * qc0.z + p04.z * qp0.z +
++            k4.w * qc0.w + p04.w * qp0.w;
++        float score1 =
++            k4.x * qc1.x + p14.x * qp1.x +
++            k4.y * qc1.y + p14.y * qp1.y +
++            k4.z * qc1.z + p14.z * qp1.z +
++            k4.w * qc1.w + p14.w * qp1.w;
++        score0 = relpos_warp_all_sum(score0);
++        score1 = relpos_warp_all_sum(score1);
++        const float additive_mask = Mb ? Mb[j] : 0.0f;
++        score0 = score0 * scale + additive_mask;
++        score1 = score1 * scale + additive_mask;
++        scores0[c] = score0;
++        scores1[c] = score1;
++        local_max0 = fmaxf(local_max0, score0);
++        local_max1 = fmaxf(local_max1, score1);
++        p14 = p04;
++    }
++    if (lane == 0) {
++        den[warp * 2] = local_max0;
++        den[warp * 2 + 1] = local_max1;
++    }
++    __syncthreads();
++
++    float maximum0 = den[0];
++    float maximum1 = den[1];
++#pragma unroll
++    for (int w = 1; w < warps; ++w) {
++        maximum0 = fmaxf(maximum0, den[w * 2]);
++        maximum1 = fmaxf(maximum1, den[w * 2 + 1]);
++    }
++    // Every warp must finish reading the maxima before lane zero reuses den.
++    __syncthreads();
++    float local_den0 = 0.0f;
++    float local_den1 = 0.0f;
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const float weight0 = __expf(scores0[c] - maximum0);
++        const float weight1 = __expf(scores1[c] - maximum1);
++        scores0[c] = weight0;
++        scores1[c] = weight1;
++        local_den0 += weight0;
++        local_den1 += weight1;
++    }
++    if (lane == 0) {
++        den[warp * 2] = local_den0;
++        den[warp * 2 + 1] = local_den1;
++    }
++
++    float4 acc0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float4 acc1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        float4 v4;
++        if (c < 7 || j < cache_len) {
++            int physical_j = ring_head + j;
++            if (physical_j >= cache_len) {
++                physical_j -= cache_len;
++            }
++            v4 = relpos_load4(Vch + (size_t) physical_j * cache_sj + d4);
++        } else {
++            v4 = relpos_load4(Vh + (size_t) (j - cache_len) * v_sj + d4);
++        }
++        acc0.x = fmaf(scores0[c], v4.x, acc0.x);
++        acc0.y = fmaf(scores0[c], v4.y, acc0.y);
++        acc0.z = fmaf(scores0[c], v4.z, acc0.z);
++        acc0.w = fmaf(scores0[c], v4.w, acc0.w);
++        acc1.x = fmaf(scores1[c], v4.x, acc1.x);
++        acc1.y = fmaf(scores1[c], v4.y, acc1.y);
++        acc1.z = fmaf(scores1[c], v4.z, acc1.z);
++        acc1.w = fmaf(scores1[c], v4.w, acc1.w);
++    }
++    *reinterpret_cast<float4 *>(
++        part + ((warp * 2) * RELPOS_ATTN_DK_128) + d4) = acc0;
++    *reinterpret_cast<float4 *>(
++        part + ((warp * 2 + 1) * RELPOS_ATTN_DK_128) + d4) = acc1;
++    __syncthreads();
++
++    float total_den0 = den[0];
++    float total_den1 = den[1];
++#pragma unroll
++    for (int w = 1; w < warps; ++w) {
++        total_den0 += den[w * 2];
++        total_den1 += den[w * 2 + 1];
++    }
++    const int i = tid / RELPOS_ATTN_DK_128;
++    const int d = tid % RELPOS_ATTN_DK_128;
++    float context = part[i * RELPOS_ATTN_DK_128 + d];
++#pragma unroll
++    for (int w = 1; w < warps; ++w) {
++        context += part[((w * 2 + i) * RELPOS_ATTN_DK_128) + d];
++    }
++    const float denominator = i == 0 ? total_den0 : total_den1;
++    ctx[(size_t) b * o_sb + (size_t) i * o_si + (size_t) h * o_sh + d] =
++        context / denominator;
++}
++
++// Nemotron 3.5 R=3 specialization: Q=4, cache=56, KV=60. Six warps own
++// ten consecutive keys each and reuse every K/V load across all four query
++// rows. Scores and softmax weights remain register-resident.
++template <typename T>
++__global__ __launch_bounds__(192, 3) void fused_relpos_attn_q4_register_kernel(
++        const float * __restrict__ Q, const T * __restrict__ K,
++        const T * __restrict__ V, const T * __restrict__ Ppos,
++        const float * __restrict__ bu, const float * __restrict__ bv,
++        const float * __restrict__ mask, float * __restrict__ ctx,
++        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
++        const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        float scale,
++        long q_sq, long q_sh, long q_sb,
++        long k_sj, long k_sh, long k_sb,
++        long v_sj, long v_sh, long v_sb,
++        long cache_sj, long cache_ss,
++        long p_sr, long p_sh,
++        long o_si, long o_sh, long o_sb, long m_sb) {
++    constexpr int warps = 6;
++    constexpr int queries = 4;
++    constexpr int keys_per_warp = 10;
++    constexpr int cache_len = 56;
++
++    extern __shared__ float sh[];
++    float * den = sh;                               // [warp, query]
++    float * part = den + warps * queries;           // [warp, query, d]
++
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int h = blockIdx.x;
++    const int b = blockIdx.y;
++    const int d4 = lane * 4;
++    const int j0 = warp * keys_per_warp;
++
++    const float * Qh0 = Q + (size_t) b * q_sb + (size_t) h * q_sh;
++    const float * Qh1 = Qh0 + q_sq;
++    const float * Qh2 = Qh1 + q_sq;
++    const float * Qh3 = Qh2 + q_sq;
++    const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
++    const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const int slot = slot_ids[b];
++    const int ring_head = ring_heads[b];
++    const float * Kch =
++        Kcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128;
++    const float * Vch =
++        Vcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128;
++    const T * Ph = Ppos + (size_t) h * p_sh;
++    const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
++
++    const float4 q04 = relpos_load4(Qh0 + d4);
++    const float4 q14 = relpos_load4(Qh1 + d4);
++    const float4 q24 = relpos_load4(Qh2 + d4);
++    const float4 q34 = relpos_load4(Qh3 + d4);
++    const float4 bu4 = relpos_load4(bu + (size_t) h * RELPOS_ATTN_DK_128 + d4);
++    const float4 bv4 = relpos_load4(bv + (size_t) h * RELPOS_ATTN_DK_128 + d4);
++#define RELPOS_ADD_BIAS(q, bias) \
++    make_float4((q).x + (bias).x, (q).y + (bias).y, (q).z + (bias).z, (q).w + (bias).w)
++    const float4 qc0 = RELPOS_ADD_BIAS(q04, bu4);
++    const float4 qc1 = RELPOS_ADD_BIAS(q14, bu4);
++    const float4 qc2 = RELPOS_ADD_BIAS(q24, bu4);
++    const float4 qc3 = RELPOS_ADD_BIAS(q34, bu4);
++    const float4 qp0 = RELPOS_ADD_BIAS(q04, bv4);
++    const float4 qp1 = RELPOS_ADD_BIAS(q14, bv4);
++    const float4 qp2 = RELPOS_ADD_BIAS(q24, bv4);
++    const float4 qp3 = RELPOS_ADD_BIAS(q34, bv4);
++#undef RELPOS_ADD_BIAS
++
++    float scores0[keys_per_warp];
++    float scores1[keys_per_warp];
++    float scores2[keys_per_warp];
++    float scores3[keys_per_warp];
++    float local_max0 = -INFINITY;
++    float local_max1 = -INFINITY;
++    float local_max2 = -INFINITY;
++    float local_max3 = -INFINITY;
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        const float4 k4 = relpos_load_kv4<T, true>(
++            Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d4);
++        const float4 p04 = relpos_load4(Ph + (size_t) (j + 3) * p_sr + d4);
++        const float4 p14 = relpos_load4(Ph + (size_t) (j + 2) * p_sr + d4);
++        const float4 p24 = relpos_load4(Ph + (size_t) (j + 1) * p_sr + d4);
++        const float4 p34 = relpos_load4(Ph + (size_t) j * p_sr + d4);
++#define RELPOS_SCORE(k, qc, p, qp) \
++        ((k).x * (qc).x + (p).x * (qp).x + (k).y * (qc).y + (p).y * (qp).y + \
++         (k).z * (qc).z + (p).z * (qp).z + (k).w * (qc).w + (p).w * (qp).w)
++        float score0 = relpos_warp_all_sum(RELPOS_SCORE(k4, qc0, p04, qp0));
++        float score1 = relpos_warp_all_sum(RELPOS_SCORE(k4, qc1, p14, qp1));
++        float score2 = relpos_warp_all_sum(RELPOS_SCORE(k4, qc2, p24, qp2));
++        float score3 = relpos_warp_all_sum(RELPOS_SCORE(k4, qc3, p34, qp3));
++#undef RELPOS_SCORE
++        const float additive_mask = Mb ? Mb[j] : 0.0f;
++        score0 = score0 * scale + additive_mask;
++        score1 = score1 * scale + additive_mask;
++        score2 = score2 * scale + additive_mask;
++        score3 = score3 * scale + additive_mask;
++        scores0[c] = score0;
++        scores1[c] = score1;
++        scores2[c] = score2;
++        scores3[c] = score3;
++        local_max0 = fmaxf(local_max0, score0);
++        local_max1 = fmaxf(local_max1, score1);
++        local_max2 = fmaxf(local_max2, score2);
++        local_max3 = fmaxf(local_max3, score3);
++    }
++    if (lane == 0) {
++        den[warp * queries + 0] = local_max0;
++        den[warp * queries + 1] = local_max1;
++        den[warp * queries + 2] = local_max2;
++        den[warp * queries + 3] = local_max3;
++    }
++    __syncthreads();
++
++    float maximum0 = den[0];
++    float maximum1 = den[1];
++    float maximum2 = den[2];
++    float maximum3 = den[3];
++#pragma unroll
++    for (int w = 1; w < warps; ++w) {
++        maximum0 = fmaxf(maximum0, den[w * queries + 0]);
++        maximum1 = fmaxf(maximum1, den[w * queries + 1]);
++        maximum2 = fmaxf(maximum2, den[w * queries + 2]);
++        maximum3 = fmaxf(maximum3, den[w * queries + 3]);
++    }
++    __syncthreads();
++
++    float local_den0 = 0.0f;
++    float local_den1 = 0.0f;
++    float local_den2 = 0.0f;
++    float local_den3 = 0.0f;
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        scores0[c] = __expf(scores0[c] - maximum0);
++        scores1[c] = __expf(scores1[c] - maximum1);
++        scores2[c] = __expf(scores2[c] - maximum2);
++        scores3[c] = __expf(scores3[c] - maximum3);
++        local_den0 += scores0[c];
++        local_den1 += scores1[c];
++        local_den2 += scores2[c];
++        local_den3 += scores3[c];
++    }
++    if (lane == 0) {
++        den[warp * queries + 0] = local_den0;
++        den[warp * queries + 1] = local_den1;
++        den[warp * queries + 2] = local_den2;
++        den[warp * queries + 3] = local_den3;
++    }
++
++    float4 acc0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float4 acc1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float4 acc2 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float4 acc3 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        const float4 v4 = relpos_load_kv4<T, true>(
++            Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d4);
++#define RELPOS_ACCUM(acc, weight, value) \
++        do { \
++            (acc).x = fmaf((weight), (value).x, (acc).x); \
++            (acc).y = fmaf((weight), (value).y, (acc).y); \
++            (acc).z = fmaf((weight), (value).z, (acc).z); \
++            (acc).w = fmaf((weight), (value).w, (acc).w); \
++        } while (0)
++        RELPOS_ACCUM(acc0, scores0[c], v4);
++        RELPOS_ACCUM(acc1, scores1[c], v4);
++        RELPOS_ACCUM(acc2, scores2[c], v4);
++        RELPOS_ACCUM(acc3, scores3[c], v4);
++#undef RELPOS_ACCUM
++    }
++    *reinterpret_cast<float4 *>(
++        part + ((warp * queries + 0) * RELPOS_ATTN_DK_128) + d4) = acc0;
++    *reinterpret_cast<float4 *>(
++        part + ((warp * queries + 1) * RELPOS_ATTN_DK_128) + d4) = acc1;
++    *reinterpret_cast<float4 *>(
++        part + ((warp * queries + 2) * RELPOS_ATTN_DK_128) + d4) = acc2;
++    *reinterpret_cast<float4 *>(
++        part + ((warp * queries + 3) * RELPOS_ATTN_DK_128) + d4) = acc3;
++    __syncthreads();
++
++    for (int index = tid; index < queries * RELPOS_ATTN_DK_128; index += blockDim.x) {
++        const int query = index / RELPOS_ATTN_DK_128;
++        const int d = index % RELPOS_ATTN_DK_128;
++        float denominator = den[query];
++        float context = part[query * RELPOS_ATTN_DK_128 + d];
++#pragma unroll
++        for (int w = 1; w < warps; ++w) {
++            denominator += den[w * queries + query];
++            context += part[(w * queries + query) * RELPOS_ATTN_DK_128 + d];
++        }
++        ctx[(size_t) b * o_sb + (size_t) query * o_si + (size_t) h * o_sh + d] =
++            context / denominator;
++    }
++}
++
++// Register-resident paired-query path for the cache-aware geometries exposed
++// by the Nemotron streaming models. Pairing halves the CTA count for larger
++// right-context presets while reusing every K/V load across two query rows.
++template <typename T>
++__global__ __launch_bounds__(256, 4) void fused_relpos_attn_common_q2_register_kernel(
++        const float * __restrict__ Q, const T * __restrict__ K,
++        const T * __restrict__ V, const T * __restrict__ Ppos,
++        const float * __restrict__ bu, const float * __restrict__ bv,
++        const float * __restrict__ mask, float * __restrict__ ctx,
++        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
++        const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        int q_len, int kv_len, int cache_len, float scale,
++        long q_sq, long q_sh, long q_sb,
++        long k_sj, long k_sh, long k_sb,
++        long v_sj, long v_sh, long v_sb,
++        long cache_sj, long cache_ss,
++        long p_sr, long p_sh,
++        long o_si, long o_sh, long o_sb, long m_sb) {
++    constexpr int warps = 8;
++    constexpr int queries = 2;
++    constexpr int keys_per_warp = 11;
++
++    extern __shared__ float sh[];
++    float * den = sh;
++    float * part = den + warps * queries;
++
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int h = blockIdx.x;
++    const int b = blockIdx.y;
++    const int query0 = blockIdx.z * queries;
++    const bool has_query1 = query0 + 1 < q_len;
++    const int d4 = lane * 4;
++    const int j0 = warp * keys_per_warp;
++
++    const float * Qh0 =
++        Q + (size_t) b * q_sb + (size_t) query0 * q_sq + (size_t) h * q_sh;
++    const float * Qh1 = has_query1 ? Qh0 + q_sq : Qh0;
++    const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
++    const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const int slot = slot_ids[b];
++    const int ring_head = ring_heads[b];
++    const float * Kch =
++        Kcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128;
++    const float * Vch =
++        Vcache + (size_t) slot * cache_ss + (size_t) h * RELPOS_ATTN_DK_128;
++    const T * Ph = Ppos + (size_t) h * p_sh;
++    const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
++
++    const float4 q04 = relpos_load4(Qh0 + d4);
++    const float4 q14 = relpos_load4(Qh1 + d4);
++    const float4 bu4 = relpos_load4(bu + (size_t) h * RELPOS_ATTN_DK_128 + d4);
++    const float4 bv4 = relpos_load4(bv + (size_t) h * RELPOS_ATTN_DK_128 + d4);
++#define RELPOS_ADD_BIAS(q, bias) \
++    make_float4((q).x + (bias).x, (q).y + (bias).y, (q).z + (bias).z, (q).w + (bias).w)
++    const float4 qc0 = RELPOS_ADD_BIAS(q04, bu4);
++    const float4 qc1 = RELPOS_ADD_BIAS(q14, bu4);
++    const float4 qp0 = RELPOS_ADD_BIAS(q04, bv4);
++    const float4 qp1 = RELPOS_ADD_BIAS(q14, bv4);
++#undef RELPOS_ADD_BIAS
++
++    float scores0[keys_per_warp];
++    float scores1[keys_per_warp];
++    float local_max0 = -INFINITY;
++    float local_max1 = -INFINITY;
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        float score0 = -INFINITY;
++        float score1 = -INFINITY;
++        if (j < kv_len) {
++            const float4 k4 = relpos_load_kv4<T, true>(
++                Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d4);
++            const int pos0 = j + q_len - 1 - query0;
++            const float4 p04 = relpos_load4(Ph + (size_t) pos0 * p_sr + d4);
++#define RELPOS_SCORE(k, qc, p, qp) \
++            ((k).x * (qc).x + (p).x * (qp).x + (k).y * (qc).y + (p).y * (qp).y + \
++             (k).z * (qc).z + (p).z * (qp).z + (k).w * (qc).w + (p).w * (qp).w)
++            score0 = relpos_warp_all_sum(RELPOS_SCORE(k4, qc0, p04, qp0));
++            if (has_query1) {
++                const float4 p14 = relpos_load4(Ph + (size_t) (pos0 - 1) * p_sr + d4);
++                score1 = relpos_warp_all_sum(RELPOS_SCORE(k4, qc1, p14, qp1));
++            }
++#undef RELPOS_SCORE
++            const float additive_mask = Mb ? Mb[j] : 0.0f;
++            score0 = score0 * scale + additive_mask;
++            if (has_query1)
++                score1 = score1 * scale + additive_mask;
++        }
++        scores0[c] = score0;
++        scores1[c] = score1;
++        local_max0 = fmaxf(local_max0, score0);
++        local_max1 = fmaxf(local_max1, score1);
++    }
++    if (lane == 0) {
++        den[warp * queries] = local_max0;
++        den[warp * queries + 1] = local_max1;
++    }
++    __syncthreads();
++
++    float maximum0 = den[0];
++    float maximum1 = den[1];
++#pragma unroll
++    for (int w = 1; w < warps; ++w) {
++        maximum0 = fmaxf(maximum0, den[w * queries]);
++        maximum1 = fmaxf(maximum1, den[w * queries + 1]);
++    }
++    __syncthreads();
++
++    float local_den0 = 0.0f;
++    float local_den1 = 0.0f;
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        if (j < kv_len) {
++            scores0[c] = __expf(scores0[c] - maximum0);
++            scores1[c] = has_query1 ? __expf(scores1[c] - maximum1) : 0.0f;
++            local_den0 += scores0[c];
++            local_den1 += scores1[c];
++        } else {
++            scores0[c] = 0.0f;
++            scores1[c] = 0.0f;
++        }
++    }
++    if (lane == 0) {
++        den[warp * queries] = local_den0;
++        den[warp * queries + 1] = local_den1;
++    }
++
++    float4 acc0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float4 acc1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++#pragma unroll
++    for (int c = 0; c < keys_per_warp; ++c) {
++        const int j = j0 + c;
++        if (j >= kv_len)
++            continue;
++        const float4 v4 = relpos_load_kv4<T, true>(
++            Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d4);
++#define RELPOS_ACCUM(acc, weight, value) \
++        do { \
++            (acc).x = fmaf((weight), (value).x, (acc).x); \
++            (acc).y = fmaf((weight), (value).y, (acc).y); \
++            (acc).z = fmaf((weight), (value).z, (acc).z); \
++            (acc).w = fmaf((weight), (value).w, (acc).w); \
++        } while (0)
++        RELPOS_ACCUM(acc0, scores0[c], v4);
++        RELPOS_ACCUM(acc1, scores1[c], v4);
++#undef RELPOS_ACCUM
++    }
++    *reinterpret_cast<float4 *>(
++        part + ((warp * queries) * RELPOS_ATTN_DK_128) + d4) = acc0;
++    *reinterpret_cast<float4 *>(
++        part + ((warp * queries + 1) * RELPOS_ATTN_DK_128) + d4) = acc1;
++    __syncthreads();
++
++    const int query = tid / RELPOS_ATTN_DK_128;
++    if (query == 0 || has_query1) {
++        const int d = tid % RELPOS_ATTN_DK_128;
++        float denominator = den[query];
++        float context = part[query * RELPOS_ATTN_DK_128 + d];
++#pragma unroll
++        for (int w = 1; w < warps; ++w) {
++            denominator += den[w * queries + query];
++            context += part[(w * queries + query) * RELPOS_ATTN_DK_128 + d];
++        }
++        ctx[(size_t) b * o_sb + (size_t) (query0 + query) * o_si +
++            (size_t) h * o_sh + d] = context / denominator;
++    }
++}
++
++static bool relpos_attn_register_resident_enabled() {
++    static const bool enabled = []() {
++        const char * value = std::getenv("GGML_CUDA_RELPOS_REGISTER_RESIDENT");
++        return value == nullptr || std::atoi(value) != 0;
++    }();
++    return enabled;
++}
++
++template <typename T, bool Cached>
+ static int relpos_attn_warp_128_max_blocks_per_sm(int device, size_t shmem) {
+     // The target shape fixes dynamic shared memory, so occupancy is invariant
+     // for a given compiled kernel and device. Avoid repeating the CUDA runtime
+@@ -310,27 +993,31 @@ static int relpos_attn_warp_128_max_blocks_per_sm(int device, size_t shmem) {
+     int blocks = cached[device].load(std::memory_order_relaxed);
+     if (blocks == 0) {
+         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+-            &blocks, fused_relpos_attn_warp_128_kernel<T>, RELPOS_ATTN_DK_128, shmem));
++            &blocks, fused_relpos_attn_warp_128_kernel<T, Cached>, RELPOS_ATTN_DK_128, shmem));
+         GGML_ASSERT(blocks > 0);
+         cached[device].store(blocks, std::memory_order_relaxed);
+     }
+     return blocks;
+ }
+ 
+-template <typename T>
++template <typename T, bool Cached>
+ static __global__ void fused_relpos_attn_kernel(
+         const float * __restrict__ Q, const T * __restrict__ K,
+         const T * __restrict__ V, const T * __restrict__ Ppos,
+         const float * __restrict__ bu, const float * __restrict__ bv,
+         const float * __restrict__ mask, float * __restrict__ ctx,
+-        int q, int kv, int n_head, float scale,
++        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
++        const int32_t * __restrict__ slot_ids,
++        const int32_t * __restrict__ ring_heads,
++        int q, int kv, int n_head, int cache_len, float scale,
+         // element strides: x_sq = between queries/keys, x_sh = between heads,
+         // x_sb = between batch items
+         long q_sq, long q_sh, long q_sb,
+         long k_sj, long k_sh, long k_sb,
+         long v_sj, long v_sh, long v_sb,
++        long cache_sj, long cache_ss,
+         long p_sr, long p_sh,
+-        long o_si, long o_sh, long o_sb, long m_sb) {
++        long o_si, long o_sh, long o_sb, long m_sq, long m_sb) {
+     extern __shared__ float sh[];
+     const int dk  = blockDim.x;
+     float * Qu  = sh;             // [dk]
+@@ -346,8 +1033,16 @@ static __global__ void fused_relpos_attn_kernel(
+     const float * Qhi = Q + (size_t) b * q_sb + (size_t) h * q_sh + (size_t) i * q_sq;
+     const T *     Kh  = K + (size_t) b * k_sb + (size_t) h * k_sh;
+     const T *     Vh  = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const int slot = Cached ? slot_ids[b] : 0;
++    const int ring_head = Cached ? ring_heads[b] : 0;
++    const float * Kch = Cached
++        ? Kcache + (size_t) slot * cache_ss + (size_t) h * dk
++        : nullptr;
++    const float * Vch = Cached
++        ? Vcache + (size_t) slot * cache_ss + (size_t) h * dk
++        : nullptr;
+     const T *     Ph  = Ppos + (size_t) h * p_sh;
+-    const float * Mb  = mask ? mask + (size_t) b * m_sb : nullptr;
++    const float * Mb  = mask ? mask + (size_t) b * m_sb + (size_t) i * m_sq : nullptr;
+ 
+     Qu[d] = Qhi[d] + bu[h * dk + d];
+     Qv[d] = Qhi[d] + bv[h * dk + d];
+@@ -364,32 +1059,17 @@ static __global__ void fused_relpos_attn_kernel(
+     if (dk == 128) {
+         const int warp = d >> 5, lane = d & 31, nw = dk >> 5;
+         for (int j = warp; j < kv; j += nw) {
+-            const T * Kj  = Kh + (size_t) j * k_sj + lane * 4;
+             const int row = (q - 1) + j - i;  // rel-shift index
+             const T * Pr  = Ph + (size_t) row * p_sr + lane * 4;
+-            float     k4[4], p4[4];
+-            if (sizeof(T) == 2) {
+-                const int2 kr = *(const int2 *) Kj;
+-                const int2 pr = *(const int2 *) Pr;
+-                const half2 * kh = (const half2 *) &kr;
+-                const half2 * ph = (const half2 *) &pr;
+-                k4[0] = __low2float(kh[0]); k4[1] = __high2float(kh[0]);
+-                k4[2] = __low2float(kh[1]); k4[3] = __high2float(kh[1]);
+-                p4[0] = __low2float(ph[0]); p4[1] = __high2float(ph[0]);
+-                p4[2] = __low2float(ph[1]); p4[3] = __high2float(ph[1]);
+-            } else {
+-                const float4 kr = *(const float4 *) Kj;
+-                const float4 pr = *(const float4 *) Pr;
+-                k4[0] = ((const float *) &kr)[0]; k4[1] = ((const float *) &kr)[1];
+-                k4[2] = ((const float *) &kr)[2]; k4[3] = ((const float *) &kr)[3];
+-                p4[0] = ((const float *) &pr)[0]; p4[1] = ((const float *) &pr)[1];
+-                p4[2] = ((const float *) &pr)[2]; p4[3] = ((const float *) &pr)[3];
+-            }
+-            float s = 0.0f;
+-#pragma unroll
+-            for (int e = 0; e < 4; e++) {
+-                s += k4[e] * Qu[lane * 4 + e] + p4[e] * Qv[lane * 4 + e];
+-            }
++            const float4 k4 =
++                relpos_load_kv4<T, Cached>(
++                    Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, lane * 4);
++            const float4 p4 = relpos_load4(Pr);
++            float s =
++                k4.x * Qu[lane * 4 + 0] + p4.x * Qv[lane * 4 + 0] +
++                k4.y * Qu[lane * 4 + 1] + p4.y * Qv[lane * 4 + 1] +
++                k4.z * Qu[lane * 4 + 2] + p4.z * Qv[lane * 4 + 2] +
++                k4.w * Qu[lane * 4 + 3] + p4.w * Qv[lane * 4 + 3];
+ #pragma unroll
+             for (int off = 16; off > 0; off >>= 1) {
+                 s += __shfl_xor_sync(0xffffffff, s, off);
+@@ -400,12 +1080,13 @@ static __global__ void fused_relpos_attn_kernel(
+         }
+     } else {
+         for (int j = d; j < kv; j += dk) {
+-            const T * Kj  = Kh + (size_t) j * k_sj;
+             const int row = (q - 1) + j - i;  // rel-shift index
+             const T * Pr  = Ph + (size_t) row * p_sr;
+             float ac = 0.0f, bd = 0.0f;
+             for (int dd = 0; dd < dk; dd++) {
+-                ac += (float) Kj[dd] * Qu[dd];
++                ac += relpos_load_kv<T, Cached>(
++                          Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, dd) *
++                      Qu[dd];
+                 bd += (float) Pr[dd] * Qv[dd];
+             }
+             sc[j] = (ac + bd) * scale + (Mb ? Mb[j] : 0.0f);
+@@ -443,7 +1124,10 @@ static __global__ void fused_relpos_attn_kernel(
+ 
+     // ctx[d] = inv * sum_j softmax(sc[j]) * V[j,d]   (thread d owns output dim d)
+     float c = 0.0f;
+-    for (int j = 0; j < kv; j++) c += sc[j] * (float) Vh[(size_t) j * v_sj + d];
++    for (int j = 0; j < kv; j++) {
++        c += sc[j] * relpos_load_kv<T, Cached>(
++                         Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d);
++    }
+     ctx[(size_t) b * o_sb + (size_t) i * o_si + (size_t) h * o_sh + d] = c * inv;
+ }
+ 
+@@ -455,6 +1139,10 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+     const ggml_tensor * bias_u = dst->src[4];
+     const ggml_tensor * bias_v = dst->src[5];
+     const ggml_tensor * mask   = dst->src[6];  // may be null
++    const ggml_tensor * kv_cache = dst->src[7];
++    const ggml_tensor * slot_ids = dst->src[8];
++    const ggml_tensor * ring_heads = dst->src[9];
++    const bool cached = kv_cache != nullptr;
+ 
+     GGML_ASSERT(q->type == GGML_TYPE_F32);
+     // K/V/P may be F32 or (all together) F16 — see the kernel comment.
+@@ -467,26 +1155,54 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+     const int q_len   = q->ne[1];
+     const int n_head  = q->ne[2];
+     const int batch   = q->ne[3];
+-    const int kv_len  = k->ne[1];
++    const int chunk_len = k->ne[1];
++    const int cache_len = cached ? ggml_get_op_params_i32(dst, 1) : 0;
++    const int kv_len  = cache_len + chunk_len;
+ 
+     GGML_ASSERT((d_k & (d_k - 1)) == 0 && "fused_relpos_attn: d_k must be a power of two");
+     GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k && p->ne[0] == d_k);
+-    GGML_ASSERT(k->ne[1] == kv_len && v->ne[1] == kv_len);
++    GGML_ASSERT(k->ne[1] == chunk_len && v->ne[1] == chunk_len);
+     GGML_ASSERT(k->ne[2] == n_head && v->ne[2] == n_head && p->ne[2] == n_head);
+     GGML_ASSERT(k->ne[3] == batch && v->ne[3] == batch);
+     GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
+     GGML_ASSERT(bias_u->ne[1] == n_head && bias_v->ne[1] == n_head);
++    if (cached) {
++        GGML_ASSERT(slot_ids != nullptr);
++        GGML_ASSERT(ring_heads != nullptr);
++        GGML_ASSERT(kv_cache->type == GGML_TYPE_F32 && ggml_is_contiguous(kv_cache));
++        GGML_ASSERT(kv_cache->ne[0] == (int64_t) d_k * n_head * cache_len);
++        GGML_ASSERT(kv_cache->ne[2] == 2 && kv_cache->ne[3] == 1);
++        GGML_ASSERT(slot_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(slot_ids));
++        GGML_ASSERT(slot_ids->ne[0] == batch);
++        GGML_ASSERT(ring_heads->type == GGML_TYPE_I32 && ggml_is_contiguous(ring_heads));
++        GGML_ASSERT(ring_heads->ne[0] == batch);
++    } else {
++        GGML_ASSERT(slot_ids == nullptr);
++        GGML_ASSERT(ring_heads == nullptr);
++    }
+     if (mask != nullptr) {
+         GGML_ASSERT(mask->type == GGML_TYPE_F32);
+         GGML_ASSERT(ggml_is_contiguous(mask));
+         GGML_ASSERT(mask->ne[0] == kv_len);
+-        // Shared across the batch (ne[1]==1) or one key-mask column per
+-        // stream (ne[1]==batch, the cache-aware layout).
+-        GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == batch);
+-        GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++        if (cached) {
++            // Streaming: shared across the batch or one key-mask column per
++            // stream.
++            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == batch);
++            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++        } else {
++            // Offline: shared key vector or one column per query.
++            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q_len);
++            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++        }
+     }
++    const long m_sq =
++        (mask != nullptr && !cached && mask->ne[1] == q_len && q_len > 1)
++            ? (long) (mask->nb[1] / sizeof(float))
++            : 0;
+     const long m_sb =
+-        (mask != nullptr && mask->ne[1] == batch && batch > 1) ? (long) (mask->nb[1] / sizeof(float)) : 0;
++        (mask != nullptr && cached && mask->ne[1] == batch && batch > 1)
++            ? (long) (mask->nb[1] / sizeof(float))
++            : 0;
+ 
+     float scale;
+     memcpy(&scale, dst->op_params, sizeof(scale));
+@@ -501,6 +1217,9 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+                k_sb = (long)(k->nb[3] / ke);
+     const long v_sj = (long)(v->nb[1] / ke), v_sh = (long)(v->nb[2] / ke),
+                v_sb = (long)(v->nb[3] / ke);
++    const long cache_sj = (long) d_k * n_head;
++    const long cache_ss = cached ? (long) (kv_cache->nb[1] / sizeof(float)) : 0;
++    const long cache_sp = cached ? (long) (kv_cache->nb[2] / sizeof(float)) : 0;
+     const long p_sr = (long)(p->nb[1] / ke), p_sh = (long)(p->nb[2] / ke);
+     const size_t oe = ggml_type_size(dst->type);
+     const long o_si = (long)(dst->nb[1] / oe), o_sh = (long)(dst->nb[2] / oe),
+@@ -513,6 +1232,31 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+     GGML_ASSERT(shmem <= max_shmem && "fused_relpos_attn: kv window too large for shared memory");
+ 
+     cudaStream_t stream = ctx.stream();
++    const float * cache_k = cached ? (const float *) kv_cache->data : nullptr;
++    const float * cache_v = cached ? cache_k + cache_sp : nullptr;
++    const int32_t * active_slots = cached ? (const int32_t *) slot_ids->data : nullptr;
++    const int32_t * active_ring_heads =
++        cached ? (const int32_t *) ring_heads->data : nullptr;
++
++    auto update_cache = [&]() {
++        if (!cached) {
++            return;
++        }
++        const dim3 update_grid((d_k * n_head + 255) / 256, batch, 2);
++        if (k->type == GGML_TYPE_F16) {
++            fused_relpos_attn_update_cache_kernel<half><<<update_grid, 256, 0, stream>>>(
++                (float *) kv_cache->data, (const half *) k->data, (const half *) v->data,
++                active_slots, active_ring_heads, cache_len, chunk_len, d_k * n_head, d_k,
++                cache_ss, cache_sp,
++                k_sj, k_sh, k_sb, v_sj, v_sh, v_sb);
++        } else {
++            fused_relpos_attn_update_cache_kernel<float><<<update_grid, 256, 0, stream>>>(
++                (float *) kv_cache->data, (const float *) k->data, (const float *) v->data,
++                active_slots, active_ring_heads, cache_len, chunk_len, d_k * n_head, d_k,
++                cache_ss, cache_sp,
++                k_sj, k_sh, k_sb, v_sj, v_sh, v_sb);
++        }
++    };
+ 
+     // The cache-aware Nemotron streaming geometry is Q=2, KV=72, H=8,
+     // d_k=128. On SM100 the one-query warp kernel is fastest while its grid
+@@ -523,6 +1267,114 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+     const bool use_sm100_q2 =
+         device_info.cc == RELPOS_ATTN_CC_SM100 && device_info.warp_size == 32 &&
+         d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72;
++    const bool use_register_q2 =
++        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
++        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && q_len == 2 &&
++        kv_len == 72 && cached && cache_len == 70 && chunk_len == 2 && n_head == 8 &&
++        relpos_attn_register_resident_enabled();
++    const bool use_register_q4 =
++        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
++        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && q_len == 4 &&
++        kv_len == 60 && cached && cache_len == 56 && chunk_len == 4 && n_head == 8 &&
++        relpos_attn_register_resident_enabled();
++    const bool common_q =
++        q_len == 1 || q_len == 2 || q_len == 4 || q_len == 7 || q_len == 14;
++    const bool use_register_common =
++        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
++        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && common_q &&
++        (cache_len == 56 || cache_len == 70) && cached && chunk_len == q_len && n_head == 8 &&
++        relpos_attn_register_resident_enabled();
++    if (use_register_q4) {
++        constexpr int register_warps = 6;
++        constexpr int register_queries = 4;
++        const size_t register_shmem =
++            ((size_t) register_warps * register_queries +
++             (size_t) register_warps * register_queries * RELPOS_ATTN_DK_128) * sizeof(float);
++        GGML_ASSERT(register_shmem <= max_shmem);
++        const dim3 register_grid(n_head, batch, 1);
++        if (k->type == GGML_TYPE_F16) {
++            fused_relpos_attn_q4_register_kernel<half><<<
++                register_grid, 192, register_shmem, stream>>>(
++                (const float *) q->data, (const half *) k->data, (const half *) v->data,
++                (const half *) p->data, (const float *) bias_u->data,
++                (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads, scale,
++                q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++        } else {
++            fused_relpos_attn_q4_register_kernel<float><<<
++                register_grid, 192, register_shmem, stream>>>(
++                (const float *) q->data, (const float *) k->data, (const float *) v->data,
++                (const float *) p->data, (const float *) bias_u->data,
++                (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads, scale,
++                q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++        }
++        update_cache();
++        return;
++    }
++    if (use_register_q2) {
++        constexpr int register_warps = 8;
++        const size_t register_shmem =
++            ((size_t) register_warps * 2 +
++             (size_t) register_warps * 2 * RELPOS_ATTN_DK_128) * sizeof(float);
++        GGML_ASSERT(register_shmem <= max_shmem);
++        const dim3 register_grid(n_head, batch, 1);
++        if (k->type == GGML_TYPE_F16) {
++            fused_relpos_attn_q2_register_kernel<half><<<
++                register_grid, 256, register_shmem, stream>>>(
++                (const float *) q->data, (const half *) k->data, (const half *) v->data,
++                (const half *) p->data, (const float *) bias_u->data,
++                (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads, scale,
++                q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++        } else {
++            fused_relpos_attn_q2_register_kernel<float><<<
++                register_grid, 256, register_shmem, stream>>>(
++                (const float *) q->data, (const float *) k->data, (const float *) v->data,
++                (const float *) p->data, (const float *) bias_u->data,
++                (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads, scale,
++                q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++        }
++        update_cache();
++        return;
++    }
++    if (use_register_common) {
++        constexpr int register_warps = 8;
++        constexpr int register_queries = 2;
++        const size_t register_shmem =
++            ((size_t) register_warps * register_queries +
++             (size_t) register_warps * register_queries * RELPOS_ATTN_DK_128) * sizeof(float);
++        GGML_ASSERT(register_shmem <= max_shmem);
++        const dim3 register_grid(n_head, batch, (q_len + register_queries - 1) / register_queries);
++        if (k->type == GGML_TYPE_F16) {
++            fused_relpos_attn_common_q2_register_kernel<half><<<
++                register_grid, 256, register_shmem, stream>>>(
++                (const float *) q->data, (const half *) k->data, (const half *) v->data,
++                (const half *) p->data, (const float *) bias_u->data,
++                (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads,
++                q_len, kv_len, cache_len, scale,
++                q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++        } else {
++            fused_relpos_attn_common_q2_register_kernel<float><<<
++                register_grid, 256, register_shmem, stream>>>(
++                (const float *) q->data, (const float *) k->data, (const float *) v->data,
++                (const float *) p->data, (const float *) bias_u->data,
++                (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads,
++                q_len, kv_len, cache_len, scale,
++                q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++        }
++        update_cache();
++        return;
++    }
+     if (use_sm100_q2) {
+         const size_t warp_shmem =
+             ((size_t) 2 * RELPOS_ATTN_DK_128 + kv_len + RELPOS_ATTN_WARPS_128) * sizeof(float);
+@@ -531,70 +1383,86 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+              (size_t) 2 * RELPOS_ATTN_WARPS_128) * sizeof(float);
+         GGML_ASSERT(q2_shmem <= max_shmem);
+ 
+-        const int max_single_blocks_per_sm = k->type == GGML_TYPE_F16
+-            ? relpos_attn_warp_128_max_blocks_per_sm<half>(device, warp_shmem)
+-            : relpos_attn_warp_128_max_blocks_per_sm<float>(device, warp_shmem);
++        int max_single_blocks_per_sm;
++        if (k->type == GGML_TYPE_F16) {
++            max_single_blocks_per_sm = cached
++                ? relpos_attn_warp_128_max_blocks_per_sm<half, true>(device, warp_shmem)
++                : relpos_attn_warp_128_max_blocks_per_sm<half, false>(device, warp_shmem);
++        } else {
++            max_single_blocks_per_sm = cached
++                ? relpos_attn_warp_128_max_blocks_per_sm<float, true>(device, warp_shmem)
++                : relpos_attn_warp_128_max_blocks_per_sm<float, false>(device, warp_shmem);
++        }
+         const int64_t single_query_blocks = (int64_t) n_head * q_len * batch;
+         const int64_t single_wave_blocks = (int64_t) device_info.nsm * max_single_blocks_per_sm;
+         const bool fuse_queries = single_query_blocks > single_wave_blocks;
+         const dim3 tuned_grid(n_head, fuse_queries ? 1 : q_len, batch);
+ 
+-        if (k->type == GGML_TYPE_F16) {
++        auto launch_tuned = [&](auto scalar, auto cache_tag) {
++            using T = decltype(scalar);
++            constexpr bool Cached = decltype(cache_tag)::value;
+             if (fuse_queries) {
+-                fused_relpos_attn_q2_warp_128_kernel<half><<<
++                fused_relpos_attn_q2_warp_128_kernel<T, Cached><<<
+                     tuned_grid, RELPOS_ATTN_DK_128, q2_shmem, stream>>>(
+-                    (const float *) q->data, (const half *) k->data, (const half *) v->data,
+-                    (const half *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
+-                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+-                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
+-                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++                    (const float *) q->data, (const T *) k->data, (const T *) v->data,
++                    (const T *) p->data, (const float *) bias_u->data,
++                    (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                    (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads, kv_len,
++                    cache_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                    cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
+             } else {
+-                fused_relpos_attn_warp_128_kernel<half><<<
++                fused_relpos_attn_warp_128_kernel<T, Cached><<<
+                     tuned_grid, RELPOS_ATTN_DK_128, warp_shmem, stream>>>(
+-                    (const float *) q->data, (const half *) k->data, (const half *) v->data,
+-                    (const half *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
+-                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+-                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
+-                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++                    (const float *) q->data, (const T *) k->data, (const T *) v->data,
++                    (const T *) p->data, (const float *) bias_u->data,
++                    (const float *) bias_v->data, mask ? (const float *) mask->data : nullptr,
++                    (float *) dst->data, cache_k, cache_v, active_slots, active_ring_heads, kv_len,
++                    cache_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                    cache_sj, cache_ss, p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++            }
++        };
++        if (k->type == GGML_TYPE_F16) {
++            if (cached) {
++                launch_tuned(half{}, std::true_type{});
++            } else {
++                launch_tuned(half{}, std::false_type{});
+             }
+         } else {
+-            if (fuse_queries) {
+-                fused_relpos_attn_q2_warp_128_kernel<float><<<
+-                    tuned_grid, RELPOS_ATTN_DK_128, q2_shmem, stream>>>(
+-                    (const float *) q->data, (const float *) k->data, (const float *) v->data,
+-                    (const float *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
+-                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+-                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
+-                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++            if (cached) {
++                launch_tuned(float{}, std::true_type{});
+             } else {
+-                fused_relpos_attn_warp_128_kernel<float><<<
+-                    tuned_grid, RELPOS_ATTN_DK_128, warp_shmem, stream>>>(
+-                    (const float *) q->data, (const float *) k->data, (const float *) v->data,
+-                    (const float *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
+-                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+-                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
+-                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++                launch_tuned(float{}, std::false_type{});
+             }
+         }
++        update_cache();
+         return;
+     }
+ 
+     const dim3 grid(n_head, q_len, batch);
+-    if (k->type == GGML_TYPE_F16) {
+-        fused_relpos_attn_kernel<half><<<grid, d_k, shmem, stream>>>(
+-            (const float *) q->data, (const half *) k->data, (const half *) v->data,
+-            (const half *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
++    auto launch_generic = [&](auto scalar, auto cache_tag) {
++        using T = decltype(scalar);
++        constexpr bool Cached = decltype(cache_tag)::value;
++        fused_relpos_attn_kernel<T, Cached><<<grid, d_k, shmem, stream>>>(
++            (const float *) q->data, (const T *) k->data, (const T *) v->data,
++            (const T *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
+             mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+-            q_len, kv_len, n_head, scale,
+-            q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb, p_sr, p_sh, o_si, o_sh, o_sb,
+-            m_sb);
++            cache_k, cache_v, active_slots, active_ring_heads, q_len, kv_len, n_head, cache_len,
++            scale,
++            q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb, cache_sj, cache_ss,
++            p_sr, p_sh, o_si, o_sh, o_sb, m_sq, m_sb);
++    };
++    if (k->type == GGML_TYPE_F16) {
++        if (cached) {
++            launch_generic(half{}, std::true_type{});
++        } else {
++            launch_generic(half{}, std::false_type{});
++        }
+     } else {
+-        fused_relpos_attn_kernel<float><<<grid, d_k, shmem, stream>>>(
+-            (const float *) q->data, (const float *) k->data, (const float *) v->data,
+-            (const float *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
+-            mask ? (const float *) mask->data : nullptr, (float *) dst->data,
+-            q_len, kv_len, n_head, scale,
+-            q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb, p_sr, p_sh, o_si, o_sh, o_sb,
+-            m_sb);
++        if (cached) {
++            launch_generic(float{}, std::true_type{});
++        } else {
++            launch_generic(float{}, std::false_type{});
++        }
+     }
++    update_cache();
+ }
+diff --git a/src/ggml.c b/src/ggml.c
+index 80b5802f..ae1b8db3 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -5377,7 +5377,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
+ 
+ // ggml_fused_relpos_attn
+ 
+-struct ggml_tensor * ggml_fused_relpos_attn(
++static struct ggml_tensor * ggml_fused_relpos_attn_impl(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * q,
+         struct ggml_tensor  * k,
+@@ -5386,6 +5386,10 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+         struct ggml_tensor  * bias_u,
+         struct ggml_tensor  * bias_v,
+         struct ggml_tensor  * mask,
++        struct ggml_tensor  * kv_cache,
++        struct ggml_tensor  * slot_ids,
++        struct ggml_tensor  * ring_heads,
++        int64_t               cache_len,
+         float                 scale,
+         bool                  merge_heads) {
+     // Q/K/V/P may be arbitrary-strided views; the CUDA op derives addressing
+@@ -5398,10 +5402,11 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+     GGML_ASSERT(ggml_is_contiguous(bias_u));
+     GGML_ASSERT(ggml_is_contiguous(bias_v));
+ 
+-    const int64_t d_k    = q->ne[0];
+-    const int64_t kv_len = k->ne[1];
+-    const int64_t q_len  = q->ne[1];
+-    const int64_t n_head = q->ne[2];
++    const int64_t d_k      = q->ne[0];
++    const int64_t chunk_len = k->ne[1];
++    const int64_t kv_len   = cache_len + chunk_len;
++    const int64_t q_len    = q->ne[1];
++    const int64_t n_head   = q->ne[2];
+ 
+     GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k && p->ne[0] == d_k);
+     GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
+@@ -5410,14 +5415,36 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+     // from p->nb, so a longer table (e.g. precomputed for the full chunk
+     // length and reused by shorter tail chunks) is safe.
+     GGML_ASSERT(p->ne[1] >= kv_len + q_len - 1);  // rel-pos length
+-    GGML_ASSERT(v->ne[1] == kv_len);
++    GGML_ASSERT(v->ne[1] == chunk_len);
++    GGML_ASSERT(cache_len >= 0);
++    GGML_ASSERT((kv_cache == NULL) == (slot_ids == NULL));
++    GGML_ASSERT((kv_cache == NULL) == (ring_heads == NULL));
++    if (kv_cache) {
++        GGML_ASSERT(cache_len > 0);
++        GGML_ASSERT(kv_cache->type == GGML_TYPE_F32 && ggml_is_contiguous(kv_cache));
++        GGML_ASSERT(kv_cache->ne[0] == d_k * n_head * cache_len);
++        GGML_ASSERT(kv_cache->ne[2] == 2 && kv_cache->ne[3] == 1);
++        GGML_ASSERT(slot_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(slot_ids));
++        GGML_ASSERT(slot_ids->ne[0] == q->ne[3]);
++        GGML_ASSERT(ring_heads->type == GGML_TYPE_I32 && ggml_is_contiguous(ring_heads));
++        GGML_ASSERT(ring_heads->ne[0] == q->ne[3]);
++    } else {
++        GGML_ASSERT(cache_len == 0);
++    }
+     if (mask) {
+         GGML_ASSERT(ggml_is_contiguous(mask));
+         GGML_ASSERT(mask->ne[0] == kv_len);
+-        // One shared key mask, or one column per batch item (the cache-aware
+-        // streaming layout, where each stream's history has its own validity).
+-        GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q->ne[3]);
+-        GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++        if (kv_cache) {
++            // Cache-aware streaming: one shared key mask, or one column per
++            // batch item whose history has its own validity.
++            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q->ne[3]);
++            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++        } else {
++            // Offline: a shared key vector or a [key,query] local-attention
++            // mask, broadcast over heads and batch.
++            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q_len);
++            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++        }
+     }
+ 
+     // Output mirrors q logically: [d_k, q_len, n_head, batch]. With
+@@ -5434,6 +5461,7 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+     }
+ 
+     ggml_set_op_params(result, &scale, sizeof(scale));
++    ggml_set_op_params_i32(result, 1, (int32_t) cache_len);
+ 
+     result->op     = GGML_OP_FUSED_RELPOS_ATTN;
+     result->src[0] = q;
+@@ -5443,10 +5471,48 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+     result->src[4] = bias_u;
+     result->src[5] = bias_v;
+     result->src[6] = mask;
++    result->src[7] = kv_cache;
++    result->src[8] = slot_ids;
++    result->src[9] = ring_heads;
+ 
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_fused_relpos_attn(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * p,
++        struct ggml_tensor  * bias_u,
++        struct ggml_tensor  * bias_v,
++        struct ggml_tensor  * mask,
++        float                 scale,
++        bool                  merge_heads) {
++    return ggml_fused_relpos_attn_impl(
++        ctx, q, k, v, p, bias_u, bias_v, mask, NULL, NULL, NULL, 0, scale, merge_heads);
++}
++
++struct ggml_tensor * ggml_fused_relpos_attn_cached(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * p,
++        struct ggml_tensor  * bias_u,
++        struct ggml_tensor  * bias_v,
++        struct ggml_tensor  * mask,
++        struct ggml_tensor  * kv_cache,
++        struct ggml_tensor  * slot_ids,
++        struct ggml_tensor  * ring_heads,
++        int64_t               cache_len,
++        float                 scale,
++        bool                  merge_heads) {
++    return ggml_fused_relpos_attn_impl(
++        ctx, q, k, v, p, bias_u, bias_v, mask, kv_cache, slot_ids, ring_heads, cache_len, scale,
++        merge_heads);
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {

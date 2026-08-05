@@ -9,13 +9,12 @@ The source checkpoint can be either:
 - a **public model repository on Hugging Face**; the converter downloads its
   `.nemo` checkpoint directly, or
 - a **local NeMo checkpoint** - any compatible `.nemo` archive, including a
-  fine-tune, can be passed directly to the converter.
+  fine-tune.
 
-The converter accepts a local `.nemo` archive **or** a Hugging Face repo id, and
-auto-detects head type (CTC vs RNNT) from the NeMo `model_config.yaml` (override
-with `--head-type {ctc,rnnt}`).
+The head type (CTC, RNNT, or TDT) is auto-detected from the NeMo
+`model_config.yaml`; override with `--head-type {ctc,rnnt,tdt}`.
 
-Create an isolated conversion environment:
+Install the conversion dependencies (a virtual environment is recommended):
 
 ```bash
 pip install -r requirements.txt
@@ -33,6 +32,22 @@ python3 convert_model.py nvidia/parakeet-ctc-1.1b \
     --outfile ./parakeet-ctc-1.1b.gguf
 ```
 
+## Parakeet TDT (0.6B v3, multilingual, offline transducer)
+
+Token-and-Duration Transducer: the joint predicts each token together with its
+frame span. 25 European languages, self-punctuating. Hugging Face:
+[nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+
+```bash
+python3 convert_model.py nvidia/parakeet-tdt-0.6b-v3 \
+    --outfile ./parakeet-tdt-0.6b-v3.q8_0.gguf --outtype q8_0
+```
+
+The converter detects the TDT head automatically. Not cache-aware trained:
+inference is full-utterance only. Streaming requests are rejected with an
+error; use offline recognition (`nemo-speech transcribe`,
+`POST /v1/audio/transcriptions`, gRPC `Recognize`).
+
 ## Nemotron-Speech Streaming (0.6B, cache-aware RNNT)
 
 Hugging Face: [nvidia/nemotron-speech-streaming-en-0.6b](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
@@ -42,7 +57,7 @@ python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
     --outfile ./nemotron-speech-streaming-en-0.6b.q8_0.gguf
 ```
 
-## Nemotron-3.5 (0.6B, multilingual, prompt-conditioned RNNT)
+## Nemotron 3.5 (0.6B, multilingual, prompt-conditioned RNNT)
 
 The same cache-aware FastConformer-RNNT plus **language-ID prompt conditioning**
 across 40+ language-locales (`EncDecRNNTBPEModelWithPrompt`). Hugging Face:
@@ -86,8 +101,8 @@ default to F16; norms / biases / positional encodings stay F32.
 | `bf16` | BF16 | 2.000 | modern NVIDIA / ARM v9 |
 | `fp16` | F16 | 2.000 | Apple Silicon, older GPUs |
 | `q6_k` | Q6_K | 0.820 | smaller artifact, more quantization |
-| `q5_k` | Q5_K | 0.696 | smaller artifact, more quantization |
-| `q4_k` | Q4_K | 0.572 | smallest listed artifact, most quantization |
+| `q5_k` | Q5_K | 0.688 | smaller artifact, more quantization |
+| `q4_k` | Q4_K | 0.562 | smallest listed artifact, most quantization |
 
 `q8_0` is the portable default; pass `--outtype` to choose a different
 size/precision tradeoff. K-quants
@@ -96,9 +111,9 @@ alignment falls back to F16 and is reported by the converter.
 
 ### CUDA batching: planar Q8 layout
 
-The converter's default Q8 layout is the portable block-interleaved format. A
-patched CUDA runtime can instead store all encoder Q8 values and scales in
-tensor-wide planes so high-concurrency FastConformer projections enter the
+The converter's default Q8 layout is the portable block-interleaved format. The
+CUDA backend in this project can instead store all encoder Q8 values and scales
+in tensor-wide planes so high-concurrency FastConformer projections enter the
 batched skinny-Q8 tensor-core path without a runtime repack:
 
 ```bash
@@ -107,8 +122,7 @@ python3 convert_model.py model.nemo --outfile model.planar.q8_0.gguf \
 ```
 
 The layout flag covers ordinary encoder projections and fused attention QKV.
-Planar Q8 is CUDA-only and requires the patched ggml build. Keep a block-layout
-artifact for other backends.
+Planar Q8 is CUDA-only. Keep a block-layout artifact for other backends.
 
 ## Companion models (optional)
 

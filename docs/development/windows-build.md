@@ -141,7 +141,7 @@ cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build-cuda --parallel
 
-# Vulkan: stock ggml (the edge patches are CUDA-only). ggml-vulkan requires the
+# Vulkan: stock ggml (the project's ggml patches are CUDA-only). ggml-vulkan requires the
 # SPIRV-Headers CMake package; the Vulkan SDK ships it under Lib\cmake.
 cmake -S . -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DGGML_VULKAN=ON -DNEMO_SPEECH_GGML_PATCHED=OFF `
@@ -198,7 +198,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\apply-ggml-patches.ps1
 | **CUDA** | ✅ Supported | ✅ Supported | ✅ Supported |
 | **Vulkan** | ✅ Supported | ✅ Supported | ✅ Supported |
 
-NMT runs through llama.cpp linked against the edge ggml, so it inherits the build's
+NMT runs through llama.cpp linked against the in-tree patched ggml, so it inherits the build's
 backend. TTS uses generic ggml graphs on Vulkan; CUDA builds additionally use
 specialized sampling and local-transformer kernels.
 
@@ -220,7 +220,7 @@ user-set value of the env var takes precedence over the auto-set.
 
 | Feature (CMake flag) | Windows status |
 |---|---|
-| **Flashlight** (`-DNEMO_SPEECH_WITH_FLASHLIGHT=ON`) | ✅ Builds replaceable `kenlm.dll`. Install `sentencepiece` with vcpkg's `x64-windows-static-md` triplet on x64 or `arm64-windows-static-md` on ARM64/N1X, then use `build.ps1 -Flashlight`. |
+| **Flashlight** (`-DNEMO_SPEECH_WITH_FLASHLIGHT=ON`) | ✅ Builds replaceable `kenlm.dll`. Install `sentencepiece` with vcpkg's `x64-windows-static-md` triplet on x64 or `arm64-windows-static-md` on ARM64, then use `build.ps1 -Flashlight`. |
 | **ITN/TN** (`-DNEMO_SPEECH_WITH_NORM=ON`) | ❌ Not supported on Windows. Requires the OpenFST 1.8 / Sparrowhawk WFST stack, which `scripts/build_itn_deps.sh` builds via Linux autotools (neither is in vcpkg). |
 
 **Combining flashlight + gRPC on Windows:** the instructions above use different

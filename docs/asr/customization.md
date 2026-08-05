@@ -6,15 +6,17 @@ helps choose the right mechanism; the exact keys and defaults are in
 
 ## Feature matrix
 
-Support depends mainly on the model head. Decoder biasing requires the
-Flashlight LM decoder and is CTC-only; postprocessing and diarization are
-head-independent.
+Support depends mostly on the head type. Word boosting works on CTC (flashlight
+LM decoder) and cache-aware RNNT (built-in context-biasing tree);
+postprocessing and diarization are head-independent.
 
-| Model | Word boosting | VAD masking | Endpointing | Profanity | ITN | Auto punctuation | Language ID | Diarization |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| [Parakeet CTC 1.1B](models.md#parakeet-ctc-11b-offline--buffered-streaming) | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| [Nemotron-Speech 0.6B](models.md#nemotron-speech-streaming-06b-cache-aware-rnnt) | No | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| [Nemotron 3.5 0.6B](models.md#nemotron-35-06b-multilingual-prompt-conditioned-rnnt) | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Model | Languages | Word boosting | VAD masking | Endpointing | Profanity | ITN | Auto punctuation | Language ID | Diarization |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| [Parakeet CTC 1.1B](models.md#parakeet-ctc-11b-offline--buffered-streaming) | en | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| [Nemotron-Speech 0.6B](models.md#nemotron-speech-streaming-06b-cache-aware-rnnt) | en | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| [Nemotron 3.5 0.6B](models.md#nemotron-35-06b-multilingual-prompt-conditioned-rnnt) | 40+ | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| [Parakeet TDT 0.6B v3](models.md#parakeet-tdt-06b-v3-multilingual-offline-transducer) | 25 | No | No | No | Yes | Yes | Yes | No | Yes |
+
 
 ## Request-time options
 
@@ -22,11 +24,16 @@ These options can vary between requests without restarting the server.
 
 ### Word boosting
 
-`RecognitionConfig.speech_contexts` biases the Flashlight decoder toward names,
-jargon, and other caller-supplied phrases. Stock Riva clients expose it through
-`--boosted_words` and `--boosted_words_score`. The server must start with a
-KenLM model and lexicon; a SentencePiece model also enables out-of-vocabulary
-and multi-word phrases. See [Word boosting](configuration.md#word-boosting).
+`RecognitionConfig.speech_contexts` biases recognition toward caller-supplied
+phrases (names, jargon); stock Riva clients expose `--boosted_words` +
+`--boosted_words_score`. Phrases are tokenized with the GGUF-embedded
+tokenizer - re-convert pre-embed GGUFs with `convert_model.py` (CTC also
+accepts an `asr.decoder.tokenizer_path` override).
+
+CTC needs the flashlight LM decoder at startup and takes typical scores of
+8-10; cache-aware RNNT boosts during greedy decoding with no extra artifacts,
+and each point is ~3x more potent (typical 2-3). Mechanism, clamps, and field
+syntax per surface: [word boosting](configuration.md#word-boosting).
 
 ### Transcript postprocessing
 

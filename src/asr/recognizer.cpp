@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "model.h"
@@ -48,10 +50,33 @@ vocab_self_punctuates(const std::vector<std::string>& vocab) {
     return false;
 }
 
+bool
+exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int input_sample_rate) {
+    if (n_samples == 0)
+        return false;
+    const int rate = input_sample_rate > 0 ? input_sample_rate : model.sample_rate();
+    if (rate <= 0)
+        return false;
+
+    const auto& enc = model.encoder_config();
+    const long double model_samples = std::ceil(
+        static_cast<long double>(n_samples) * model.sample_rate() / static_cast<long double>(rate));
+    long double frames =
+        std::floor((model_samples + 1.0L) / static_cast<long double>(model.fe().hop_length())) +
+        1.0L;
+    const int stages = static_cast<int>(std::log2(enc.subsampling_factor));
+    for (int i = 0; i < stages; ++i) {
+        frames = enc.conv_context == ConvContext::Causal ? std::floor(frames / 2.0L) + 1.0L
+                                                         : std::floor((frames + 1.0L) / 2.0L);
+    }
+    return frames > enc.pos_emb_max_len;
+}
+
 }  // namespace
 
 Recognizer::Recognizer(RecognizerConfig cfg)
-    : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)), ingress_batches_(cfg_.batching) {
+    : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)),
+      streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
     if (cfg_.streaming.chunk_size <= 0.0f || cfg_.streaming.ctc_left_padding < 0.0f ||
         cfg_.streaming.ctc_right_padding < 0.0f)
         throw std::invalid_argument(
@@ -78,6 +103,7 @@ Recognizer::Recognizer(RecognizerConfig cfg)
         fcfg.lm_path = cfg_.decoder.lm_path;
         fcfg.lexicon_path = cfg_.decoder.lexicon_path;
         fcfg.tokenizer_path = cfg_.decoder.tokenizer_path;
+        fcfg.embedded_spm = ctc->embedded_tokenizer();
         flashlight_resources_ =
             std::make_shared<const FlashlightResources>(ctc->ctc_config(), ctc->vocab(), fcfg);
         std::cerr << "[recognizer] flashlight resources loaded (lm + lexicon trie, shared)\n";
@@ -88,7 +114,7 @@ Recognizer::Recognizer(RecognizerConfig cfg)
               << "s right=" << cfg_.streaming.ctc_right_padding << "s\n";
 
     if (!cfg_.diar.model_path.empty()) {
-        diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path);
+        diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path, cfg_.batching);
         const DiarGeometry geo = cfg_.diar.resolved_geometry();
         std::cerr << "[recognizer] diarizer loaded: " << cfg_.diar.model_path
                   << " (spkcache=" << geo.spkcache_len << " fifo=" << geo.fifo_len
@@ -97,6 +123,11 @@ Recognizer::Recognizer(RecognizerConfig cfg)
 }
 
 Recognizer::~Recognizer() = default;
+
+BatchMetrics
+Recognizer::vad_batch_metrics() const {
+    return vad_model_ ? vad_model_->batch_metrics() : BatchMetrics{};
+}
 
 std::unique_ptr<AsrRunner>
 Recognizer::make_runner() const {
@@ -118,9 +149,11 @@ Recognizer::warmup() {
     // build (and, for RNNT, the cache-aware Session setup) happens now. 0.1 s
     // chunks: enough for the buffered runner to emit one full window and the
     // cache-aware runner to advance several chunks; finalize() flushes the tail.
+    const bool supports_streaming =
+        model_->head_kind() == HeadKind::Ctc ||
+        static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
     std::unique_ptr<AsrRunner> runner;
-    if (model_->head_kind() != HeadKind::Ctc &&
-        !static_cast<RnntModel*>(model_.get())->supports_cache_streaming())
+    if (!supports_streaming)
         runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     else
         runner = make_runner();
@@ -139,6 +172,63 @@ Recognizer::warmup() {
         runner->step();
     }
     runner->finalize();
+    runner.reset();
+
+    // The scalar pass cannot populate CUDA graphs for production microbatch
+    // shapes. Without this pass, the first wide-concurrency request wave pays
+    // graph construction/capture and grows shared scheduler pools while its
+    // latency is already being measured. Warm the configured physical maximum
+    // twice: pass one grows all shared pools, pass two rebuilds stable graph
+    // placements after that growth. CPU deployments retain the lightweight
+    // scalar warmup.
+    const int warmup_batch =
+        std::min(cfg_.batching.max_batch_size, cfg_.batching.state_arena_slots);
+    if (supports_streaming && model_->backend_manager().get_params().use_gpu &&
+        cfg_.batching.enabled && warmup_batch > 1) {
+        auto run_batch_warmup = [&] {
+            std::vector<std::unique_ptr<AsrRunner>> runners;
+            runners.reserve(static_cast<size_t>(warmup_batch));
+            for (int b = 0; b < warmup_batch; ++b) {
+                auto batched_runner = make_runner();
+                if (model_->has_prompt())
+                    batched_runner->set_prompt_index(model_->prompt_index_for_lang("auto"));
+                runners.push_back(std::move(batched_runner));
+            }
+
+            std::atomic<int> ready{0};
+            std::atomic<bool> start{false};
+            std::vector<std::exception_ptr> errors(static_cast<size_t>(warmup_batch));
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<size_t>(warmup_batch));
+            for (int b = 0; b < warmup_batch; ++b) {
+                threads.emplace_back([&, b, batched_runner = std::move(runners[b])]() mutable {
+                    try {
+                        const ScopedBatchCohort cohort(warmup_batch);
+                        ready.fetch_add(1, std::memory_order_release);
+                        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+                        for (int i = 0; i < iters; ++i) {
+                            batched_runner->feed_audio(chunk.data(), chunk.size());
+                            batched_runner->step();
+                        }
+                        batched_runner->finalize();
+                    }
+                    catch (...) {
+                        errors[static_cast<size_t>(b)] = std::current_exception();
+                    }
+                });
+            }
+            while (ready.load(std::memory_order_acquire) != warmup_batch) std::this_thread::yield();
+            start.store(true, std::memory_order_release);
+            for (auto& thread : threads) thread.join();
+            for (const auto& error : errors)
+                if (error)
+                    std::rethrow_exception(error);
+        };
+
+        run_batch_warmup();
+        run_batch_warmup();
+        std::cerr << "[recognizer] warmed streaming batch shape B=" << warmup_batch << "\n";
+    }
 
     // Warm the diarizer Session's graph shapes too: the streaming warmup
     // ladder (growing fifo), the first spkcache compression (~19 s in), and
@@ -166,6 +256,13 @@ RecognitionStream::RecognitionStream(
         diar_ = std::make_unique<DiarStream>(
             *recognizer_->diar_model(), recognizer_->config().diar.resolved_geometry());
     }
+    if (coordinate_ingress_)
+        recognizer_->register_streaming_ingress();
+}
+
+RecognitionStream::~RecognitionStream() {
+    if (coordinate_ingress_)
+        recognizer_->unregister_streaming_ingress();
 }
 
 void
@@ -358,26 +455,37 @@ RecognitionStream::finish() {
 }
 
 std::unique_ptr<RecognitionStream>
-Recognizer::streaming_recognize(AsrRequestOptions opts, const std::string& language_code) {
+Recognizer::streaming_recognize(
+    AsrRequestOptions opts, const std::string& language_code, bool coordinate_ingress) {
     opts.language_code = language_code;
     auto runner = make_runner();
     if (model_->has_prompt())
         runner->set_prompt_index(model_->prompt_index_for_lang(language_code));
-    return std::make_unique<RecognitionStream>(this, std::move(runner), std::move(opts));
+    return std::make_unique<RecognitionStream>(
+        this, std::move(runner), std::move(opts), coordinate_ingress);
 }
 
 Result
 Recognizer::recognize(
     const float* samples, size_t n, AsrRequestOptions opts, const std::string& language_code,
     int sample_rate) {
+    const ScopedBatchCohort cohort_scope(offline_ingress_batches_.arrive());
     const ggml_backend_t gpu = bm_->gpu_backend_handle();
     const bool vulkan =
         gpu != nullptr && std::string(ggml_backend_name(gpu)).rfind("Vulkan", 0) == 0;
+    const bool exceeds_offline_limit = exceeds_offline_position_limit(*model_, n, sample_rate);
+    const bool supports_streaming =
+        model_->head_kind() == HeadKind::Ctc ||
+        static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
     std::unique_ptr<AsrRunner> runner;
-    if (vulkan && model_->head_kind() != HeadKind::Ctc &&
-        static_cast<RnntModel*>(model_.get())->supports_cache_streaming()) {
+    if ((exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
+        supports_streaming) {
         runner = make_runner();
     } else {
+        if (exceeds_offline_limit)
+            throw std::runtime_error(
+                "audio exceeds this model's offline positional-encoding limit and the model does "
+                "not support streaming");
         runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     }
     if (model_->has_prompt())

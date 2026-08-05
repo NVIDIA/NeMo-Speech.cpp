@@ -6,7 +6,7 @@
 #             packages, and CMake. Builds nemo-speech, riva_server, the ggml
 #             backend .so files, and optional developer targets.
 #   rootfs  - assembles a FROM scratch root with the binaries, ggml .so files,
-#             and exact ldd-resolved library closure. The CUDA driver
+#             and the exact shared libraries reported by ldd. The CUDA driver
 #             (libcuda.so.1) is not bundled; it is injected at run time by the
 #             NVIDIA Container Toolkit.
 #   runtime - FROM scratch; model-free, mount the GGUF at run time.
@@ -230,10 +230,6 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
         "$license_dir/kenlm/COPYING.LESSER.3" \
     && install -Dm0644 /work/third_party/cpp-httplib/LICENSE \
         "$license_dir/cpp-httplib/LICENSE" \
-    && openssl_notice="$(find /usr/share/doc -path '*/libssl*/copyright' -type f -print -quit)" \
-    && if [ -n "$openssl_notice" ]; then \
-           install -Dm0644 "$openssl_notice" "$license_dir/openssl/copyright"; \
-       fi \
     && if [ "${ENABLE_TTS_JA}" = "ON" ]; then \
            install -Dm0644 /work/third_party/open_jtalk/src/COPYING \
                "$license_dir/open_jtalk/COPYING"; \
@@ -262,26 +258,30 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
        fi
 
 ############################################################################
-# Stage 2: assemble a scratch rootfs from the ldd closure
+# Stage 2: assemble a scratch rootfs from dependencies reported by ldd
 ############################################################################
 FROM builder AS rootfs
 
 RUN set -eux; \
     root=/opt/nemo-speech-scratch-rootfs; \
     mkdir -p \
-        "$root/etc/ssl/certs" \
+        "$root/etc" \
         "$root/home/nemo" \
         "$root/models" \
         "$root/opt/nemo-speech/bin" \
         "$root/opt/nemo-speech/lib" \
         "$root/opt/nemo-speech/share"; \
-    cp /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/ca-certificates.crt"; \
     printf 'nemo:x:1000:1000:NeMo-Speech.cpp:/home/nemo:/sbin/nologin\n' > "$root/etc/passwd"; \
     printf 'nemo:x:1000:\n' > "$root/etc/group"; \
     printf 'hosts: files dns\npasswd: files\ngroup: files\n' > "$root/etc/nsswitch.conf"; \
     cp -a /out/bin/. "$root/opt/nemo-speech/bin/"; \
     cp -a /out/lib/. "$root/opt/nemo-speech/lib/"; \
     cp -a /out/share/. "$root/opt/nemo-speech/share/"; \
+    system_license_dir="$root/opt/nemo-speech/share/licenses/nemo-speech/third_party/system"; \
+    mkdir -p "$system_license_dir"; \
+    if [ -d /usr/share/common-licenses ]; then \
+        cp -a /usr/share/common-licenses "$system_license_dir/debian-common-licenses"; \
+    fi; \
     # Strip the build-tree rpath (/work/build/bin). In-tree shared libraries,
     # including ggml and KenLM, resolve from /opt/nemo-speech/lib at run time.
     apt-get update -qq && apt-get install -y --no-install-recommends patchelf >/dev/null; \
@@ -289,6 +289,15 @@ RUN set -eux; \
     for f in "$root"/opt/nemo-speech/bin/* "$root"/opt/nemo-speech/lib/*.so*; do \
         if [ -f "$f" ] && [ ! -L "$f" ]; then patchelf --remove-rpath "$f" || true; fi; \
     done; \
+    copy_package_notice() { \
+        dep="$1"; \
+        owner="$(dpkg-query -S "$dep" 2>/dev/null | head -n 1 || true)"; \
+        [ -n "$owner" ] || return 0; \
+        package="${owner%%:*}"; \
+        notice="/usr/share/doc/${package}/copyright"; \
+        [ -f "$notice" ] || return 0; \
+        install -Dm0644 "$notice" "$system_license_dir/${package}/copyright"; \
+    }; \
     copy_dep() { \
         dep="$1"; \
         # Skip the CUDA driver (toolkit-injected at run time) and real cuBLAS/
@@ -300,6 +309,7 @@ RUN set -eux; \
         dest="$root${dep}"; \
         mkdir -p "$(dirname "$dest")"; \
         cp -L "$dep" "$dest"; \
+        copy_package_notice "$dep"; \
     }; \
     copy_ldd_deps() { \
         LD_LIBRARY_PATH="$root/opt/nemo-speech/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \

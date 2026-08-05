@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "sortformer_model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -153,7 +154,137 @@ SortformerGraph::build_graph(
     return out;
 }
 
-SortformerModel::SortformerModel(ggml_runtime::BackendManager& bm, const std::string& gguf_path) {
+class SortformerModel::SortformerBatcher {
+   public:
+    struct Key {
+        int t_mel = 0;
+        int spkcache_frames = 0;
+        int fifo_frames = 0;
+
+        bool operator==(const Key& other) const {
+            return t_mel == other.t_mel && spkcache_frames == other.spkcache_frames &&
+                   fifo_frames == other.fifo_frames;
+        }
+    };
+
+    struct Request {
+        std::vector<float> mel;
+        std::vector<float> spkcache;
+        std::vector<float> fifo;
+    };
+
+    SortformerBatcher(SortformerModel* model, const BatchingConfig& batching)
+        : model_(model), queue_(batching, [this](const Key& key, std::vector<Request>&& requests) {
+              return execute(key, std::move(requests));
+          }) {}
+
+    ChunkOutput run(
+        const float* mel, int t_mel, const float* spkcache, int spkcache_frames, const float* fifo,
+        int fifo_frames) {
+        const int d = model_->cfg_.encoder.d_model;
+        Request request;
+        request.mel.assign(
+            mel, mel + static_cast<size_t>(model_->cfg_.n_mels) * static_cast<size_t>(t_mel));
+        if (spkcache_frames > 0) {
+            request.spkcache.assign(spkcache, spkcache + static_cast<size_t>(d) * spkcache_frames);
+        }
+        if (fifo_frames > 0)
+            request.fifo.assign(fifo, fifo + static_cast<size_t>(d) * fifo_frames);
+        return queue_.run({t_mel, spkcache_frames, fifo_frames}, std::move(request));
+    }
+
+    BatchMetrics metrics() const { return queue_.metrics(); }
+
+   private:
+    std::vector<ChunkOutput> execute(const Key& key, std::vector<Request>&& requests) {
+        const int B = static_cast<int>(requests.size());
+        const int d = model_->cfg_.encoder.d_model;
+        const int n_mels = model_->cfg_.n_mels;
+        const int n_spk = model_->cfg_.num_speakers;
+        const int t3 = model_->subsampled_len(key.t_mel);
+        const int total = key.spkcache_frames + key.fifo_frames + t3;
+        const size_t mel_item = static_cast<size_t>(n_mels) * key.t_mel;
+        const size_t spkcache_item = static_cast<size_t>(d) * key.spkcache_frames;
+        const size_t fifo_item = static_cast<size_t>(d) * key.fifo_frames;
+
+        std::vector<float> mel(mel_item * B);
+        std::vector<float> spkcache(spkcache_item * B);
+        std::vector<float> fifo(fifo_item * B);
+        for (int b = 0; b < B; ++b) {
+            const auto& request = requests[static_cast<size_t>(b)];
+            if (request.mel.size() != mel_item || request.spkcache.size() != spkcache_item ||
+                request.fifo.size() != fifo_item) {
+                throw std::runtime_error("sortformer batch contains incompatible inputs");
+            }
+            std::copy(
+                request.mel.begin(), request.mel.end(),
+                mel.begin() + static_cast<size_t>(b) * mel_item);
+            std::copy(
+                request.spkcache.begin(), request.spkcache.end(),
+                spkcache.begin() + static_cast<size_t>(b) * spkcache_item);
+            std::copy(
+                request.fifo.begin(), request.fifo.end(),
+                fifo.begin() + static_cast<size_t>(b) * fifo_item);
+        }
+
+        std::vector<ggml_runtime::Session::Input> inputs;
+        inputs.push_back({"input.mel", GGML_TYPE_F32, mel.data(), {n_mels, key.t_mel, 1, B}});
+        if (key.spkcache_frames > 0) {
+            inputs.push_back(
+                {"input.spkcache", GGML_TYPE_F32, spkcache.data(), {d, key.spkcache_frames, B}});
+        }
+        if (key.fifo_frames > 0) {
+            inputs.push_back({"input.fifo", GGML_TYPE_F32, fifo.data(), {d, key.fifo_frames, B}});
+        }
+
+        const size_t preds_item = static_cast<size_t>(total) * n_spk;
+        const size_t embs_item = static_cast<size_t>(t3) * d;
+        std::vector<float> preds(preds_item * B);
+        std::vector<float> embs(embs_item * B);
+        std::vector<ggml_runtime::Session::Output> outputs(2);
+        outputs[0].index = 0;
+        outputs[0].host_buffer = preds.data();
+        outputs[0].nbytes = preds.size() * sizeof(float);
+        outputs[1].index = 1;
+        outputs[1].host_buffer = embs.data();
+        outputs[1].nbytes = embs.size() * sizeof(float);
+        model_->session_->run(inputs, outputs);
+
+        const int out_total = static_cast<int>(outputs[0].out_shape[1]);
+        const int out_pred_batch = static_cast<int>(outputs[0].out_shape[2]);
+        const int out_t3 = static_cast<int>(outputs[1].out_shape[1]);
+        const int out_emb_batch = static_cast<int>(outputs[1].out_shape[2]);
+        if (out_total != total || out_t3 != t3 || out_pred_batch != B || out_emb_batch != B) {
+            throw std::runtime_error(
+                "sortformer: unexpected batched output shape (got total=" +
+                std::to_string(out_total) + " chunk=" + std::to_string(out_t3) +
+                " batch=" + std::to_string(out_pred_batch) + "/" + std::to_string(out_emb_batch) +
+                ", expected total=" + std::to_string(total) + " chunk=" + std::to_string(t3) +
+                " batch=" + std::to_string(B) + ")");
+        }
+
+        std::vector<ChunkOutput> results(static_cast<size_t>(B));
+        for (int b = 0; b < B; ++b) {
+            auto& result = results[static_cast<size_t>(b)];
+            result.total_frames = total;
+            result.chunk_frames = t3;
+            result.preds.assign(
+                preds.begin() + static_cast<size_t>(b) * preds_item,
+                preds.begin() + static_cast<size_t>(b + 1) * preds_item);
+            result.chunk_embs.assign(
+                embs.begin() + static_cast<size_t>(b) * embs_item,
+                embs.begin() + static_cast<size_t>(b + 1) * embs_item);
+        }
+        return results;
+    }
+
+    SortformerModel* model_;
+    MicroBatcher<Key, Request, ChunkOutput> queue_;
+};
+
+SortformerModel::SortformerModel(
+    ggml_runtime::BackendManager& bm, const std::string& gguf_path,
+    const BatchingConfig& batching) {
     loader_ = std::make_unique<ggml_runtime::GGUFLoader>(gguf_path);
     cfg_ = parse_config(*loader_);
 
@@ -169,6 +300,7 @@ SortformerModel::SortformerModel(ggml_runtime::BackendManager& bm, const std::st
     // (T_mel, L1, L2) shapes; keep them all cached.
     session_->set_run_cache_capacity(48);
     session_->setup();
+    batcher_ = std::make_unique<SortformerBatcher>(this, batching);
 }
 
 SortformerModel::~SortformerModel() = default;
@@ -185,39 +317,10 @@ SortformerModel::ChunkOutput
 SortformerModel::run_chunk(
     const float* mel, int t_mel, const float* spkcache, int spkcache_frames, const float* fifo,
     int fifo_frames) {
-    const int d = cfg_.encoder.d_model;
-    const int n_spk = cfg_.num_speakers;
-    const int t3 = subsampled_len(t_mel);
-    const int total = spkcache_frames + fifo_frames + t3;
+    return batcher_->run(mel, t_mel, spkcache, spkcache_frames, fifo, fifo_frames);
+}
 
-    std::vector<ggml_runtime::Session::Input> inputs;
-    inputs.push_back({"input.mel", GGML_TYPE_F32, mel, {cfg_.n_mels, t_mel}});
-    if (spkcache_frames > 0) {
-        inputs.push_back({"input.spkcache", GGML_TYPE_F32, spkcache, {d, spkcache_frames}});
-    }
-    if (fifo_frames > 0) {
-        inputs.push_back({"input.fifo", GGML_TYPE_F32, fifo, {d, fifo_frames}});
-    }
-
-    ChunkOutput res;
-    res.preds.resize(static_cast<size_t>(total) * n_spk);
-    res.chunk_embs.resize(static_cast<size_t>(t3) * d);
-    std::vector<ggml_runtime::Session::Output> outputs(2);
-    outputs[0].index = 0;
-    outputs[0].host_buffer = res.preds.data();
-    outputs[0].nbytes = res.preds.size() * sizeof(float);
-    outputs[1].index = 1;
-    outputs[1].host_buffer = res.chunk_embs.data();
-    outputs[1].nbytes = res.chunk_embs.size() * sizeof(float);
-    session_->run(inputs, outputs);
-
-    res.total_frames = static_cast<int>(outputs[0].out_shape[1]);
-    res.chunk_frames = static_cast<int>(outputs[1].out_shape[1]);
-    if (res.total_frames != total || res.chunk_frames != t3) {
-        throw std::runtime_error(
-            "sortformer: unexpected output shape (got total=" + std::to_string(res.total_frames) +
-            " chunk=" + std::to_string(res.chunk_frames) +
-            ", expected total=" + std::to_string(total) + " chunk=" + std::to_string(t3) + ")");
-    }
-    return res;
+BatchMetrics
+SortformerModel::batch_metrics() const {
+    return batcher_->metrics();
 }

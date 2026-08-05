@@ -19,9 +19,12 @@ commit.
 | diarization | `f32` | `nvidia/diar_streaming_sortformer_4spk-v2` |
 | PnC | `q8_0` | local NeMo checkpoint |
 | VAD | `f32` | `silero` |
-| TTS | `f16` | `nvidia/magpie_tts_multilingual_357m` (`v2602`) |
+| TTS | `f16` | `nvidia/magpie_tts_multilingual_357m` |
 | codec | `f16` | `nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps` |
 | NMT | `f16` | `nvidia/Riva-Translate-4B-Instruct-v2` |
+
+The full per-domain model catalogs live in [ASR models](asr/models.md),
+[TTS models](tts/models.md), and [NMT models](nmt/models.md).
 
 For example:
 

@@ -15,7 +15,8 @@ PTX for ad-hoc builds. Dropping real cuBLAS + cuBLASLt is the bulk of the
 container size. The shim is built as a separate library from ggml.
 
 It's a normal CMake target, **`NEMO_SPEECH_CUBLAS_SHIM` (default `ON`)**, built
-whenever `GGML_CUDA` is also on (a no-op for Metal/Vulkan/CPU builds). So a CUDA
+whenever `GGML_CUDA` is also on (Linux only, auto-skipped on Windows; a no-op
+for Metal/Vulkan/CPU builds). So a CUDA
 build produces `libcublas.so.13` in its binary directory by default; the
 Dockerfile relies on that and skips real cuBLAS/cuBLASLt in the library closure.
 To run a local CLI command with the shim, put it first on the loader path:

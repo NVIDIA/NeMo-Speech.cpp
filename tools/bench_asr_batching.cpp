@@ -36,6 +36,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(GGML_USE_CUDA)
+#include <cuda_profiler_api.h>
+#endif
+
 #include "fe.h"
 #include "model.h"
 #include "nvtx_utils.h"
@@ -57,12 +61,19 @@ struct Options {
     std::string json_path;
     std::string vad_model;
     std::string pnc_model;
+    std::string diar_model;
+    std::string lm_path;
+    std::string lexicon_path;
+    std::string tokenizer_path;
     std::vector<int> concurrency;
     int gpu = 0;
     int reps = 0;
     int chunk_ms = 160;
     int right_context = 1;
     bool batching = true;
+    bool vad_masking = true;
+    bool vad_endpointing = false;
+    bool acoustic_endpointing = false;
     int max_batch = 8;
     int queue_us = 1000;
     int state_slots = 0;
@@ -147,7 +158,10 @@ usage(const char* exe) {
         "Options: --gpu N --concurrency 1,2,4,8 --reps N --batching 0|1\n"
         "         --max-batch N --queue-us N --state-slots N --chunk-ms N\n"
         "         --right-context N --language CODE --vad-model PATH\n"
-        "         --pnc-model PATH --json PATH\n",
+        "         --vad-masking 0|1 --vad-endpointing 0|1\n"
+        "         --acoustic-endpointing 0|1\n"
+        "         --pnc-model PATH --diar-model PATH\n"
+        "         --lm-path PATH --lexicon PATH [--tokenizer PATH] --json PATH\n",
         exe, exe);
 }
 
@@ -191,8 +205,22 @@ parse_options(int argc, char** argv) {
             o.language = value();
         else if (a == "--vad-model")
             o.vad_model = value();
+        else if (a == "--vad-masking")
+            o.vad_masking = std::atoi(value()) != 0;
+        else if (a == "--vad-endpointing")
+            o.vad_endpointing = std::atoi(value()) != 0;
+        else if (a == "--acoustic-endpointing")
+            o.acoustic_endpointing = std::atoi(value()) != 0;
         else if (a == "--pnc-model")
             o.pnc_model = value();
+        else if (a == "--diar-model")
+            o.diar_model = value();
+        else if (a == "--lm-path")
+            o.lm_path = value();
+        else if (a == "--lexicon")
+            o.lexicon_path = value();
+        else if (a == "--tokenizer")
+            o.tokenizer_path = value();
         else if (a == "--json")
             o.json_path = value();
         else
@@ -332,9 +360,10 @@ emit_results(const Options& o, const std::vector<Row>& rows) {
     js << "{\"mode\":\"" << json_escape(o.mode) << "\",\"model\":\"" << json_escape(o.model)
        << "\",\"audio\":\"" << json_escape(o.audio) << "\",\"vad_model\":\""
        << json_escape(o.vad_model) << "\",\"pnc_model\":\"" << json_escape(o.pnc_model)
-       << "\",\"batching\":" << (o.batching ? "true" : "false") << ",\"max_batch\":" << o.max_batch
-       << ",\"queue_us\":" << o.queue_us << ",\"chunk_ms\":" << o.chunk_ms << ",\"reps\":" << o.reps
-       << ",\"rows\":[";
+       << "\",\"diar_model\":\"" << json_escape(o.diar_model) << "\",\"lm_path\":\""
+       << json_escape(o.lm_path) << "\",\"batching\":" << (o.batching ? "true" : "false")
+       << ",\"max_batch\":" << o.max_batch << ",\"queue_us\":" << o.queue_us
+       << ",\"chunk_ms\":" << o.chunk_ms << ",\"reps\":" << o.reps << ",\"rows\":[";
     for (size_t i = 0; i < rows.size(); ++i) {
         if (i)
             js << ',';
@@ -445,8 +474,16 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
     cfg.model.path = o.model;
     cfg.streaming.rnnt_right_context = o.right_context;
     cfg.vad.model_path = o.vad_model;
-    cfg.vad.masker.mask_enable = !o.vad_model.empty();
+    cfg.vad.masker.mask_enable = !o.vad_model.empty() && o.vad_masking;
+    cfg.endpointing.enable = o.acoustic_endpointing || (!o.vad_model.empty() && o.vad_endpointing);
+    cfg.endpointing.vad_based = !o.vad_model.empty() && o.vad_endpointing;
     cfg.postproc.pnc_model_path = o.pnc_model;
+    cfg.diar.model_path = o.diar_model;
+    cfg.decoder.lm_path = o.lm_path;
+    cfg.decoder.lexicon_path = o.lexicon_path;
+    cfg.decoder.tokenizer_path = o.tokenizer_path;
+    if (!o.lm_path.empty())
+        cfg.decoder.kind = DecoderConfig::Kind::Flashlight;
     Recognizer recognizer(std::move(cfg));
     auto* model = recognizer.model();
     if (sr != recognizer.sample_rate())
@@ -456,6 +493,7 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
     // self-punctuating RNNT this preserves model formatting; its production
     // postprocessor intentionally ignores an incompatible external PnC model.
     opts.enable_automatic_punctuation = true;
+    opts.enable_speaker_diarization = !o.diar_model.empty();
 
     // B=1 establishes both the transcript reference and all scalar graph
     // caches.  Each sweep point then gets one unpaced shape warmup.
@@ -484,6 +522,10 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
         BatchMetrics eb;
         BatchMetrics pb;
         BatchMetrics jb;
+        const auto vb = recognizer.vad_batch_metrics();
+        const auto db =
+            recognizer.diar_model() ? recognizer.diar_model()->batch_metrics() : BatchMetrics{};
+        const auto pnb = recognizer.postproc().pnc_batch_metrics();
         if (model->head_kind() == HeadKind::Ctc) {
             eb = static_cast<CtcModel*>(model)->batch_metrics();
         } else {
@@ -497,9 +539,19 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
         const std::string compute_range = "asr.bench.compute.C" + std::to_string(n);
         for (int rep = 0; rep < o.reps; ++rep) {
             const ggml_nvtx::range nvtx(compute_range.c_str());
+#if defined(GGML_USE_CUDA)
+            const bool profile_cuda =
+                rep == 0 && std::getenv("NEMO_SPEECH_BENCH_CUDA_PROFILE") != nullptr;
+            if (profile_cuda)
+                cudaProfilerStart();
+#endif
             row.compute_wall_ms +=
                 run_stream_once(recognizer, opts, o.language, audio, sr, o.chunk_ms, n, false)
                     .wall_ms;
+#if defined(GGML_USE_CUDA)
+            if (profile_cuda)
+                cudaProfilerStop();
+#endif
         }
         row.compute_wall_ms /= o.reps;
         const double audio_s = static_cast<double>(audio.size()) / sr;
@@ -550,6 +602,16 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
             row.stages.push_back(
                 stage_row("predictor", delta(transducer->predictor_batch_metrics(), pb)));
             row.stages.push_back(stage_row("joint", delta(transducer->joint_batch_metrics(), jb)));
+        }
+        if (!o.vad_model.empty())
+            row.stages.push_back(stage_row("vad", delta(recognizer.vad_batch_metrics(), vb)));
+        if (!o.diar_model.empty()) {
+            row.stages.push_back(
+                stage_row("diar", delta(recognizer.diar_model()->batch_metrics(), db)));
+        }
+        if (!o.pnc_model.empty()) {
+            row.stages.push_back(
+                stage_row("pnc", delta(recognizer.postproc().pnc_batch_metrics(), pnb)));
         }
         rows.push_back(std::move(row));
     }
@@ -608,14 +670,23 @@ bench_offline(const Options& o, const std::vector<float>& audio, int sr) {
     cfg.batching = batching_config(o);
     cfg.model.path = o.model;
     cfg.vad.model_path = o.vad_model;
-    cfg.vad.masker.mask_enable = !o.vad_model.empty();
+    cfg.vad.masker.mask_enable = !o.vad_model.empty() && o.vad_masking;
+    cfg.endpointing.enable = o.acoustic_endpointing || (!o.vad_model.empty() && o.vad_endpointing);
+    cfg.endpointing.vad_based = !o.vad_model.empty() && o.vad_endpointing;
     cfg.postproc.pnc_model_path = o.pnc_model;
+    cfg.diar.model_path = o.diar_model;
+    cfg.decoder.lm_path = o.lm_path;
+    cfg.decoder.lexicon_path = o.lexicon_path;
+    cfg.decoder.tokenizer_path = o.tokenizer_path;
+    if (!o.lm_path.empty())
+        cfg.decoder.kind = DecoderConfig::Kind::Flashlight;
     Recognizer recognizer(std::move(cfg));
     auto* model = recognizer.model();
     if (sr != recognizer.sample_rate())
         throw std::runtime_error("audio/model sample-rate mismatch");
     AsrRequestOptions opts;
     opts.enable_automatic_punctuation = true;
+    opts.enable_speaker_diarization = !o.diar_model.empty();
     auto ref_run = run_offline_once(recognizer, opts, o.language, audio, 1);
     const auto reference = ref_run.transcripts.front();
     std::fprintf(stderr, "[reference] %s\n", reference.c_str());
@@ -626,6 +697,10 @@ bench_offline(const Options& o, const std::vector<float>& audio, int sr) {
         BatchMetrics enc_before;
         BatchMetrics pred_before;
         BatchMetrics joint_before;
+        const auto vad_before = recognizer.vad_batch_metrics();
+        const auto diar_before =
+            recognizer.diar_model() ? recognizer.diar_model()->batch_metrics() : BatchMetrics{};
+        const auto pnc_before = recognizer.postproc().pnc_batch_metrics();
         if (model->head_kind() == HeadKind::Ctc) {
             auto* ctc = static_cast<CtcModel*>(model);
             fe_before = ctc->offline_frontend_batch_metrics();
@@ -685,6 +760,18 @@ bench_offline(const Options& o, const std::vector<float>& audio, int sr) {
                 stage_row("predictor", delta(transducer->predictor_batch_metrics(), pred_before)));
             row.stages.push_back(
                 stage_row("joint", delta(transducer->joint_batch_metrics(), joint_before)));
+        }
+        if (!o.vad_model.empty()) {
+            row.stages.push_back(
+                stage_row("vad", delta(recognizer.vad_batch_metrics(), vad_before)));
+        }
+        if (!o.diar_model.empty()) {
+            row.stages.push_back(
+                stage_row("diar", delta(recognizer.diar_model()->batch_metrics(), diar_before)));
+        }
+        if (!o.pnc_model.empty()) {
+            row.stages.push_back(
+                stage_row("pnc", delta(recognizer.postproc().pnc_batch_metrics(), pnc_before)));
         }
         rows.push_back(std::move(row));
     }

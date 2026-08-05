@@ -97,7 +97,7 @@ nmt:
   backend:
     gpu: 0                      # GPU device index, -1 = CPU
   model:
-    path: /models/riva-translate-4b-instruct-v1.1.q8_0.gguf   # f16 also works
+    path: /models/riva-translate-4b-instruct-v2.q8_0.gguf   # f16 also works
     n_ctx: 8192
   generation:
     max_new_tokens: 256

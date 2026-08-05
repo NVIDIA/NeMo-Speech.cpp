@@ -239,9 +239,7 @@ class MelSpectrogramExtractor::GpuBatcher {
         request.audio.assign(audio, audio + n_samples);
         request.reflect_left = reflect_left;
         request.normalize = normalize;
-        return queue_.run(
-            {n_samples, reflect_left, normalize}, std::move(request),
-            nemo_speech::asr::current_batch_cohort_target());
+        return queue_.run({n_samples, reflect_left, normalize}, std::move(request));
     }
 
     nemo_speech::asr::BatchMetrics metrics() const { return queue_.metrics(); }
@@ -468,14 +466,21 @@ MelSpectrogramExtractor::compute(
         }
     }
 
-    // Per-feature normalization over the valid frames in this call.
+    const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
+    if (cfg_.mask_invalid_frames) {
+        for (int f = valid; f < n_frames; ++f) {
+            std::fill_n(features.data() + static_cast<size_t>(f) * cfg_.n_mels, cfg_.n_mels, 0.0f);
+        }
+    }
+
+    // Per-feature normalization over the valid frames in this call. Streaming
+    // mode skips it and maintains incremental statistics in the runner.
     if (!normalize)
         return;
 
     // NeMo normalizes only the valid `floor(samples / hop)` frames, uses an
     // unbiased variance, and masks the final centered/padded frame. This is
     // observably different from normalizing every STFT frame.
-    const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
     for (int m = 0; m < cfg_.n_mels; m++) {
         double sum = 0.0;
         for (int f = 0; f < valid; f++)
@@ -659,9 +664,14 @@ MelSpectrogramExtractor::compute_gpu_batch_via_session(std::vector<BatchRequest>
         auto& features = results[b].features;
         results[b].n_frames = n_frames;
         features.assign(packed.begin() + b * output_item, packed.begin() + (b + 1) * output_item);
+        const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
+        if (cfg_.mask_invalid_frames) {
+            for (int f = valid; f < n_frames; ++f) {
+                std::fill_n(features.data() + static_cast<size_t>(f) * n_mels, n_mels, 0.0f);
+            }
+        }
         if (!normalize)
             continue;
-        const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
         for (int m = 0; m < n_mels; ++m) {
             double sum = 0.0;
             for (int f = 0; f < valid; ++f) sum += features[(size_t)m + (size_t)f * n_mels];

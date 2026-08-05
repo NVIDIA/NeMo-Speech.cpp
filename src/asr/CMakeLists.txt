@@ -64,60 +64,63 @@ endif()
 # leak through this .so's ABI.
 target_link_libraries(nemo_speech_asr PUBLIC nemo_speech_runtime_ggml)
 
+# SentencePiece is a core ASR dependency: the RNNT head tokenizes word-boosting
+# phrases with the model's embedded tokenizer (context biasing in
+# rnnt_greedy_decoder.cpp / RnntModel::encode_phrase); the flashlight decoder
+# also encodes OOV boost phrases with it. Prefer a static archive on ELF
+# platforms so its bundled protobuf symbols stay private.
+if(UNIX AND NOT APPLE)
+    set(_NEMO_SPEECH_LIBRARY_SUFFIXES "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    find_library(SENTENCEPIECE_STATIC_LIB sentencepiece
+        HINTS "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/lib")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_NEMO_SPEECH_LIBRARY_SUFFIXES}")
+    unset(_NEMO_SPEECH_LIBRARY_SUFFIXES)
+endif()
+if(SENTENCEPIECE_STATIC_LIB)
+    find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h
+        HINTS "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/include")
+    if(NOT SENTENCEPIECE_INCLUDE_DIR)
+        message(FATAL_ERROR "SentencePiece archive found without sentencepiece_processor.h")
+    endif()
+    target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_STATIC_LIB})
+    target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
+    target_link_options(
+        nemo_speech_asr PRIVATE "LINKER:--exclude-libs,libsentencepiece.a")
+elseif(NEMO_SPEECH_WITH_NORM AND UNIX AND NOT APPLE)
+    message(FATAL_ERROR
+        "ITN + Flashlight requires private static SentencePiece; "
+        "run scripts/build_sentencepiece_static.sh")
+else()
+    # vcpkg's imported target carries its platform-specific usage requirements.
+    find_package(unofficial-sentencepiece CONFIG QUIET)
+    if(TARGET unofficial::sentencepiece::sentencepiece)
+        target_link_libraries(
+            nemo_speech_asr PRIVATE unofficial::sentencepiece::sentencepiece)
+    else()
+        find_library(SENTENCEPIECE_LIB sentencepiece REQUIRED)
+        find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h REQUIRED)
+        target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_LIB})
+        target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
+    endif()
+endif()
+# SentencePiece (vcpkg) uses absl::flat_hash_map + protobuf internally, but its
+# config target doesn't propagate those link deps. On Windows/vcpkg, add them
+# explicitly; elsewhere SentencePiece links its own deps (apt's -dev package).
+if(WIN32)
+    find_package(absl CONFIG QUIET)
+    if(absl_FOUND)
+        target_link_libraries(nemo_speech_asr PRIVATE
+            absl::flat_hash_map absl::flat_hash_set absl::strings absl::str_format absl::hash)
+    endif()
+    find_package(protobuf CONFIG QUIET)
+    if(TARGET protobuf::libprotobuf)
+        target_link_libraries(nemo_speech_asr PRIVATE protobuf::libprotobuf)
+    endif()
+endif()
+
 if(NEMO_SPEECH_WITH_FLASHLIGHT)
     target_compile_definitions(nemo_speech_asr PUBLIC NEMO_SPEECH_WITH_FLASHLIGHT=1)
-
-    # Word boosting encodes OOV phrases with SentencePiece. Prefer a static
-    # archive on ELF platforms so its bundled protobuf symbols stay private.
-    if(UNIX AND NOT APPLE)
-        set(_NEMO_SPEECH_LIBRARY_SUFFIXES "${CMAKE_FIND_LIBRARY_SUFFIXES}")
-        set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-        find_library(SENTENCEPIECE_STATIC_LIB sentencepiece
-            HINTS "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/lib")
-        set(CMAKE_FIND_LIBRARY_SUFFIXES "${_NEMO_SPEECH_LIBRARY_SUFFIXES}")
-        unset(_NEMO_SPEECH_LIBRARY_SUFFIXES)
-    endif()
-    if(SENTENCEPIECE_STATIC_LIB)
-        find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h
-            HINTS "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/include")
-        if(NOT SENTENCEPIECE_INCLUDE_DIR)
-            message(FATAL_ERROR "SentencePiece archive found without sentencepiece_processor.h")
-        endif()
-        target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_STATIC_LIB})
-        target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
-        target_link_options(
-            nemo_speech_asr PRIVATE "LINKER:--exclude-libs,libsentencepiece.a")
-    elseif(NEMO_SPEECH_WITH_NORM AND UNIX AND NOT APPLE)
-        message(FATAL_ERROR
-            "ITN + Flashlight requires private static SentencePiece; "
-            "run scripts/build_sentencepiece_static.sh")
-    else()
-        # vcpkg's imported target carries its platform-specific usage requirements.
-        find_package(unofficial-sentencepiece CONFIG QUIET)
-        if(TARGET unofficial::sentencepiece::sentencepiece)
-            target_link_libraries(
-                nemo_speech_asr PRIVATE unofficial::sentencepiece::sentencepiece)
-        else()
-            find_library(SENTENCEPIECE_LIB sentencepiece REQUIRED)
-            find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h REQUIRED)
-            target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_LIB})
-            target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
-        endif()
-    endif()
-    # SentencePiece (vcpkg) uses absl::flat_hash_map + protobuf internally, but its
-    # config target doesn't propagate those link deps. On Windows/vcpkg, add them
-    # explicitly; elsewhere SentencePiece links its own deps (apt's -dev package).
-    if(WIN32)
-        find_package(absl CONFIG QUIET)
-        if(absl_FOUND)
-            target_link_libraries(nemo_speech_asr PRIVATE
-                absl::flat_hash_map absl::flat_hash_set absl::strings absl::str_format absl::hash)
-        endif()
-        find_package(protobuf CONFIG QUIET)
-        if(TARGET protobuf::libprotobuf)
-            target_link_libraries(nemo_speech_asr PRIVATE protobuf::libprotobuf)
-        endif()
-    endif()
     target_link_libraries(nemo_speech_asr PRIVATE flashlight-text flashlight-text-kenlm)
 endif()
 

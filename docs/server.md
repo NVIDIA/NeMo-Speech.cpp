@@ -10,7 +10,7 @@ They are separate processes and do not share loaded model instances. The
 source installer and `*-server` presets build the HTTP executable for ASR and
 diarization plus TTS without the gRPC dependency chain. `cuda-full`, `developer`,
 or explicit component options add NMT, optional language frontends, and
-`riva_server`.
+`riva_server` (presets: [build guide](build.md)).
 
 ```bash
 nemo-speech serve \
@@ -64,8 +64,9 @@ asr:
 Unknown keys are errors. For environment variables, uppercase the dotted key
 and replace `.` and `-` with `_`; for example,
 `asr.model.path` becomes `NEMO_SPEECH_ASR_MODEL_PATH`. CLI options accept the
-canonical dotted form (`--asr.model.path /models/asr.gguf`) and common aliases
-such as `--asr-model`. Boolean keys can be negated with an explicit value, such
+canonical dotted form (`--asr.model.path /models/asr.gguf`); `nemo-speech serve`
+also accepts common aliases such as `--asr-model` (`riva_server` does not).
+Boolean keys can be negated with an explicit value, such
 as `--asr.endpointing.enable=false`.
 
 HTTP listener settings use the same precedence:
@@ -74,6 +75,11 @@ HTTP listener settings use the same precedence:
 |---|---|---|
 | `--host` / `http.host` | `127.0.0.1` | HTTP bind address |
 | `--port` / `http.port` | `8080` | HTTP port |
+| `--api-key` / `http.api-key` | none | require `Authorization: Bearer <key>` on API routes |
+| `--tls-cert` / `http.tls-cert` | none | TLS certificate path (with `--tls-key`, enables HTTPS) |
+| `--tls-key` / `http.tls-key` | none | TLS private-key path |
+| `--cors-origin` / `http.cors-origin` | none | allowed browser origin |
+| `--no-ui` / `http.playground` | playground on | disable the embedded playground |
 | `--threads` / `http.threads` | `4` | bounded worker pool |
 | `--max-upload-mb` / `http.max-upload-mb` | `512` | request-body limit |
 | `--read-timeout` / `http.read-timeout` | `30` | socket read timeout in seconds |
@@ -84,7 +90,7 @@ HTTP listener settings use the same precedence:
 Capabilities auto-enable when their required model paths are present. An
 explicit `asr.enabled`, `tts.enabled`, or `nmt.enabled` value can be `true`,
 `false`, or `auto` (the default). Starting with no enabled capability is an
-error. `riva_server` ignores HTTP listener settings and instead accepts
+error. `riva_server` does not accept HTTP listener settings; it takes
 `--bind HOST:PORT` (default `0.0.0.0:50051`); use an engine-only YAML file with
 that binary.
 
@@ -92,8 +98,8 @@ The complete engine key references are in [ASR configuration](asr/configuration.
 [TTS configuration](tts/configuration.md), and
 [NMT configuration](nmt/configuration.md).
 
-The default loopback binding is intentional. Use `--host 0.0.0.0`, TLS, and an
-API key explicitly for remote access. Prefer the
+The default loopback binding is intentional. For remote access, set
+`--host 0.0.0.0`, TLS (`--tls-cert` + `--tls-key`), and an API key explicitly. Prefer the
 `NEMO_SPEECH_HTTP_API_KEY` environment variable over placing a secret in
 command-line arguments. API keys require `Authorization: Bearer <key>`;
 browser WebSockets may supply `?api_key=<key>`. NVIDIA NIM is the supported
@@ -129,23 +135,22 @@ nemo-speech health --url http://127.0.0.1:8080/ready
 
 ## HTTP endpoints
 
+Full request/response field reference: **[HTTP API reference](api.md)**.
+
 - `GET /`, `GET /health`, `GET /ready`, and `GET /version`
 - `GET /v1/models`
-- `POST /v1/audio/transcriptions` (OpenAI-compatible multipart subset)
-- `POST /v1/audio/speech` (OpenAI-compatible JSON subset)
-- `POST /v1/audio/translations` when ASR and NMT are loaded
-- `POST /v1/audio/speech/translations` for ASR → NMT → TTS audio (extension)
-- `POST /v1/translations` for text NMT
-- `POST /v1/audio/diarizations` for speaker segments (`/v1/diarizations` alias;
-  optional multipart `mode=streaming|offline`)
-- WebSocket `/v1/realtime` for live PCM16 transcription
+- `POST /v1/audio/transcriptions` - speech-to-text (OpenAI-compatible subset)
+- `POST /v1/audio/speech` - text-to-speech (OpenAI-compatible subset)
+- `POST /v1/translations` - text translation
+- `POST /v1/audio/translations` - speech translation (ASR -> NMT)
+- `POST /v1/audio/speech/translations` - speech-to-speech translation (extension)
+- `POST /v1/audio/diarizations` - speaker segments (`/v1/diarizations` alias)
+- WebSocket `/v1/realtime` - live PCM16 transcription
 
-The realtime socket accepts binary little-endian PCM16 frames. Send a
-`session.update` JSON event before audio to set `sample_rate`, `language`,
-`automatic_punctuation`, `verbatim`, or `word_timestamps`; then send
-`input_audio_buffer.commit` to finish. Base64 audio in
-`input_audio_buffer.append` is also accepted. The server emits
-`conversation.item.input_audio_transcription.delta` and `.completed` events.
+The realtime socket accepts binary little-endian PCM16 frames; an optional
+`session.update` JSON event before the first frame sets session options. See
+the [API reference](api.md#websocket-v1realtime) for session fields and the
+event protocol.
 
 The bundled playground uses this protocol directly for microphone input and
 has no Node.js, Python, CDN, analytics, or external runtime assets. It reports
@@ -159,7 +164,8 @@ query credential is not accepted on non-realtime routes.
 
 ## Limits and lifecycle
 
-Uploads are capped at 512 MiB by default (`--max-upload-mb`). Socket reads and
+Uploads are capped at 512 MiB by default (`--max-upload-mb`); the same limit
+applies to cumulative audio on a realtime WebSocket stream. Socket reads and
 writes time out after 30 seconds by default (`--read-timeout` and
 `--write-timeout`); inference work runs on a bounded worker pool (`--threads`).
 The NMT context pool remains an engine setting (`nmt.pool.contexts`) and is not

@@ -122,6 +122,13 @@ make_cache_aware_config(const EncoderConfig& base, int right_ctx) {
 struct LayerCacheIO {
     ggml_tensor* k_cache_cur = nullptr;
     ggml_tensor* v_cache_cur = nullptr;
+    // CUDA fused-attention path: read the persistent paired K/V arena by
+    // active slot and circular-cache head directly, then append the current
+    // chunk in the same backend op. Portable backends leave these null and use
+    // the gathered tensors above.
+    ggml_tensor* kv_cache_arena = nullptr;
+    ggml_tensor* kv_cache_slot_ids = nullptr;
+    ggml_tensor* kv_cache_ring_heads = nullptr;
     ggml_tensor* conv_cache_cur = nullptr;
     ggml_tensor* attn_mask = nullptr;
     // Precomputed per-layer positional projection in head-split layout

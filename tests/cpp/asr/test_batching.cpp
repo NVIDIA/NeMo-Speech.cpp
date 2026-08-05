@@ -11,7 +11,9 @@
 #include "batching.h"
 
 using nemo_speech::asr::BatchingConfig;
+using nemo_speech::asr::IngressBatchCoordinator;
 using nemo_speech::asr::MicroBatcher;
+using nemo_speech::asr::ScopedBatchCohort;
 
 int
 main() {
@@ -65,14 +67,44 @@ main() {
             return std::move(in);
         });
     const auto started = std::chrono::steady_clock::now();
-    auto c = std::async(std::launch::async, [&] { return cohort_batcher.run(3, 30, 2); });
-    auto d = std::async(std::launch::async, [&] { return cohort_batcher.run(3, 40, 2); });
+    auto c = std::async(std::launch::async, [&] {
+        const ScopedBatchCohort cohort(2);
+        return cohort_batcher.run(3, 30);
+    });
+    auto d = std::async(std::launch::async, [&] {
+        const ScopedBatchCohort cohort(2);
+        return cohort_batcher.run(3, 40);
+    });
     require(c.get() == 30 && d.get() == 40, "wrong cohort result");
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count();
     require(cohort_batch.load() == 2, "cohort did not release as one batch");
     require(elapsed_ms < 250, "cohort waited for the physical maximum");
+    const auto scalar_cohort_started = std::chrono::steady_clock::now();
+    {
+        const ScopedBatchCohort cohort(1);
+        require(cohort_batcher.run(3, 50) == 50, "wrong scalar cohort result");
+    }
+    const auto scalar_cohort_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - scalar_cohort_started)
+                                      .count();
+    require(scalar_cohort_ms < 50, "scalar cohort crossed the worker queue");
+
+    BatchingConfig ingress_cfg = cohort_cfg;
+    ingress_cfg.ingress_cohort_delay_us = 500000;
+    IngressBatchCoordinator ingress(ingress_cfg);
+    const auto singleton_started = std::chrono::steady_clock::now();
+    require(ingress.arrive(1) == 1, "singleton ingress returned the wrong target");
+    const auto singleton_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - singleton_started)
+                                  .count();
+    require(singleton_ms < 50, "singleton ingress waited for a cohort");
+    auto ingress_a = std::async(std::launch::async, [&] { return ingress.arrive(2); });
+    auto ingress_b = std::async(std::launch::async, [&] { return ingress.arrive(2); });
+    require(
+        ingress_a.get() == 2 && ingress_b.get() == 2,
+        "concurrent ingress did not release a complete cohort");
 
     // Direct scalar and inline calls must reject work after shutdown without
     // entering the callback during owner teardown.

@@ -26,6 +26,10 @@ target_include_directories(nemo_speech_runtime_ggml PUBLIC
 
 target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
 
+if(NEMO_SPEECH_GGML_PATCHED)
+    target_compile_definitions(nemo_speech_runtime_ggml PRIVATE NEMO_SPEECH_GGML_PATCHED=1)
+endif()
+
 # CUDA-only direct depthwise-conv kernel (see CMakeLists.txt option). When off,
 # nn.cpp uses the portable ggml_conv_1d_dw lowering (F16-safe on all backends).
 if(NEMO_SPEECH_DIRECT_DW_CONV)

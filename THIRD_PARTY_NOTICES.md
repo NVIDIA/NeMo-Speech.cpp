@@ -55,13 +55,18 @@ used by its model-conversion tooling:
   [`COPYING.3`](third_party/kenlm/COPYING.3), and
   [`COPYING.LESSER.3`](third_party/kenlm/COPYING.LESSER.3)
 
-File-level exceptions used by the runtime include MurmurHash (Austin Appleby,
-public domain/MIT), StringPiece (Google and RE2 authors, BSD 3-Clause),
-double-conversion (V8 authors, BSD 3-Clause), and integer conversion code (Milo
-Yip and Wojciech Muła, MIT/BSD). Their upstream notices remain intact.
+The runtime uses these file-level exceptions:
 
-KenLM's AT&T-licensed `util/getopt.*` files are explicitly excluded from this
-project's runtime source allowlist and are not compiled or linked.
+- `util/murmur_hash.cc`: Austin Appleby, MIT option
+- `util/string_piece.cc` and `util/string_piece.hh`: Google and RE2 authors,
+  BSD 3-Clause
+- `util/double-conversion/*`: V8 authors, BSD 3-Clause
+- `util/integer_to_string.cc` and `util/integer_to_string.hh`: Milo Yip and
+  Wojciech Muła, MIT/BSD
+
+All other files in the project's explicit KenLM runtime source allowlist are
+LGPL 2.1 or later. KenLM's AT&T-licensed `util/getopt.c` and `util/getopt.hh`
+are explicitly excluded and are not compiled or linked.
 
 ### Open JTalk
 
@@ -103,9 +108,24 @@ project's runtime source allowlist and are not compiled or linked.
 - Copyright The OpenSSL Project Authors and other contributors
 - License: Apache License 2.0
 
-OpenSSL is dynamically linked for optional HTTP-server TLS. It is not
-incorporated into the source tree; binary and container distributions include
-the applicable OpenSSL attribution and Apache 2.0 terms.
+OpenSSL is dynamically linked only when optional HTTP-server TLS is enabled. It
+is not incorporated into the source tree. The default container disables HTTP
+TLS, links gRPC's unsecure libraries, and does not distribute OpenSSL.
+Distributions that enable HTTP TLS must include the applicable OpenSSL
+attribution and Apache 2.0 terms.
+
+### Container system libraries
+
+The Linux container copies the shared libraries required by its executables
+from the CUDA/Ubuntu builder into a `FROM scratch` runtime. This includes the
+GNU C Library, GCC runtime libraries, c-ares, zlib, bzip2, and XZ Utils/liblzma,
+subject to the exact feature set and package revisions in the built image.
+
+The container records the package copyright file for every copied
+Debian/Ubuntu shared library under
+`/opt/nemo-speech/share/licenses/nemo-speech/third_party/system/`. The complete
+project notice set is installed under
+`/opt/nemo-speech/share/licenses/nemo-speech/`.
 
 ## Other incorporated third-party code and data
 

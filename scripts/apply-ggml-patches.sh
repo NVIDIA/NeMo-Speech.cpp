@@ -6,7 +6,9 @@
 # upstream; our project-specific ggml changes (fused rel-pos attention, NVFP4
 # quantization, norm fusion, dw-conv F16, skinny-q8 GEMM, FastConformer BF16
 # fusions, large-batch CUDA fixes, and MagpieTTS/NanoCodec CUDA ops) are applied
-# at build setup time.
+# at build setup time. Later patches also add the NVIDIA SM80+ cached-F16 route
+# and a portable direct circular K/V fused-attention path with an SM80+ exact-
+# shape register specialization.
 #
 # Patches that still reverse-apply cleanly are skipped. Apply the complete
 # series to a clean submodule for deterministic setup; later patches may refine

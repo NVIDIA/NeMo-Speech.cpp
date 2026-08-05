@@ -64,11 +64,14 @@ struct DiarConfig {
 // Shared, stream-independent resources: the model Session + its FE config.
 class DiarModel {
    public:
-    DiarModel(ggml_runtime::BackendManager& bm, const std::string& gguf_path);
+    DiarModel(
+        ggml_runtime::BackendManager& bm, const std::string& gguf_path,
+        const BatchingConfig& batching = {});
 
     SortformerModel& model() { return model_; }
     MelSpectrogramExtractor& fe() { return fe_; }
     const SortformerModelConfig& cfg() const { return model_.cfg(); }
+    BatchMetrics batch_metrics() const { return model_.batch_metrics(); }
 
     // Full offline diarization: one forward pass over the whole file with
     // full self-attention and NO streaming state (NeMo streaming_mode=False;

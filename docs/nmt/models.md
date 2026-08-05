@@ -27,16 +27,12 @@ python3 convert_model.py nvidia/Riva-Translate-4B-Instruct-v2 \
 ## llama.cpp and ggml compatibility
 
 The build reuses the root `ggml` target instead of compiling llama.cpp's
-bundled copy, so ASR, TTS, and NMT share one backend at runtime. The submodule
-pins are authoritative; update llama.cpp and ggml together and confirm their
-public APIs remain compatible.
+bundled copy, so ASR, TTS, and NMT share one backend at runtime.
 
 ## Precision
 
-f16 and q8_0 are supported on CPU and GPU backends. q8_0 is smaller and is the
-example-config default. The runtime selects the appropriate ggml kernel
-configuration for NMT-only and combined ASR+NMT processes; no environment
-override is required. See [ggml patches](../development/ggml-patches.md) for
-implementation details.
+The converter accepts `f32`, `f16`, `bf16`, and `q8_0`; f16 and q8_0 are the
+tested runtime precisions on CPU and GPU backends, and q8_0 is smaller and the
+example-config default.
 
 Once converted, point the server at it: see [NMT configuration](configuration.md).

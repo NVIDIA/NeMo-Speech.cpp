@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "batching.h"
 #include "fastconformer.h"
 #include "runtime.h"
 #include "transformer_encoder.h"
@@ -93,7 +94,9 @@ class SortformerGraph : public ggml_runtime::Module {
 // buffers per call.
 class SortformerModel {
    public:
-    SortformerModel(ggml_runtime::BackendManager& bm, const std::string& gguf_path);
+    SortformerModel(
+        ggml_runtime::BackendManager& bm, const std::string& gguf_path,
+        const BatchingConfig& batching = {});
     ~SortformerModel();
 
     const SortformerModelConfig& cfg() const { return cfg_; }
@@ -119,13 +122,17 @@ class SortformerModel {
     ChunkOutput run_chunk(
         const float* mel, int t_mel, const float* spkcache, int spkcache_frames, const float* fifo,
         int fifo_frames);
+    BatchMetrics batch_metrics() const;
 
    private:
+    class SortformerBatcher;
+
     SortformerModelConfig cfg_;
     std::vector<float> mel_basis_;
     std::unique_ptr<ggml_runtime::GGUFLoader> loader_;
     std::unique_ptr<SortformerGraph> graph_;
     std::unique_ptr<ggml_runtime::Session> session_;
+    std::unique_ptr<SortformerBatcher> batcher_;
 };
 
 }  // namespace nemo_speech::asr

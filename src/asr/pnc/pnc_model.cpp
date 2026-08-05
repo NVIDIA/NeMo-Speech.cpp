@@ -142,6 +142,9 @@ class PncBertModule : public rt::Module {
                 ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, d_k, n_head, L, B), 0, 2, 1, 3));
 
             ggml_tensor* scores = ggml_scale_inplace(ctx, ggml_mul_mat(ctx, kh, qh), scale);
+            if (tc->has_tensor_by_name("pnc.in.mask")) {
+                scores = ggml_add(ctx, scores, tc->get_tensor_by_name("pnc.in.mask").tensor);
+            }
             ggml_tensor* attn = ggml_soft_max_inplace(ctx, scores);
             auto vtk = ggml_cont(ctx, ggml_permute(ctx, vh, 1, 0, 2, 3));
             auto ctxh = ggml_mul_mat(ctx, vtk, attn);
@@ -212,14 +215,21 @@ class PncModel::PncBatcher {
         std::vector<int> punct, capit;
     };
     PncBatcher(PncModel* model, const BatchingConfig& cfg)
-        : model_(model), queue_(cfg, [this](const int& n, std::vector<std::vector<int32_t>>&& req) {
+        : model_(model), queue_(cfg, [this](const int&, std::vector<std::vector<int32_t>>&& req) {
               const int B = static_cast<int>(req.size());
-              std::vector<int32_t> ids(static_cast<size_t>(n) * B);
+              int n = 0;
+              for (const auto& item : req) n = std::max(n, static_cast<int>(item.size()));
+              std::vector<int32_t> ids(static_cast<size_t>(n) * B, model_->cfg_.pad_id);
               std::vector<int32_t> pos(static_cast<size_t>(n) * B);
               std::vector<int32_t> typ(static_cast<size_t>(n) * B, 0);
+              std::vector<float> mask(static_cast<size_t>(n) * B, 0.0f);
               for (int b = 0; b < B; ++b) {
                   std::copy(req[b].begin(), req[b].end(), ids.begin() + static_cast<size_t>(b) * n);
-                  for (int i = 0; i < n; ++i) pos[static_cast<size_t>(b) * n + i] = i;
+                  for (int i = 0; i < n; ++i) {
+                      pos[static_cast<size_t>(b) * n + i] = i;
+                      if (i >= static_cast<int>(req[b].size()))
+                          mask[static_cast<size_t>(b) * n + i] = -1e9f;
+                  }
               }
               std::vector<std::vector<int32_t>> pbuf(
                   static_cast<size_t>(B), std::vector<int32_t>(static_cast<size_t>(n)));
@@ -231,20 +241,25 @@ class PncModel::PncBatcher {
                   outputs.push_back({b, "", pbuf[b].data(), pbuf[b].size() * sizeof(int32_t)});
               for (int b = 0; b < B; ++b)
                   outputs.push_back({B + b, "", cbuf[b].data(), cbuf[b].size() * sizeof(int32_t)});
-              model_->session_->run(
-                  {{"pnc.in.ids", GGML_TYPE_I32, ids.data(), {n, B}},
-                   {"pnc.in.pos", GGML_TYPE_I32, pos.data(), {n, B}},
-                   {"pnc.in.typ", GGML_TYPE_I32, typ.data(), {n, B}}},
-                  outputs);
+              std::vector<rt::Session::Input> inputs = {
+                  {"pnc.in.ids", GGML_TYPE_I32, ids.data(), {n, B}},
+                  {"pnc.in.pos", GGML_TYPE_I32, pos.data(), {n, B}},
+                  {"pnc.in.typ", GGML_TYPE_I32, typ.data(), {n, B}}};
+              if (B > 1)
+                  inputs.push_back({"pnc.in.mask", GGML_TYPE_F32, mask.data(), {n, 1, 1, B}});
+              model_->session_->run(inputs, outputs);
               std::vector<Result> result(static_cast<size_t>(B));
               for (int b = 0; b < B; ++b) {
-                  result[b].punct.assign(pbuf[b].begin(), pbuf[b].end());
-                  result[b].capit.assign(cbuf[b].begin(), cbuf[b].end());
+                  const size_t item_size = req[b].size();
+                  result[b].punct.assign(pbuf[b].begin(), pbuf[b].begin() + item_size);
+                  result[b].capit.assign(cbuf[b].begin(), cbuf[b].begin() + item_size);
               }
               return result;
           }) {}
     Result run(const int32_t* ids, int n) {
-        return queue_.run(n, std::vector<int32_t>(ids, ids + n));
+        constexpr int bucket_size = 16;
+        const int bucket = ((n + bucket_size - 1) / bucket_size) * bucket_size;
+        return queue_.run(bucket, std::vector<int32_t>(ids, ids + n));
     }
     BatchMetrics metrics() const { return queue_.metrics(); }
 

@@ -85,13 +85,15 @@ index 128883b4..7429cc45 100644
              return
 diff --git a/src/ggml-cuda/fused-relpos-attn.cu b/src/ggml-cuda/fused-relpos-attn.cu
 new file mode 100644
-index 00000000..48b7eb72
+index 00000000..f3c4836a
 --- /dev/null
 +++ b/src/ggml-cuda/fused-relpos-attn.cu
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,600 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +#include "fused-relpos-attn.cuh"
++
++#include <atomic>
 +
 +// Fused FastConformer relative-position multi-head attention.
 +//
@@ -117,6 +119,295 @@ index 00000000..48b7eb72
 +// K/V/P are templated: F16 operands halve the dominant re-read traffic when
 +// the caller stages them; F32 operands skip the staging casts entirely. All
 +// math stays in F32 either way.
++
++static constexpr int RELPOS_ATTN_DK_128 = 128;
++static constexpr int RELPOS_ATTN_WARPS_128 = RELPOS_ATTN_DK_128 / 32;
++static constexpr int RELPOS_ATTN_CC_SM100 = 1000;
++
++static __device__ __forceinline__ float relpos_warp_sum(float value) {
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        value += __shfl_down_sync(0xffffffff, value, offset);
++    }
++    return value;
++}
++
++static __device__ __forceinline__ float4 relpos_load4(const float * ptr) {
++    return *reinterpret_cast<const float4 *>(ptr);
++}
++
++static __device__ __forceinline__ float4 relpos_load4(const half * ptr) {
++    const int2 packed = *reinterpret_cast<const int2 *>(ptr);
++    const half2 * values = reinterpret_cast<const half2 *>(&packed);
++    return make_float4(
++        __low2float(values[0]), __high2float(values[0]),
++        __low2float(values[1]), __high2float(values[1]));
++}
++
++// SM100 streaming specialization for d_k=128 and q=2. Keeping one block per
++// query preserves the two rows' parallelism while the complete grid fits in a
++// resident wave. Compared with the generic shared-memory reduction tree, the
++// score-producing warps retain their local maxima and max/sum use only four
++// warp partials. This removes fourteen block barriers and 124 scratch floats.
++template <typename T>
++static __global__ void fused_relpos_attn_warp_128_kernel(
++        const float * __restrict__ Q, const T * __restrict__ K,
++        const T * __restrict__ V, const T * __restrict__ Ppos,
++        const float * __restrict__ bu, const float * __restrict__ bv,
++        const float * __restrict__ mask, float * __restrict__ ctx,
++        int kv, float scale,
++        long q_sq, long q_sh, long q_sb,
++        long k_sj, long k_sh, long k_sb,
++        long v_sj, long v_sh, long v_sb,
++        long p_sr, long p_sh,
++        long o_si, long o_sh, long o_sb, long m_sb) {
++    extern __shared__ float sh[];
++    float * Qu  = sh;
++    float * Qv  = Qu + RELPOS_ATTN_DK_128;
++    float * sc  = Qv + RELPOS_ATTN_DK_128;
++    float * red = sc + kv;
++
++    const int h    = blockIdx.x;
++    const int i    = blockIdx.y;
++    const int b    = blockIdx.z;
++    const int d    = threadIdx.x;
++    const int warp = d >> 5;
++    const int lane = d & 31;
++
++    const float * Qhi = Q + (size_t) b * q_sb + (size_t) h * q_sh + (size_t) i * q_sq;
++    const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
++    const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const T * Ph = Ppos + (size_t) h * p_sh;
++    const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
++
++    Qu[d] = Qhi[d] + bu[h * RELPOS_ATTN_DK_128 + d];
++    Qv[d] = Qhi[d] + bv[h * RELPOS_ATTN_DK_128 + d];
++    __syncthreads();
++
++    const int d4 = lane * 4;
++    const float4 qu4 = *reinterpret_cast<const float4 *>(Qu + d4);
++    const float4 qv4 = *reinterpret_cast<const float4 *>(Qv + d4);
++    float produced_max = -INFINITY;
++    for (int j = warp; j < kv; j += RELPOS_ATTN_WARPS_128) {
++        const float4 k4 = relpos_load4(Kh + (size_t) j * k_sj + d4);
++        const int row = 1 + j - i;
++        const float4 p4 = relpos_load4(Ph + (size_t) row * p_sr + d4);
++        float score =
++            k4.x * qu4.x + p4.x * qv4.x +
++            k4.y * qu4.y + p4.y * qv4.y +
++            k4.z * qu4.z + p4.z * qv4.z +
++            k4.w * qu4.w + p4.w * qv4.w;
++        score = relpos_warp_sum(score);
++        if (lane == 0) {
++            sc[j] = score * scale + (Mb ? Mb[j] : 0.0f);
++            produced_max = fmaxf(produced_max, sc[j]);
++        }
++    }
++    if (lane == 0) {
++        red[warp] = produced_max;
++    }
++    __syncthreads();
++
++    if (d == 0) {
++        float maximum = red[0];
++#pragma unroll
++        for (int w = 1; w < RELPOS_ATTN_WARPS_128; ++w) {
++            maximum = fmaxf(maximum, red[w]);
++        }
++        red[0] = maximum;
++    }
++    __syncthreads();
++    const float maximum = red[0];
++
++    // red[] is reused below. Ensure every warp has captured red[0] first;
++    // otherwise warp 0 can overwrite the maximum while another warp loads it.
++    __syncthreads();
++    float local_sum = 0.0f;
++    for (int j = d; j < kv; j += RELPOS_ATTN_DK_128) {
++        const float weight = __expf(sc[j] - maximum);
++        sc[j] = weight;
++        local_sum += weight;
++    }
++    local_sum = relpos_warp_sum(local_sum);
++    if (lane == 0) {
++        red[warp] = local_sum;
++    }
++    __syncthreads();
++    if (d == 0) {
++        float sum = red[0];
++#pragma unroll
++        for (int w = 1; w < RELPOS_ATTN_WARPS_128; ++w) {
++            sum += red[w];
++        }
++        red[0] = sum;
++    }
++    __syncthreads();
++
++    float context = 0.0f;
++    for (int j = 0; j < kv; ++j) {
++        context += sc[j] * (float) Vh[(size_t) j * v_sj + d];
++    }
++    ctx[(size_t) b * o_sb + (size_t) i * o_si + (size_t) h * o_sh + d] = context / red[0];
++}
++
++// Once the one-block-per-query grid spills into another occupancy wave, one
++// block computes both query rows. K and V are then loaded once and reused;
++// only the two relative-position rows differ. The reduction order matches the
++// one-query specialization so changing batch size does not change numerics.
++template <typename T>
++static __global__ void fused_relpos_attn_q2_warp_128_kernel(
++        const float * __restrict__ Q, const T * __restrict__ K,
++        const T * __restrict__ V, const T * __restrict__ Ppos,
++        const float * __restrict__ bu, const float * __restrict__ bv,
++        const float * __restrict__ mask, float * __restrict__ ctx,
++        int kv, float scale,
++        long q_sq, long q_sh, long q_sb,
++        long k_sj, long k_sh, long k_sb,
++        long v_sj, long v_sh, long v_sb,
++        long p_sr, long p_sh,
++        long o_si, long o_sh, long o_sb, long m_sb) {
++    extern __shared__ float sh[];
++    float * Qu0  = sh;
++    float * Qv0  = Qu0 + RELPOS_ATTN_DK_128;
++    float * Qu1  = Qv0 + RELPOS_ATTN_DK_128;
++    float * Qv1  = Qu1 + RELPOS_ATTN_DK_128;
++    float * sc0  = Qv1 + RELPOS_ATTN_DK_128;
++    float * sc1  = sc0 + kv;
++    float * red0 = sc1 + kv;
++    float * red1 = red0 + RELPOS_ATTN_WARPS_128;
++
++    const int h    = blockIdx.x;
++    const int b    = blockIdx.z;
++    const int d    = threadIdx.x;
++    const int warp = d >> 5;
++    const int lane = d & 31;
++
++    const float * Qh0 = Q + (size_t) b * q_sb + (size_t) h * q_sh;
++    const float * Qh1 = Qh0 + q_sq;
++    const T * Kh = K + (size_t) b * k_sb + (size_t) h * k_sh;
++    const T * Vh = V + (size_t) b * v_sb + (size_t) h * v_sh;
++    const T * Ph = Ppos + (size_t) h * p_sh;
++    const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
++
++    const float bias_u = bu[h * RELPOS_ATTN_DK_128 + d];
++    const float bias_v = bv[h * RELPOS_ATTN_DK_128 + d];
++    Qu0[d] = Qh0[d] + bias_u;
++    Qv0[d] = Qh0[d] + bias_v;
++    Qu1[d] = Qh1[d] + bias_u;
++    Qv1[d] = Qh1[d] + bias_v;
++    __syncthreads();
++
++    const int d4 = lane * 4;
++    const float4 qu04 = *reinterpret_cast<const float4 *>(Qu0 + d4);
++    const float4 qv04 = *reinterpret_cast<const float4 *>(Qv0 + d4);
++    const float4 qu14 = *reinterpret_cast<const float4 *>(Qu1 + d4);
++    const float4 qv14 = *reinterpret_cast<const float4 *>(Qv1 + d4);
++    float produced_max0 = -INFINITY;
++    float produced_max1 = -INFINITY;
++    for (int j = warp; j < kv; j += RELPOS_ATTN_WARPS_128) {
++        const float4 k4  = relpos_load4(Kh + (size_t) j * k_sj + d4);
++        const float4 p04 = relpos_load4(Ph + (size_t) (j + 1) * p_sr + d4);
++        const float4 p14 = relpos_load4(Ph + (size_t) j * p_sr + d4);
++        float score0 =
++            k4.x * qu04.x + p04.x * qv04.x +
++            k4.y * qu04.y + p04.y * qv04.y +
++            k4.z * qu04.z + p04.z * qv04.z +
++            k4.w * qu04.w + p04.w * qv04.w;
++        float score1 =
++            k4.x * qu14.x + p14.x * qv14.x +
++            k4.y * qu14.y + p14.y * qv14.y +
++            k4.z * qu14.z + p14.z * qv14.z +
++            k4.w * qu14.w + p14.w * qv14.w;
++        score0 = relpos_warp_sum(score0);
++        score1 = relpos_warp_sum(score1);
++        if (lane == 0) {
++            const float additive_mask = Mb ? Mb[j] : 0.0f;
++            sc0[j] = score0 * scale + additive_mask;
++            sc1[j] = score1 * scale + additive_mask;
++            produced_max0 = fmaxf(produced_max0, sc0[j]);
++            produced_max1 = fmaxf(produced_max1, sc1[j]);
++        }
++    }
++    if (lane == 0) {
++        red0[warp] = produced_max0;
++        red1[warp] = produced_max1;
++    }
++    __syncthreads();
++
++    if (d == 0) {
++        float maximum0 = red0[0];
++        float maximum1 = red1[0];
++#pragma unroll
++        for (int w = 1; w < RELPOS_ATTN_WARPS_128; ++w) {
++            maximum0 = fmaxf(maximum0, red0[w]);
++            maximum1 = fmaxf(maximum1, red1[w]);
++        }
++        red0[0] = maximum0;
++        red1[0] = maximum1;
++    }
++    __syncthreads();
++    const float maximum0 = red0[0];
++    const float maximum1 = red1[0];
++    __syncthreads();
++
++    float local_sum0 = 0.0f;
++    float local_sum1 = 0.0f;
++    for (int j = d; j < kv; j += RELPOS_ATTN_DK_128) {
++        const float weight0 = __expf(sc0[j] - maximum0);
++        const float weight1 = __expf(sc1[j] - maximum1);
++        sc0[j] = weight0;
++        sc1[j] = weight1;
++        local_sum0 += weight0;
++        local_sum1 += weight1;
++    }
++    local_sum0 = relpos_warp_sum(local_sum0);
++    local_sum1 = relpos_warp_sum(local_sum1);
++    if (lane == 0) {
++        red0[warp] = local_sum0;
++        red1[warp] = local_sum1;
++    }
++    __syncthreads();
++    if (d == 0) {
++        float sum0 = red0[0];
++        float sum1 = red1[0];
++#pragma unroll
++        for (int w = 1; w < RELPOS_ATTN_WARPS_128; ++w) {
++            sum0 += red0[w];
++            sum1 += red1[w];
++        }
++        red0[0] = sum0;
++        red1[0] = sum1;
++    }
++    __syncthreads();
++
++    float context0 = 0.0f;
++    float context1 = 0.0f;
++    for (int j = 0; j < kv; ++j) {
++        const float value = (float) Vh[(size_t) j * v_sj + d];
++        context0 += sc0[j] * value;
++        context1 += sc1[j] * value;
++    }
++    const size_t out = (size_t) b * o_sb + (size_t) h * o_sh + d;
++    ctx[out] = context0 / red0[0];
++    ctx[out + o_si] = context1 / red1[0];
++}
++
++template <typename T>
++static int relpos_attn_warp_128_max_blocks_per_sm(int device, size_t shmem) {
++    // The target shape fixes dynamic shared memory, so occupancy is invariant
++    // for a given compiled kernel and device. Avoid repeating the CUDA runtime
++    // query in every attention layer and graph execution.
++    static std::atomic<int> cached[GGML_CUDA_MAX_DEVICES] = {};
++    int blocks = cached[device].load(std::memory_order_relaxed);
++    if (blocks == 0) {
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++            &blocks, fused_relpos_attn_warp_128_kernel<T>, RELPOS_ATTN_DK_128, shmem));
++        GGML_ASSERT(blocks > 0);
++        cached[device].store(blocks, std::memory_order_relaxed);
++    }
++    return blocks;
++}
++
 +template <typename T>
 +static __global__ void fused_relpos_attn_kernel(
 +        const float * __restrict__ Q, const T * __restrict__ K,
@@ -306,12 +597,80 @@ index 00000000..48b7eb72
 +    const long o_si = (long)(dst->nb[1] / oe), o_sh = (long)(dst->nb[2] / oe),
 +               o_sb = (long)(dst->nb[3] / oe);
 +
++    const int device = ggml_cuda_get_device();
++    const auto & device_info = ggml_cuda_info().devices[device];
 +    const size_t shmem = ((size_t) 3 * d_k + kv_len) * sizeof(float);
-+    const size_t max_shmem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
++    const size_t max_shmem = device_info.smpb;
 +    GGML_ASSERT(shmem <= max_shmem && "fused_relpos_attn: kv window too large for shared memory");
 +
-+    const dim3 grid(n_head, q_len, batch);
 +    cudaStream_t stream = ctx.stream();
++
++    // The cache-aware Nemotron streaming geometry is Q=2, KV=72, H=8,
++    // d_k=128. On SM100 the one-query warp kernel is fastest while its grid
++    // fits in one resident wave. If that grid exceeds its measured occupancy,
++    // fuse both query rows: halving the block count and reusing K/V then wins.
++    // cudaOccupancyMaxActiveBlocksPerMultiprocessor uses the compiled kernel's
++    // actual register count, avoiding a hard-coded batch-size threshold.
++    const bool use_sm100_q2 =
++        device_info.cc == RELPOS_ATTN_CC_SM100 && device_info.warp_size == 32 &&
++        d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72;
++    if (use_sm100_q2) {
++        const size_t warp_shmem =
++            ((size_t) 2 * RELPOS_ATTN_DK_128 + kv_len + RELPOS_ATTN_WARPS_128) * sizeof(float);
++        const size_t q2_shmem =
++            ((size_t) 4 * RELPOS_ATTN_DK_128 + (size_t) 2 * kv_len +
++             (size_t) 2 * RELPOS_ATTN_WARPS_128) * sizeof(float);
++        GGML_ASSERT(q2_shmem <= max_shmem);
++
++        const int max_single_blocks_per_sm = k->type == GGML_TYPE_F16
++            ? relpos_attn_warp_128_max_blocks_per_sm<half>(device, warp_shmem)
++            : relpos_attn_warp_128_max_blocks_per_sm<float>(device, warp_shmem);
++        const int64_t single_query_blocks = (int64_t) n_head * q_len * batch;
++        const int64_t single_wave_blocks = (int64_t) device_info.nsm * max_single_blocks_per_sm;
++        const bool fuse_queries = single_query_blocks > single_wave_blocks;
++        const dim3 tuned_grid(n_head, fuse_queries ? 1 : q_len, batch);
++
++        if (k->type == GGML_TYPE_F16) {
++            if (fuse_queries) {
++                fused_relpos_attn_q2_warp_128_kernel<half><<<
++                    tuned_grid, RELPOS_ATTN_DK_128, q2_shmem, stream>>>(
++                    (const float *) q->data, (const half *) k->data, (const half *) v->data,
++                    (const half *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
++                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
++                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++            } else {
++                fused_relpos_attn_warp_128_kernel<half><<<
++                    tuned_grid, RELPOS_ATTN_DK_128, warp_shmem, stream>>>(
++                    (const float *) q->data, (const half *) k->data, (const half *) v->data,
++                    (const half *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
++                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
++                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++            }
++        } else {
++            if (fuse_queries) {
++                fused_relpos_attn_q2_warp_128_kernel<float><<<
++                    tuned_grid, RELPOS_ATTN_DK_128, q2_shmem, stream>>>(
++                    (const float *) q->data, (const float *) k->data, (const float *) v->data,
++                    (const float *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
++                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
++                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++            } else {
++                fused_relpos_attn_warp_128_kernel<float><<<
++                    tuned_grid, RELPOS_ATTN_DK_128, warp_shmem, stream>>>(
++                    (const float *) q->data, (const float *) k->data, (const float *) v->data,
++                    (const float *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
++                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
++                    kv_len, scale, q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb,
++                    p_sr, p_sh, o_si, o_sh, o_sb, m_sb);
++            }
++        }
++        return;
++    }
++
++    const dim3 grid(n_head, q_len, batch);
 +    if (k->type == GGML_TYPE_F16) {
 +        fused_relpos_attn_kernel<half><<<grid, d_k, shmem, stream>>>(
 +            (const float *) q->data, (const half *) k->data, (const half *) v->data,

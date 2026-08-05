@@ -19,7 +19,7 @@ Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidi
 
 ```bash
 # 1. download the .nemo
-hf download nvidia/magpie_tts_multilingual_357m --revision v2602 --local-dir magpie-tts
+hf download nvidia/magpie_tts_multilingual_357m --local-dir magpie-tts
 
 # 2. extract it - this directory holds the tokenizer the server loads at runtime
 mkdir -p magpie-tts/extracted
@@ -38,7 +38,11 @@ Japanese tokenization requires a build with `NEMO_SPEECH_TTS_WITH_JA=ON`
 (disabled by default), which builds Open JTalk, MeCab, and the NAIST dictionary.
 Mandarin requires `NEMO_SPEECH_TTS_WITH_ZH=ON` (disabled by default) and
 additionally uses cppjieba plus pypinyin-compatible tables bundled with the
-native runtime. No Python environment is needed when serving `zh` or `zh-CN`.
+native runtime. Those tables are stored in Git LFS, so run `git lfs install`
+once and `git lfs pull` before configuring this feature. No Python environment
+is needed when serving `zh` or `zh-CN`. Run `git lfs pull` in the checkout
+before `docker build` as well, because the build context does not include
+`.git`.
 
 **Text normalization.** TTS can optionally run Sparrowhawk TN before Magpie
 tokenization. Build with `-DNEMO_SPEECH_WITH_NORM=ON`, install the WFST

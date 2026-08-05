@@ -36,19 +36,21 @@ main(int argc, char** argv) {
 
     BatchingConfig batching;
     batching.enabled = true;
-    batching.max_batch_size = 4;
-    batching.max_queue_delay_us = 20000;
+    batching.max_batch_size = 8;
+    batching.max_queue_delay_us = 500000;
     pnc::PncModel model(bm, argv[1], batching);
     pnc::PncRunner runner(&model);
+    const ScopedBatchCohort scalar_cohort(1);
 
     // Alternate sequence lengths to exercise recurring graph-cache entries.
     const char* inputs[] = {
-        "hello there",
-        "we build useful software",
+        "and so my",
+        "i live in new york and work at nvidia",
         "what time is it",
-        "hello there",
-        "this is a longer sentence with several words for testing punctuation and capitalization",
-        "hello there",
+        "and so my",
+        "and so my fellow americans ask not what your country can do for you ask what you "
+        "can do for your country",
+        "and so my",
     };
 
     int fail = 0;
@@ -66,8 +68,10 @@ main(int argc, char** argv) {
         std::atomic<int> ready{0};
         std::atomic<bool> go{false};
         std::vector<std::future<bool>> calls;
+        const auto metrics_before = model.batch_metrics();
         for (int i = 0; i < 4; ++i) {
             calls.push_back(std::async(std::launch::async, [&] {
+                const ScopedBatchCohort cohort(4);
                 ready.fetch_add(1);
                 while (!go.load()) std::this_thread::yield();
                 std::vector<int> p, c;
@@ -80,7 +84,13 @@ main(int argc, char** argv) {
         for (auto& call : calls)
             if (!call.get())
                 ++fail;
-        if (model.batch_metrics().max_observed_batch < 4) {
+        const auto metrics_after = model.batch_metrics();
+        if (metrics_after.deadline_batches != metrics_before.deadline_batches ||
+            metrics_after.target_reached_batches <= metrics_before.target_reached_batches) {
+            std::fprintf(stderr, "PnC cohort waited for the queue deadline\n");
+            ++fail;
+        }
+        if (metrics_after.max_observed_batch < 4) {
             std::fprintf(stderr, "PnC requests did not coalesce\n");
             ++fail;
         } else {
@@ -97,6 +107,7 @@ main(int argc, char** argv) {
         std::vector<std::future<std::string>> calls;
         for (int i = 0; i < 4; ++i) {
             calls.push_back(std::async(std::launch::async, [&] {
+                const ScopedBatchCohort cohort(4);
                 pnc::PncRunner local(&model);
                 ready.fetch_add(1);
                 while (!go.load()) std::this_thread::yield();
@@ -113,6 +124,47 @@ main(int argc, char** argv) {
                     expected.c_str(), got.c_str());
                 ++fail;
             }
+        }
+    }
+    {
+        const auto& c = model.config();
+        std::vector<std::vector<int32_t>> requests;
+        for (int n : {4, 6, 10, 15}) {
+            std::vector<int32_t> ids(static_cast<size_t>(n), c.unk_id);
+            ids.front() = c.cls_id;
+            ids.back() = c.sep_id;
+            requests.push_back(std::move(ids));
+        }
+        std::vector<std::vector<int>> ref_p(requests.size()), ref_c(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            model.infer(
+                requests[i].data(), static_cast<int>(requests[i].size()), ref_p[i], ref_c[i]);
+        }
+        const auto before = model.batch_metrics();
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::future<bool>> calls;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            calls.push_back(std::async(std::launch::async, [&, i] {
+                const ScopedBatchCohort cohort(4);
+                ready.fetch_add(1);
+                while (!go.load()) std::this_thread::yield();
+                std::vector<int> p, c_out;
+                model.infer(requests[i].data(), static_cast<int>(requests[i].size()), p, c_out);
+                return p == ref_p[i] && c_out == ref_c[i];
+            }));
+        }
+        while (ready.load() != 4) std::this_thread::yield();
+        go.store(true);
+        for (auto& call : calls)
+            if (!call.get())
+                ++fail;
+        const auto after = model.batch_metrics();
+        if (after.batches - before.batches != 1 || after.items - before.items != 4) {
+            std::fprintf(stderr, "mixed-length PnC requests did not share one batch\n");
+            ++fail;
+        } else {
+            std::fprintf(stdout, "PnC mixed-length B=4 parity OK\n");
         }
     }
     std::fprintf(stdout, fail ? "FAILED (%d)\n" : "OK\n", fail);

@@ -68,6 +68,7 @@ TransformerBlock::build_graph(
     const int n_head = cfg_.n_heads;
     const int d_k = cfg_.hidden_size / n_head;
     const int64_t T = x.tensor->ne[1];
+    const int64_t B = x.tensor->ne[2];
 
     // Scaled dot-product self-attention without positional terms.
     auto q = query_net_->build_graph(session, input_tensors, tc).get_tensor(0);
@@ -75,9 +76,9 @@ TransformerBlock::build_graph(
     auto v = value_net_->build_graph(session, input_tensors, tc).get_tensor(0);
 
     // (hidden, T) -> (d_k, n_head, T) -> (d_k, T, n_head)
-    auto q_mh = ggml_reshape_4d(ctx, q.tensor, d_k, n_head, T, 1);
-    auto k_mh = ggml_reshape_4d(ctx, k.tensor, d_k, n_head, T, 1);
-    auto v_mh = ggml_reshape_4d(ctx, v.tensor, d_k, n_head, T, 1);
+    auto q_mh = ggml_reshape_4d(ctx, q.tensor, d_k, n_head, T, B);
+    auto k_mh = ggml_reshape_4d(ctx, k.tensor, d_k, n_head, T, B);
+    auto v_mh = ggml_reshape_4d(ctx, v.tensor, d_k, n_head, T, B);
     auto q_p = ggml_cont(ctx, ggml_permute(ctx, q_mh, 0, 2, 1, 3));
     auto k_p = ggml_cont(ctx, ggml_permute(ctx, k_mh, 0, 2, 1, 3));
 
@@ -91,7 +92,7 @@ TransformerBlock::build_graph(
     auto v_t = ggml_cont(ctx, ggml_permute(ctx, ggml_permute(ctx, v_mh, 2, 1, 0, 3), 0, 2, 1, 3));
     auto attn = ggml_permute(ctx, ggml_mul_mat(ctx, v_t, probs), 0, 2, 1, 3);
     // merge heads: (d_k, n_head, T) -> (hidden, T)
-    auto merged = ggml_reshape_3d(ctx, ggml_cont(ctx, attn), n_head * d_k, T, 1);
+    auto merged = ggml_reshape_3d(ctx, ggml_cont(ctx, attn), n_head * d_k, T, B);
 
     ggml_runtime::TensorBag proj_in;
     proj_in.add_tensor(ggml_runtime::ggml_bf_tensor(merged, x.buft));

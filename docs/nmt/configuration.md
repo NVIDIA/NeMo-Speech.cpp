@@ -36,7 +36,7 @@ NMT auto-enables when `nmt.model.path` is set; force with `nmt.enabled`.
 
 | key | default | meaning |
 |---|---|---|
-| `nmt.backend.gpu` | `0` | GPU device index, `-1` for CPU |
+| `nmt.backend.gpu` | `0` (`-1` on CPU-only builds) | GPU device index, `-1` for CPU; alias `--gpu` / `-g` |
 | `nmt.model.path` | (none) | path to the Riva-Translate GGUF |
 | `nmt.model.n_ctx` | `1024` | decode context length in tokens (model max `8192`) |
 | `nmt.generation.max_new_tokens` | `256` | cap per input text |
@@ -67,9 +67,9 @@ and `ListSupportedLanguagePairs`.
 `target_language` and returns one `Translation` per input. The pair is resolved
 to the model's tag (`en-de`, `en-zh-cn`, ...); pass the two codes
 (`source_language: en`, `target_language: de`) or the full tag in either field.
-Unsupported pairs return `INVALID_ARGUMENT`. The server frames each request as
-the model's chat template does (`Translate this into <language>: <text>`), so the
-client sends plain text.
+Unsupported pairs return `INVALID_ARGUMENT`. The server wraps each text in the
+model's chat-style translation prompt (System/User turns naming the source and
+target languages), so the client sends plain text only.
 
 `ListSupportedLanguagePairs` returns the supported `source -> target` pairs keyed
 by model name.

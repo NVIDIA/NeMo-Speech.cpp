@@ -8,9 +8,42 @@
 
 #include <math.h>
 
+#include <cstdlib>
+
 #include "runtime.h"
 
 namespace ggml_runtime {
+
+ggml_tensor*
+cached_q8_input(
+    Session* session, TensorContainer* session_tensor_container, const ggml_bf_tensor& weight,
+    ggml_tensor* input) {
+#ifdef NEMO_SPEECH_GGML_PATCHED
+    static const bool enabled = [] {
+        const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16");
+        return value != nullptr && value[0] != '0';
+    }();
+    static const int min_columns = [] {
+        const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
+        const int parsed = value != nullptr ? std::atoi(value) : 128;
+        return parsed > 0 ? parsed : 1;
+    }();
+    const int64_t columns = ggml_nelements(input) / input->ne[0];
+    const bool planar = (weight.tensor->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
+    const bool eligible_block_q8 = std::string(weight.tensor->name).rfind("encoder.", 0) == 0 &&
+                                   input->ne[1] > 8 && input->ne[1] <= 64;
+    if (enabled && session->params.use_gpu && weight.tensor->type == GGML_TYPE_Q8_0 &&
+        (planar || eligible_block_q8) && input->type == GGML_TYPE_F32 && columns >= min_columns) {
+        const auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight.buft);
+        return ggml_cast(bf_ctx.ctx, input, GGML_TYPE_F16);
+    }
+#else
+    (void)session;
+    (void)session_tensor_container;
+    (void)weight;
+#endif
+    return input;
+}
 
 void
 Conv1D::define_tensors(Session* session) {
@@ -54,6 +87,7 @@ Conv1D::build_graph(
         // from ggml_conv_1d.
         auto x_in =
             ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, input_tensor.tensor, 1, 0, 2, 3));
+        x_in = cached_q8_input(session, session_tensor_container, weight_tensor, x_in);
         // Older CTC GGUFs keep the k=1 conv as [1,in,out]; newer quantized
         // pointwise tensors are [in,out].  Both are byte-identical after
         // dropping the unit kernel dimension.
@@ -280,7 +314,9 @@ Linear::build_graph(
     ggml_bf_tensor weight_tensor = session->model_tensor_container->get_tensor_by_name(weight_name);
     ggml_bf_context bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight_tensor.buft);
 
-    ggml_tensor* matmul_ret = ggml_mul_mat(bf_ctx.ctx, weight_tensor.tensor, input_tensor.tensor);
+    ggml_tensor* matmul_input =
+        cached_q8_input(session, session_tensor_container, weight_tensor, input_tensor.tensor);
+    ggml_tensor* matmul_ret = ggml_mul_mat(bf_ctx.ctx, weight_tensor.tensor, matmul_input);
 
     ggml_tensor* output_tensor = nullptr;
     if (use_bias) {

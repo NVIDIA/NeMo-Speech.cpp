@@ -2,11 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "model.h"
 
+#include <sentencepiece_processor.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <iostream>
+#include <map>
+#include <optional>
+#include <shared_mutex>
 #include <stdexcept>
+#include <thread>
 
 #include "cache_aware_encoder.h"  // CacheAwareEncoder (cache-aware streaming subsystem)
 #include "nvtx_utils.h"
@@ -14,6 +22,37 @@
 #include "runtime.h"
 
 namespace nemo_speech::asr {
+
+namespace {
+// Decode standard base64 (the SPM tokenizer proto is stored base64 in GGUF
+// metadata so it survives the UTF-8 string value type). Ignores whitespace;
+// returns "" on malformed input.
+std::string
+base64_decode(const std::string& in) {
+    static constexpr char kPad = '=';
+    std::array<int8_t, 256> rev;
+    rev.fill(-1);
+    const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; ++i) rev[static_cast<uint8_t>(tbl[i])] = static_cast<int8_t>(i);
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    int val = 0, bits = 0;
+    for (char ch : in) {
+        if (ch == kPad)
+            break;
+        const int8_t d = rev[static_cast<uint8_t>(ch)];
+        if (d < 0)
+            continue;  // skip whitespace / newlines
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((val >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+}  // namespace
 
 // CTCEncoderClassifier: ggml Module wrapping (encoder + head) so a single Session
 // can build/run one graph through both.
@@ -244,7 +283,9 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
         const std::string name = first.tensor->name;
 
         const bool fused_tdt = name == "rnnt.predict_joint.0" || name == "rnnt.predict_joint.1";
-        if (name == "rnnt.predict.0" || name == "rnnt.predict.1" || fused_tdt) {
+        const bool fused_rnnt =
+            name == "rnnt.predict_joint_rnnt.0" || name == "rnnt.predict_joint_rnnt.1";
+        if (name == "rnnt.predict.0" || name == "rnnt.predict.1" || fused_tdt || fused_rnnt) {
             const int active_bank = name.back() - '0';
             const int candidate_bank = active_bank ^ 1;
             auto slot_ids = input.get_tensor(1);
@@ -292,7 +333,7 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
                         slot_ids.tensor),
                     pred_out.get_tensor(1 + 2 * i + 1).buft));
             }
-            if (!fused_tdt)
+            if (!fused_tdt && !fused_rnnt)
                 return state_out;
 
             const int64_t B = slot_ids.tensor->ne[0];
@@ -351,13 +392,15 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
 
 class RnntModel::RnntDecoderState : public RnntStreamState {
    public:
-    RnntDecoderState(RnntModel* owner, int slot) : owner(owner), slot(slot) {}
+    RnntDecoderState(RnntModel* owner, int slot, bool needs_reset)
+        : owner(owner), slot(slot), needs_reset(needs_reset) {}
     ~RnntDecoderState() override {
         if (owner && slot >= 0)
             owner->release_decoder_slot(slot);
     }
     RnntModel* owner;
     int slot;
+    bool needs_reset;
 };
 
 class RnntModel::DecoderBatchers {
@@ -365,6 +408,7 @@ class RnntModel::DecoderBatchers {
     struct PredictRequest {
         int slot;
         int32_t token;
+        bool reset;
     };
     struct JointKey {
         int T;
@@ -379,6 +423,7 @@ class RnntModel::DecoderBatchers {
     struct TdtFusedRequest {
         int slot;
         int32_t token;
+        bool reset;
         std::vector<float> enc;
     };
     struct JointResult {
@@ -387,157 +432,721 @@ class RnntModel::DecoderBatchers {
     };
 
     DecoderBatchers(RnntModel* owner, const BatchingConfig& cfg)
-        : owner_(owner),
-          predictor_(
-              cfg,
-              [this](const int& bank, std::vector<PredictRequest>&& req) {
-                  const ggml_nvtx::range nvtx("asr.predictor.batch");
-                  const int B = static_cast<int>(req.size());
-                  std::vector<int32_t> tokens(static_cast<size_t>(B));
-                  std::vector<int32_t> slots(static_cast<size_t>(B));
-                  for (int b = 0; b < B; ++b) {
-                      tokens[b] = req[b].token;
-                      slots[b] = req[b].slot;
-                  }
-                  std::vector<ggml_runtime::Session::Input> inputs = {
-                      {"rnnt.predict." + std::to_string(bank), GGML_TYPE_I32, tokens.data(), {B}},
-                      {"rnnt.slot_ids", GGML_TYPE_I32, slots.data(), {B}}};
-                  std::vector<ggml_runtime::Session::Output> outputs;
-                  owner_->decoder_session_->run(inputs, outputs);
-                  return std::vector<uint8_t>(static_cast<size_t>(B), 1);
-              }),
-          joint_(
-              cfg,
-              [this](const JointKey& key, std::vector<JointRequest>&& req) {
-                  const ggml_nvtx::range nvtx("asr.joint.batch");
-                  const int B = static_cast<int>(req.size());
-                  const int J = owner_->rnnt_cfg_.joint_dim;
-                  const int V = owner_->rnnt_cfg_.vocab_size;
-                  const size_t enc_item = static_cast<size_t>(J) * key.T;
-                  std::vector<float> enc(enc_item * B);
-                  std::vector<int32_t> slots(static_cast<size_t>(B));
-                  std::vector<float> bias;
-                  if (key.has_bias)
-                      bias.resize(static_cast<size_t>(V) * B);
-                  for (int b = 0; b < B; ++b) {
-                      std::copy(req[b].enc.begin(), req[b].enc.end(), enc.begin() + b * enc_item);
-                      slots[b] = req[b].slot;
-                      if (key.has_bias)
-                          std::copy(
-                              req[b].bias.begin(), req[b].bias.end(),
-                              bias.begin() + static_cast<size_t>(b) * V);
-                  }
-                  std::vector<ggml_runtime::Session::Input> inputs = {
-                      {"rnnt.joint.enc", GGML_TYPE_F32, enc.data(), {J, key.T * B}},
-                      {"rnnt.slot_ids", GGML_TYPE_I32, slots.data(), {B}}};
-                  if (key.has_bias)
-                      inputs.push_back({"rnnt.joint.bias", GGML_TYPE_F32, bias.data(), {V, 1, B}});
-                  std::vector<int32_t> packed_tokens(static_cast<size_t>(key.T) * B);
-                  std::vector<int32_t> packed_durations;
-                  std::vector<ggml_runtime::Session::Output> outputs(1);
-                  outputs[0].index = 0;
-                  outputs[0].host_buffer = packed_tokens.data();
-                  outputs[0].nbytes = packed_tokens.size() * sizeof(int32_t);
-                  if (owner_->rnnt_cfg_.is_tdt()) {
-                      packed_durations.resize(static_cast<size_t>(key.T) * B);
-                      outputs.resize(2);
-                      outputs[1].index = 1;
-                      outputs[1].host_buffer = packed_durations.data();
-                      outputs[1].nbytes = packed_durations.size() * sizeof(int32_t);
-                  }
-                  owner_->decoder_session_->run(inputs, outputs);
-                  std::vector<JointResult> result(static_cast<size_t>(B));
-                  for (int b = 0; b < B; ++b) {
-                      const auto token_begin =
-                          packed_tokens.begin() + static_cast<size_t>(b) * key.T;
-                      result[b].tokens.assign(token_begin, token_begin + key.T);
-                      if (owner_->rnnt_cfg_.is_tdt()) {
-                          const auto duration_begin =
-                              packed_durations.begin() + static_cast<size_t>(b) * key.T;
-                          result[b].durations.assign(duration_begin, duration_begin + key.T);
-                      }
-                  }
-                  return result;
-              }),
-          fused_tdt_(cfg, [this](const int& bank, std::vector<TdtFusedRequest>&& req) {
-              const int B = static_cast<int>(req.size());
-              const int J = owner_->rnnt_cfg_.joint_dim;
-              std::vector<int32_t> tokens(static_cast<size_t>(B));
-              std::vector<int32_t> slots(static_cast<size_t>(B));
-              std::vector<float> enc(static_cast<size_t>(J) * B);
-              for (int b = 0; b < B; ++b) {
-                  tokens[b] = req[b].token;
-                  slots[b] = req[b].slot;
-                  std::copy(
-                      req[b].enc.begin(), req[b].enc.end(),
-                      enc.begin() + static_cast<size_t>(b) * J);
-              }
-              std::vector<ggml_runtime::Session::Input> inputs = {
-                  {"rnnt.predict_joint." + std::to_string(bank), GGML_TYPE_I32, tokens.data(), {B}},
-                  {"rnnt.slot_ids", GGML_TYPE_I32, slots.data(), {B}},
-                  {"rnnt.joint.enc", GGML_TYPE_F32, enc.data(), {J, B}}};
-              std::vector<int32_t> packed_tokens(static_cast<size_t>(B));
-              std::vector<int32_t> packed_durations(static_cast<size_t>(B));
-              std::vector<ggml_runtime::Session::Output> outputs(2);
-              outputs[0].index = 0;
-              outputs[0].host_buffer = packed_tokens.data();
-              outputs[0].nbytes = packed_tokens.size() * sizeof(int32_t);
-              outputs[1].index = 1;
-              outputs[1].host_buffer = packed_durations.data();
-              outputs[1].nbytes = packed_durations.size() * sizeof(int32_t);
-              owner_->decoder_session_->run(inputs, outputs);
-              std::vector<JointResult> result(static_cast<size_t>(B));
-              for (int b = 0; b < B; ++b) {
-                  result[b].tokens = {packed_tokens[static_cast<size_t>(b)]};
-                  result[b].durations = {packed_durations[static_cast<size_t>(b)]};
-              }
-              return result;
-          }) {}
-
-    void predict(int slot, int32_t token, int bank, int active_decodes) {
-        if (active_decodes == 1)
-            (void)predictor_.run_inline(bank, {slot, token});
-        else
-            (void)predictor_.run(bank, {slot, token}, active_decodes);
+        : owner_(owner), max_batch_size_(std::max(1, cfg.max_batch_size)),
+          max_queue_delay_us_(std::max(0, cfg.max_queue_delay_us)),
+          max_queue_depth_(std::max(max_batch_size_, cfg.max_queue_depth)) {
+        if (cfg.enabled && max_batch_size_ > 1) {
+            for (int i = 0; i < kExecutorCount; ++i)
+                executors_.emplace_back([this] { executor_loop(); });
+            scheduler_ = std::thread([this] { scheduler_loop(); });
+        }
     }
+
+    ~DecoderBatchers() { shutdown(); }
+
+    DecoderBatchers(const DecoderBatchers&) = delete;
+    DecoderBatchers& operator=(const DecoderBatchers&) = delete;
+
+    void predict(int slot, int32_t token, int bank, int admitted_decodes, bool reset) {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mu_);
+        if (!scheduler_.joinable() || admitted_decodes == 1) {
+            reject_if_stopping();
+            (void)run_predictor(bank, {{slot, token, reset}});
+            predictor_metrics_.record_inline();
+            return;
+        }
+        lifecycle_lock.unlock();
+        auto job = std::make_shared<PredictJob>(PredictRequest{slot, token, reset});
+        auto result = job->promise.get_future();
+        enqueue(predictor_queues_[static_cast<size_t>(bank)], job);
+        (void)result.get();
+    }
+
     JointResult joint(
-        int slot, const float* enc, int T, const float* bias, int vocab_size, int active_decodes) {
+        int slot, const float* enc, int T, const float* bias, int vocab_size,
+        int admitted_decodes) {
         JointRequest req;
         req.slot = slot;
         req.enc.assign(enc, enc + static_cast<size_t>(owner_->rnnt_cfg_.joint_dim) * T);
         if (bias)
             req.bias.assign(bias, bias + vocab_size);
-        if (active_decodes == 1)
-            return joint_.run_inline({T, bias != nullptr}, std::move(req));
-        return joint_.run({T, bias != nullptr}, std::move(req), active_decodes);
+        const JointKey key{T, bias != nullptr};
+        std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mu_);
+        if (!scheduler_.joinable() || admitted_decodes == 1) {
+            reject_if_stopping();
+            auto result = run_joint(key, {std::move(req)});
+            joint_metrics_.record_inline();
+            return std::move(result.front());
+        }
+        lifecycle_lock.unlock();
+        auto job = std::make_shared<JointJob>(std::move(req));
+        auto result = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            check_enqueue_locked();
+            joint_queues_[key].push_back(job);
+        }
+        cv_.notify_one();
+        return result.get();
     }
+
+    JointResult joint_device(
+        int slot, const ggml_runtime::DeviceTensor& enc, int frame_offset, int T, const float* bias,
+        int vocab_size) {
+        return run_joint_device(slot, enc, frame_offset, T, bias, vocab_size);
+    }
+
+    JointResult predict_joint_rnnt_device(
+        int slot, int32_t token, int bank, const ggml_runtime::DeviceTensor& enc, int frame_offset,
+        int T, const float* bias, int vocab_size, bool reset) {
+        return run_fused_rnnt_device(
+            slot, token, bank, enc, frame_offset, T, bias, vocab_size, reset);
+    }
+
     JointResult predict_joint_tdt(
-        int slot, int32_t token, int bank, const float* enc, int active_decodes) {
+        int slot, int32_t token, int bank, const float* enc, int admitted_decodes, bool reset) {
         TdtFusedRequest req;
         req.slot = slot;
         req.token = token;
+        req.reset = reset;
         req.enc.assign(enc, enc + owner_->rnnt_cfg_.joint_dim);
-        if (active_decodes == 1)
-            return fused_tdt_.run_inline(bank, std::move(req));
-        return fused_tdt_.run(bank, std::move(req), active_decodes);
+        std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mu_);
+        if (!scheduler_.joinable() || admitted_decodes == 1) {
+            reject_if_stopping();
+            auto result = run_fused_tdt(bank, {std::move(req)});
+            fused_metrics_.record_inline();
+            return std::move(result.front());
+        }
+        lifecycle_lock.unlock();
+        auto job = std::make_shared<FusedJob>(std::move(req));
+        auto result = job->promise.get_future();
+        enqueue(fused_queues_[static_cast<size_t>(bank)], job);
+        return result.get();
     }
+
+    // A decode step can finish while all remaining steps are blocked in ready
+    // queues. Wake the scheduler so it can re-evaluate that exact ready set
+    // instead of waiting for a queue timer.
+    void notify_active_change() { cv_.notify_one(); }
+
     static BatchMetrics add(BatchMetrics a, const BatchMetrics& b) {
         a.batches += b.batches;
         a.items += b.items;
         a.singleton_batches += b.singleton_batches;
         a.max_observed_batch = std::max(a.max_observed_batch, b.max_observed_batch);
+        a.target_reached_batches += b.target_reached_batches;
+        a.deadline_batches += b.deadline_batches;
+        a.requested_items += b.requested_items;
+        a.queue_wait_ns += b.queue_wait_ns;
+        a.capacity_batches += b.capacity_batches;
+        a.ready_set_batches += b.ready_set_batches;
+        a.ready_items += b.ready_items;
+        a.compatible_items += b.compatible_items;
+        a.execution_ns += b.execution_ns;
         return a;
     }
     BatchMetrics predictor_metrics() const {
-        return add(predictor_.metrics(), fused_tdt_.metrics());
+        return add(predictor_metrics_.snapshot(), fused_metrics_.snapshot());
     }
-    BatchMetrics joint_metrics() const { return add(joint_.metrics(), fused_tdt_.metrics()); }
+    BatchMetrics joint_metrics() const {
+        return add(joint_metrics_.snapshot(), fused_metrics_.snapshot());
+    }
 
    private:
+    using Clock = std::chrono::steady_clock;
+    enum class Op { Predictor, Joint, FusedTdt };
+    enum class DispatchReason { Capacity, ReadySet, Deadline, Shutdown };
+
+    struct JointKeyLess {
+        bool operator()(const JointKey& a, const JointKey& b) const {
+            if (a.T != b.T)
+                return a.T < b.T;
+            return a.has_bias < b.has_bias;
+        }
+    };
+
+    template <class Request, class Result>
+    struct Job {
+        explicit Job(Request r) : request(std::move(r)), queued_at(Clock::now()) {}
+        Request request;
+        Clock::time_point queued_at;
+        std::promise<Result> promise;
+    };
+    using PredictJob = Job<PredictRequest, uint8_t>;
+    using JointJob = Job<JointRequest, JointResult>;
+    using FusedJob = Job<TdtFusedRequest, JointResult>;
+
+    struct Candidate {
+        Op op = Op::Predictor;
+        int bank = 0;
+        JointKey joint_key{0, false};
+        size_t count = 0;
+        Clock::time_point oldest{};
+    };
+
+    struct BatchTask {
+        Candidate selected;
+        DispatchReason reason = DispatchReason::Deadline;
+        size_t admitted = 0;
+        size_t ready = 0;
+        size_t compatible = 0;
+        uint64_t wait_ns = 0;
+        std::vector<std::shared_ptr<PredictJob>> predict_jobs;
+        std::vector<std::shared_ptr<JointJob>> joint_jobs;
+        std::vector<std::shared_ptr<FusedJob>> fused_jobs;
+
+        size_t size() const { return predict_jobs.size() + joint_jobs.size() + fused_jobs.size(); }
+    };
+
+    struct AtomicMetrics {
+        std::atomic<uint64_t> batches{0};
+        std::atomic<uint64_t> items{0};
+        std::atomic<uint64_t> singleton_batches{0};
+        std::atomic<uint64_t> max_observed_batch{0};
+        std::atomic<uint64_t> capacity_batches{0};
+        std::atomic<uint64_t> ready_set_batches{0};
+        std::atomic<uint64_t> deadline_batches{0};
+        std::atomic<uint64_t> requested_items{0};
+        std::atomic<uint64_t> ready_items{0};
+        std::atomic<uint64_t> compatible_items{0};
+        std::atomic<uint64_t> queue_wait_ns{0};
+        std::atomic<uint64_t> execution_ns{0};
+
+        void record_inline() {
+            batches.fetch_add(1, std::memory_order_relaxed);
+            items.fetch_add(1, std::memory_order_relaxed);
+            singleton_batches.fetch_add(1, std::memory_order_relaxed);
+            uint64_t old = max_observed_batch.load(std::memory_order_relaxed);
+            while (old < 1 && !max_observed_batch.compare_exchange_weak(
+                                  old, 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            }
+        }
+
+        void record(
+            size_t n, DispatchReason reason, size_t admitted, size_t ready, size_t compatible,
+            uint64_t wait_ns, uint64_t run_ns) {
+            batches.fetch_add(1, std::memory_order_relaxed);
+            items.fetch_add(n, std::memory_order_relaxed);
+            if (n == 1)
+                singleton_batches.fetch_add(1, std::memory_order_relaxed);
+            uint64_t old = max_observed_batch.load(std::memory_order_relaxed);
+            while (old < n && !max_observed_batch.compare_exchange_weak(
+                                  old, n, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            }
+            if (reason == DispatchReason::Capacity)
+                capacity_batches.fetch_add(1, std::memory_order_relaxed);
+            else if (reason == DispatchReason::ReadySet)
+                ready_set_batches.fetch_add(1, std::memory_order_relaxed);
+            else if (reason == DispatchReason::Deadline)
+                deadline_batches.fetch_add(1, std::memory_order_relaxed);
+            requested_items.fetch_add(admitted, std::memory_order_relaxed);
+            ready_items.fetch_add(ready, std::memory_order_relaxed);
+            compatible_items.fetch_add(compatible, std::memory_order_relaxed);
+            queue_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+            execution_ns.fetch_add(run_ns, std::memory_order_relaxed);
+        }
+
+        BatchMetrics snapshot() const {
+            BatchMetrics out;
+            out.batches = batches.load(std::memory_order_relaxed);
+            out.items = items.load(std::memory_order_relaxed);
+            out.singleton_batches = singleton_batches.load(std::memory_order_relaxed);
+            out.max_observed_batch = max_observed_batch.load(std::memory_order_relaxed);
+            out.target_reached_batches = capacity_batches.load(std::memory_order_relaxed);
+            out.deadline_batches = deadline_batches.load(std::memory_order_relaxed);
+            out.requested_items = requested_items.load(std::memory_order_relaxed);
+            out.queue_wait_ns = queue_wait_ns.load(std::memory_order_relaxed);
+            out.capacity_batches = capacity_batches.load(std::memory_order_relaxed);
+            out.ready_set_batches = ready_set_batches.load(std::memory_order_relaxed);
+            out.ready_items = ready_items.load(std::memory_order_relaxed);
+            out.compatible_items = compatible_items.load(std::memory_order_relaxed);
+            out.execution_ns = execution_ns.load(std::memory_order_relaxed);
+            return out;
+        }
+    };
+
+    template <class JobType>
+    void enqueue(std::deque<std::shared_ptr<JobType>>& queue, std::shared_ptr<JobType> job) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            check_enqueue_locked();
+            queue.push_back(std::move(job));
+        }
+        cv_.notify_one();
+    }
+
+    void reject_if_stopping() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stopping_)
+            throw std::runtime_error("RNNT decoder scheduler: submit after shutdown");
+    }
+
+    void check_enqueue_locked() const {
+        if (stopping_)
+            throw std::runtime_error("RNNT decoder scheduler: submit after shutdown");
+        if (pending_locked() >= static_cast<size_t>(max_queue_depth_))
+            throw std::runtime_error("RNNT decoder scheduler: queue is full");
+    }
+
+    size_t pending_locked() const {
+        size_t total = 0;
+        for (const auto& queue : predictor_queues_) total += queue.size();
+        for (const auto& entry : joint_queues_) total += entry.second.size();
+        for (const auto& queue : fused_queues_) total += queue.size();
+        return total;
+    }
+
+    std::vector<Candidate> candidates_locked() const {
+        std::vector<Candidate> out;
+        out.reserve(4 + joint_queues_.size());
+        for (int bank = 0; bank < 2; ++bank) {
+            const auto& predictor = predictor_queues_[static_cast<size_t>(bank)];
+            if (!predictor.empty())
+                out.push_back(
+                    {Op::Predictor, bank, {}, predictor.size(), predictor.front()->queued_at});
+            const auto& fused = fused_queues_[static_cast<size_t>(bank)];
+            if (!fused.empty())
+                out.push_back({Op::FusedTdt, bank, {}, fused.size(), fused.front()->queued_at});
+        }
+        for (const auto& [key, queue] : joint_queues_)
+            if (!queue.empty())
+                out.push_back({Op::Joint, 0, key, queue.size(), queue.front()->queued_at});
+        return out;
+    }
+
+    static Candidate oldest_candidate(const std::vector<Candidate>& candidates) {
+        return *std::min_element(
+            candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.oldest < b.oldest; });
+    }
+
+    static Candidate largest_candidate(const std::vector<Candidate>& candidates) {
+        return *std::max_element(
+            candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+                if (a.count != b.count)
+                    return a.count < b.count;
+                return a.oldest > b.oldest;
+            });
+    }
+
+    std::optional<Candidate> capacity_candidate(const std::vector<Candidate>& candidates) const {
+        std::optional<Candidate> selected;
+        for (const auto& candidate : candidates) {
+            if (candidate.count < static_cast<size_t>(max_batch_size_))
+                continue;
+            if (!selected || candidate.oldest < selected->oldest)
+                selected = candidate;
+        }
+        return selected;
+    }
+
+    std::vector<uint8_t> run_predictor(int bank, std::vector<PredictRequest>&& req) {
+        const ggml_nvtx::range nvtx("asr.predictor.batch");
+        const int B = static_cast<int>(req.size());
+        std::vector<int32_t> tokens(static_cast<size_t>(B));
+        std::vector<int32_t> slots(static_cast<size_t>(B));
+        std::vector<int> reset_slots;
+        for (int b = 0; b < B; ++b) {
+            tokens[b] = req[b].token;
+            slots[b] = req[b].slot;
+            if (req[b].reset)
+                reset_slots.push_back(req[b].slot);
+        }
+        if (!reset_slots.empty())
+            owner_->zero_decoder_slots(std::move(reset_slots));
+        std::vector<ggml_runtime::Session::Input> inputs = {
+            {"rnnt.predict." + std::to_string(bank), GGML_TYPE_I32, tokens.data(), {B}},
+            {"rnnt.slot_ids", GGML_TYPE_I32, slots.data(), {B}}};
+        std::vector<ggml_runtime::Session::Output> outputs;
+        owner_->decoder_session_->run(inputs, outputs);
+        return std::vector<uint8_t>(static_cast<size_t>(B), 1);
+    }
+
+    std::vector<JointResult> run_joint(const JointKey& key, std::vector<JointRequest>&& req) {
+        const ggml_nvtx::range nvtx("asr.joint.batch");
+        const int B = static_cast<int>(req.size());
+        const int J = owner_->rnnt_cfg_.joint_dim;
+        const int V = owner_->rnnt_cfg_.vocab_size;
+        const size_t enc_item = static_cast<size_t>(J) * key.T;
+        std::vector<float> enc(enc_item * B);
+        std::vector<int32_t> slots(static_cast<size_t>(B));
+        std::vector<float> bias;
+        if (key.has_bias)
+            bias.resize(static_cast<size_t>(V) * B);
+        for (int b = 0; b < B; ++b) {
+            std::copy(req[b].enc.begin(), req[b].enc.end(), enc.begin() + b * enc_item);
+            slots[b] = req[b].slot;
+            if (key.has_bias)
+                std::copy(
+                    req[b].bias.begin(), req[b].bias.end(),
+                    bias.begin() + static_cast<size_t>(b) * V);
+        }
+        std::vector<ggml_runtime::Session::Input> inputs = {
+            {"rnnt.joint.enc", GGML_TYPE_F32, enc.data(), {J, key.T * B}},
+            {"rnnt.slot_ids", GGML_TYPE_I32, slots.data(), {B}}};
+        if (key.has_bias)
+            inputs.push_back({"rnnt.joint.bias", GGML_TYPE_F32, bias.data(), {V, 1, B}});
+        std::vector<int32_t> packed_tokens(static_cast<size_t>(key.T) * B);
+        std::vector<int32_t> packed_durations;
+        std::vector<ggml_runtime::Session::Output> outputs(1);
+        outputs[0].index = 0;
+        outputs[0].host_buffer = packed_tokens.data();
+        outputs[0].nbytes = packed_tokens.size() * sizeof(int32_t);
+        if (owner_->rnnt_cfg_.is_tdt()) {
+            packed_durations.resize(static_cast<size_t>(key.T) * B);
+            outputs.resize(2);
+            outputs[1].index = 1;
+            outputs[1].host_buffer = packed_durations.data();
+            outputs[1].nbytes = packed_durations.size() * sizeof(int32_t);
+        }
+        owner_->decoder_session_->run(inputs, outputs);
+        std::vector<JointResult> result(static_cast<size_t>(B));
+        for (int b = 0; b < B; ++b) {
+            const auto token_begin = packed_tokens.begin() + static_cast<size_t>(b) * key.T;
+            result[b].tokens.assign(token_begin, token_begin + key.T);
+            if (owner_->rnnt_cfg_.is_tdt()) {
+                const auto duration_begin =
+                    packed_durations.begin() + static_cast<size_t>(b) * key.T;
+                result[b].durations.assign(duration_begin, duration_begin + key.T);
+            }
+        }
+        return result;
+    }
+
+    JointResult run_joint_device(
+        int slot, const ggml_runtime::DeviceTensor& enc, int frame_offset, int T, const float* bias,
+        int vocab_size) {
+        const ggml_nvtx::range nvtx("asr.joint.device");
+        const int J = owner_->rnnt_cfg_.joint_dim;
+        ggml_runtime::DeviceTensor enc_slice = enc;
+        enc_slice.byte_offset += static_cast<size_t>(frame_offset) * J * sizeof(float);
+
+        ggml_runtime::Session::Input enc_input{"rnnt.joint.enc", GGML_TYPE_F32, nullptr, {J, T}};
+        enc_input.upload = false;
+        enc_input.device_tensor = &enc_slice;
+        int32_t slot_id = slot;
+        std::vector<ggml_runtime::Session::Input> inputs;
+        inputs.push_back(enc_input);
+        inputs.push_back({"rnnt.slot_ids", GGML_TYPE_I32, &slot_id, {1}});
+        if (bias != nullptr)
+            inputs.push_back({"rnnt.joint.bias", GGML_TYPE_F32, bias, {vocab_size, 1, 1}});
+
+        JointResult result;
+        result.tokens.resize(static_cast<size_t>(T));
+        std::vector<ggml_runtime::Session::Output> outputs(1);
+        outputs[0].index = 0;
+        outputs[0].host_buffer = result.tokens.data();
+        outputs[0].nbytes = result.tokens.size() * sizeof(int32_t);
+        if (owner_->rnnt_cfg_.is_tdt()) {
+            result.durations.resize(static_cast<size_t>(T));
+            outputs.resize(2);
+            outputs[1].index = 1;
+            outputs[1].host_buffer = result.durations.data();
+            outputs[1].nbytes = result.durations.size() * sizeof(int32_t);
+        }
+        owner_->decoder_session_->run(inputs, outputs);
+        return result;
+    }
+
+    JointResult run_fused_rnnt_device(
+        int slot, int32_t token, int bank, const ggml_runtime::DeviceTensor& enc, int frame_offset,
+        int T, const float* bias, int vocab_size, bool reset) {
+        const ggml_nvtx::range nvtx("asr.predict_joint.device");
+        if (reset)
+            owner_->zero_decoder_slot(slot);
+        const int J = owner_->rnnt_cfg_.joint_dim;
+        ggml_runtime::DeviceTensor enc_slice = enc;
+        enc_slice.byte_offset += static_cast<size_t>(frame_offset) * J * sizeof(float);
+        ggml_runtime::Session::Input enc_input{"rnnt.joint.enc", GGML_TYPE_F32, nullptr, {J, T}};
+        enc_input.upload = false;
+        enc_input.device_tensor = &enc_slice;
+        int32_t slot_id = slot;
+        std::vector<ggml_runtime::Session::Input> inputs = {
+            {"rnnt.predict_joint_rnnt." + std::to_string(bank), GGML_TYPE_I32, &token, {1}},
+            {"rnnt.slot_ids", GGML_TYPE_I32, &slot_id, {1}},
+            enc_input};
+        if (bias != nullptr)
+            inputs.push_back({"rnnt.joint.bias", GGML_TYPE_F32, bias, {vocab_size, 1, 1}});
+
+        JointResult result;
+        result.tokens.resize(static_cast<size_t>(T));
+        std::vector<ggml_runtime::Session::Output> outputs(1);
+        outputs[0].index = 0;
+        outputs[0].host_buffer = result.tokens.data();
+        outputs[0].nbytes = result.tokens.size() * sizeof(int32_t);
+        owner_->decoder_session_->run(inputs, outputs);
+        return result;
+    }
+
+    std::vector<JointResult> run_fused_tdt(int bank, std::vector<TdtFusedRequest>&& req) {
+        const ggml_nvtx::range nvtx("asr.predict_joint_tdt.batch");
+        const int B = static_cast<int>(req.size());
+        const int J = owner_->rnnt_cfg_.joint_dim;
+        std::vector<int32_t> tokens(static_cast<size_t>(B));
+        std::vector<int32_t> slots(static_cast<size_t>(B));
+        std::vector<int> reset_slots;
+        std::vector<float> enc(static_cast<size_t>(J) * B);
+        for (int b = 0; b < B; ++b) {
+            tokens[b] = req[b].token;
+            slots[b] = req[b].slot;
+            if (req[b].reset)
+                reset_slots.push_back(req[b].slot);
+            std::copy(
+                req[b].enc.begin(), req[b].enc.end(), enc.begin() + static_cast<size_t>(b) * J);
+        }
+        if (!reset_slots.empty())
+            owner_->zero_decoder_slots(std::move(reset_slots));
+        std::vector<ggml_runtime::Session::Input> inputs = {
+            {"rnnt.predict_joint." + std::to_string(bank), GGML_TYPE_I32, tokens.data(), {B}},
+            {"rnnt.slot_ids", GGML_TYPE_I32, slots.data(), {B}},
+            {"rnnt.joint.enc", GGML_TYPE_F32, enc.data(), {J, B}}};
+        std::vector<int32_t> packed_tokens(static_cast<size_t>(B));
+        std::vector<int32_t> packed_durations(static_cast<size_t>(B));
+        std::vector<ggml_runtime::Session::Output> outputs(2);
+        outputs[0].index = 0;
+        outputs[0].host_buffer = packed_tokens.data();
+        outputs[0].nbytes = packed_tokens.size() * sizeof(int32_t);
+        outputs[1].index = 1;
+        outputs[1].host_buffer = packed_durations.data();
+        outputs[1].nbytes = packed_durations.size() * sizeof(int32_t);
+        owner_->decoder_session_->run(inputs, outputs);
+        std::vector<JointResult> result(static_cast<size_t>(B));
+        for (int b = 0; b < B; ++b) {
+            result[b].tokens = {packed_tokens[static_cast<size_t>(b)]};
+            result[b].durations = {packed_durations[static_cast<size_t>(b)]};
+        }
+        return result;
+    }
+
+    template <class JobType>
+    static std::vector<std::shared_ptr<JobType>> take_jobs(
+        std::deque<std::shared_ptr<JobType>>& queue, size_t count) {
+        std::vector<std::shared_ptr<JobType>> jobs;
+        jobs.reserve(count);
+        while (jobs.size() < count) {
+            jobs.push_back(std::move(queue.front()));
+            queue.pop_front();
+        }
+        return jobs;
+    }
+
+    template <class JobType>
+    static void fail_jobs(
+        const std::vector<std::shared_ptr<JobType>>& jobs, const std::exception_ptr& error) {
+        for (const auto& job : jobs) job->promise.set_exception(error);
+    }
+
+    void scheduler_loop() {
+        for (;;) {
+            BatchTask task;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [this] {
+                    return (stopping_ && pending_locked() == 0) ||
+                           (pending_locked() > 0 && tasks_in_flight_ < kExecutorCount);
+                });
+                if (stopping_ && pending_locked() == 0) {
+                    scheduling_done_ = true;
+                    executor_cv_.notify_all();
+                    return;
+                }
+
+                for (;;) {
+                    const auto candidates = candidates_locked();
+                    if (candidates.empty())
+                        break;
+                    task.ready = pending_locked();
+                    task.admitted = static_cast<size_t>(std::max(
+                        0, owner_->admitted_decode_steps_.load(std::memory_order_acquire)));
+                    if (const auto full = capacity_candidate(candidates)) {
+                        task.selected = *full;
+                        task.reason = DispatchReason::Capacity;
+                        break;
+                    }
+                    const size_t blocked = task.ready + items_in_flight_;
+                    if (task.admitted > 0 && blocked >= task.admitted) {
+                        task.selected = largest_candidate(candidates);
+                        task.reason = DispatchReason::ReadySet;
+                        break;
+                    }
+                    const Candidate oldest = oldest_candidate(candidates);
+                    const auto deadline =
+                        oldest.oldest + std::chrono::microseconds(max_queue_delay_us_);
+                    if (stopping_) {
+                        task.selected = largest_candidate(candidates);
+                        task.reason = DispatchReason::Shutdown;
+                        break;
+                    }
+                    if (Clock::now() >= deadline) {
+                        task.selected = oldest;
+                        task.reason = DispatchReason::Deadline;
+                        break;
+                    }
+                    cv_.wait_until(lock, deadline);
+                }
+
+                task.compatible = task.selected.count;
+                const size_t count =
+                    std::min(task.selected.count, static_cast<size_t>(max_batch_size_));
+                task.wait_ns =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              Clock::now() - task.selected.oldest)
+                                              .count());
+                if (task.selected.op == Op::Predictor) {
+                    task.predict_jobs = take_jobs(
+                        predictor_queues_[static_cast<size_t>(task.selected.bank)], count);
+                } else if (task.selected.op == Op::FusedTdt) {
+                    task.fused_jobs =
+                        take_jobs(fused_queues_[static_cast<size_t>(task.selected.bank)], count);
+                } else {
+                    auto it = joint_queues_.find(task.selected.joint_key);
+                    task.joint_jobs = take_jobs(it->second, count);
+                    if (it->second.empty())
+                        joint_queues_.erase(it);
+                }
+                items_in_flight_ += task.size();
+                ++tasks_in_flight_;
+                task_queue_.push_back(std::move(task));
+            }
+            executor_cv_.notify_one();
+        }
+    }
+
+    void execute_task(BatchTask task) {
+        const size_t task_size = task.size();
+        const auto run_started = Clock::now();
+        bool released = false;
+        try {
+            if (!task.predict_jobs.empty()) {
+                std::vector<PredictRequest> requests;
+                requests.reserve(task.predict_jobs.size());
+                for (auto& job : task.predict_jobs) requests.push_back(std::move(job->request));
+                auto results = run_predictor(task.selected.bank, std::move(requests));
+                if (results.size() != task.predict_jobs.size())
+                    throw std::runtime_error("RNNT predictor returned wrong result count");
+                const uint64_t run_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - run_started)
+                        .count());
+                predictor_metrics_.record(
+                    task.predict_jobs.size(), task.reason, task.admitted, task.ready,
+                    task.compatible, task.wait_ns, run_ns);
+                finish_task(task_size);
+                released = true;
+                for (size_t i = 0; i < task.predict_jobs.size(); ++i)
+                    task.predict_jobs[i]->promise.set_value(results[i]);
+            } else if (!task.fused_jobs.empty()) {
+                std::vector<TdtFusedRequest> requests;
+                requests.reserve(task.fused_jobs.size());
+                for (auto& job : task.fused_jobs) requests.push_back(std::move(job->request));
+                auto results = run_fused_tdt(task.selected.bank, std::move(requests));
+                if (results.size() != task.fused_jobs.size())
+                    throw std::runtime_error("RNNT fused TDT returned wrong result count");
+                const uint64_t run_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - run_started)
+                        .count());
+                fused_metrics_.record(
+                    task.fused_jobs.size(), task.reason, task.admitted, task.ready, task.compatible,
+                    task.wait_ns, run_ns);
+                finish_task(task_size);
+                released = true;
+                for (size_t i = 0; i < task.fused_jobs.size(); ++i)
+                    task.fused_jobs[i]->promise.set_value(std::move(results[i]));
+            } else {
+                std::vector<JointRequest> requests;
+                requests.reserve(task.joint_jobs.size());
+                for (auto& job : task.joint_jobs) requests.push_back(std::move(job->request));
+                auto results = run_joint(task.selected.joint_key, std::move(requests));
+                if (results.size() != task.joint_jobs.size())
+                    throw std::runtime_error("RNNT joint returned wrong result count");
+                const uint64_t run_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - run_started)
+                        .count());
+                joint_metrics_.record(
+                    task.joint_jobs.size(), task.reason, task.admitted, task.ready, task.compatible,
+                    task.wait_ns, run_ns);
+                finish_task(task_size);
+                released = true;
+                for (size_t i = 0; i < task.joint_jobs.size(); ++i)
+                    task.joint_jobs[i]->promise.set_value(std::move(results[i]));
+            }
+        }
+        catch (...) {
+            const auto error = std::current_exception();
+            if (!released)
+                finish_task(task_size);
+            fail_jobs(task.predict_jobs, error);
+            fail_jobs(task.joint_jobs, error);
+            fail_jobs(task.fused_jobs, error);
+        }
+    }
+
+    void finish_task(size_t items) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            items_in_flight_ -= items;
+            --tasks_in_flight_;
+        }
+        cv_.notify_one();
+    }
+
+    void executor_loop() {
+        for (;;) {
+            BatchTask task;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                executor_cv_.wait(
+                    lock, [this] { return scheduling_done_ || !task_queue_.empty(); });
+                if (task_queue_.empty() && scheduling_done_)
+                    return;
+                task = std::move(task_queue_.front());
+                task_queue_.pop_front();
+            }
+            execute_task(std::move(task));
+        }
+    }
+
+    void shutdown() {
+        std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_mu_);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopping_)
+                return;
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if (scheduler_.joinable())
+            scheduler_.join();
+        executor_cv_.notify_all();
+        for (auto& executor : executors_)
+            if (executor.joinable())
+                executor.join();
+    }
+
     RnntModel* owner_;
-    MicroBatcher<int, PredictRequest, uint8_t> predictor_;
-    MicroBatcher<JointKey, JointRequest, JointResult> joint_;
-    MicroBatcher<int, TdtFusedRequest, JointResult> fused_tdt_;
+    int max_batch_size_;
+    int max_queue_delay_us_;
+    int max_queue_depth_;
+    mutable std::shared_mutex lifecycle_mu_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::condition_variable executor_cv_;
+    std::array<std::deque<std::shared_ptr<PredictJob>>, 2> predictor_queues_;
+    std::map<JointKey, std::deque<std::shared_ptr<JointJob>>, JointKeyLess> joint_queues_;
+    std::array<std::deque<std::shared_ptr<FusedJob>>, 2> fused_queues_;
+    std::deque<BatchTask> task_queue_;
+    // The backend remains serialized. Three bounded preparation slots overlap
+    // host packing and dependency wakeups without allowing an unbounded queue
+    // of already-shaped GPU submissions to accumulate.
+    static constexpr int kExecutorCount = 3;
+    size_t items_in_flight_ = 0;
+    int tasks_in_flight_ = 0;
+    bool stopping_ = false;
+    bool scheduling_done_ = false;
+    std::thread scheduler_;
+    std::vector<std::thread> executors_;
+    AtomicMetrics predictor_metrics_;
+    AtomicMetrics joint_metrics_;
+    AtomicMetrics fused_metrics_;
 };
 
 namespace {
@@ -624,6 +1233,11 @@ load_fe_cfg(const ggml_runtime::GGUFLoader& loader, const std::string& A) {
     fe.preemph = loader.get_f32(A + ".preprocessor.preemph", fe.preemph);
     fe.normalize_per_feature =
         loader.get_str(A + ".preprocessor.normalize", "per_feature") == "per_feature";
+    fe.stft_center_window =
+        loader.get_bool(A + ".preprocessor.stft_center_window", fe.stft_center_window);
+    fe.hann_periodic = loader.get_bool(A + ".preprocessor.hann_periodic", fe.hann_periodic);
+    fe.mask_invalid_frames =
+        loader.get_bool(A + ".preprocessor.mask_invalid_frames", fe.mask_invalid_frames);
     return fe;
 }
 
@@ -642,6 +1256,25 @@ AsrModel::AsrModel(ggml_runtime::BackendManager& bm, Common&& c, const BatchingC
     fe_ = std::make_unique<MelSpectrogramExtractor>(fe_cfg_, gpu_fe ? &bm : nullptr, batching);
 
     apply_model_mel_basis(*fe_);
+
+    // Load the embedded SentencePiece tokenizer for word-boosting phrase
+    // tokenization (flashlight OOV phrases, RNNT context biasing). Stored
+    // base64 under asr.tokenizer.spm_model; absent in older GGUFs (boosting
+    // paths then fall back or no-op with a warning).
+    const std::string spm_b64 = loader()->get_str("asr.tokenizer.spm_model", "");
+    if (!spm_b64.empty()) {
+        const std::string proto = base64_decode(spm_b64);
+        auto sp = std::make_unique<sentencepiece::SentencePieceProcessor>();
+        const auto st = sp->LoadFromSerializedProto(proto);
+        if (st.ok()) {
+            spm_ = std::move(sp);
+            std::cerr << "[asr_model] embedded SentencePiece tokenizer loaded ("
+                      << spm_->GetPieceSize() << " pieces) for word boosting\n";
+        } else {
+            std::cerr << "[asr_model] failed to load embedded SentencePiece tokenizer: "
+                      << st.ToString() << " (word boosting degraded)\n";
+        }
+    }
 }
 
 void
@@ -702,6 +1335,20 @@ AsrModel::load(
 
     c.enc_cfg = load_encoder_cfg(loader, c.ns);
     c.fe_cfg = load_fe_cfg(loader, c.ns);
+    // Cache-aware GGUFs produced before the frontend-geometry metadata was
+    // introduced still originate from NeMo FilterbankFeatures. Recover its
+    // actual centered/symmetric/masked contract for those existing files.
+    // New conversions serialize these keys explicitly above, so this fallback
+    // is limited to old cache-aware artifacts rather than changing legacy CTC.
+    if (c.enc_cfg.cache_supported) {
+        const std::string fe_prefix = c.ns + ".preprocessor.";
+        if (!loader.has_key(fe_prefix + "stft_center_window"))
+            c.fe_cfg.stft_center_window = true;
+        if (!loader.has_key(fe_prefix + "hann_periodic"))
+            c.fe_cfg.hann_periodic = false;
+        if (!loader.has_key(fe_prefix + "mask_invalid_frames"))
+            c.fe_cfg.mask_invalid_frames = true;
+    }
     c.vocab = loader.get_str_array(c.ns + ".tokenizer.vocab");
 
     const char* head_name =
@@ -750,7 +1397,7 @@ class CtcModel::CtcBatcher {
         Request request;
         request.features.assign(
             features, features + static_cast<size_t>(model_->enc_cfg_.feat_in) * n_frames);
-        return queue_.run({n_frames, greedy}, std::move(request), current_batch_cohort_target());
+        return queue_.run({n_frames, greedy}, std::move(request));
     }
 
     BatchMetrics metrics() const { return queue_.metrics(); }
@@ -863,6 +1510,16 @@ CtcModel::infer_ctc(
 }
 
 void
+CtcModel::infer_ctc_greedy(
+    const float* audio, size_t n_samples, std::vector<int32_t>& best_ids,
+    std::vector<float>& best_probs, int& T_out) {
+    std::vector<float> feats;
+    int n_frames = 0;
+    offline_fe_->compute(audio, n_samples, feats, n_frames);
+    infer_ctc_greedy_from_mel(feats.data(), n_frames, best_ids, best_probs, T_out);
+}
+
+void
 CtcModel::infer_ctc_from_mel(
     const float* feats, int n_frames, std::vector<float>& out_log_probs, int& T_out,
     int& n_classes) {
@@ -969,6 +1626,7 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
     decoder_session_->set_run_cache_capacity(64);
     decoder_session_->setup();
     decoder_slots_used_.assign(static_cast<size_t>(decoder_arena_slots_), false);
+    decoder_slots_need_reset_.assign(static_cast<size_t>(decoder_arena_slots_), false);
     decoder_batchers_ = std::make_unique<DecoderBatchers>(this, batching);
 
     // The cache-aware streaming encoder Session is built lazily after the
@@ -981,6 +1639,16 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
 }
 
 RnntModel::~RnntModel() = default;
+
+std::vector<int>
+RnntModel::encode_phrase(const std::string& text) const {
+    if (!spm_)
+        return {};
+    std::vector<int> ids;
+    if (!spm_->Encode(text, &ids).ok())
+        return {};
+    return ids;
+}
 
 void
 RnntModel::ensure_offline_path() {
@@ -1081,26 +1749,40 @@ RnntModel::prompt_index_for_lang(const std::string& lang) const {
 
 std::unique_ptr<RnntStreamState>
 RnntModel::make_rnnt_stream_state() {
-    return std::make_unique<RnntDecoderState>(this, acquire_decoder_slot());
+    bool needs_reset = false;
+    const int slot = acquire_decoder_slot(needs_reset);
+    return std::make_unique<RnntDecoderState>(this, slot, needs_reset);
 }
 
 void
 RnntModel::begin_decode_step() {
-    active_decode_steps_.fetch_add(1, std::memory_order_acq_rel);
+    const int cohort_target = current_batch_cohort_target();
     if (!batching_cfg_.enabled || batching_cfg_.max_batch_size <= 1 ||
-        batching_cfg_.max_queue_delay_us <= 0)
+        batching_cfg_.max_queue_delay_us <= 0 || cohort_target == 1) {
+        admitted_decode_steps_.fetch_add(1, std::memory_order_acq_rel);
+        decoder_batchers_->notify_active_change();
         return;
+    }
 
     std::unique_lock<std::mutex> lock(decode_admission_mu_);
     const uint64_t generation = decode_admission_generation_;
     if (decode_admission_waiting_++ == 0) {
+        decode_admission_target_ = cohort_target > 1
+                                       ? std::min(cohort_target, batching_cfg_.max_batch_size)
+                                       : batching_cfg_.max_batch_size;
         decode_admission_deadline_ = std::chrono::steady_clock::now() +
                                      std::chrono::microseconds(batching_cfg_.max_queue_delay_us);
+    } else if (cohort_target > 1) {
+        decode_admission_target_ = std::min(
+            decode_admission_target_, std::min(cohort_target, batching_cfg_.max_batch_size));
     }
-    if (decode_admission_waiting_ >= batching_cfg_.max_batch_size) {
+    if (decode_admission_waiting_ >= decode_admission_target_) {
+        admitted_decode_steps_.fetch_add(decode_admission_waiting_, std::memory_order_acq_rel);
         decode_admission_waiting_ = 0;
+        decode_admission_target_ = 0;
         ++decode_admission_generation_;
         decode_admission_cv_.notify_all();
+        decoder_batchers_->notify_active_change();
         return;
     }
     if (!decode_admission_cv_.wait_until(lock, decode_admission_deadline_, [&] {
@@ -1109,16 +1791,20 @@ RnntModel::begin_decode_step() {
         // The oldest waiter closes this wave at the shared deadline. Every
         // other waiter observes the generation change and starts together.
         if (decode_admission_generation_ == generation) {
+            admitted_decode_steps_.fetch_add(decode_admission_waiting_, std::memory_order_acq_rel);
             decode_admission_waiting_ = 0;
+            decode_admission_target_ = 0;
             ++decode_admission_generation_;
             decode_admission_cv_.notify_all();
+            decoder_batchers_->notify_active_change();
         }
     }
 }
 
 void
 RnntModel::end_decode_step() {
-    active_decode_steps_.fetch_sub(1, std::memory_order_acq_rel);
+    admitted_decode_steps_.fetch_sub(1, std::memory_order_acq_rel);
+    decoder_batchers_->notify_active_change();
 }
 
 void
@@ -1130,7 +1816,8 @@ RnntModel::predict_rnnt(RnntStreamState& stream_state, int prev_token, int activ
         throw std::invalid_argument("predict_rnnt: active bank must be 0 or 1");
     decoder_batchers_->predict(
         state->slot, static_cast<int32_t>(prev_token), active_bank,
-        active_decode_steps_.load(std::memory_order_acquire));
+        admitted_decode_steps_.load(std::memory_order_acquire), state->needs_reset);
+    state->needs_reset = false;
 }
 
 void
@@ -1145,7 +1832,43 @@ RnntModel::joint_argmax(
     }
     auto result = decoder_batchers_->joint(
         state->slot, enc_proj, T, logit_bias, rnnt_cfg_.vocab_size,
-        active_decode_steps_.load(std::memory_order_acquire));
+        admitted_decode_steps_.load(std::memory_order_acquire));
+    std::copy(result.tokens.begin(), result.tokens.end(), token_ids);
+}
+
+void
+RnntModel::joint_argmax_device(
+    RnntStreamState& stream_state, const ggml_runtime::DeviceTensor& enc_proj, int frame_offset,
+    int joint_dim, int T, int32_t* token_ids, const float* logit_bias) {
+    auto* state = dynamic_cast<RnntDecoderState*>(&stream_state);
+    if (!state || state->owner != this || state->slot < 0)
+        throw std::invalid_argument("joint_argmax_device: stream state belongs to another engine");
+    if (!enc_proj.valid() || joint_dim != rnnt_cfg_.joint_dim || frame_offset < 0 || T <= 0)
+        throw std::runtime_error("joint_argmax_device: invalid projected encoder input");
+    auto result = decoder_batchers_->joint_device(
+        state->slot, enc_proj, frame_offset, T, logit_bias, rnnt_cfg_.vocab_size);
+    std::copy(result.tokens.begin(), result.tokens.end(), token_ids);
+}
+
+void
+RnntModel::predict_and_joint_rnnt_argmax_device(
+    RnntStreamState& stream_state, int prev_token, int active_bank,
+    const ggml_runtime::DeviceTensor& enc_proj, int frame_offset, int joint_dim, int T,
+    int32_t* token_ids, const float* logit_bias) {
+    auto* state = dynamic_cast<RnntDecoderState*>(&stream_state);
+    if (!state || state->owner != this || state->slot < 0)
+        throw std::invalid_argument(
+            "predict_and_joint_rnnt_argmax_device: stream state belongs to another engine");
+    if (!enc_proj.valid() || joint_dim != rnnt_cfg_.joint_dim || frame_offset < 0 || T <= 0)
+        throw std::runtime_error(
+            "predict_and_joint_rnnt_argmax_device: invalid projected encoder input");
+    if (active_bank != 0 && active_bank != 1)
+        throw std::invalid_argument(
+            "predict_and_joint_rnnt_argmax_device: active bank must be 0 or 1");
+    auto result = decoder_batchers_->predict_joint_rnnt_device(
+        state->slot, static_cast<int32_t>(prev_token), active_bank, enc_proj, frame_offset, T,
+        logit_bias, rnnt_cfg_.vocab_size, state->needs_reset);
+    state->needs_reset = false;
     std::copy(result.tokens.begin(), result.tokens.end(), token_ids);
 }
 
@@ -1162,7 +1885,7 @@ RnntModel::joint_tdt_argmax(
         throw std::runtime_error("joint_tdt_argmax: invalid projected encoder shape");
     auto result = decoder_batchers_->joint(
         state->slot, enc_proj, T, nullptr, rnnt_cfg_.vocab_size,
-        active_decode_steps_.load(std::memory_order_acquire));
+        admitted_decode_steps_.load(std::memory_order_acquire));
     if (result.durations.size() != result.tokens.size())
         throw std::runtime_error("TDT joint did not return duration argmax values");
     std::copy(result.tokens.begin(), result.tokens.end(), token_ids);
@@ -1184,51 +1907,87 @@ RnntModel::predict_and_joint_tdt_argmax(
         throw std::invalid_argument("fused TDT active bank must be 0 or 1");
     auto result = decoder_batchers_->predict_joint_tdt(
         state->slot, static_cast<int32_t>(prev_token), active_bank, enc_proj,
-        active_decode_steps_.load(std::memory_order_acquire));
+        admitted_decode_steps_.load(std::memory_order_acquire), state->needs_reset);
+    state->needs_reset = false;
     *token_id = result.tokens.front();
     *duration_id = result.durations.front();
 }
 
 std::unique_ptr<Decoder>
-RnntModel::make_transducer_decoder() {
+RnntModel::make_transducer_decoder(const DecoderConfig& cfg) {
     if (rnnt_cfg_.is_tdt())
         return std::make_unique<TdtGreedyDecoder>(this);
-    return std::make_unique<RnntGreedyDecoder>(this);
+    return std::make_unique<RnntGreedyDecoder>(this, cfg);
 }
 
 int
-RnntModel::acquire_decoder_slot() {
-    std::lock_guard<std::mutex> lock(decoder_slots_mu_);
-    for (int slot = 0; slot < decoder_arena_slots_; ++slot) {
-        if (!decoder_slots_used_[static_cast<size_t>(slot)]) {
-            decoder_slots_used_[static_cast<size_t>(slot)] = true;
-            return slot;
+RnntModel::acquire_decoder_slot(bool& needs_reset) {
+    int acquired = -1;
+    needs_reset = false;
+    std::unique_lock<std::mutex> lock(decoder_slots_mu_);
+    const auto claim_free = [&]() -> bool {
+        for (int slot = 0; slot < decoder_arena_slots_; ++slot) {
+            if (!decoder_slots_used_[static_cast<size_t>(slot)]) {
+                decoder_slots_used_[static_cast<size_t>(slot)] = true;
+                needs_reset = decoder_slots_need_reset_[static_cast<size_t>(slot)];
+                decoder_slots_need_reset_[static_cast<size_t>(slot)] = false;
+                acquired = slot;
+                return true;
+            }
         }
-    }
-    throw std::runtime_error("RnntModel: predictor-state arena is full");
+        return false;
+    };
+    // Block (bounded) when every slot is transiently held rather than failing:
+    // teardown frees slots on the RPC's own thread and lags admission under
+    // churn. The timeout only fires on genuine over-subscription.
+    decoder_slots_cv_.wait_for(lock, std::chrono::seconds(60), claim_free);
+    if (acquired < 0)
+        throw std::runtime_error("RnntModel: predictor-state arena is full");
+    return acquired;
 }
 
 void
 RnntModel::zero_decoder_slot(int slot) {
+    zero_decoder_slots({slot});
+}
+
+void
+RnntModel::zero_decoder_slots(std::vector<int> slots) {
+    if (slots.empty())
+        return;
+    std::sort(slots.begin(), slots.end());
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
     std::lock_guard<std::mutex> compute_lock(backend_manager().compute_mutex());
-    for (int bank = 0; bank < 2; ++bank) {
-        for (int l = 0; l < rnnt_cfg_.pred_num_layers; ++l) {
-            for (const auto& name : {rnnt_h_state_name(bank, l), rnnt_c_state_name(bank, l)}) {
-                auto t = decoder_session_->model_tensor_container->get_tensor_by_name(name).tensor;
-                ggml_backend_tensor_memset(t, 0, static_cast<size_t>(slot) * t->nb[1], t->nb[1]);
+    for (size_t first = 0; first < slots.size();) {
+        size_t last = first + 1;
+        while (last < slots.size() && slots[last] == slots[last - 1] + 1) ++last;
+        const size_t start = static_cast<size_t>(slots[first]);
+        const size_t count = last - first;
+        for (int bank = 0; bank < 2; ++bank) {
+            for (int l = 0; l < rnnt_cfg_.pred_num_layers; ++l) {
+                for (const auto& name : {rnnt_h_state_name(bank, l), rnnt_c_state_name(bank, l)}) {
+                    auto t =
+                        decoder_session_->model_tensor_container->get_tensor_by_name(name).tensor;
+                    ggml_backend_tensor_memset(t, 0, start * t->nb[1], count * t->nb[1]);
+                }
             }
         }
+        auto p =
+            decoder_session_->model_tensor_container->get_tensor_by_name(kRnntPredProjectionState)
+                .tensor;
+        ggml_backend_tensor_memset(p, 0, start * p->nb[1], count * p->nb[1]);
+        first = last;
     }
-    auto p = decoder_session_->model_tensor_container->get_tensor_by_name(kRnntPredProjectionState)
-                 .tensor;
-    ggml_backend_tensor_memset(p, 0, static_cast<size_t>(slot) * p->nb[1], p->nb[1]);
 }
 
 void
 RnntModel::release_decoder_slot(int slot) {
-    zero_decoder_slot(slot);
-    std::lock_guard<std::mutex> lock(decoder_slots_mu_);
-    decoder_slots_used_[static_cast<size_t>(slot)] = false;
+    {
+        std::lock_guard<std::mutex> lock(decoder_slots_mu_);
+        decoder_slots_need_reset_[static_cast<size_t>(slot)] = true;
+        decoder_slots_used_[static_cast<size_t>(slot)] = false;
+    }
+    decoder_slots_cv_.notify_one();
 }
 
 BatchMetrics
@@ -1286,7 +2045,8 @@ RnntModel::diagnostic_sessions() const {
 void
 RnntModel::encode_cache_aware(
     CacheAwareEncoder::State& state, const float* mel, int n_mel_frames, const float* attn_mask,
-    int attn_mask_len, std::vector<float>& enc_out, int& T_enc, int prompt_index) {
+    int attn_mask_len, std::vector<float>& enc_out, int& T_enc, int prompt_index,
+    ggml_runtime::DeviceTensor* device_output) {
     if (!cache_encoder_)
         throw std::runtime_error("model encoder does not support cache-aware streaming");
     std::vector<float> onehot;
@@ -1300,7 +2060,7 @@ RnntModel::encode_cache_aware(
     }
     cache_encoder_->encode(
         state, mel, n_mel_frames, attn_mask, attn_mask_len, enc_out, T_enc, tail_input,
-        tail_input ? num_prompts_ : 0);
+        tail_input ? num_prompts_ : 0, device_output);
 }
 
 }  // namespace nemo_speech::asr

@@ -22,9 +22,11 @@ Session::Session(BackendManager& backend_manager, Module* module, GGUFLoader* gg
     this->gguf_loader = gguf_loader;
 }
 
-// Scheduler-managed outputs must be read before the caller resets the scheduler.
+// Launches without forcing each graph boundary to wait for the device. The
+// caller synchronizes once after any queued host transfers.
 static bool
-ggml_graph_compute_helper(ggml_backend_sched_t sched, struct ggml_cgraph* graph, int n_threads) {
+ggml_graph_compute_helper_async(
+    ggml_backend_sched_t sched, struct ggml_cgraph* graph, int n_threads) {
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -37,7 +39,7 @@ ggml_graph_compute_helper(ggml_backend_sched_t sched, struct ggml_cgraph* graph,
         }
     }
 
-    return ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
+    return ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS;
 }
 
 // Cache-aware encoder graphs grow with the true batch dimension. Keep enough
@@ -154,6 +156,17 @@ hash_inputs(Session* s, const std::vector<Session::Input>& inputs) {
             int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
             for (size_t d = 0; d < in.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = in.shape[d];
             hash_tensor_sig(h, in.name.c_str(), in.dtype, ne);
+        }
+        if (in.device_tensor != nullptr) {
+            // Hashing runs before create_input_tensor's validation.
+            if (!in.device_tensor->valid()) {
+                throw std::runtime_error(
+                    format("Session::Input '%s': invalid device tensor handle", in.name.c_str()));
+            }
+            const uintptr_t address = reinterpret_cast<uintptr_t>(in.device_tensor->tensor->data) +
+                                      in.device_tensor->byte_offset;
+            h ^= static_cast<uint64_t>(address);
+            h *= 1099511628211ULL;
         }
     }
     return h;
@@ -331,20 +344,51 @@ namespace {
 ggml_bf_tensor
 create_input_tensor(TensorContainer* tc, const Session::Input& in) {
     const auto& s = in.shape;
-    switch (s.size()) {
-        case 1:
-            return tc->create_tensor_1d(in.name, in.dtype, s[0]);
-        case 2:
-            return tc->create_tensor_2d(in.name, in.dtype, s[0], s[1]);
-        case 3:
-            return tc->create_tensor_3d(in.name, in.dtype, s[0], s[1], s[2]);
-        case 4:
-            return tc->create_tensor_4d(in.name, in.dtype, s[0], s[1], s[2], s[3]);
-        default:
+    ggml_bf_tensor result = [&]() {
+        switch (s.size()) {
+            case 1:
+                return tc->create_tensor_1d(in.name, in.dtype, s[0]);
+            case 2:
+                return tc->create_tensor_2d(in.name, in.dtype, s[0], s[1]);
+            case 3:
+                return tc->create_tensor_3d(in.name, in.dtype, s[0], s[1], s[2]);
+            case 4:
+                return tc->create_tensor_4d(in.name, in.dtype, s[0], s[1], s[2], s[3]);
+            default:
+                throw std::runtime_error(format(
+                    "Session::Input '%s': shape rank %zu unsupported (need 1..4)", in.name.c_str(),
+                    s.size()));
+        }
+    }();
+
+    if (in.device_tensor != nullptr) {
+        const DeviceTensor& source = *in.device_tensor;
+        if (in.persistent || in.upload) {
             throw std::runtime_error(format(
-                "Session::Input '%s': shape rank %zu unsupported (need 1..4)", in.name.c_str(),
-                s.size()));
+                "Session::Input '%s': device input cannot be persistent or uploaded",
+                in.name.c_str()));
+        }
+        if (!source.valid() || source.tensor->type != in.dtype) {
+            throw std::runtime_error(format(
+                "Session::Input '%s': invalid device tensor or dtype mismatch", in.name.c_str()));
+        }
+        size_t want = ggml_type_size(in.dtype);
+        for (const int64_t dim : in.shape) want *= static_cast<size_t>(dim);
+        const size_t have = ggml_nbytes(source.tensor);
+        if (source.byte_offset > have || want > have - source.byte_offset) {
+            throw std::runtime_error(format(
+                "Session::Input '%s': device range [%zu, %zu) exceeds source size %zu",
+                in.name.c_str(), source.byte_offset, source.byte_offset + want, have));
+        }
+        if (result.buft != source.buft) {
+            throw std::runtime_error(format(
+                "Session::Input '%s': device buffer type does not match session placement",
+                in.name.c_str()));
+        }
+        result.tensor->buffer = source.tensor->buffer;
+        result.tensor->data = static_cast<char*>(source.tensor->data) + source.byte_offset;
     }
+    return result;
 }
 
 size_t
@@ -352,6 +396,27 @@ nbytes_of(const Session::Input& in) {
     size_t n = ggml_type_size(in.dtype);
     for (auto d : in.shape) n *= static_cast<size_t>(d);
     return n;
+}
+
+ggml_backend_t
+backend_for_tensor(const std::vector<ggml_backend_t>& backends, const ggml_tensor* tensor) {
+    const ggml_tensor* storage = tensor;
+    while (storage != nullptr && storage->buffer == nullptr) {
+        storage = storage->view_src;
+    }
+    if (storage == nullptr || storage->buffer == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(storage->buffer);
+    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    for (ggml_backend_t backend : backends) {
+        if (ggml_backend_get_device(backend) == device &&
+            ggml_backend_supports_buft(backend, buft)) {
+            return backend;
+        }
+    }
+    return nullptr;
 }
 
 }  // namespace
@@ -365,6 +430,12 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
         [&inputs](Session* s, TensorContainer* tc) {
             TensorBag bag;
             for (const auto& in : inputs) {
+                if (in.persistent && in.device_tensor != nullptr) {
+                    throw std::runtime_error(format(
+                        "Session::Input '%s': persistent and device bindings are mutually "
+                        "exclusive",
+                        in.name.c_str()));
+                }
                 if (in.persistent) {
                     // Tensor was declared in Module::define_tensors on
                     // model_tensor_container. Surface its metadata into the
@@ -377,7 +448,11 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
             return bag;
         },
         [&inputs](Session* s, TensorContainer* tc) {
+            bool transferred_host_data = false;
             for (const auto& in : inputs) {
+                if (in.device_tensor != nullptr) {
+                    continue;
+                }
                 if (!in.upload) {
                     continue;  // device contents already current (see Input::upload)
                 }
@@ -393,10 +468,18 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
                         "Session::Input '%s': host size %zu != declared tensor size %zu",
                         in.name.c_str(), have, want));
                 }
-                ggml_backend_tensor_set(t.tensor, in.host_data, 0, have);
+                ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
+                if (backend != nullptr && !in.synchronous_upload) {
+                    ggml_backend_tensor_set_async(backend, t.tensor, in.host_data, 0, have);
+                    transferred_host_data = true;
+                } else {
+                    ggml_backend_tensor_set(t.tensor, in.host_data, 0, have);
+                }
             }
+            return transferred_host_data;
         },
-        [&outputs](Session*, TensorBag out_bag, TensorContainer* tc) {
+        [&outputs](Session* s, TensorBag out_bag, TensorContainer* tc) {
+            bool transferred_host_data = false;
             for (auto& out : outputs) {
                 if ((out.index < 0) == out.name.empty()) {
                     throw std::runtime_error(
@@ -410,14 +493,31 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
                 ggml_bf_tensor t = (out.index >= 0) ? out_bag.get_tensor(out.index)
                                                     : tc->get_tensor_by_name(out.name);
                 const size_t want = ggml_nbytes(t.tensor);
-                if (out.nbytes < want) {
-                    throw std::runtime_error(format(
-                        "Session::Output buffer too small for tensor (have %zu, need %zu)",
-                        out.nbytes, want));
+                if (out.device_tensor != nullptr) {
+                    // May reference scheduler-owned storage: valid only until
+                    // the next run on this Session (async chaining contract).
+                    *out.device_tensor = DeviceTensor{t.tensor, t.buft, 0};
                 }
-                ggml_backend_tensor_get(t.tensor, out.host_buffer, 0, want);
+                if (out.host_buffer != nullptr) {
+                    if (out.nbytes < want) {
+                        throw std::runtime_error(format(
+                            "Session::Output buffer too small for tensor (have %zu, need %zu)",
+                            out.nbytes, want));
+                    }
+                    ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
+                    if (backend != nullptr) {
+                        ggml_backend_tensor_get_async(backend, t.tensor, out.host_buffer, 0, want);
+                    } else {
+                        ggml_backend_tensor_get(t.tensor, out.host_buffer, 0, want);
+                    }
+                    transferred_host_data = true;
+                } else if (out.device_tensor == nullptr) {
+                    throw std::runtime_error(
+                        "Session::Output requires a host buffer or a device tensor destination");
+                }
                 for (int i = 0; i < 4; ++i) out.out_shape[i] = t.tensor->ne[i];
             }
+            return transferred_host_data;
         },
         state);
 }
@@ -535,8 +635,8 @@ Session::read_model_tensor(const std::string& name, void* host_buffer, size_t nb
 void
 Session::run_impl(
     uint64_t key, const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
-    const std::function<void(Session*, TensorContainer*)>& set_input_data,
-    const std::function<void(Session*, TensorBag, TensorContainer*)>& return_output,
+    const std::function<bool(Session*, TensorContainer*)>& set_input_data,
+    const std::function<bool(Session*, TensorBag, TensorContainer*)>& return_output,
     SessionState* state) {
     // Cache mutation, allocation, and compute share backend state.
     std::lock_guard<std::mutex> compute_lock(backend_manager_->compute_mutex());
@@ -671,19 +771,23 @@ Session::run_impl(
     // failure rather than retried as a cache hit; a deterministic failure
     // (bad graph, undersized output) would otherwise never rebuild.
     try {
-        set_input_data(this, cr.container.get());
+        const bool host_input_pending = set_input_data(this, cr.container.get());
         auto _t1 = _clk::now();
 
         // Valid single-backend placements can bypass scheduler allocation.
         const bool direct = !fresh && cr.direct_ok && state == nullptr && cr.state_views.empty();
         if (direct) {
             auto _t2d = _clk::now();
-            if (ggml_backend_graph_compute(cr.direct_backend, cr.gf) != GGML_STATUS_SUCCESS) {
+            if (ggml_backend_graph_compute_async(cr.direct_backend, cr.gf) != GGML_STATUS_SUCCESS) {
                 GGMLF_LOG_ERROR("Failed to compute graph (direct)\n");
                 throw std::runtime_error("failed to compute graph");
             }
             auto _t3d = _clk::now();
-            return_output(this, cr.output_tensors, cr.container.get());
+            const bool host_output_pending =
+                return_output(this, cr.output_tensors, cr.container.get());
+            if (host_input_pending || host_output_pending) {
+                ggml_backend_synchronize(cr.direct_backend);
+            }
             auto _t4d = _clk::now();
             if (t_log) {
                 auto ms = [](auto a, auto b) {
@@ -776,7 +880,7 @@ Session::run_impl(
         }
 
         auto _t2 = _clk::now();
-        if (!ggml_graph_compute_helper(sched.get(), cr.gf, 4)) {
+        if (!ggml_graph_compute_helper_async(sched.get(), cr.gf, 4)) {
             GGMLF_LOG_ERROR("Failed to compute graph\n");
             throw std::runtime_error("failed to compute graph");
         }
@@ -785,7 +889,11 @@ Session::run_impl(
         // Outputs are read before the guard resets the scheduler: in
         // sched_managed mode non-named output tensors live in the scheduler's
         // allocator.
-        return_output(this, cr.output_tensors, cr.container.get());
+        const bool host_output_pending = return_output(this, cr.output_tensors, cr.container.get());
+        // Scheduler-managed storage cannot be reset while the graph is still
+        // using it. Cache hits eligible for asynchronous chaining take the
+        // direct path above.
+        ggml_backend_sched_synchronize(sched.get());
         auto _t4 = _clk::now();
         if (t_log) {
             auto ms = [](auto a, auto b) {

@@ -14,4 +14,5 @@ the server want [ASR configuration](../asr/configuration.md),
 - [`ggml-patches.md`](ggml-patches.md) - the project-specific ggml patches and how
   they are applied at build setup.
 - [`cublas-shim.md`](cublas-shim.md) - the in-tree drop-in cuBLAS replacement
-  and GPU kernels under `kernels/`.
+  under `kernels/` and where the custom GPU kernels live.
+- [Windows build notes](windows-build.md)

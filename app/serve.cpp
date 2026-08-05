@@ -124,6 +124,7 @@ run_server(int argc, char** argv) {
 #if defined(NEMO_SPEECH_CLI_ASR)
     nemo_speech::asr::RecognizerConfig asr_config;
     asr_config.backend.gpu = default_gpu_index();
+    asr_config.batching.enabled = true;
     std::string asr_model, vad_model, pnc_model, itn_model;
     int asr_enabled = -1;
 #endif
@@ -361,7 +362,6 @@ run_server(int argc, char** argv) {
         if (device_set)
             asr_config.backend.gpu = gpu;
         asr_config.model.path = asr_path;
-        asr_config.batching.enabled = true;
     }
     if (asr_enabled != 0 && (asr_requested || !asr_path.empty())) {
         asr_config.vad.model_path = resolve("VAD model", [&] {

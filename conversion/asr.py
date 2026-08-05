@@ -200,6 +200,9 @@ KEY_FE_N_MELS = f"{ARCH}.preprocessor.features"
 KEY_FE_NORMALIZE = f"{ARCH}.preprocessor.normalize"
 KEY_FE_PREEMPH = f"{ARCH}.preprocessor.preemph"
 KEY_FE_DITHER = f"{ARCH}.preprocessor.dither"
+KEY_FE_STFT_CENTER_WINDOW = f"{ARCH}.preprocessor.stft_center_window"
+KEY_FE_HANN_PERIODIC = f"{ARCH}.preprocessor.hann_periodic"
+KEY_FE_MASK_INVALID_FRAMES = f"{ARCH}.preprocessor.mask_invalid_frames"
 
 # CTC head
 KEY_CTC_NUM_CLASSES = f"{ARCH}.ctc.num_classes"
@@ -223,6 +226,7 @@ KEY_TDT_DURATIONS = f"{ARCH}.tdt.durations"
 # Tokenizer
 KEY_TOK_TYPE = f"{ARCH}.tokenizer.type"
 KEY_TOK_VOCAB = f"{ARCH}.tokenizer.vocab"
+KEY_TOK_MODEL = f"{ARCH}.tokenizer.spm_model"  # base64 SentencePiece model proto
 
 
 # ===========================================================================
@@ -570,6 +574,13 @@ def convert(
         gw.add_string(KEY_FE_NORMALIZE, str(pp_cfg.get("normalize", "per_feature")))
         gw.add_float32(KEY_FE_PREEMPH, float(pp_cfg.get("preemph", 0.97) or 0.0))
         gw.add_float32(KEY_FE_DITHER, float(pp_cfg.get("dither", 1e-5)))
+        # NeMo FilterbankFeatures / the Transformers Nemotron processor use a
+        # symmetric Hann centered inside n_fft. center=True emits one trailing
+        # padded frame, which their attention mask marks invalid. Serialize all
+        # three choices so the runtime never has to guess frontend geometry.
+        gw.add_bool(KEY_FE_STFT_CENTER_WINDOW, True)
+        gw.add_bool(KEY_FE_HANN_PERIODIC, False)
+        gw.add_bool(KEY_FE_MASK_INVALID_FRAMES, True)
 
         if head_type == "ctc":
             gw.add_uint32(KEY_CTC_NUM_CLASSES, num_classes)
@@ -597,13 +608,21 @@ def convert(
 
         # ---- Tokenizer ----
         if files["tokenizer"] is not None:
+            import base64
+
             import sentencepiece as spm
 
+            proto_bytes = open(files["tokenizer"], "rb").read()
             sp = spm.SentencePieceProcessor()
-            sp.LoadFromSerializedProto(open(files["tokenizer"], "rb").read())
+            sp.LoadFromSerializedProto(proto_bytes)
             vocab = [sp.IdToPiece(i) for i in range(sp.GetPieceSize())]
             gw.add_string(KEY_TOK_TYPE, "sentencepiece_bpe")
             gw.add_array(KEY_TOK_VOCAB, vocab)
+            # Embed the full SentencePiece model (base64) so the C++ runtime can
+            # tokenize arbitrary text exactly as the model does - needed for RNNT
+            # word boosting (context biasing). base64 keeps it a valid UTF-8 GGUF
+            # string value.
+            gw.add_string(KEY_TOK_MODEL, base64.b64encode(proto_bytes).decode("ascii"))
         else:
             gw.add_string(KEY_TOK_TYPE, "none")
 

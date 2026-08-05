@@ -10,7 +10,7 @@ mid-graph is a GPU↔CPU roundtrip per audio chunk, which kills streaming latenc
 scripts/configure.sh cuda-asr -DNEMO_SPEECH_BUILD_TOOLS=ON
 cmake --build --preset cuda-asr --target check_backend_coverage
 build/cuda-asr/bin/check_backend_coverage \
-  nemotron-speech-streaming-0.6b.gguf --gpu 0
+  nemotron-speech-streaming-en-0.6b.q8_0.gguf --gpu 0
 # --gpu N    GPU device index (default 0). -1 forces CPU.
 ```
 

@@ -61,9 +61,11 @@ class SileroVadModel {
 
        private:
         friend class SileroVadModel;
-        State(SileroVadModel* owner, int slot) : owner_(owner), slot_(slot) {}
+        State(SileroVadModel* owner, int slot, bool needs_reset)
+            : owner_(owner), slot_(slot), needs_reset_(needs_reset) {}
         SileroVadModel* owner_ = nullptr;
         int slot_ = -1;
+        bool needs_reset_ = false;
     };
 
     SileroVadModel(
@@ -77,7 +79,7 @@ class SileroVadModel {
     const SileroVadConfig& config() const { return cfg_; }
     State make_state();
     void reset_state(State& state);
-    float infer(State& state, const float* frame);
+    void infer(State& state, const float* frames, int n_windows, std::vector<float>& probabilities);
     BatchMetrics batch_metrics() const;
 
    private:
@@ -91,8 +93,10 @@ class SileroVadModel {
     std::unique_ptr<VadBatcher> batcher_;
     mutable std::mutex slots_mu_;
     std::vector<bool> slots_used_;
+    std::vector<bool> slots_need_reset_;
     void release_slot(int slot);
     void zero_slot(int slot);
+    void zero_slots(std::vector<int> slots);
 };
 
 class SileroVad {
@@ -155,9 +159,8 @@ class SileroVad {
     void discard_timeline_before(int64_t g);
 
    private:
-    // Run the graph on one full window_size frame, returning its probability
-    // and advancing the persistent LSTM state.
-    float run_window(const float* frame);
+    // Run consecutive windows in one graph while preserving recurrent order.
+    void run_windows(const float* frames, int n_windows, std::vector<float>& probabilities);
     // Binarize one window's probability (global window index k): update the
     // onset/offset hysteresis and record it across the mel frames the window
     // covers (floor(k*win/hop)..floor((k+1)*win/hop)).

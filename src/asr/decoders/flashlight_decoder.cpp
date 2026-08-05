@@ -276,26 +276,38 @@ FlashlightDecoder::set_request_options(const AsrRequestOptions& opts) {
     if (opts.speech_contexts.empty())
         return;
 
-    auto ensure_spm = [this]() -> bool {
-        if (spm_)
+    bool spm_load_failed = false;
+    auto ensure_spm = [this, &spm_load_failed]() -> bool {
+        if (active_spm_ != nullptr)
             return true;
-        if (cfg_.tokenizer_path.empty())
+        if (spm_load_failed)
             return false;
-        auto sp = std::make_unique<sentencepiece::SentencePieceProcessor>();
-        const auto st = sp->Load(cfg_.tokenizer_path);
-        if (!st.ok()) {
-            std::cerr << "[boost] failed to load tokenizer '" << cfg_.tokenizer_path
-                      << "': " << st.ToString() << "\n";
-            return false;
+        // Explicit tokenizer_path overrides; otherwise use the tokenizer
+        // embedded in the GGUF (guaranteed to match the model's vocab).
+        if (!cfg_.tokenizer_path.empty()) {
+            auto sp = std::make_unique<sentencepiece::SentencePieceProcessor>();
+            const auto st = sp->Load(cfg_.tokenizer_path);
+            if (!st.ok()) {
+                std::cerr << "[boost] failed to load tokenizer '" << cfg_.tokenizer_path
+                          << "': " << st.ToString() << "\n";
+                spm_load_failed = true;
+                return false;
+            }
+            spm_ = std::move(sp);
+            active_spm_ = spm_.get();
+            return true;
         }
-        spm_ = std::move(sp);
-        return true;
+        if (cfg_.embedded_spm != nullptr) {
+            active_spm_ = cfg_.embedded_spm;
+            return true;
+        }
+        return false;
     };
     // SentencePiece-encode `word` into token-dict ids. False if any piece is not
     // in the model's token vocab (then the word can't be represented/emitted).
     auto encode_to_token_ids = [this](const std::string& word, std::vector<int>& out) -> bool {
         std::vector<std::string> pieces;
-        const auto st = spm_->Encode(word, &pieces);
+        const auto st = active_spm_->Encode(word, &pieces);
         if (!st.ok() || pieces.empty())
             return false;
         out.clear();

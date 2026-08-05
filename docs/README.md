@@ -10,6 +10,7 @@ Start with:
 - [Command-line workflows](cli.md)
 - [Model conversion](model-conversion.md)
 - [HTTP/realtime and optional gRPC server](server.md)
+- [HTTP API reference](api.md)
 - [Client integration](clients.md)
 - [Native SDK integration](sdk.md)
 - [Troubleshooting](troubleshooting.md)
@@ -42,5 +43,5 @@ Start with:
 - [ASR batching](development/asr-batching.md) - neural microbatching and
   streaming-state arenas.
 - [ggml patches](development/ggml-patches.md) - the project-specific ggml changes.
-- [cuBLAS shim](development/cublas-shim.md) - the in-tree drop-in cuBLAS and GPU
-  kernels.
+- [cuBLAS shim](development/cublas-shim.md) - the in-tree drop-in cuBLAS
+  replacement.

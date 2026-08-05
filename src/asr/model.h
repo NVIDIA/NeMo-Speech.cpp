@@ -22,6 +22,12 @@
 #include "rnnt_greedy_decoder.h"
 #include "runtime.h"
 
+// Forward-declared so model.h consumers don't pull in the SentencePiece header;
+// only model.cpp (which loads the embedded tokenizer) needs the complete type.
+namespace sentencepiece {
+class SentencePieceProcessor;
+}
+
 namespace nemo_speech::asr {
 
 class RnntPredictorModule;
@@ -83,6 +89,10 @@ class AsrModel {
     virtual int prompt_index_for_lang(const std::string& /*lang*/) const { return -1; }
     virtual std::vector<std::string> prompt_languages() const { return {}; }
 
+    // Embedded SentencePiece tokenizer, shared by both word-boosting paths
+    // (flashlight OOV phrases, RNNT context biasing). Null if not embedded.
+    const sentencepiece::SentencePieceProcessor* embedded_tokenizer() const { return spm_.get(); }
+
    protected:
     struct Common {
         std::unique_ptr<ggml_runtime::GGUFLoader> loader;
@@ -108,6 +118,10 @@ class AsrModel {
     EncoderConfig enc_cfg_;
     MelSpecConfig fe_cfg_;
     std::vector<std::string> vocab_;
+    // SentencePiece tokenizer loaded from the GGUF's embedded model proto
+    // (asr.tokenizer.spm_model); tokenizes word-boosting phrases exactly as the
+    // model does. Null when the GGUF predates the embedded tokenizer.
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> spm_;
     std::unique_ptr<MelSpectrogramExtractor> fe_;
 };
 
@@ -127,14 +141,17 @@ class CtcModel final : public AsrModel {
         const float* audio, size_t n_samples, std::vector<float>& out_log_probs, int& T_out,
         int& n_classes);
 
+    void infer_ctc_greedy(
+        const float* audio, size_t n_samples, std::vector<int32_t>& best_ids,
+        std::vector<float>& best_probs, int& T_out);
+
     // `feats` is frame-major (n_mels, n_frames).
     void infer_ctc_from_mel(
         const float* feats, int n_frames, std::vector<float>& out_log_probs, int& T_out,
         int& n_classes);
 
     // Greedy-only compact result: device argmax + winning softmax probability
-    // per encoder frame. Flashlight continues to use infer_ctc_from_mel because
-    // beam search requires the complete class distribution.
+    // per encoder frame. Flashlight continues to use the full CTC distribution.
     void infer_ctc_greedy_from_mel(
         const float* feats, int n_frames, std::vector<int32_t>& best_ids,
         std::vector<float>& best_probs, int& T_out);
@@ -178,6 +195,13 @@ class RnntModel final : public AsrModel, public RnntEngine {
     void joint_argmax(
         RnntStreamState& state, const float* enc_proj, int joint_dim, int T, int32_t* token_ids,
         const float* logit_bias = nullptr) override;
+    void joint_argmax_device(
+        RnntStreamState& state, const ggml_runtime::DeviceTensor& enc_proj, int frame_offset,
+        int joint_dim, int T, int32_t* token_ids, const float* logit_bias = nullptr) override;
+    void predict_and_joint_rnnt_argmax_device(
+        RnntStreamState& state, int prev_token, int active_bank,
+        const ggml_runtime::DeviceTensor& enc_proj, int frame_offset, int joint_dim, int T,
+        int32_t* token_ids, const float* logit_bias = nullptr) override;
     void joint_tdt_argmax(
         RnntStreamState& state, const float* enc_proj, int joint_dim, int T, int32_t* token_ids,
         int32_t* duration_ids) override;
@@ -185,7 +209,11 @@ class RnntModel final : public AsrModel, public RnntEngine {
         RnntStreamState& state, int prev_token, int active_bank, const float* enc_proj,
         int joint_dim, int32_t* token_id, int32_t* duration_id) override;
 
-    std::unique_ptr<Decoder> make_transducer_decoder();
+    std::unique_ptr<Decoder> make_transducer_decoder(const DecoderConfig& cfg = {});
+
+    // Tokenize a word-boosting phrase with the embedded SentencePiece model.
+    // Empty when the GGUF carries no tokenizer model (boosting then no-ops).
+    std::vector<int> encode_phrase(const std::string& text) const override;
 
     // Full-utterance frontend + non-cache-aware encoder + joint encoder
     // projection. Compatible requests batch as [feature,time,batch].
@@ -211,7 +239,8 @@ class RnntModel final : public AsrModel, public RnntEngine {
     // the mask spans cache_left_ctx + 1 + R, and prompt_index=-1 disables fusion.
     void encode_cache_aware(
         CacheAwareEncoder::State& state, const float* mel, int n_mel_frames, const float* attn_mask,
-        int attn_mask_len, std::vector<float>& enc_out, int& T_enc, int prompt_index = -1);
+        int attn_mask_len, std::vector<float>& enc_out, int& T_enc, int prompt_index = -1,
+        ggml_runtime::DeviceTensor* device_output = nullptr);
 
     std::vector<DiagSession> diagnostic_sessions() const override;
     BatchMetrics encoder_batch_metrics() const;
@@ -251,8 +280,13 @@ class RnntModel final : public AsrModel, public RnntEngine {
     std::unique_ptr<DecoderBatchers> decoder_batchers_;
     int decoder_arena_slots_ = 0;
     std::mutex decoder_slots_mu_;
+    std::condition_variable decoder_slots_cv_;
     std::vector<bool> decoder_slots_used_;
-    std::atomic<int> active_decode_steps_{0};
+    std::vector<bool> decoder_slots_need_reset_;
+    // Steps released by the admission barrier. This excludes the next ingress
+    // wave while it is still collecting, so the decoder scheduler knows how
+    // many streams can actually declare ready work.
+    std::atomic<int> admitted_decode_steps_{0};
     // One admission barrier per host decode step. It spends the queue budget
     // once to align a newly-arrived wave; predictor/joint iterations can then
     // batch immediately instead of fragmenting into permanently offset cohorts.
@@ -260,10 +294,12 @@ class RnntModel final : public AsrModel, public RnntEngine {
     std::condition_variable decode_admission_cv_;
     uint64_t decode_admission_generation_ = 0;
     int decode_admission_waiting_ = 0;
+    int decode_admission_target_ = 0;
     std::chrono::steady_clock::time_point decode_admission_deadline_;
-    int acquire_decoder_slot();
+    int acquire_decoder_slot(bool& needs_reset);
     void release_decoder_slot(int slot);
     void zero_decoder_slot(int slot);
+    void zero_decoder_slots(std::vector<int> slots);
 
     // Cache-aware streaming encoder: owns the one shared device-resident encoder
     // Session. Each stream owns an indexed row in its persistent cache arena;

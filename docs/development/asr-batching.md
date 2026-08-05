@@ -6,6 +6,12 @@ keeps its own stream, decoder state, transcript, and result. Batching is opt-in
 because collecting a batch adds queueing latency to otherwise uncontended local
 inference.
 
+RNNT/TDT decoder stages use a work-conserving scheduler because their next
+operation is conditional. Predictor requests split by recurrent-state bank,
+and joint requests split by remaining frame count and optional bias. The
+scheduler releases useful exact-compatible work without treating every active
+decoder as eligible for every operation.
+
 ## CUDA throughput workflow
 
 High-throughput CUDA operation involves three separate choices: the build, the
@@ -71,6 +77,10 @@ More streams than `max_batch_size` are processed in multiple waves. Increasing
 the cap or either delay does not guarantee better throughput; tune them on the
 target GPU with the expected request cadence and audio chunk size.
 
+The gRPC and HTTP streaming adapters opt into ingress coordination. Direct
+library streams and benchmark calls do not, so they avoid the transport
+alignment delay and continue to measure the native pipeline.
+
 ## Measure the result
 
 The unified benchmark loads one recognizer and automatically enables and sizes
@@ -90,22 +100,33 @@ input.
 
 `bench_asr_batching` remains available with
 `NEMO_SPEECH_BUILD_TOOLS=ON` when paced chunk latency or per-stage batch
-metrics are needed for runtime development. A sustained realtime workload must
-keep paced chunk latency below the incoming chunk duration; otherwise work
-accumulates. The developer tool is not required for normal throughput tuning.
+metrics are needed for runtime development; the tool prints its stage metrics
+unconditionally. A sustained realtime workload must keep paced chunk latency
+below the incoming chunk duration; otherwise work accumulates. For the gRPC
+server, set `NEMO_SPEECH_BATCH_METRICS=1` before process start to print
+formed-batch, release-reason, queue-wait, compatibility, and execution
+summaries.
 
 ## Runtime constraints
 
 - Only work with the same graph-shaping dimensions and options can share a
   microbatch. Incompatible work remains queued for a separate graph.
+- A transducer decode wave is admitted once at the start of `step()`. The
+  predictor/joint scheduler dispatches when one exact-compatible group reaches
+  physical capacity, all admitted decoders are queued or selected, or the
+  oldest compatible group reaches its deadline. It selects the largest ready
+  group instead of waiting for an impossible batch of all active decoders.
 - Stateful RNNT/TDT encoder and decoder caches, plus VAD recurrent state, use
   indexed device rows. Exhausting `state_arena_slots` rejects new stateful work
-  instead of silently reusing another stream's state.
+  instead of silently reusing another stream's state. Released rows are marked
+  dirty and cleared in coalesced ranges before their next use.
 - CUDA streaming and offline recognition use the GPU frontend even when
   batching is disabled. Batching combines compatible frontend work as well as
   encoder, predictor, joint, VAD, and PnC work.
-- Backend submission remains serialized. Throughput improves by submitting
-  fewer, wider graphs rather than running unrelated ggml graphs concurrently.
+- Backend submission remains serialized. Bounded decoder execution slots
+  overlap host packing and dependency wakeups, but the backend compute mutex
+  still serializes each ggml graph. Throughput improves through fewer, wider
+  submissions rather than concurrent access to ggml's shared scheduler.
 - Disabling batching keeps the scalar path and avoids its queue-delay cost.
 
 For planar-Q8 kernel behavior, diagnostic environment switches, and patched

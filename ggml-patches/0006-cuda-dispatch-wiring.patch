@@ -87,8 +87,8 @@ index e25be359..6f3e1c42 100644
 +static bool ggml_cuda_q8_narrow_epilogue_enabled() {
 +    static const bool enabled = [] {
 +        const char * value = getenv("GGML_CUDA_Q8_NARROW_EPILOGUE");
-+        // Preserve the experimental spelling so the recorded A/B commands
-+        // remain reproducible.
++        // Keep the former variable name as an alias for existing
++        // deployments.
 +        if (value == nullptr) {
 +            value = getenv("GGML_CUDA_Q8_NARROW_BIAS_FUSION");
 +        }

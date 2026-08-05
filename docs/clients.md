@@ -6,7 +6,8 @@ Start a local server with the models needed by your application:
 nemo-speech serve --asr-model models/asr.q8_0.gguf
 ```
 
-The HTTP server implements the documented OpenAI audio API subset used below.
+The HTTP server implements the OpenAI audio API subset documented in the
+[HTTP API reference](api.md).
 An API key is only required when the server was started with `--api-key`; SDKs
 still require a nonempty placeholder locally.
 

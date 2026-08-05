@@ -177,6 +177,8 @@ parse_options(int argc, char** argv) {
             o.batching = false;
         else if (arg == "--max-alternatives")
             o.request.max_alternatives = parse_int(required_value(i, argc, argv, arg), arg, 1, 100);
+        else if (arg == "--max-speaker-count")
+            o.request.max_speaker_count = parse_int(required_value(i, argc, argv, arg), arg, 1, 32);
         else if (arg == "--profanity-filter")
             o.request.profanity_filter = true;
         else if (arg == "--endpointing-ms")
@@ -448,6 +450,7 @@ print_transcribe_help(const char* program) {
         "  --word-times              Include word timestamps in diagnostics\n"
         "  --vad-model PATH          Optional Silero VAD GGUF\n"
         "  --diar-model PATH         Tag words with a Sortformer diarizer\n"
+        "  --max-speaker-count N     Diarization speaker cap (default 8)\n"
         "  --itn-model-dir DIR       Inverse text normalization grammars\n"
         "  --pnc-model PATH          Punctuation/capitalization GGUF\n"
 #if defined(NEMO_SPEECH_CLI_NMT)

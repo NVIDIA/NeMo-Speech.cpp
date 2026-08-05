@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -63,6 +65,19 @@ struct BatchMetrics {
     uint64_t items = 0;
     uint64_t singleton_batches = 0;
     uint64_t max_observed_batch = 0;
+    uint64_t target_reached_batches = 0;
+    uint64_t deadline_batches = 0;
+    uint64_t requested_items = 0;
+    uint64_t queue_wait_ns = 0;
+    // Work-conserving schedulers can release for three distinct reasons:
+    // physical capacity, the complete ready set becoming blocked, or age.
+    // The ready/compatible sums describe the queue at each dispatch and make
+    // compatibility loss visible without tracing every request.
+    uint64_t capacity_batches = 0;
+    uint64_t ready_set_batches = 0;
+    uint64_t ready_items = 0;
+    uint64_t compatible_items = 0;
+    uint64_t execution_ns = 0;
 };
 
 // A transport or pipeline coordinator can establish one expected cohort for
@@ -95,25 +110,48 @@ class ScopedBatchCohort {
 class IngressBatchCoordinator {
    public:
     explicit IngressBatchCoordinator(const BatchingConfig& config)
-        : enabled_(config.enabled), delay_us_(std::max(0, config.ingress_cohort_delay_us)) {
-        if (const char* value = std::getenv("NEMO_SPEECH_INGRESS_COHORT"))
-            enabled_ = enabled_ && std::atoi(value) != 0;
-        if (const char* value = std::getenv("NEMO_SPEECH_INGRESS_COHORT_US"))
-            delay_us_ = std::max(0, std::atoi(value));
+        : enabled_(config.enabled), delay_us_(std::max(0, config.ingress_cohort_delay_us)),
+          max_batch_size_(std::max(1, config.max_batch_size)) {
+        auto parse_env_int = [](const char* name, int& parsed) {
+            const char* value = std::getenv(name);
+            if (value == nullptr)
+                return false;
+            const std::string_view text(value);
+            if (text.empty())
+                return false;
+            int candidate = 0;
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), candidate);
+            if (result.ec != std::errc{} || result.ptr != text.data() + text.size())
+                return false;
+            parsed = candidate;
+            return true;
+        };
+        int value = 0;
+        if (parse_env_int("NEMO_SPEECH_INGRESS_COHORT", value))
+            enabled_ = enabled_ && value != 0;
+        if (parse_env_int("NEMO_SPEECH_INGRESS_COHORT_US", value))
+            delay_us_ = std::max(0, value);
     }
 
-    int arrive() {
+    int arrive(int expected_participants = 0) {
         if (!enabled_)
             return 0;
+        if (expected_participants == 1)
+            return 1;
+        const int target = expected_participants > 1
+                               ? std::min(expected_participants, max_batch_size_)
+                               : max_batch_size_;
         std::shared_ptr<Group> group;
         {
             std::unique_lock<std::mutex> lock(mu_);
             if (!current_)
                 current_ = std::make_shared<Group>();
             group = current_;
+            if (group->target == 0 && target > 0)
+                group->target = target;
             if (group->waiters++ == 0)
                 group->deadline = Clock::now() + std::chrono::microseconds(delay_us_);
-            if (delay_us_ <= 0) {
+            if (delay_us_ <= 0 || (group->target > 0 && group->waiters >= group->target)) {
                 release_locked(group);
             } else {
                 group->cv.wait_until(lock, group->deadline, [&] { return group->released; });
@@ -128,6 +166,7 @@ class IngressBatchCoordinator {
     using Clock = std::chrono::steady_clock;
     struct Group {
         int waiters = 0;
+        int target = 0;
         int released_size = 0;
         bool released = false;
         Clock::time_point deadline{};
@@ -146,6 +185,7 @@ class IngressBatchCoordinator {
 
     bool enabled_ = false;
     int delay_us_ = 0;
+    int max_batch_size_ = 1;
     std::mutex mu_;
     std::shared_ptr<Group> current_;
 };
@@ -173,9 +213,24 @@ class MicroBatcher {
     // decoders know how many step() calls are currently active, so they can
     // release a complete lock-step wave without waiting for the configured
     // physical maximum. Zero retains the generic max-batch/deadline policy.
-    Result run(Key key, Request request, int target_batch_size = 0) {
+    Result run(Key key, Request request, int target_batch_size = current_batch_cohort_target()) {
         std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mu_);
         if (!worker_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (stopping_)
+                    throw std::runtime_error("MicroBatcher: submit after shutdown");
+            }
+            std::vector<Request> requests;
+            requests.push_back(std::move(request));
+            auto results = run_batch_(key, std::move(requests));
+            if (results.size() != 1)
+                throw std::runtime_error(
+                    "MicroBatcher: scalar callback returned wrong result count");
+            record_batch(1);
+            return std::move(results.front());
+        }
+        if (target_batch_size == 1) {
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 if (stopping_)
@@ -232,9 +287,14 @@ class MicroBatcher {
 
     BatchMetrics metrics() const {
         return {
-            batches_.load(std::memory_order_relaxed), items_.load(std::memory_order_relaxed),
+            batches_.load(std::memory_order_relaxed),
+            items_.load(std::memory_order_relaxed),
             singleton_batches_.load(std::memory_order_relaxed),
-            max_observed_batch_.load(std::memory_order_relaxed)};
+            max_observed_batch_.load(std::memory_order_relaxed),
+            target_reached_batches_.load(std::memory_order_relaxed),
+            deadline_batches_.load(std::memory_order_relaxed),
+            requested_items_.load(std::memory_order_relaxed),
+            queue_wait_ns_.load(std::memory_order_relaxed)};
     }
 
     void shutdown() {
@@ -297,6 +357,11 @@ class MicroBatcher {
                 cv_.wait_until(lock, deadline, [this, &key, target] {
                     return stopping_ || compatible_count_locked(key) >= target;
                 });
+                const bool target_reached = compatible_count_locked(key) >= target;
+                const uint64_t queue_wait_ns =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              Clock::now() - queue_.front()->queued_at)
+                                              .count());
 
                 for (auto it = queue_.begin();
                      it != queue_.end() &&
@@ -308,6 +373,12 @@ class MicroBatcher {
                         ++it;
                     }
                 }
+                if (target_reached)
+                    target_reached_batches_.fetch_add(1, std::memory_order_relaxed);
+                else
+                    deadline_batches_.fetch_add(1, std::memory_order_relaxed);
+                requested_items_.fetch_add(target, std::memory_order_relaxed);
+                queue_wait_ns_.fetch_add(queue_wait_ns, std::memory_order_relaxed);
             }
 
             try {
@@ -352,6 +423,10 @@ class MicroBatcher {
     std::atomic<uint64_t> items_{0};
     std::atomic<uint64_t> singleton_batches_{0};
     std::atomic<uint64_t> max_observed_batch_{0};
+    std::atomic<uint64_t> target_reached_batches_{0};
+    std::atomic<uint64_t> deadline_batches_{0};
+    std::atomic<uint64_t> requested_items_{0};
+    std::atomic<uint64_t> queue_wait_ns_{0};
 };
 
 }  // namespace nemo_speech::asr

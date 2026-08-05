@@ -14,17 +14,17 @@ using namespace nemo_speech::asr;
 
 #include "runtime.h"
 
-// Portable equivalent of ggml_pad_ext that emits ops universally supported
-// across CUDA / Vulkan / Metal / CPU. ggml_pad_ext with nonzero left-pad
-// isn't supported on every backend (Metal's PAD kernel, for one, rejects
-// it), so we emulate left-pad with `right-pad by (lp+rp) on each dim` +
-// `ggml_roll(lp...)` to rotate the zero region to the front. Both ops are
-// supported on all targeted backends, keeping the encoder graph
-// GPU-resident regardless of target.
+// CUDA implements asymmetric left padding directly. Other builds retain the
+// pad+roll formulation because Metal's PAD kernel rejects nonzero left pads.
+// Keeping that compatibility choice at graph construction time avoids paying
+// for a separate ROLL kernel on CUDA without changing portable backends.
 static inline ggml_tensor*
-pad_ext_portable(
+pad_ext_backend(
     ggml_context* ctx, ggml_tensor* t, int lp0, int rp0, int lp1, int rp1, int lp2, int rp2,
     int lp3, int rp3) {
+#ifdef NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS
+    return ggml_pad_ext(ctx, t, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+#else
     ggml_tensor* right_padded =
         ggml_pad_ext(ctx, t, 0, lp0 + rp0, 0, lp1 + rp1, 0, lp2 + rp2, 0, lp3 + rp3);
 
@@ -40,6 +40,7 @@ pad_ext_portable(
         return right_padded;
     }
     return ggml_roll(ctx, right_padded, s0, s1, s2, s3);
+#endif
 }
 
 // Cache-aware Nemotron uses **causal** Conv2D subsampling: for every strided
@@ -157,7 +158,7 @@ SubSampling::build_graph(
                 auto t = bag.get_tensor(0);
                 auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(t.buft);
                 auto padded =
-                    pad_ext_portable(bf_ctx.ctx, t.tensor, pad_l, pad_r, pad_t, pad_b, 0, 0, 0, 0);
+                    pad_ext_backend(bf_ctx.ctx, t.tensor, pad_l, pad_r, pad_t, pad_b, 0, 0, 0, 0);
                 bag.set_first_tensor(ggml_runtime::ggml_bf_tensor(padded, t.buft));
             }
             bag = m->build_graph(session, bag, session_tensor_container);
@@ -319,7 +320,7 @@ ConformerConv::build_post_glu(
         } else {
             // First chunk OR non-streaming causal mode: zero-pad on the left
             // by kernel-1 frames so the conv keeps the same output length.
-            dw_input = pad_ext_portable(
+            dw_input = pad_ext_backend(
                 bf_ctx.ctx, dw_input, cache_len, 0,  // dim 0 (time): left, right
                 0, 0, 0, 0, 0, 0);
             concat_buffer = dw_input;
@@ -566,7 +567,7 @@ ConformerConv::build_graph_cached_ct(
     if (cache_cur != nullptr) {
         u = ggml_concat(bf_ctx.ctx, cache_cur, x_glu, 1);  // (C, cache+T, B)
     } else {
-        u = pad_ext_portable(bf_ctx.ctx, x_glu, 0, 0, (int)cache_len, 0, 0, 0, 0, 0);
+        u = pad_ext_backend(bf_ctx.ctx, x_glu, 0, 0, (int)cache_len, 0, 0, 0, 0, 0);
     }
     const int64_t Tu = u->ne[1];
     auto u4 = ggml_reshape_4d(bf_ctx.ctx, u, C, Tu, 1, B);
@@ -818,7 +819,12 @@ ConformerLayer::build_mha_cached(
     auto v_chunk = qkv_view(2);
 
     const int64_t chunk_len = x.tensor->ne[1];
-    const int64_t cache_len = (cache->k_cache_cur != nullptr) ? cache->k_cache_cur->ne[1] : 0;
+    const bool direct_kv_cache = cache->kv_cache_arena != nullptr &&
+                                 cache->kv_cache_slot_ids != nullptr &&
+                                 cache->kv_cache_ring_heads != nullptr;
+    const int64_t cache_len =
+        direct_kv_cache ? cache->left_context
+                        : ((cache->k_cache_cur != nullptr) ? cache->k_cache_cur->ne[1] : 0);
 
     // Concat with K/V cache along the time axis (ne[1]). NeMo prepends its
     // cache to key/value the same way (MultiHeadAttention.update_cache,
@@ -827,7 +833,11 @@ ConformerLayer::build_mha_cached(
     // per-frame equivalent and skips the recompute.
     ggml_tensor* k_full = nullptr;
     ggml_tensor* v_full = nullptr;
-    if (cache->k_cache_cur != nullptr && cache_len > 0) {
+    if (direct_kv_cache) {
+        // The CUDA fused op consumes the persistent circular arena and the
+        // strided current-chunk K/V views separately; no full window is
+        // materialized.
+    } else if (cache->k_cache_cur != nullptr && cache_len > 0) {
         // k_chunk and the gathered cache are [d_model,time,B]. Concatenate the
         // stream-local histories on the time axis (output is contiguous).
         auto k_c3 =
@@ -851,7 +861,7 @@ ConformerLayer::build_mha_cached(
     const int64_t left_ctx = cache->left_context;
     const int64_t cache_keep_len = std::min<int64_t>(kv_len, left_ctx);
     const int64_t cache_keep_offset = kv_len - cache_keep_len;
-    if (cache_keep_offset >= 0) {
+    if (!direct_kv_cache && cache_keep_offset >= 0) {
         // Slice last cache_keep_len rows from k_full / v_full and pad-front
         // back to left_ctx so the host buffer shape stays constant.
         auto k_tail = ggml_view_3d(
@@ -865,9 +875,9 @@ ConformerLayer::build_mha_cached(
             // matches what the encoder graph allocated.
             const int64_t pad_left = left_ctx - cache_keep_len;
             cache->k_cache_next =
-                pad_ext_portable(bf_ctx.ctx, k_tail, 0, 0, pad_left, 0, 0, 0, 0, 0);
+                pad_ext_backend(bf_ctx.ctx, k_tail, 0, 0, pad_left, 0, 0, 0, 0, 0);
             cache->v_cache_next =
-                pad_ext_portable(bf_ctx.ctx, v_tail, 0, 0, pad_left, 0, 0, 0, 0, 0);
+                pad_ext_backend(bf_ctx.ctx, v_tail, 0, 0, pad_left, 0, 0, 0, 0, 0);
         } else {
             // Raw strided views; the encoder's cache feedback either copies
             // them straight into the arena row (single-slot) or materializes
@@ -906,17 +916,27 @@ ConformerLayer::build_mha_cached(
         auto q_heads = ggml_view_4d(
             bf_ctx.ctx, qkv, d_k, chunk_len, n_head, batch, qkv->nb[1],
             static_cast<size_t>(d_k) * qkv_es, qkv->nb[2], 0);
+        auto k_source = direct_kv_cache ? k_chunk : k_full;
+        auto v_source = direct_kv_cache ? v_chunk : v_full;
+        const int64_t source_len = direct_kv_cache ? chunk_len : kv_len;
         auto k_heads = ggml_view_4d(
-            bf_ctx.ctx, k_full, d_k, kv_len, n_head, batch, k_full->nb[1],
-            static_cast<size_t>(d_k) * ggml_element_size(k_full), k_full->nb[2], 0);
+            bf_ctx.ctx, k_source, d_k, source_len, n_head, batch, k_source->nb[1],
+            static_cast<size_t>(d_k) * ggml_element_size(k_source), k_source->nb[2], 0);
         auto v_heads = ggml_view_4d(
-            bf_ctx.ctx, v_full, d_k, kv_len, n_head, batch, v_full->nb[1],
-            static_cast<size_t>(d_k) * ggml_element_size(v_full), v_full->nb[2], 0);
+            bf_ctx.ctx, v_source, d_k, source_len, n_head, batch, v_source->nb[1],
+            static_cast<size_t>(d_k) * ggml_element_size(v_source), v_source->nb[2], 0);
         // (kv_len, B): one additive key-mask column per stream.
         auto mask_2d = ggml_reshape_2d(bf_ctx.ctx, cache->attn_mask, kv_len, batch);
-        auto ctx_heads = ggml_fused_relpos_attn(
-            bf_ctx.ctx, q_heads, k_heads, v_heads, p_p, bias_u.tensor, bias_v.tensor, mask_2d,
-            scale, /*merge_heads=*/true);
+        auto ctx_heads =
+            direct_kv_cache
+                ? ggml_fused_relpos_attn_cached(
+                      bf_ctx.ctx, q_heads, k_heads, v_heads, p_p, bias_u.tensor, bias_v.tensor,
+                      mask_2d, cache->kv_cache_arena, cache->kv_cache_slot_ids,
+                      cache->kv_cache_ring_heads, cache_len, scale,
+                      /*merge_heads=*/true)
+                : ggml_fused_relpos_attn(
+                      bf_ctx.ctx, q_heads, k_heads, v_heads, p_p, bias_u.tensor, bias_v.tensor,
+                      mask_2d, scale, /*merge_heads=*/true);
         // Head-merged layout: this permute view is contiguous (n_feat, chunk).
         ctx_attn = ggml_reshape_3d(
             bf_ctx.ctx, ggml_permute(bf_ctx.ctx, ctx_heads, 0, 2, 1, 3), n_feat, chunk_len, batch);
@@ -965,7 +985,7 @@ ConformerLayer::build_mha_cached(
         // The arithmetic only needs pos_len >= kv_len + chunk_len - 1, so the
         // precomputed strip (sized for the configured chunk) also serves
         // shorter tail chunks.
-        auto bd_pad = pad_ext_portable(bf_ctx.ctx, matrix_bd_raw, 1, 0, 0, 0, 0, 0, 0, 0);
+        auto bd_pad = pad_ext_backend(bf_ctx.ctx, matrix_bd_raw, 1, 0, 0, 0, 0, 0, 0, 0);
         // step 2: swap dims via reshape (only safe because bd_pad is contiguous
         // after the pad). pos_len+1 = bd_pad->ne[0]; chunk_len = bd_pad->ne[1].
         auto bd_pad_c = ggml_cont(bf_ctx.ctx, bd_pad);
@@ -1365,6 +1385,7 @@ FastConformerEncoder::build_graph(
     ggml_runtime::TensorBag x_bag = pre;
     auto mask_t = input_tensors.get_tensor(1);
     auto slot_ids_kv = input_tensors.get_tensor(2);  // [B,2], identical K/V columns
+    auto ring_heads = input_tensors.get_tensor(3);   // [B], oldest physical K/V cache row
     const int64_t batch = slot_ids_kv.tensor->ne[0];
     auto slot_ids = ggml_runtime::ggml_bf_tensor(
         ggml_view_1d(
@@ -1375,6 +1396,13 @@ FastConformerEncoder::build_graph(
     // gathers degenerate to arena views and feedback uses in-place copies.
     // Multi-slot arenas retain indexed gather/scatter.
     const bool single_slot = cfg_.cache_state_slots == 1 && batch == 1;
+#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+    const int d_k = cfg_.d_model / cfg_.n_heads;
+    const bool direct_kv_arena =
+        session->params.use_gpu && mask_t.tensor != nullptr && (d_k & (d_k - 1)) == 0;
+#else
+    const bool direct_kv_arena = false;
+#endif
     for (int l = 0; l < cfg_.n_layers; l++) {
         LayerCacheIO cache;
         cache.left_context = cfg_.cache_left_ctx;
@@ -1390,7 +1418,15 @@ FastConformerEncoder::build_graph(
                 bf.ctx, ggml_get_rows(bf.ctx, arena, slot_ids.tensor), cfg_.d_model, frames, batch);
         };
         const int64_t kv_row = cfg_.d_model * cfg_.cache_left_ctx;
-        if (single_slot) {
+        if (direct_kv_arena) {
+            // The fused CUDA attention op addresses active circular-arena rows
+            // itself and appends K/V on the same stream. This avoids
+            // materializing a paired gather before every layer and the
+            // concat/tail-concat/scatter feedback sequence afterward.
+            cache.kv_cache_arena = kv_arena.tensor;
+            cache.kv_cache_slot_ids = slot_ids.tensor;
+            cache.kv_cache_ring_heads = ring_heads.tensor;
+        } else if (single_slot) {
             auto k_plane =
                 ggml_view_2d(bf.ctx, kv_arena.tensor, kv_row, 1, kv_arena.tensor->nb[1], 0);
             auto v_plane = ggml_view_2d(

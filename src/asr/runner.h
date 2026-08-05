@@ -223,6 +223,7 @@ class OfflineRunner final : public AsrRunner {
 
    private:
     AsrModel* model_;
+    DecoderConfig decoder_cfg_;
     std::unique_ptr<Decoder> ctc_decoder_;
     AsrRequestOptions opts_;
     std::vector<float> audio_;
@@ -279,6 +280,7 @@ class CacheStreamRunner final : public AsrRunner {
     bool poll_endpoint(StreamingUpdate& update, bool after_chunk);
     // Drop the audio prefix that FE and VAD have both consumed.
     void trim_buffers();
+    void compact_mel_buffer();
 
     RnntModel* model_ = nullptr;
     AsrRequestOptions opts_;
@@ -327,6 +329,7 @@ class CacheStreamRunner final : public AsrRunner {
     std::vector<float> audio_buf_;
     size_t audio_base_ = 0;
     std::vector<float> mel_buf_;  // (n_mels, T) flat, frame-major
+    size_t mel_offset_ = 0;
     // Total number of mel frames produced from audio_buf_ across all step()
     // calls (monotonic). NB: mel_buf_ also gets frames *consumed* from the
     // front each chunk, so its current size is smaller than this counter.

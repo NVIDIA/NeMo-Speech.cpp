@@ -77,15 +77,31 @@ void
 test_sentencepiece_punctuation_detokenization() {
     const std::vector<std::string> vocab = {
         "\xE2\x96\x81"
-        "Hello",
-        "\xE2\x96\x81there", "\xE2\x96\x81?", "\xE2\x96\x81!", "\xE2\x96\x81\xE0\xA5\xA4"};
+        "How",
+        "\xE2\x96\x81old",
+        "\xE2\x96\x81is",
+        "\xE2\x96\x81"
+        "Brooklyn",
+        "\xE2\x96\x81"
+        "Bridge",
+        "\xE2\x96\x81?",
+        "\xE2\x96\x81!",
+        "\xE2\x96\x81\xE0\xA5\xA4"};
     check(
-        detokenize_sentencepiece({0, 1, 2}, vocab) == "Hello there?",
+        detokenize_sentencepiece({0, 1, 2, 3, 4, 5}, vocab) == "How old is Brooklyn Bridge?",
         "sentencepiece: boundary-prefixed terminator attaches to preceding word");
     check(
-        detokenize_sentencepiece({0, 3}, vocab) == "Hello!" &&
-            detokenize_sentencepiece({0, 4}, vocab) == "Hello\xE0\xA5\xA4",
+        detokenize_sentencepiece({0, 6}, vocab) == "How!" &&
+            detokenize_sentencepiece({0, 7}, vocab) == "How\xE0\xA5\xA4",
         "sentencepiece: ASCII and Devanagari terminators attach consistently");
+
+    std::string incremental;
+    append_sentencepiece_tokens(incremental, {0, 1}, vocab);
+    append_sentencepiece_tokens(incremental, {2, 3, 4}, vocab);
+    append_sentencepiece_tokens(incremental, {5}, vocab);
+    check(
+        incremental == detokenize_sentencepiece({0, 1, 2, 3, 4, 5}, vocab),
+        "sentencepiece: incremental detokenization matches full detokenization");
 }
 
 void

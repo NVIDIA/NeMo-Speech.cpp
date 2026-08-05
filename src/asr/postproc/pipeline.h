@@ -64,9 +64,10 @@ class Postprocessor {
     std::string apply(
         const std::string& transcript, const AsrRequestOptions& opts,
         std::vector<WordTiming>* words = nullptr, const std::string& language_code = "") const;
+    BatchMetrics pnc_batch_metrics() const;
 
    private:
-    std::string apply_impl(
+    std::string apply_cpu(
         const std::string& transcript, const AsrRequestOptions& opts,
         std::vector<WordTiming>* words, const std::string& language_code) const;
 

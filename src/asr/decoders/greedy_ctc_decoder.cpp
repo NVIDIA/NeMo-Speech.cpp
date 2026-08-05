@@ -197,9 +197,10 @@ GreedyCtcDecoder::step_compact(
     return emitted;
 }
 
-std::string
-detokenize_sentencepiece(const std::vector<int>& ids, const std::vector<std::string>& vocab) {
-    std::string out;
+void
+append_sentencepiece_tokens(
+    std::string& out, const std::vector<int>& ids, const std::vector<std::string>& vocab) {
+    const bool trim_leading_space = out.empty();
     for (int id : ids) {
         if (id < 0 || id >= static_cast<int>(vocab.size()))
             continue;
@@ -217,9 +218,20 @@ detokenize_sentencepiece(const std::vector<int>& ids, const std::vector<std::str
             }
         }
     }
-    size_t s = 0;
-    while (s < out.size() && out[s] == ' ') s++;
-    return out.substr(s);
+    if (trim_leading_space) {
+        const size_t s = out.find_first_not_of(' ');
+        if (s == std::string::npos)
+            out.clear();
+        else if (s > 0)
+            out.erase(0, s);
+    }
+}
+
+std::string
+detokenize_sentencepiece(const std::vector<int>& ids, const std::vector<std::string>& vocab) {
+    std::string out;
+    append_sentencepiece_tokens(out, ids, vocab);
+    return out;
 }
 
 }  // namespace nemo_speech::asr

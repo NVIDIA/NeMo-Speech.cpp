@@ -84,10 +84,10 @@ landmarks are:
 | `vulkan-diar` | Vulkan standalone diarization build |
 | `<backend>-server` | ASR, diarization, TTS, HTTP API, realtime WebSocket, and playground |
 | `cuda-full` | CUDA server plus normalization, Flashlight, and language frontends |
-| `developer` | CPU components, examples, tests, and tools |
+| `developer` | CPU speech components plus HTTP, gRPC, examples, tests, and tools |
 
-`server` is the preset used by the source installer. It does not pull in NMT,
-protobuf, or gRPC. Use `cuda-full`, `developer`, or explicit CMake options when
+The `<backend>-server` presets are what the source installer uses. They do not
+pull in NMT, protobuf, or gRPC. Use `cuda-full`, `developer`, or explicit CMake options when
 those features and the separate `riva_server` executable are needed.
 
 The preset selects which components and ggml backend are compiled.
@@ -201,7 +201,7 @@ target containing the toolchain and sources:
 docker build --platform=linux/amd64 -f docker/Dockerfile --target runtime \
   -t nemo-speech-runtime:x86_64 .
 
-docker run --runtime=nvidia --gpus all -p 8080:8080 \
+docker run --gpus all -p 8080:8080 \
   -v "$PWD/models:/models:ro" nemo-speech-runtime:x86_64 \
   serve --host 0.0.0.0 --config /models/server.yaml
 ```

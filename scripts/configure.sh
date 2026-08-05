@@ -104,6 +104,18 @@ need_flashlight="$(cmake_bool_override NEMO_SPEECH_WITH_FLASHLIGHT "$need_flashl
 need_ja="$(cmake_bool_override NEMO_SPEECH_TTS_WITH_JA "$need_ja" "$@")"
 need_zh="$(cmake_bool_override NEMO_SPEECH_TTS_WITH_ZH "$need_zh" "$@")"
 
+lfs_pointer="$(git grep -Il '^version https://git-lfs.github.com/spec/v1$' -- . 2>/dev/null \
+    | while read -r path; do
+        if [[ "$path" != src/tts/tokenizer/mandarin_data/* || "$need_zh" = ON ]]; then
+            printf '%s\n' "$path"
+        fi
+    done | head -n 1 || true)"
+if [ -n "$lfs_pointer" ]; then
+    echo "error: required Git LFS content has not been materialized (for example: $lfs_pointer)" >&2
+    echo "       run: git lfs install && git lfs pull" >&2
+    exit 1
+fi
+
 missing=()
 require_submodule() { # require_submodule PATH SENTINEL
     if [ ! -e "$1/$2" ]; then

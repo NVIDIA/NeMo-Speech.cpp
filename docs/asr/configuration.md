@@ -44,7 +44,10 @@ column lists the short flag where one exists - the dotted form
 | `asr.decoder.beam_threshold` | `--beam-threshold` | `20.0` | beam pruning threshold |
 | `asr.decoder.lm_weight` | `--lm-weight` | `0.8` | LM rescoring weight |
 | `asr.decoder.word_insertion_score` | `--word-score` | `1.0` | word insertion bonus |
-| `asr.decoder.max_boost` | `--max-boost` | `10.0` | max per-word boost magnitude |
+| `asr.decoder.max_boost` | `--max-boost` | `10.0` | CTC: max per-word boost magnitude |
+| `asr.decoder.boosting_tree_alpha` | `--boosting-tree-alpha` | `1.0` | RNNT word-boosting weight (0 disables) |
+| `asr.decoder.boosting_max_boost` | `--boosting-max-boost` | `5.0` | RNNT boost clamp (greedy-safe) |
+| `asr.decoder.boosting_depth_scaling` | `--boosting-depth-scaling` | `2.0` | RNNT per-token depth scaling |
 | `asr.vad.model_path` | `--vad-model` | - | Silero VAD GGUF (empty = no VAD) |
 | `asr.vad.masker.mask_enable` | `--vad-masking` | `false` | mask silence mel frames |
 | `asr.vad.masker.onset` | `--vad-onset` | `0.5` | prob > onset → enter speech |
@@ -118,34 +121,58 @@ language model, lexicon, and audio domain.
 
 Per-request word boosting biases the decoder toward caller-supplied phrases
 (names, jargon). Sent via `RecognitionConfig.speech_contexts` (`{phrases[],
-boost}`); stock clients expose `--boosted_words` + `--boosted_words_score`:
+boost}`); stock clients expose `--boosted_words` + `--boosted_words_score`.
+The same name and shape apply on every surface: gRPC, HTTP form field, realtime
+`session.update` (`[{"phrases": ["..."], "boost": N}]`), and the CLI
+`--speech-context` flags. HTTP `prompt` is an OpenAI-compat shim: one phrase at
+boost 10. Requests are portable between CTC and cache-aware RNNT; each clamps
+to its safe range. Heads without boosting support (greedy CTC without an LM,
+Parakeet TDT) ignore `speech_contexts` with a one-time warning.
+
+**Tokenizer (both heads):** boost phrases are tokenized with the SentencePiece
+tokenizer **embedded in the GGUF** (`asr.tokenizer.spm_model`), which is
+guaranteed to match the model's vocab. GGUFs converted before the embed:
+re-convert with `convert_model.py`, or (CTC only) pass an external
+`asr.decoder.tokenizer_path` as an override.
+
+**CTC (flashlight, beam)** - requires the flashlight LM decoder
+(`asr.decoder.lm_path` + `asr.decoder.lexicon_path`); greedy CTC with no LM
+ignores `speech_contexts` (warns once). The boost is a per-word bump inside the
+beam-search LM score: competing hypotheses push back, so scores run high.
+Clamp `asr.decoder.max_boost` (default `10`); typical requests 8-10.
 
 ```bash
+nemo-speech serve \
+    --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
+    --lm-path lm.bin --lexicon lexicon.txt
+
 riva_streaming_asr_client --riva_uri=localhost:50051 \
     --audio_file=audio.wav --language_code=en-US \
     --boosted_words="nvidia,parakeet,nemotron" --boosted_words_score=8.0
 ```
 
-Scores are clamped to `asr.decoder.max_boost` (10 by default).
-
-Decoder boosting requires the **flashlight LM decoder** (`asr.decoder.lm_path` +
-`asr.decoder.lexicon_path`). Heads with no LM ignore `speech_contexts` (warn
-once) - greedy CTC and RNNT have no decoder to bias. Two decoder-boosting tiers:
-in-vocab words get a per-word LM bump; OOV / multi-word phrases are encoded with
-SentencePiece - set `asr.decoder.tokenizer_path` (the model's
-`tokenizer.model`), else OOV phrases are skipped (warns once).
+**Cache-aware RNNT (greedy)** - built in, no flashlight or LM artifacts:
+phrases compile into a context-biasing tree (Aho-Corasick shallow fusion, the
+approach NeMo uses). Greedy has no competing hypothesis to push back, so
+each point of score is far more potent than on CTC - roughly 3x. Clamp `asr.decoder.boosting_max_boost`
+(default `5.0`); typical requests 2-3. Tune deployment-wide strength with
+`asr.decoder.boosting_tree_alpha` (default `1.0`, `0` disables);
+`asr.decoder.boosting_depth_scaling` (default `2.0`) shapes how the score grows
+along a phrase match.
 
 ```bash
-nemo-speech serve \
-    --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
-    --lm-path lm.bin --lexicon lexicon.txt \
-    --tokenizer tokenizer.model     # enables OOV / multi-word boosting
+riva_streaming_asr_client --riva_uri=localhost:50051 \
+    --audio_file=audio.wav --language_code=en-US \
+    --boosted_words="Kowalczyk,Nemotron" --boosted_words_score=3.0
 ```
+
+A CTC-scale request against an RNNT head is safe: the score clamps to 5.0 and
+stays in the stable region (no repeats or insertions).
 
 ## VAD feature masking
 
 Optional Silero VAD floors silence mel frames before the encoder, matching
-Riva's `vad_plus_masker`. **Off by default even with a VAD model loaded** -
+NVIDIA Riva's VAD feature-masking behavior. **Off by default even with a VAD model loaded** -
 the default Riva configuration uses VAD for endpointing without feature masking
 (`mask_features=false`). Enable masking with `asr.vad.masker.mask_enable`
 (`--vad-masking 1`). Always compiled; composes with greedy or LM decoding on both
@@ -197,7 +224,7 @@ nemo-speech serve --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
     --endpointing --stop-history-eou-ms 1000
 
 # VAD-driven EOU, RNNT:
-nemo-speech serve --asr.model.path nemotron-speech-streaming-0.6b.gguf --gpu 0 \
+nemo-speech serve --asr.model.path nemotron-speech-streaming-en-0.6b.q8_0.gguf --gpu 0 \
     --endpointing --vad-based-eou 1 --vad-model models/silero-v6.2.0.gguf
 ```
 
@@ -249,7 +276,7 @@ These request gates are independent.
 
 ## Riva parity: known exclusions
 
-Intentional differences from Riva include:
+Intentional differences a side-by-side with riva-speech will surface:
 
 - **LINEAR_PCM only.** Mono 16-bit PCM from 8-96 kHz is accepted and resampled
   to the model rate with a streaming anti-alias filter. FLAC, µ-law, A-law, and

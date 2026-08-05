@@ -3,6 +3,7 @@
 // Converts encoder chunks into tokens and owns per-stream decoder state.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -34,6 +35,19 @@ struct DecoderConfig {
     // repeats spuriously. Clamping caps that at the largest value that still
     // selects without repeating; raise it only knowingly.
     double max_boost = 10.0;
+    // RNNT context-biasing (word boosting) shallow-fusion weight: the boosting
+    // tree contributes alpha * arc_score to the joint logits at each greedy
+    // step. 0 disables RNNT boosting. Independent of the flashlight (CTC) path.
+    double boosting_tree_alpha = 1.0;
+    // Per-token depth scaling for the RNNT boosting tree (NeMo RNN-T default
+    // 2.0): tokens after the first in a phrase get a larger score.
+    double boosting_depth_scaling = 2.0;
+    // Upper clamp on the per-request boost folded into the RNNT boosting
+    // shallow-fusion alpha. riva clamps to 10 (for beam search); the edge RNNT
+    // path is greedy, which has no competing hypothesis, so a high boost makes
+    // the boosted words insert spuriously / repeat. 5.0 keeps enough headroom
+    // for harder words while staying well below riva's beam-oriented 10.
+    double boosting_max_boost = 5.0;
     void Register(common::ParameterParser& p) {
         p.Register(
             "kind",
@@ -70,6 +84,16 @@ struct DecoderConfig {
         p.Register(
             "max_boost", &max_boost, "Max magnitude of a speech-context word boost",
             {"--max-boost"});
+        p.Register(
+            "boosting_tree_alpha", &boosting_tree_alpha,
+            "RNNT word-boosting shallow-fusion weight (0 disables)", {"--boosting-tree-alpha"});
+        p.Register(
+            "boosting_depth_scaling", &boosting_depth_scaling,
+            "RNNT word-boosting per-token depth scaling", {"--boosting-depth-scaling"});
+        p.Register(
+            "boosting_max_boost", &boosting_max_boost,
+            "Upper clamp on the RNNT word-boosting alpha (greedy-safe default 5.0)",
+            {"--boosting-max-boost"});
     }
 };
 
@@ -144,6 +168,12 @@ class Decoder {
     virtual std::vector<int> step(
         const float* enc_out, int d_model, int T, int64_t frame_offset) = 0;
 
+    // CUDA RNNT may keep the encoder projection resident and bind it directly
+    // into the decoder graph. Other decoders retain the host-buffer path.
+    virtual std::vector<int> step_device(const ggml_runtime::DeviceTensor&, int, int, int64_t) {
+        throw std::runtime_error("decoder does not accept device-resident encoder output");
+    }
+
     virtual int blank_id() const = 0;
     virtual const std::vector<std::string>& vocab() const = 0;
 
@@ -206,13 +236,12 @@ class Decoder {
         // applies it. Warn once so speech_contexts aren't dropped silently on
         // the greedy CTC / RNNT heads.
         if (!opts.speech_contexts.empty()) {
-            static bool warned = false;
-            if (!warned) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
                 std::fprintf(
                     stderr,
                     "[asr] speech_contexts (word boosting) ignored: this head has no LM; "
                     "boosting requires the Flashlight decoder (--lm-path/--lexicon).\n");
-                warned = true;
             }
         }
     }
@@ -222,5 +251,7 @@ class Decoder {
 // Replaces U+2581 ('▁') with a single space and trims leading space.
 std::string detokenize_sentencepiece(
     const std::vector<int>& ids, const std::vector<std::string>& vocab);
+void append_sentencepiece_tokens(
+    std::string& text, const std::vector<int>& ids, const std::vector<std::string>& vocab);
 
 }  // namespace nemo_speech::asr
