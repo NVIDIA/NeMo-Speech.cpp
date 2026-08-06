@@ -57,33 +57,33 @@ Each capture was approximately 2.3–2.9 seconds including leading and trailing 
 195.10 ms
 151.69 ms
 163.22 ms
-620.39 ms
 ```
 
-Minimum: 151.69 ms; maximum: 670.57 ms; median: 195.10 ms.
+Minimum: 151.69 ms; maximum: 670.57 ms; median: 179.16 ms.
 
 ### Custom observed
 
 ```text
+620.39 ms
 73.63 ms
 77.19 ms
 74.29 ms
 72.31 ms
 ```
 
-Minimum: 72.31 ms; maximum: 77.19 ms; median: approximately 73.96 ms.
+Minimum: 72.31 ms; maximum: 620.39 ms; median: 74.29 ms. The 620.39 ms reading was the first custom observation.
 
 | Short scenario | Samples | Minimum | Maximum | Median |
 | --- | ---: | ---: | ---: | ---: |
-| Default | 5 | 151.69 ms | 670.57 ms | 195.10 ms |
-| Custom | 4 | 72.31 ms | 77.19 ms | 73.96 ms |
+| Default | 4 | 151.69 ms | 670.57 ms | 179.16 ms |
+| Custom | 5 | 72.31 ms | 620.39 ms | 74.29 ms |
 
-The preliminary median comparison is 195.10 ms versus 73.96 ms: an observed difference of approximately 121.14 ms and an observed relative reduction of approximately 62%.
+The preliminary median comparison is 179.16 ms versus 74.29 ms: an observed difference of approximately 104.87 ms and an observed relative reduction of approximately 58.5%.
 
 > [!IMPORTANT]
 > The short-speech results are preliminary observations made with the local microphone. Although the same phrase, computer, microphone, HTTP client, and model were used, every recording has small differences in duration, silence, intensity, and pronunciation.
 >
-> Therefore, the approximately 62% reduction represents behavior observed in this environment. It is not yet a scientific benchmark or performance guarantee.
+> Therefore, the approximately 58.5% median reduction represents behavior observed in this environment. It is not yet a scientific benchmark or performance guarantee.
 
 The microphone does not execute inference. It creates an in-memory mono PCM16 WAV and sends it to the same HTTP endpoint; inference runs entirely in whichever default or custom server is open. The capture interval is not included in the reported `HTTP + inference` time. The pattern was consistent enough to warrant investigation, but it still needs repeated testing with exactly the same short WAV on both runtimes.
 
@@ -91,7 +91,7 @@ The microphone does not execute inference. It creates an in-memory mono PCM16 WA
 
 The current evidence suggests that the custom runtime does not significantly change throughput for longer recordings, such as the 11-second JFK sample.
 
-However, on the tested GTX 1060 6 GB, the custom runtime showed substantially lower and more consistent latency for short requests around two to three seconds.
+However, on the tested GTX 1060 6 GB, the custom runtime showed a substantially lower median latency for short requests around two to three seconds. Four custom observations were around 72–80 ms, but the first custom observation was a 620.39 ms outlier, so consistency is not established.
 
 This may indicate that the fork changes affect fixed per-request overhead, backend initialization, buffer preparation, kernel selection, synchronization, or another short-request execution path. The exact cause has not yet been isolated.
 

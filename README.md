@@ -57,9 +57,9 @@ math.
 On the tested GTX 1060 6 GB, the custom runtime showed performance similar to the default runtime
 for the included 11-second JFK sample.
 
-For manually recorded short requests around two to three seconds, the custom runtime showed
-substantially lower latency in the local test environment, typically around 72–80 ms, while the
-default runtime was generally above 130 ms and showed larger latency spikes.
+For manually recorded short requests around two to three seconds, four of the custom observations
+were around 72–80 ms, while one first custom observation was 620.39 ms. The default observations
+were generally above 130 ms and also included a large latency spike.
 
 These short-request results are preliminary. A fully reproducible benchmark using the same short
 English WAV is being prepared, pending a redistributable fixture.
@@ -67,7 +67,7 @@ English WAV is being prepared, pending a redistributable fixture.
 | Test | Default median | Custom median | Observation |
 | --- | ---: | ---: | --- |
 | 11-second JFK WAV | 181.41 ms | 178.26 ms | Similar performance |
-| Short local speech | 195.10 ms | 73.96 ms | Large preliminary difference |
+| Short local speech | 179.16 ms | 74.29 ms | Large preliminary median difference |
 
 See [Pascal performance observations](docs/pascal-performance-observations.md) for the complete
 methodology, raw values, limitations, and reproduction instructions.
