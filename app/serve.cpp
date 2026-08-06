@@ -641,6 +641,9 @@ print_serve_help(const char* program) {
 #endif
         "  --device, --backend DEVICE\n"
         "                          auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
+        "  --skinny-q8 auto|on|off CUDA control: auto uses the safe Pascal fallback; off\n"
+        "                          replaces GGML_SKINNY_Q8=0; on requires SM 8.0+\n"
+        "  --suppress-cuda-graph-log Suppress only the repeated CUDA-graph architecture log\n"
         "  --config FILE           Apply YAML configuration\n"
 #if defined(NEMO_SPEECH_CLI_ASR)
         "  --asr.* VALUE           Override ASR engine configuration\n"
