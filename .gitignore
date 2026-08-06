@@ -7,3 +7,8 @@ __pycache__/
 core.*
 client_logs/
 .venv/
+.tools/
+benchmark-results/
+models/
+results/
+*.gguf
