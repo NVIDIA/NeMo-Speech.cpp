@@ -15,9 +15,9 @@ or explicit component options add NMT, optional language frontends, and
 ```bash
 nemo-speech serve \
   --asr-model models/asr.q8_0.gguf \
-  --tts-model models/magpie.f16.gguf \
-  --codec-model models/nano-codec.decoder.f16.gguf \
-  --tokenizer-dir models/magpie-tokenizer
+  --tts-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+  --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+  --tokenizer-dir models/magpie-tts/extracted
 # HTTP API and playground: http://127.0.0.1:8080/
 
 # Open the playground after the listener is ready.

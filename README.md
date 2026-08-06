@@ -31,23 +31,23 @@ and the native release-archive flow.
 
 ## Quick start
 
-The runtime consumes GGUF models. Until the preconverted GGUF is published,
-use the included converter to download the public `.nemo` checkpoint and
-produce a portable Q8 model. Complete the one-time
-[conversion setup](docs/model-conversion.md) first; it does not install NeMo.
+Download the ready-to-run Q8 GGUF from the model's Hugging Face repository,
+then transcribe the bundled sample:
 
 ```bash
-python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
-  --outfile nemotron-speech-streaming-en-0.6b.q8_0.gguf
+hf download nvidia/nemotron-speech-streaming-en-0.6b \
+  nemotron-speech-streaming-en-0.6b.q8_0.gguf \
+  --local-dir models
 
 nemo-speech transcribe test_files/asr/wav/test/jfk.wav \
-  --model nemotron-speech-streaming-en-0.6b.q8_0.gguf
+  --model models/nemotron-speech-streaming-en-0.6b.q8_0.gguf
 ```
 
-The converter downloads only the `.nemo` checkpoint through the standard
-Hugging Face cache. The CLI selects an available backend and handles common
-mono or stereo PCM WAV sample rates automatically. Substitute your own WAV
-file after verifying the bundled sample.
+Install the `hf` command with `pip install -U huggingface_hub` if needed. The
+CLI selects an available backend and handles common mono or stereo PCM WAV
+sample rates automatically. Substitute your own WAV file after verifying the
+bundled sample. See [ASR models](docs/asr/models.md) for the other published
+GGUFs and [model conversion](docs/model-conversion.md) for custom checkpoints.
 
 ## Command line
 
@@ -62,7 +62,7 @@ Start the same runtime as a local HTTP service and open the playground:
 
 ```bash
 nemo-speech serve \
-  --asr-model nemotron-speech-streaming-en-0.6b.q8_0.gguf \
+  --asr-model models/nemotron-speech-streaming-en-0.6b.q8_0.gguf \
   --open
 ```
 

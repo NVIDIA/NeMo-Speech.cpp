@@ -1,35 +1,20 @@
-# ASR models and conversion
+# ASR models
 
-The runtime loads a single **GGUF** file per model. The root
-[`convert_model.py`](../../convert_model.py) converter ingests a NeMo checkpoint
-and emits the unified `asr.*` metadata this SDK expects.
-
-The source checkpoint can be either:
-
-- a **public model repository on Hugging Face**; the converter downloads its
-  `.nemo` checkpoint directly, or
-- a **local NeMo checkpoint** - any compatible `.nemo` archive, including a
-  fine-tune.
-
-The head type (CTC, RNNT, or TDT) is auto-detected from the NeMo
-`model_config.yaml`; override with `--head-type {ctc,rnnt,tdt}`.
-
-Install the conversion dependencies (a virtual environment is recommended):
+The runtime loads one **GGUF** per ASR model. Ready-to-run Q8 GGUFs are
+published alongside the original checkpoints on Hugging Face. Install the
+Hugging Face CLI if needed:
 
 ```bash
-pip install -r requirements.txt
+pip install -U huggingface_hub
 ```
-
-The converters read `.nemo` archives directly and do not require
-`nemo_toolkit`. Remote checkpoints use the standard Hugging Face cache.
 
 ## Parakeet CTC (1.1B, offline / buffered streaming)
 
 Hugging Face: [nvidia/parakeet-ctc-1.1b](https://huggingface.co/nvidia/parakeet-ctc-1.1b)
 
 ```bash
-python3 convert_model.py nvidia/parakeet-ctc-1.1b \
-    --outfile ./parakeet-ctc-1.1b.gguf
+hf download nvidia/parakeet-ctc-1.1b \
+    parakeet-ctc-1.1b.q8_0.gguf --local-dir models
 ```
 
 ## Parakeet TDT (0.6B v3, multilingual, offline transducer)
@@ -39,22 +24,22 @@ frame span. 25 European languages, self-punctuating. Hugging Face:
 [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
 
 ```bash
-python3 convert_model.py nvidia/parakeet-tdt-0.6b-v3 \
-    --outfile ./parakeet-tdt-0.6b-v3.q8_0.gguf --outtype q8_0
+hf download nvidia/parakeet-tdt-0.6b-v3 \
+    parakeet-tdt-0.6b-v3.q8_0.gguf --local-dir models
 ```
 
-The converter detects the TDT head automatically. Not cache-aware trained:
-inference is full-utterance only. Streaming requests are rejected with an
-error; use offline recognition (`nemo-speech transcribe`,
-`POST /v1/audio/transcriptions`, gRPC `Recognize`).
+The model is not cache-aware trained: inference is full-utterance only.
+Streaming requests are rejected with an error; use offline recognition
+(`nemo-speech transcribe`, `POST /v1/audio/transcriptions`, or gRPC
+`Recognize`).
 
 ## Nemotron-Speech Streaming (0.6B, cache-aware RNNT)
 
 Hugging Face: [nvidia/nemotron-speech-streaming-en-0.6b](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
 
 ```bash
-python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
-    --outfile ./nemotron-speech-streaming-en-0.6b.q8_0.gguf
+hf download nvidia/nemotron-speech-streaming-en-0.6b \
+    nemotron-speech-streaming-en-0.6b.q8_0.gguf --local-dir models
 ```
 
 ## Nemotron 3.5 (0.6B, multilingual, prompt-conditioned RNNT)
@@ -64,18 +49,23 @@ across 40+ language-locales (`EncDecRNNTBPEModelWithPrompt`). Hugging Face:
 [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 
 ```bash
-python3 convert_model.py nvidia/nemotron-3.5-asr-streaming-0.6b \
-    --outfile ./nemotron-3.5-asr-streaming-0.6b.q8_0.gguf --outtype q8_0
+hf download nvidia/nemotron-3.5-asr-streaming-0.6b \
+    nemotron-3.5-asr-streaming-0.6b.q8_0.gguf --local-dir models
 ```
 
-The converter emits the prompt metadata (`asr.rnnt.num_prompts`,
-`asr.rnnt.prompt_dictionary`) and the runtime applies the model's `prompt_kernel`
-language fusion ahead of the RNNT joint. Select the language via the request's
-`language_code` (`en-US`, `es-ES`, ...) or `auto`; the `<lang>` tag is stripped
-from the transcript and the detected language is returned on
+The GGUF contains the prompt metadata (`asr.rnnt.num_prompts`,
+`asr.rnnt.prompt_dictionary`), and the runtime applies the model's
+`prompt_kernel` language fusion ahead of the RNNT joint. Select the language via
+the request's `language_code` (`en-US`, `es-ES`, ...) or `auto`; the `<lang>` tag
+is stripped from the transcript and the detected language is returned on
 `SpeechRecognitionAlternative.language_code` and per-word `WordInfo.language_code`:
 
 ```bash
+riva_server \
+    --asr.model.path models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf \
+    --bind 0.0.0.0:50051
+
+# In another shell:
 riva_streaming_asr_client --riva_uri=localhost:50051 \
     --audio_file=audio.wav --language_code=auto \
     --interim_results=false --word_time_offsets=true
@@ -84,6 +74,23 @@ riva_streaming_asr_client --riva_uri=localhost:50051 \
 When ITN is configured with a parent grammar directory (`en/`, `es/`, ...),
 the same explicit or auto-detected language code selects the grammar used for
 the final transcript. Unsupported languages remain unchanged.
+
+## Converting custom ASR checkpoints
+
+The root [`convert_model.py`](../../convert_model.py) converter accepts a local
+`.nemo` archive, an extracted NeMo checkpoint, a local Hugging Face model
+directory, or a Hugging Face repository ID. It emits the unified `asr.*`
+metadata the runtime expects. The head type (CTC, RNNT, or TDT) is auto-detected
+from `model_config.yaml`; override it with `--head-type {ctc,rnnt,tdt}`.
+
+Install the conversion dependencies in a virtual environment:
+
+```bash
+pip install -r requirements.txt
+```
+
+The converter reads `.nemo` archives directly and does not require
+`nemo_toolkit`. Remote checkpoints use the standard Hugging Face cache.
 
 ## Quantization (`--outtype`)
 

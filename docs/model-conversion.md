@@ -1,5 +1,10 @@
 # Model conversion
 
+Published NeMo-Speech.cpp models provide ready-to-run GGUF files on their
+Hugging Face pages; see the [ASR](asr/models.md) and [TTS](tts/models.md) model
+guides. Use the converter for compatible custom checkpoints, alternate
+quantization choices, and optional sidecar models that do not publish a GGUF.
+
 All model families use the same root entry point:
 
 ```bash

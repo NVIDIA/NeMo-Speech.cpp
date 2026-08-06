@@ -131,12 +131,12 @@ endif()
 # Drop-in cuBLAS shim (native GEMM, no cuBLASLt). When ON, builds
 # libcublas.so.13 from kernels/cublas_shim.cu. The shipping container image
 # substitutes it for real cuBLAS to drop ~564 MB; put it on LD_LIBRARY_PATH
-# ahead of the system cuBLAS to reproduce that GEMM path natively. See README.
-# On by default: the shim is the intended production GEMM path (it's what the
-# container images ship in place of real cuBLAS). Only built when GGML_CUDA is
-# also ON (see the target below); a no-op for Metal/Vulkan/CPU builds. Set OFF
-# to link real cuBLAS instead.
-option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (libcublas.so.13, native GEMM, no cuBLASLt)" ON)
+# ahead of the system cuBLAS to reproduce that GEMM path natively.
+# Disabled by default for source builds, which link the CUDA toolkit's cuBLAS.
+# Container builds enable the shim explicitly to reduce the runtime image size.
+# It is only built when GGML_CUDA is also ON (see the target below), and is a
+# no-op for Metal, Vulkan, and CPU builds.
+option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (libcublas.so.13, native GEMM, no cuBLASLt)" OFF)
 
 # Whether the linked ggml has the project ASR patches applied (ggml-patches/:
 # the fused rel-pos attention op and the F16 depthwise-conv kernel). The ASR

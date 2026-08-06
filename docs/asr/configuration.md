@@ -107,7 +107,7 @@ in the ASR library.
 
 ```bash
 riva_server \
-    --asr.model.path parakeet-ctc-1.1b.gguf --bind 0.0.0.0:50051 --gpu 0 \
+    --asr.model.path parakeet-ctc-1.1b.q8_0.gguf --bind 0.0.0.0:50051 --gpu 0 \
     --lm-path /path/to/lm.bin --lexicon /path/to/lexicon.txt
 ```
 
@@ -142,10 +142,11 @@ beam-search LM score: competing hypotheses push back, so scores run high.
 Clamp `asr.decoder.max_boost` (default `10`); typical requests 8-10.
 
 ```bash
-nemo-speech serve \
-    --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
-    --lm-path lm.bin --lexicon lexicon.txt
+riva_server \
+    --asr.model.path parakeet-ctc-1.1b.q8_0.gguf --gpu 0 \
+    --lm-path lm.bin --lexicon lexicon.txt --bind 0.0.0.0:50051
 
+# In another shell:
 riva_streaming_asr_client --riva_uri=localhost:50051 \
     --audio_file=audio.wav --language_code=en-US \
     --boosted_words="nvidia,parakeet,nemotron" --boosted_words_score=8.0
@@ -161,6 +162,11 @@ each point of score is far more potent than on CTC - roughly 3x. Clamp `asr.deco
 along a phrase match.
 
 ```bash
+riva_server \
+    --asr.model.path nemotron-speech-streaming-en-0.6b.q8_0.gguf \
+    --gpu 0 --bind 0.0.0.0:50051
+
+# In another shell:
 riva_streaming_asr_client --riva_uri=localhost:50051 \
     --audio_file=audio.wav --language_code=en-US \
     --boosted_words="Kowalczyk,Nemotron" --boosted_words_score=3.0
@@ -186,7 +192,7 @@ pip install "silero-vad==6.2.0"
 python3 convert_model.py silero --outfile models/silero-v6.2.0.gguf
 
 nemo-speech serve \
-    --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
+    --asr.model.path parakeet-ctc-1.1b.q8_0.gguf --gpu 0 \
     --lm-path lm.bin --lexicon lexicon.txt \
     --vad-model models/silero-v6.2.0.gguf --vad-masking 1
 ```
@@ -220,7 +226,7 @@ time would finalize before the tail is decoded.
 
 ```bash
 # token-silence EOU (default, no VAD), CTC, 1 s threshold:
-nemo-speech serve --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
+nemo-speech serve --asr.model.path parakeet-ctc-1.1b.q8_0.gguf --gpu 0 \
     --endpointing --stop-history-eou-ms 1000
 
 # VAD-driven EOU, RNNT:
@@ -250,7 +256,7 @@ request; stages with no artifact are skipped at zero cost.
 
 ```bash
 nemo-speech serve \
-    --asr.model.path parakeet-ctc-1.1b.gguf --gpu 0 \
+    --asr.model.path parakeet-ctc-1.1b.q8_0.gguf --gpu 0 \
     --profanity-list profanity.txt \
     --itn-model-dir /path/to/sparrowhawk_grammars \
     --pnc-model pnc-bert-base-en.q8_0.gguf

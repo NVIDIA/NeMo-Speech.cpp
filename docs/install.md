@@ -3,7 +3,9 @@
 The current public installation path builds and installs the backend-matched
 ASR, diarization, and TTS CLI, HTTP API, realtime WebSocket endpoint, and browser
 playground from a source checkout. Models are distributed separately and are
-never downloaded when the server starts.
+never downloaded when the server starts. Ready-to-run GGUFs are available from
+the linked Hugging Face repositories in the [ASR](asr/models.md) and
+[TTS](tts/models.md) model guides.
 
 The installers also contain the native release flow. Once a public release URL
 is configured, they prefer release archives containing the CLI, runtime

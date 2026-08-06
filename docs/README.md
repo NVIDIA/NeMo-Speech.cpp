@@ -18,8 +18,8 @@ Start with:
 
 ## ASR
 
-- [Models and conversion](asr/models.md) - download from Hugging Face or convert
-  a local NeMo checkpoint to GGUF; quantization options.
+- [Models](asr/models.md) - ready-to-run GGUF downloads, custom checkpoint
+  conversion, and quantization options.
 - [Configuration](asr/configuration.md) - full `asr.*` key reference plus the
   decoding / word-boosting / VAD / endpointing / diarization / postprocessing knobs.
 - [Feature matrix and customization](asr/customization.md) - which models
@@ -27,7 +27,8 @@ Start with:
 
 ## TTS
 
-- [Models and conversion](tts/models.md) - MagpieTTS + NanoCodec GGUF conversion.
+- [Models](tts/models.md) - ready-to-run MagpieTTS and NanoCodec GGUF downloads,
+  tokenizer setup, and custom conversion.
 - [Configuration](tts/configuration.md) - `tts.*` key reference and serving.
 
 ## NMT

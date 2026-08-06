@@ -1,38 +1,34 @@
-# TTS models and conversion
+# TTS models
 
 The TTS pipeline loads two GGUFs: a **MagpieTTS** token generator and a **NeMo
-NanoCodec** decoder. Both are converted from NeMo checkpoints - either public
-models from Hugging Face or compatible local NeMo checkpoints (an extracted
-checkpoint or `.nemo` archive can be passed to the converter).
+NanoCodec** decoder. Ready-to-run F16 GGUFs are published in their Hugging Face
+repositories. Install the Hugging Face CLI if needed:
 
-The unified [`convert_model.py`](../../convert_model.py) entry point defaults to
-**`--outtype f16`** for both models; pass `--outtype f32` to keep full precision.
-
-The converters read `.nemo` archives directly with PyTorch and do not require
-`nemo_toolkit`. The optional `scripts/tts/tokenize-magpietts.py` debugging
-helper does use NeMo's Python tokenizer implementation.
+```bash
+pip install -U huggingface_hub
+```
 
 ## MagpieTTS token generator
 
 Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidia/magpie_tts_multilingual_357m)
-(the repo is a single `.nemo` archive).
 
 ```bash
-# 1. download the .nemo
-hf download nvidia/magpie_tts_multilingual_357m --local-dir magpie-tts
+# Download the v2602 GGUF and the original archive containing its tokenizer.
+hf download nvidia/magpie_tts_multilingual_357m \
+    --include magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --include magpie_tts_multilingual_357m.nemo \
+    --local-dir models/magpie-tts
 
-# 2. extract it - this directory holds the tokenizer the server loads at runtime
-mkdir -p magpie-tts/extracted
-tar -xf magpie-tts/magpie_tts_multilingual_357m.nemo -C magpie-tts/extracted
-
-# 3. convert to GGUF (the converter also accepts the .nemo path directly)
-python3 convert_model.py magpie-tts/extracted \
-    --outfile magpie-tts/magpie.f16.gguf --outtype f16
+# Extract the tokenizer assets loaded by the runtime.
+mkdir -p models/magpie-tts/extracted
+tar -xf models/magpie-tts/magpie_tts_multilingual_357m.nemo \
+    -C models/magpie-tts/extracted
 ```
 
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
-they are not part of the GGUF. Extract the `.nemo` (step 2) and pass that
-directory to the server as `--tts.tokenizer-model-dir` (here `magpie-tts/extracted`).
+they are not part of the GGUF. Extract the `.nemo` and pass that directory to
+the server as `--tts.tokenizer-model-dir` (here
+`models/magpie-tts/extracted`).
 The model-specific IPA/text tokenizer assets are loaded from this directory.
 Japanese tokenization requires a build with `NEMO_SPEECH_TTS_WITH_JA=ON`
 (disabled by default), which builds Open JTalk, MeCab, and the NAIST dictionary.
@@ -58,14 +54,39 @@ server, YAML, and offline runner examples.
 ## NanoCodec decoder
 
 Hugging Face: [nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps)
-(a single `.nemo` archive; no tokenizer needed - it's a codec decoder).
+(no tokenizer is needed for the codec decoder).
 
 ```bash
-hf download nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps --local-dir nano-codec
-python3 convert_model.py \
-    nano-codec/nemo-nano-codec-22khz-1.89kbps-21.5fps.nemo \
-    --outfile nano-codec/nano-codec.decoder.f16.gguf
+hf download nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps \
+    nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --local-dir models/nano-codec
 ```
+
+Run both models together:
+
+```bash
+nemo-speech synthesize "Hello from Magpie Multilingual." \
+    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tokenizer-dir models/magpie-tts/extracted \
+    --output output.wav
+```
+
+## Converting custom TTS checkpoints
+
+The unified [`convert_model.py`](../../convert_model.py) entry point accepts
+compatible local `.nemo` archives and extracted NeMo checkpoints. It defaults
+to `--outtype f16` for MagpieTTS and NanoCodec; pass `--outtype f32` to retain
+full precision.
+
+```bash
+pip install -r requirements.txt
+python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.f16.gguf
+```
+
+The converter reads `.nemo` archives directly with PyTorch and does not require
+`nemo_toolkit`. The optional `scripts/tts/tokenize-magpietts.py` debugging
+helper does use NeMo's Python tokenizer implementation.
 
 ## Notes
 

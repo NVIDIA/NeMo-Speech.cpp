@@ -5,7 +5,7 @@ separate `riva_server` hosts Riva-compatible gRPC.
 Either process can load ASR, TTS, and NMT together. For how keys are set (YAML,
 environment, and CLI precedence), see
 [Server configuration](../server.md#engine-and-listener-configuration). To
-obtain and convert the models, see [TTS models](models.md).
+download the models and extract the tokenizer, see [TTS models](models.md).
 
 ## Serving
 
@@ -17,9 +17,9 @@ or with flags for HTTP:
 
 ```bash
 nemo-speech serve \
-    --tts.magpie-model magpie-tts/magpie.f16.gguf \
-    --tts.codec-model nano-codec/nano-codec.decoder.f16.gguf \
-    --tts.tokenizer-model-dir magpie-tts/extracted \
+    --tts.magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --tts.codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tts.tokenizer-model-dir models/magpie-tts/extracted \
     --host 127.0.0.1 --port 8080 \
     --tts.language-code en-US --tts.voice-name John --tts.benchmark true
 ```
@@ -72,9 +72,9 @@ Pass the grammar directory to the CLI or server:
 
 ```bash
 nemo-speech synthesize "I have 2 apples." \
-    --magpie-model models/magpie.f16.gguf \
-    --codec-model models/nano-codec.decoder.f16.gguf \
-    --tokenizer-dir models/magpie/extracted \
+    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tokenizer-dir models/magpie-tts/extracted \
     --tn-model-dir models/tn_configs \
     --output normalized.wav
 ```
@@ -83,8 +83,8 @@ The equivalent YAML setting is:
 
 ```yaml
 tts:
-  magpie-model: /models/magpie.f16.gguf
-  codec-model: /models/nano-codec.decoder.f16.gguf
+  magpie-model: /models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf
+  codec-model: /models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf
   tokenizer-model-dir: /models/magpie-tts/extracted
   tn-model-dir: /models/tn_configs
   language-code: en-US
@@ -105,9 +105,9 @@ Use the unified CLI for synthesis without a server:
 
 ```bash
 nemo-speech synthesize "Hello from Magpie." \
-    --magpie-model models/magpie.f16.gguf \
-    --codec-model models/nano-codec.decoder.f16.gguf \
-    --tokenizer-dir models/magpie/extracted \
+    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tokenizer-dir models/magpie-tts/extracted \
     --speaker 0 --output magpie.wav
 ```
 

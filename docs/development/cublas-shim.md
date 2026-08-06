@@ -14,22 +14,22 @@ WMMA tensor-core paths, but **no cuBLASLt**. It inherits
 PTX for ad-hoc builds. Dropping real cuBLAS + cuBLASLt is the bulk of the
 container size. The shim is built as a separate library from ggml.
 
-It's a normal CMake target, **`NEMO_SPEECH_CUBLAS_SHIM` (default `ON`)**, built
-whenever `GGML_CUDA` is also on (Linux only, auto-skipped on Windows; a no-op
-for Metal/Vulkan/CPU builds). So a CUDA
-build produces `libcublas.so.13` in its binary directory by default; the
-Dockerfile relies on that and skips real cuBLAS/cuBLASLt in the library closure.
-To run a local CLI command with the shim, put it first on the loader path:
+It's an optional CMake target, **`NEMO_SPEECH_CUBLAS_SHIM` (default `OFF`)**,
+built when explicitly enabled together with `GGML_CUDA` (Linux only,
+auto-skipped on Windows; a no-op for Metal, Vulkan, and CPU builds). Normal
+source builds therefore link the CUDA toolkit's cuBLAS and cuBLASLt. The
+Dockerfile enables the shim explicitly and skips those libraries in the runtime
+image's library closure.
+
+To build and exercise the container GEMM path outside the container, enable the
+shim and put its output directory first on the loader path:
 
 ```bash
-scripts/configure.sh cuda-asr
+scripts/configure.sh cuda-asr -DNEMO_SPEECH_CUBLAS_SHIM=ON
 cmake --build --preset cuda-asr
 LD_LIBRARY_PATH=$PWD/build/cuda-asr/bin \
   ./build/cuda-asr/bin/nemo-speech transcribe audio.wav --model model.gguf
 ```
-
-Pass `-DNEMO_SPEECH_CUBLAS_SHIM=OFF` to opt out and link real cuBLAS instead
-(e.g. to A/B the shim against stock cuBLAS).
 
 ## Custom GPU kernels
 

@@ -89,9 +89,9 @@ to a file.
 
 ```bash
 nemo-speech synthesize "Hello" \
-  --magpie-model magpie.f16.gguf \
-  --codec-model nanocodec.f16.gguf \
-  --tokenizer-dir magpie-tokenizer \
+  --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+  --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+  --tokenizer-dir models/magpie-tts/extracted \
   --output hello.wav
 ```
 
@@ -111,17 +111,18 @@ Run `nemo-speech doctor` to see the compiled backends and detected devices.
 
 ## Convert and inspect models
 
+Published model repositories provide ready-to-run GGUFs. Use the converter when
+working with a custom checkpoint or producing a different quantization:
+
 ```bash
-python convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
-  --outfile nemotron-speech-streaming-en-0.6b.q8_0.gguf
-nemo-speech model info nemotron-speech-streaming-en-0.6b.q8_0.gguf
+python convert_model.py custom-model.nemo --outfile custom-model.q8_0.gguf
+nemo-speech model info custom-model.q8_0.gguf
 ```
 
-The converter downloads the published `.nemo` checkpoint through the standard
-Hugging Face cache and writes the GGUF consumed by the runtime. See
-[model conversion](model-conversion.md) for the isolated Python environment and
-other model families. Model files remain local; pass their paths explicitly or
-record a reusable multi-model setup in a
+The converter can also resolve Hugging Face repository IDs through the standard
+cache. See [model conversion](model-conversion.md) for the isolated Python
+environment and supported model families. Model files remain local; pass their
+paths explicitly or record a reusable multi-model setup in a
 [YAML configuration file](server.md#engine-and-listener-configuration).
 
 ## Benchmark
