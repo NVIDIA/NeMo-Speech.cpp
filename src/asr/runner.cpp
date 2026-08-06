@@ -602,8 +602,81 @@ OfflineRunner::OfflineRunner(
     : model_(model), decoder_cfg_(cfg.decoder) {
     if (!model_)
         throw std::invalid_argument("OfflineRunner: null model");
+    if (cfg.batching.offline_bucket_ms > 0) {
+        bucket_samples_ = static_cast<size_t>(cfg.batching.offline_bucket_ms) *
+                          static_cast<size_t>(model_->sample_rate()) / 1000;
+    }
     if (model_->head_kind() == HeadKind::Ctc)
         ctc_decoder_ = make_ctc_decoder(static_cast<CtcModel*>(model_), cfg, std::move(flashlight));
+}
+
+// Trailing-silence pad to the next bucket boundary: the offline microbatchers
+// batch only identical frame counts, so bucketed lengths are what lets mixed-
+// duration requests share batches (and graph shapes). Skipped if the pad would
+// cross the positional-encoding budget; the exact length is always safe.
+size_t
+OfflineRunner::max_offline_samples_() const {
+    if (!exceeds_offline_position_limit(*model_, audio_.size(), model_->sample_rate()))
+        return audio_.size();
+    size_t lo = static_cast<size_t>(model_->sample_rate());
+    size_t hi = audio_.size();
+    while (hi - lo > static_cast<size_t>(model_->fe().hop_length())) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (exceeds_offline_position_limit(*model_, mid, model_->sample_rate()))
+            hi = mid;
+        else
+            lo = mid;
+    }
+    return lo;
+}
+
+// Center of the quietest 100 ms window in [target - search_span, target], so
+// segment boundaries land in pauses rather than mid-word.
+size_t
+OfflineRunner::snap_to_quiet_(size_t target, size_t search_span) const {
+    const size_t win = static_cast<size_t>(model_->sample_rate()) / 10;
+    const size_t hop = win / 2;
+    if (target <= search_span || search_span < 2 * win || target > audio_.size())
+        return target;
+    const size_t begin = target - search_span;
+    size_t best = target;
+    double best_energy = std::numeric_limits<double>::max();
+    for (size_t off = begin; off + win <= target; off += hop) {
+        double energy = 0.0;
+        for (size_t i = off; i < off + win; ++i) energy += audio_[i] * audio_[i];
+        if (energy < best_energy) {
+            best_energy = energy;
+            best = off + win / 2;
+        }
+    }
+    return best;
+}
+
+std::vector<std::pair<size_t, size_t>>
+OfflineRunner::offline_segments_() const {
+    const size_t max_seg = max_offline_samples_();
+    std::vector<std::pair<size_t, size_t>> segments;
+    size_t off = 0;
+    while (audio_.size() - off > max_seg) {
+        size_t cut = snap_to_quiet_(off + max_seg, max_seg / 10);
+        cut = std::max(cut, off + max_seg / 2);
+        segments.emplace_back(off, cut - off);
+        off = cut;
+    }
+    segments.emplace_back(off, audio_.size() - off);
+    return segments;
+}
+
+void
+OfflineRunner::pad_audio_to_bucket_() {
+    if (bucket_samples_ == 0 || audio_.empty())
+        return;
+    const size_t padded = (audio_.size() + bucket_samples_ - 1) / bucket_samples_ * bucket_samples_;
+    if (padded == audio_.size())
+        return;
+    if (exceeds_offline_position_limit(*model_, padded, model_->sample_rate()))
+        return;
+    audio_.resize(padded, 0.0f);
 }
 
 void
@@ -624,7 +697,13 @@ OfflineRunner::finalize() {
         static_cast<float>(audio_.size()) / static_cast<float>(model_->sample_rate());
     if (audio_.empty())
         return update;
+    pad_audio_to_bucket_();
 
+    // Audio past the positional-encoding budget is split at quiet points and
+    // decoded segment by segment through one stateful decoder with cumulative
+    // frame offsets - the same contract the streaming runners use, so
+    // transcripts and word timings stitch without any seam handling here.
+    const auto segments = offline_segments_();
     std::unique_ptr<Decoder> owned_decoder;
     Decoder* decoder = nullptr;
     std::vector<int> tokens;
@@ -633,23 +712,28 @@ OfflineRunner::finalize() {
         decoder = ctc_decoder_.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
-        if (auto* greedy = dynamic_cast<GreedyCtcDecoder*>(decoder)) {
-            std::vector<int32_t> best_ids;
-            std::vector<float> best_probs;
-            int T = 0;
-            ctc->infer_ctc_greedy(audio_.data(), audio_.size(), best_ids, best_probs, T);
-            tokens = greedy->step_compact(best_ids.data(), best_probs.data(), T, 0);
-        } else {
-            std::vector<float> log_probs;
-            int T = 0, C = 0;
-            ctc->infer_ctc(audio_.data(), audio_.size(), log_probs, T, C);
-            tokens = decoder->step(log_probs.data(), C, T, 0);
+        int64_t frame_offset = 0;
+        for (const auto& [off, len] : segments) {
+            std::vector<int> seg_tokens;
+            if (auto* greedy = dynamic_cast<GreedyCtcDecoder*>(decoder)) {
+                std::vector<int32_t> best_ids;
+                std::vector<float> best_probs;
+                int T = 0;
+                ctc->infer_ctc_greedy(audio_.data() + off, len, best_ids, best_probs, T);
+                seg_tokens =
+                    greedy->step_compact(best_ids.data(), best_probs.data(), T, frame_offset);
+                frame_offset += T;
+            } else {
+                std::vector<float> log_probs;
+                int T = 0, C = 0;
+                ctc->infer_ctc(audio_.data() + off, len, log_probs, T, C);
+                seg_tokens = decoder->step(log_probs.data(), C, T, frame_offset);
+                frame_offset += T;
+            }
+            tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
         }
     } else {
         auto* transducer = static_cast<RnntModel*>(model_);
-        std::vector<float> enc;
-        int T = 0;
-        transducer->infer_offline(audio_.data(), audio_.size(), enc, T, prompt_index_);
         owned_decoder = transducer->make_transducer_decoder(decoder_cfg_);
         decoder = owned_decoder.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
@@ -661,10 +745,20 @@ OfflineRunner::finalize() {
         // some cases truncating the hypothesis. HF/NeMo offline greedy decode
         // applies no such bias, and this model already self-punctuates.
         const auto decode_begin = std::chrono::steady_clock::now();
-        tokens = decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, 0);
+        int64_t frame_offset = 0;
+        for (const auto& [off, len] : segments) {
+            std::vector<float> enc;
+            int T = 0;
+            transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
+            auto seg_tokens =
+                decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+            frame_offset += T;
+            tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
+        }
         if (std::getenv("NEMO_SPEECH_TIMING")) {
             std::fprintf(
-                stderr, "[timing] offline-transducer decode frames=%d = %.2f ms\n", T,
+                stderr, "[timing] offline-transducer decode frames=%lld segments=%zu = %.2f ms\n",
+                static_cast<long long>(frame_offset), segments.size(),
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - decode_begin)
                     .count());

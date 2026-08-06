@@ -43,6 +43,9 @@ struct BatchingConfig {
     // Persistent recurrent/cache state is much larger than queued work, so
     // size its indexed row arena independently from queue backpressure.
     int state_arena_slots = 16;
+    // Silence-pad offline utterances to this duration multiple so mixed
+    // lengths share batch keys and graph shapes. 0 = off.
+    int offline_bucket_ms = 0;
 
     void Register(common::ParameterParser& p) {
         p.Register("enabled", &enabled, "Enable transparent dynamic batching");
@@ -57,6 +60,10 @@ struct BatchingConfig {
         p.Register(
             "state_arena_slots", &state_arena_slots,
             "Maximum concurrent stateful streams held in device row arenas");
+        p.Register(
+            "offline_bucket_ms", &offline_bucket_ms,
+            "Pad offline utterances with silence to this duration multiple so "
+            "mixed lengths batch together (0 = off)");
     }
 };
 
@@ -104,6 +111,21 @@ class ScopedBatchCohort {
 
    private:
     int previous_;
+};
+
+// RAII participant counter; count() reports concurrency including this scope.
+class ScopedActiveCount {
+   public:
+    explicit ScopedActiveCount(std::atomic<int>& counter) : counter_(counter), count_(++counter_) {}
+    ~ScopedActiveCount() { --counter_; }
+    ScopedActiveCount(const ScopedActiveCount&) = delete;
+    ScopedActiveCount& operator=(const ScopedActiveCount&) = delete;
+
+    int count() const { return count_; }
+
+   private:
+    std::atomic<int>& counter_;
+    int count_;
 };
 
 // Forms one bounded streaming-ingress wave across RecognitionStreams.

@@ -50,6 +50,8 @@ vocab_self_punctuates(const std::vector<std::string>& vocab) {
     return false;
 }
 
+}  // namespace
+
 bool
 exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int input_sample_rate) {
     if (n_samples == 0)
@@ -71,8 +73,6 @@ exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int inpu
     }
     return frames > enc.pos_emb_max_len;
 }
-
-}  // namespace
 
 Recognizer::Recognizer(RecognizerConfig cfg)
     : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)),
@@ -412,7 +412,10 @@ RecognitionStream::flush_diar_deficit_(const StreamingUpdate& u) {
 
 std::optional<Result>
 RecognitionStream::next() {
-    const ScopedBatchCohort cohort_scope(pending_cohort_target_);
+    // Inherit an enclosing cohort (e.g. Recognizer::recognize's ingress
+    // result) when this stream has none of its own.
+    const ScopedBatchCohort cohort_scope(
+        pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     auto u = runner_->step();
     if (u.is_final) {
         flush_diar_deficit_(u);
@@ -436,7 +439,8 @@ RecognitionStream::next() {
 
 Result
 RecognitionStream::finish() {
-    const ScopedBatchCohort cohort_scope(pending_cohort_target_);
+    const ScopedBatchCohort cohort_scope(
+        pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     pending_cohort_target_ = 0;
     if (resampler_ && !resampler_flushed_) {
         resampled_audio_.clear();
@@ -469,7 +473,9 @@ Result
 Recognizer::recognize(
     const float* samples, size_t n, AsrRequestOptions opts, const std::string& language_code,
     int sample_rate) {
-    const ScopedBatchCohort cohort_scope(offline_ingress_batches_.arrive());
+    // A lone in-flight request skips the ingress gather wait entirely.
+    const ScopedActiveCount active(active_offline_requests_);
+    const ScopedBatchCohort cohort_scope(offline_ingress_batches_.arrive(active.count()));
     const ggml_backend_t gpu = bm_->gpu_backend_handle();
     const bool vulkan =
         gpu != nullptr && std::string(ggml_backend_name(gpu)).rfind("Vulkan", 0) == 0;
@@ -482,10 +488,8 @@ Recognizer::recognize(
         supports_streaming) {
         runner = make_runner();
     } else {
-        if (exceeds_offline_limit)
-            throw std::runtime_error(
-                "audio exceeds this model's offline positional-encoding limit and the model does "
-                "not support streaming");
+        // Past the positional-encoding limit OfflineRunner splits the audio at
+        // quiet points and decodes segment by segment.
         runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     }
     if (model_->has_prompt())

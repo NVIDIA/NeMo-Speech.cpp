@@ -159,6 +159,7 @@ class Recognizer {
     RecognizerConfig cfg_;
     IngressBatchCoordinator streaming_ingress_batches_;
     IngressBatchCoordinator offline_ingress_batches_;
+    std::atomic<int> active_offline_requests_{0};
     std::atomic<int> active_streaming_ingress_{0};
     // Shared by CTC flashlight streams; null for other decoders.
     std::shared_ptr<const FlashlightResources> flashlight_resources_;
