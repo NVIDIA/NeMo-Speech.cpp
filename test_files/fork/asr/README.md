@@ -36,3 +36,10 @@ not as a redistribution grant:
 It is intended only for functional testing and reproducible benchmarking once its legal status is
 verified. Do not invent a license for this recording. A reviewer should document the actual source,
 license, and any attribution requirements before it is added to the repository.
+
+## Short English benchmark fixture
+
+`short-en.wav` is reserved for the two-to-three-second HTTP latency benchmark. No suitable short
+English WAV with a verified redistribution license was found in the local project material, so it is
+not included and `short-en.txt` is intentionally not created. Before adding one, document its exact
+phrase, duration, PCM16/16 kHz/mono format, SHA-256, source, license, and attribution here.

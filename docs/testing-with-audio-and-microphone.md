@@ -4,6 +4,10 @@ This guide covers the Pascal-oriented Windows workflow: build the runtime, test 
 start a persistent HTTP server, and use the separate microphone client. The microphone client does
 not load a model; the server owns the loaded model.
 
+For the long and short latency observations, raw measurements, and method limitations, see
+[Pascal performance observations](pascal-performance-observations.md). That document is the source
+of truth for performance numbers; this guide focuses on the workflow.
+
 ## Test-fixture licensing status
 
 The expected fixture path is `test_files/fork/asr/teste-en.wav`, but the WAV is intentionally not
@@ -113,6 +117,14 @@ After the reviewed WAV exists, run:
 It performs an excluded warm-up, records wall-clock time for each subsequent run, and saves JSON
 and Markdown with minimum, maximum, mean, median, P95, hardware, model, commit, and command in
 `benchmark-results/`. That directory is ignored by Git.
+
+## Short HTTP benchmark
+
+The comparison script is `scripts/windows/benchmark-short-wav.ps1`. It sends the same
+`test_files/fork/asr/short-en.wav` to an already-running default or custom server and measures only
+HTTP plus inference. The fixture is currently pending a verified redistribution license, so the
+script intentionally stops until `short-en.wav` is supplied. See
+[Pascal performance observations](pascal-performance-observations.md) for usage and methodology.
 
 ## Publishing checklist
 

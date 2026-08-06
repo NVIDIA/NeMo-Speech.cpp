@@ -44,7 +44,7 @@ uses the existing CUDA fallback. `--suppress-cuda-graph-log` does not enable CUD
 not make inference faster. Neither change alters model precision, model contents, or transcription
 math.
 
-### Tested environment and preliminary observations
+### Tested environment
 
 - OS: Windows 11
 - GPU: NVIDIA GeForce GTX 1060 6 GB (Pascal, Compute Capability 6.1)
@@ -52,18 +52,25 @@ math.
 - Model: Nemotron 3.5 ASR Streaming 0.6B Q8 GGUF
 - Mode: persistent HTTP server
 
-Manual observations with the microphone client and persistent HTTP server included complete
-phrases at 27.035x and 27.220x realtime, and shorter captures from 9.601x to 20.497x realtime.
-They were verified manually by UNDER192103 / Under Nouzen. See
-[Pascal fork overview](docs/pascal-fork-overview.md) for the complete results table, context,
-limitations, and reproduction notes.
+## Pascal performance observations
 
-> [!IMPORTANT]
-> These are preliminary observations, not a proven percentage improvement over upstream. The old
-> and current runs did not necessarily use the same WAV input, duration, or controlled benchmark
-> protocol. A repeatable comparison with warm-up, multiple runs, median, and P95 is still needed.
-> The persistent server and CUDA execution are the main causes of the observed low latency; the new
-> flags primarily improve compatibility, safety, diagnostics, usability, and log readability.
+On the tested GTX 1060 6 GB, the custom runtime showed performance similar to the default runtime
+for the included 11-second JFK sample.
+
+For manually recorded short requests around two to three seconds, the custom runtime showed
+substantially lower latency in the local test environment, typically around 72–80 ms, while the
+default runtime was generally above 130 ms and showed larger latency spikes.
+
+These short-request results are preliminary. A fully reproducible benchmark using the same short
+English WAV is being prepared, pending a redistributable fixture.
+
+| Test | Default median | Custom median | Observation |
+| --- | ---: | ---: | --- |
+| 11-second JFK WAV | 181.41 ms | 178.26 ms | Similar performance |
+| Short local speech | 195.10 ms | 73.96 ms | Large preliminary difference |
+
+See [Pascal performance observations](docs/pascal-performance-observations.md) for the complete
+methodology, raw values, limitations, and reproduction instructions.
 
 ### Current status
 
@@ -230,6 +237,7 @@ Windows, and container instructions are in
 | [Client integration](docs/clients.md) | OpenAI SDKs, curl, and Riva gRPC clients |
 | [Troubleshooting](docs/troubleshooting.md) | `doctor` output and common runtime failures |
 | [Build from source](docs/build.md) | Presets, optional components, dependencies, containers, and artifacts |
+| [Pascal performance](docs/pascal-performance-observations.md) | GTX 1060 short/long latency observations and reproducible benchmark instructions |
 | [All documentation](docs/README.md) | ASR, TTS, NMT, configuration, and developer references |
 
 ## License

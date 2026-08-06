@@ -14,6 +14,8 @@ Start with:
 - [Native SDK integration](sdk.md)
 - [Troubleshooting](troubleshooting.md)
 - [Build from source](build.md)
+- [Pascal performance observations](pascal-performance-observations.md) - GTX 1060 short/long
+  latency observations and the planned reproducible short-WAV benchmark.
 
 ## ASR
 

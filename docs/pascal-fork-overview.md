@@ -84,38 +84,19 @@ change kernels, affect memory use, or improve inference speed.
 | Model | Nemotron 3.5 ASR Streaming 0.6B Q8 GGUF |
 | Mode | Persistent HTTP server |
 
-## Preliminary observed results
+## Performance observations
 
-The following runs were manually verified by **UNDER192103 / Under Nouzen**, using the microphone
-client and a persistent HTTP server.
+The source of truth for the current numerical results is
+[Pascal performance observations](pascal-performance-observations.md). It records both the
+reproducible 11-second JFK comparison and the preliminary two-to-three-second microphone comparison,
+including raw values, methodology, and limitations.
 
-| Observed runtime/test | Audio duration | HTTP + inference | RTF | Speed |
-| --- | ---: | ---: | ---: | ---: |
-| Previous configuration | approximately 2.2 s | approximately 114–116 ms | not recorded | approximately 19–20x |
-| Custom — complete phrase | 2.054 s | 75.98 ms | 0.0370 | 27.035x |
-| Custom — complete phrase | 1.976 s | 72.59 ms | 0.0367 | 27.220x |
-| Custom — short speech | 1.040 s | 50.74 ms | 0.0488 | 20.497x |
-| Custom — very short capture | 0.650 s | 67.70 ms | 0.1042 | 9.601x |
-
-Recognized text in the complete-phrase tests:
-
-```text
-Olá! Como que você está hoje?
-```
-
-> [!IMPORTANT]
-> These are real observations from development, but the previous and current tests did not
-> necessarily use the same WAV input, audio duration, or identical formal test suite. The
-> difference between approximately 114–116 ms and approximately 72–76 ms must therefore be treated
-> as preliminary, not as a proven percentage improvement.
->
-> A controlled benchmark using the same audio file, warm-up, multiple repetitions, median, and P95
-> will be published separately. Do not describe this fork as “40% faster” until that experiment
-> exists.
-
-The main contributors to low observed latency are CUDA execution and keeping the model loaded in a
-persistent server. The new flags are primarily improvements to compatibility, safety, diagnostics,
-ease of execution, and log readability.
+The custom runtime is effectively equivalent to default for the measured 11-second sample. The
+manual short-request observations are promising but not yet a controlled same-WAV benchmark. The
+main expected low-latency factors are persistent serving and CUDA execution; the fork flags are for
+compatibility, safety, diagnostics, and log readability. `--suppress-cuda-graph-log` is not a speed
+optimization, and `--skinny-q8 auto` selects the existing Pascal-compatible fallback rather than a
+new Pascal kernel.
 
 ## Reproduction
 
@@ -163,7 +144,7 @@ Not yet implemented:
 - DP4A-based optimization;
 - CUDA Graphs for Pascal;
 - tests on other GTX 10 GPUs;
-- formal reproducible benchmark between upstream and this fork.
+- formal reproducible same-WAV short-request benchmark between upstream and this fork.
 
 ## Community contributions
 
@@ -183,7 +164,8 @@ controlled benchmark.
 
 ## Next steps
 
-1. Create a reproducible upstream-versus-fork benchmark protocol.
+1. Add a reviewed, redistributable short English WAV and run the reproducible upstream-versus-fork
+   benchmark protocol.
 2. Gather community validation across the GTX 10 family.
 3. Investigate Pascal-appropriate optimizations, including DP4A, only after measurement identifies
    a meaningful bottleneck.
