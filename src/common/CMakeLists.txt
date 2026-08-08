@@ -12,6 +12,7 @@ add_library(nemo_speech_common STATIC
     audio_resampler.cpp
     json.cpp
     parameter_parser.cpp
+    subtitles.cpp
 )
 
 # Public so config headers' `#include "parameter_parser.h"` reaches every

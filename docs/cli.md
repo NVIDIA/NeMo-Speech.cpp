@@ -27,6 +27,10 @@ nemo-speech transcribe recording.wav --format vtt --output recording.vtt
 nemo-speech transcribe recording.wav --json --word-times
 ```
 
+SRT and WebVTT cues prefer sentence, clause, and pause boundaries. Cues use up
+to two lines, target 37 characters per line, and allow small whole-word
+overflow within the common 42-character subtitle limit.
+
 Plain results are written to stdout. Progress and diagnostics are written to
 stderr so output can be redirected safely. Global `--json`, `--quiet`, and
 `--verbose` options work across commands.

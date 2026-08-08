@@ -20,6 +20,7 @@
 #include "model_utils.h"
 #include "parameter_parser.h"
 #include "recognizer.h"
+#include "subtitles.h"
 #if defined(NEMO_SPEECH_CLI_NMT)
 #include "speech_translator.h"
 #endif
@@ -28,14 +29,6 @@ namespace {
 namespace fs = std::filesystem;
 namespace asr = nemo_speech::asr;
 
-struct Word {
-    std::string text;
-    int start_ms = 0;
-    int end_ms = 0;
-    float confidence = 0.0f;
-    int speaker = 0;
-};
-
 struct Transcript {
     std::string text;
     std::string source_text;
@@ -43,7 +36,7 @@ struct Transcript {
     float confidence = 0.0f;
     float audio_seconds = 0.0f;
     std::vector<std::string> languages;
-    std::vector<Word> words;
+    std::vector<nemo_speech::subtitle::Word> words;
 };
 
 enum class OutputFormat { Text, Json, Srt, Vtt };
@@ -304,57 +297,6 @@ transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::pa
     return transcript;
 }
 
-bool
-attaches_to_previous(const std::string& word) {
-    static const std::string punctuation = ".,!?;:%)]}\xE2\x80\x9D\xE2\x80\x99";
-    return !word.empty() && punctuation.find(word) != std::string::npos;
-}
-
-std::string
-join_words(const std::vector<Word>& words, size_t begin, size_t end) {
-    std::string output;
-    for (size_t i = begin; i < end; ++i) {
-        if (!output.empty() && !attaches_to_previous(words[i].text))
-            output += ' ';
-        output += words[i].text;
-    }
-    return output;
-}
-
-struct Cue {
-    int start_ms;
-    int end_ms;
-    std::string text;
-};
-
-std::vector<Cue>
-make_cues(const Transcript& transcript) {
-    std::vector<Cue> cues;
-    if (transcript.words.empty()) {
-        if (!transcript.text.empty())
-            cues.push_back(
-                {0, std::max(1, static_cast<int>(transcript.audio_seconds * 1000)),
-                 transcript.text});
-        return cues;
-    }
-    size_t begin = 0;
-    for (size_t i = 1; i <= transcript.words.size(); ++i) {
-        const bool end = i == transcript.words.size();
-        const int duration =
-            end ? 0 : transcript.words[i].end_ms - transcript.words[begin].start_ms;
-        const int pause = end ? 0 : transcript.words[i].start_ms - transcript.words[i - 1].end_ms;
-        const std::string candidate =
-            end ? std::string() : join_words(transcript.words, begin, i + 1);
-        if (end || duration > 5000 || pause > 800 || candidate.size() > 84) {
-            cues.push_back(
-                {transcript.words[begin].start_ms, transcript.words[i - 1].end_ms,
-                 join_words(transcript.words, begin, i)});
-            begin = i;
-        }
-    }
-    return cues;
-}
-
 std::string
 timestamp(int milliseconds, bool vtt) {
     milliseconds = std::max(0, milliseconds);
@@ -401,7 +343,8 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
         const bool vtt = format == OutputFormat::Vtt;
         if (vtt)
             output << "WEBVTT\n\n";
-        const auto cues = make_cues(t);
+        const auto cues = nemo_speech::subtitle::make_cues(
+            t.words, t.text, static_cast<int>(t.audio_seconds * 1000));
         for (size_t i = 0; i < cues.size(); ++i) {
             if (!vtt)
                 output << i + 1 << '\n';

@@ -22,6 +22,7 @@
 #include "audio_resampler.h"
 #include "engine_registry.h"
 #include "json.h"
+#include "subtitles.h"
 
 namespace nemo_speech::http {
 namespace {
@@ -273,12 +274,21 @@ transcript_response(
         return alternative.transcript + "\n";
     if (format == "srt" || format == "vtt") {
         const bool vtt = format == "vtt";
-        int end = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
-        if (!alternative.words.empty())
-            end = std::max(end, alternative.words.back().end_time);
-        std::string output = vtt ? "WEBVTT\n\n" : "1\n";
-        output += timecode(0, vtt) + " --> " + timecode(end, vtt) + "\n";
-        output += alternative.transcript + "\n";
+        int audio_ms = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
+        std::vector<subtitle::Word> words;
+        words.reserve(alternative.words.size());
+        for (const auto& word : alternative.words)
+            words.push_back(
+                {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag});
+        const auto cues = subtitle::make_cues(words, alternative.transcript, audio_ms);
+        std::string output = vtt ? "WEBVTT\n\n" : "";
+        for (size_t i = 0; i < cues.size(); ++i) {
+            if (!vtt)
+                output += std::to_string(i + 1) + "\n";
+            output += timecode(cues[i].start_ms, vtt) + " --> " +
+                      timecode(std::max(cues[i].start_ms + 1, cues[i].end_ms), vtt) + "\n";
+            output += cues[i].text + "\n\n";
+        }
         return output;
     }
     Value root(Value::Object{});
@@ -553,7 +563,8 @@ struct Server::Impl {
                     form_bool(request, "automatic_punctuation", true);
                 options.verbatim_transcripts = form_bool(request, "verbatim");
                 options.profanity_filter = form_bool(request, "profanity_filter");
-                options.enable_word_time_offsets = format == "verbose_json";
+                options.enable_word_time_offsets =
+                    format == "verbose_json" || format == "srt" || format == "vtt";
                 options.enable_speaker_diarization = form_bool(request, "diarization");
                 if (options.enable_speaker_diarization) {
                     const std::string speakers = form_value(request, "max_speaker_count");

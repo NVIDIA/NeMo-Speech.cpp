@@ -15,6 +15,11 @@ target_link_libraries(test_shared_utilities PRIVATE
     nemo_speech_common nemo_speech_engine_registry)
 add_test(NAME shared_utilities COMMAND test_shared_utilities)
 
+add_executable(test_subtitles
+    ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_subtitles.cpp)
+target_link_libraries(test_subtitles PRIVATE nemo_speech_common)
+add_test(NAME subtitles COMMAND test_subtitles)
+
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND AND
    (NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR OR

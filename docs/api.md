@@ -48,7 +48,8 @@ curl -X POST http://127.0.0.1:8080/v1/audio/transcriptions \
 
 Response (`json`): `{"text": "..."}`. `verbose_json` adds `task`, `language`,
 `duration`, and `words[]` (`word`, `start`, `end`, `confidence`, and `speaker`
-when diarization is on).
+when diarization is on). SRT and WebVTT responses use the same readable,
+punctuation-aware cue grouping as the file CLI.
 
 ## WebSocket /v1/realtime
 

@@ -271,6 +271,17 @@ def main() -> None:
                     is not None,
                     "WebVTT timestamps",
                 )
+            blocks = subtitle.text.strip().split("\n\n")
+            if response_format == "vtt":
+                blocks = blocks[1:]
+            text_lines = []
+            for block in blocks:
+                lines = block.splitlines()
+                cue_text = lines[2:] if response_format == "srt" else lines[1:]
+                require(1 <= len(cue_text) <= 2, "subtitle cue line count")
+                text_lines.extend(cue_text)
+            require(text_lines, "subtitle cue text")
+            require(max(map(len, text_lines)) <= 42, "subtitle line length")
 
         with wave.open(args.audio, "rb") as audio:
             require(audio.getnchannels() == 1, "WebSocket fixture must be mono")
