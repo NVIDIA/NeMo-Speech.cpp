@@ -254,6 +254,10 @@ class TdtGreedyDecoder : public Decoder {
     int prev_token_ = -1;
     int active_bank_ = 0;
     bool predictor_valid_ = false;
+    // A duration may advance past the end of one encoder block. Carry that
+    // remainder into the next step() so segmented and contiguous decoding
+    // present the same encoder clock to TDT.
+    int pending_skip_ = 0;
     RnntDecodeStats stats_;
     int64_t last_emit_frame_ = -1;
     bool compute_ts_ = false;

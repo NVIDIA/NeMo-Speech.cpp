@@ -579,6 +579,25 @@ test_tdt_zero_duration_guard() {
     check(ids.empty() && eng.joint_calls == 1, "tdt: blank duration zero advances immediately");
 }
 
+void
+test_tdt_duration_crosses_step_boundary() {
+    MockTdtEngine eng;
+    TdtGreedyDecoder dec(&eng);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> frame(2, 0.0f);
+    eng.rounds = {{blank, 2}};
+    check(dec.step(frame.data(), 2, 1, 0).empty(), "tdt: boundary setup is blank");
+
+    const int calls_before_skip = eng.joint_calls;
+    check(dec.step(frame.data(), 2, 1, 1).empty(), "tdt: carried duration skips a whole block");
+    check(eng.joint_calls == calls_before_skip, "tdt: skipped block performs no joint call");
+
+    eng.rounds = {{0, 1}};
+    const auto ids = dec.step(frame.data(), 2, 1, 2);
+    check(ids == std::vector<int>({0}), "tdt: emits after carried duration");
+    check(dec.last_emit_frame() == 2, "tdt: carries duration across step boundaries");
+}
+
 }  // namespace
 
 int
@@ -602,6 +621,7 @@ main() {
     test_rnnt_open_word_needs_finalize();
     test_tdt_duration_and_state_commit();
     test_tdt_zero_duration_guard();
+    test_tdt_duration_crosses_step_boundary();
     std::fprintf(stdout, g_fail ? "FAILED (%d)\n" : "ALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

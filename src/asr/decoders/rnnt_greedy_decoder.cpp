@@ -355,6 +355,7 @@ TdtGreedyDecoder::reset() {
     prev_token_ = engine_->rnnt_config().blank_id;
     active_bank_ = 0;
     predictor_valid_ = false;
+    pending_skip_ = 0;
     stats_ = {};
     last_emit_frame_ = -1;
     words_.clear();
@@ -364,6 +365,7 @@ TdtGreedyDecoder::reset() {
 
 void
 TdtGreedyDecoder::reset_utterance() {
+    pending_skip_ = 0;
     words_.clear();
     cur_open_ = false;
     cur_ = WordTiming{};
@@ -394,7 +396,8 @@ TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_o
     DecodeStepScope decode_scope(engine_);
 
     stats_.encoder_frames += static_cast<uint64_t>(T);
-    int t = 0;
+    int t = pending_skip_;
+    pending_skip_ = 0;
     while (t < T) {
         int symbols_added = 0;
         bool need_loop = true;
@@ -461,6 +464,7 @@ TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_o
         if (symbols_added == cfg.max_symbols_per_step && skip == 0)
             ++t;
     }
+    pending_skip_ = std::max(0, t - T);
     return emitted;
 }
 
