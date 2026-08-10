@@ -67,6 +67,41 @@ test_sentence_and_pause_boundaries() {
 }
 
 void
+test_adjacent_short_sentences_share_a_cue() {
+    const std::vector<Word> words{{"Yes.", 0, 250}, {"No.", 250, 1000}};
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 1000);
+    require(cues.size() == 1, "adjacent short sentences share one cue");
+    require(cues[0].text == "Yes. No.", "short sentence text is preserved");
+    require(cues[0].end_ms - cues[0].start_ms >= 834, "combined cue meets minimum duration");
+}
+
+void
+test_short_sentence_with_time_stays_separate() {
+    const std::vector<Word> words{{"Yes.", 0, 250}, {"No.", 900, 1200}};
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 1800);
+    require(cues.size() == 2, "short sentence stays separate when display time is available");
+    require(cues[0].text == "Yes." && cues[0].end_ms == 834, "first cue uses minimum duration");
+    require(cues[1].start_ms == 900 && cues[1].end_ms == 1734, "second cue uses minimum duration");
+}
+
+void
+test_title_abbreviation_does_not_split_sentence() {
+    const std::vector<Word> words{{"Dr.", 0, 220}, {"Smith", 220, 600}, {"arrived.", 600, 1054}};
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 1054);
+    require(cues.size() == 1, "title abbreviation stays with its sentence");
+    require(cues[0].text == "Dr. Smith arrived.", "abbreviation sentence text");
+}
+
+void
+test_suffix_abbreviation_can_end_sentence() {
+    const std::vector<Word> words{
+        {"John", 0, 220}, {"Jr.", 220, 450}, {"He", 900, 1050}, {"left.", 1050, 1400}};
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 1800);
+    require(cues.size() == 2, "suffix abbreviation may end a sentence");
+    require(cues[0].text == "John Jr." && cues[1].text == "He left.", "suffix sentence text");
+}
+
+void
 test_two_lines_and_utf8_character_count() {
     const std::vector<Word> words{
         {"Друзья,", 0, 300},      {"сегодня", 300, 600},       {"мы", 600, 800},
@@ -112,6 +147,10 @@ int
 main() {
     test_clause_wrapping_and_readable_duration();
     test_sentence_and_pause_boundaries();
+    test_adjacent_short_sentences_share_a_cue();
+    test_short_sentence_with_time_stays_separate();
+    test_title_abbreviation_does_not_split_sentence();
+    test_suffix_abbreviation_can_end_sentence();
     test_two_lines_and_utf8_character_count();
     test_duration_and_length_split_are_ordered();
     test_fallback_text();

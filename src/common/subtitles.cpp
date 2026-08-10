@@ -4,6 +4,7 @@
 #include "subtitles.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <limits>
 #include <sstream>
@@ -14,6 +15,10 @@ namespace {
 // BBC broadcast subtitles target two 37-character lines and 180 words per
 // minute. Netflix permits a 42-character outer line bound and cue durations
 // from 5/6 second through 7 seconds.
+// References:
+// https://www.bbc.co.uk/accessibility/forproducts/guides/subtitles/
+// https://partnerhelp.netflixstudios.com/hc/en-us/articles/215758617-Timed-Text-Style-Guide-General-Requirements
+// https://partnerhelp.netflixstudios.com/hc/en-us/articles/360051554394-Timed-Text-Style-Guide-Subtitle-Timing-Guidelines
 constexpr int kTargetLineCharacters = 37;
 constexpr int kMaximumCueCharacters = 2 * kTargetLineCharacters;
 constexpr int kMaximumCueDurationMs = 7000;
@@ -47,10 +52,22 @@ attaches_to_previous(const std::string& word) {
 }
 
 bool
+is_title_abbreviation(const std::string& word) {
+    std::string lower;
+    lower.reserve(word.size());
+    for (const unsigned char character : word)
+        lower.push_back(static_cast<char>(std::tolower(character)));
+    static const std::vector<std::string> titles{"capt.", "cmdr.", "col.", "dr.",  "gen.",
+                                                 "gov.",  "lt.",   "mr.",  "mrs.", "ms.",
+                                                 "prof.", "rep.",  "rev.", "sen.", "sgt."};
+    return std::find(titles.begin(), titles.end(), lower) != titles.end();
+}
+
+bool
 sentence_end(const std::string& word) {
     static const std::vector<std::string> punctuation{".",  "!",  "?", "\xE2\x80\xA6",
                                                       "。", "！", "？"};
-    return ends_with_any(word, punctuation);
+    return !is_title_abbreviation(word) && ends_with_any(word, punctuation);
 }
 
 bool
@@ -115,6 +132,14 @@ format_lines(const std::vector<Word>& words, size_t begin, size_t end) {
     return join_words(words, begin, best_break) + '\n' + join_words(words, best_break, end);
 }
 
+bool
+has_minimum_display_time(const std::vector<Word>& words, size_t begin, size_t end, int audio_ms) {
+    const int cue_start = std::max(0, words[begin].start_ms);
+    const int available_end =
+        end < words.size() ? words[end].start_ms : std::max(words[end - 1].end_ms, audio_ms);
+    return available_end - cue_start >= kMinimumCueDurationMs;
+}
+
 struct Group {
     size_t begin;
     size_t end;
@@ -156,7 +181,8 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
                 last_clause = end;
                 has_clause = true;
             }
-            if (sentence_end(words[current].text))
+            if (sentence_end(words[current].text) &&
+                has_minimum_display_time(words, begin, end, audio_ms))
                 break;
         }
         end = std::min(std::max(end, begin + 1), words.size());
