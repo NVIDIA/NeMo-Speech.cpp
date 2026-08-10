@@ -723,6 +723,12 @@ ConformerLayer::build_graph(
     ggml_runtime::TensorBag conv_in;
     conv_in.add_tensor(ggml_runtime::ggml_bf_tensor(residual, input_tensor.buft));
     conv_in = norm_conv_->build_graph(session, conv_in, session_tensor_container);
+    if (cache == nullptr && input_tensors.tensor_count() >= 4) {
+        auto normalized = conv_in.get_tensor(0);
+        auto valid = input_tensors.get_tensor(3);
+        auto masked = ggml_mul(bf_ctx.ctx, normalized.tensor, valid.tensor);
+        conv_in.set_first_tensor(ggml_runtime::ggml_bf_tensor(masked, normalized.buft));
+    }
     if (cache == nullptr) {
         conv_in = conv_->build_graph(session, conv_in, session_tensor_container);
     } else if (cache->dw_conv_w_ct != nullptr && conv_->supports_ct_layout()) {
@@ -761,6 +767,9 @@ ConformerLayer::build_graph(
         out.add_tensor(input_tensors.get_tensor(1));
         if (input_tensors.tensor_count() >= 3) {
             out.add_tensor(input_tensors.get_tensor(2));
+        }
+        if (input_tensors.tensor_count() >= 4) {
+            out.add_tensor(input_tensors.get_tensor(3));
         }
     }
     return out;
@@ -1252,6 +1261,8 @@ FastConformerEncoder::build_graph_from_embeddings(
     ggml_runtime::TensorContainer* session_tensor_container) {
     GGML_ASSERT(cfg_.cache_mode == CacheMode::Disabled);
     auto pre = input_tensors;
+    const bool has_external_mask = input_tensors.tensor_count() >= 2;
+    const bool has_valid_mask = input_tensors.tensor_count() >= 3;
 
     // xscaling: NeMo's PositionalEncoding.forward does x = x * sqrt(d_model).
     if (cfg_.xscaling) {
@@ -1263,7 +1274,9 @@ FastConformerEncoder::build_graph_from_embeddings(
     }
 
     {
-        auto pe_out = pos_enc_->build_graph(session, pre, session_tensor_container);
+        ggml_runtime::TensorBag pos_in;
+        pos_in.add_tensor(pre.get_tensor(0));
+        auto pe_out = pos_enc_->build_graph(session, pos_in, session_tensor_container);
 
         // Every layer projects the same positional embedding. With BF16
         // weights, round that shared input once rather than letting each of
@@ -1279,6 +1292,11 @@ FastConformerEncoder::build_graph_from_embeddings(
             shared_pe.add_tensor(x);
             shared_pe.add_tensor(ggml_runtime::ggml_bf_tensor(pos_bf16, pos.buft));
             pe_out = shared_pe;
+        }
+
+        ggml_runtime::ggml_bf_tensor attention_mask(nullptr, nullptr);
+        if (has_external_mask) {
+            attention_mask = input_tensors.get_tensor(1);
         }
 
         // Offline attention mask: only built when the model asked for a
@@ -1334,8 +1352,20 @@ FastConformerEncoder::build_graph_from_embeddings(
             ggml_tensor* mask = ggml_scale(bf_ctx.ctx, ggml_step(bf_ctx.ctx, penalty), -1e9f);
             // Reshape to (T_kv, T_q, 1, 1) so it broadcasts across n_head & batch.
             mask = ggml_reshape_4d(bf_ctx.ctx, mask, T, T, 1, 1);
-            pe_out.add_tensor(ggml_runtime::ggml_bf_tensor(mask, bf_ctx.buft));
+            if (has_external_mask) {
+                const int B = static_cast<int>(x.tensor->ne[2]);
+                auto target = ggml_new_tensor_4d(bf_ctx.ctx, GGML_TYPE_F32, T, T, 1, B);
+                mask = ggml_add(
+                    bf_ctx.ctx, ggml_repeat(bf_ctx.ctx, mask, target),
+                    ggml_repeat(bf_ctx.ctx, attention_mask.tensor, target));
+            }
+            attention_mask = ggml_runtime::ggml_bf_tensor(mask, bf_ctx.buft);
         }
+
+        if (attention_mask.tensor != nullptr)
+            pe_out.add_tensor(attention_mask);
+        if (has_valid_mask)
+            pe_out.add_tensor(input_tensors.get_tensor(2));
 
         // Conformer layers (non-cached).
         auto enc_out = layers_->build_graph(session, pe_out, session_tensor_container);

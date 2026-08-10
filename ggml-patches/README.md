@@ -191,9 +191,9 @@ stock comparison therefore requires both a pristine ggml checkout and
   circular head, then overwrites only the rows replaced by the current chunk.
   Register-resident NVIDIA SM80+ kernels cover the common R=0, 1, 3, 6, and 13
   streaming shapes for both Nemotron cache geometries, with exact-shape kernels
-  retained where they are faster. The offline mask contract accepts
-  `[key, query]` L/R masks so offline attention can use the generic fused CUDA
-  kernel. Set `GGML_CUDA_RELPOS_REGISTER_RESIDENT=0` before process start to
+  retained where they are faster. The offline mask contract accepts both
+  per-batch key-padding masks and `[key, query]` L/R masks. Set
+  `GGML_CUDA_RELPOS_REGISTER_RESIDENT=0` before process start to
   disable the register-resident specializations without changing the direct
   circular-cache path.
 

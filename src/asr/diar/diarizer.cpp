@@ -21,12 +21,12 @@ backend_params(int gpu) {
     return params;
 }
 
-struct OwnedDiarizationModel {
+struct DiarizerResources {
     ggml_runtime::BackendManager backend;
     DiarModel model;
 
-    OwnedDiarizationModel(int gpu, const std::string& model_path)
-        : backend(backend_params(gpu)), model(backend, model_path) {}
+    DiarizerResources(int gpu, const std::string& model_path, const BatchingConfig& batching)
+        : backend(backend_params(gpu)), model(backend, model_path, batching) {}
 };
 
 }  // namespace
@@ -108,10 +108,12 @@ DiarizationStream::segments(const DiarSegmentationCfg& config) const {
 }
 
 std::shared_ptr<Diarizer>
-Diarizer::load(int gpu, const std::string& model_path, DiarGeometry geometry) {
-    auto owner = std::make_shared<OwnedDiarizationModel>(gpu, model_path);
-    auto* model_pointer = &owner->model;
-    auto model = std::shared_ptr<DiarModel>(std::move(owner), model_pointer);
+Diarizer::load(
+    int gpu, const std::string& model_path, DiarGeometry geometry, BatchingConfig batching) {
+    auto resources = std::make_shared<DiarizerResources>(gpu, model_path, batching);
+    // Streams retain this alias, which keeps both the model and its backend alive.
+    auto* model_pointer = &resources->model;
+    auto model = std::shared_ptr<DiarModel>(std::move(resources), model_pointer);
     return std::make_shared<Diarizer>(std::move(model), std::move(geometry));
 }
 
@@ -191,6 +193,11 @@ double
 Diarizer::seconds_per_frame() const {
     const auto& config = model_->cfg();
     return config.encoder.subsampling_factor * static_cast<double>(config.window_stride);
+}
+
+BatchMetrics
+Diarizer::batch_metrics() const {
+    return model_->batch_metrics();
 }
 
 }  // namespace nemo_speech::asr

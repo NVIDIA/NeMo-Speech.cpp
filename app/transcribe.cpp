@@ -218,32 +218,6 @@ parse_options(int argc, char** argv) {
     return o;
 }
 
-std::vector<fs::path>
-collect_inputs(const Options& options) {
-    std::error_code error;
-    if (fs::is_regular_file(options.input, error)) {
-        if (!nemo_speech::audio::is_wav_path(options.input.string()))
-            throw std::invalid_argument("input must be a .wav file");
-        return {fs::absolute(options.input)};
-    }
-    if (!fs::is_directory(options.input, error))
-        throw std::invalid_argument(options.input.string() + " is not a file or directory");
-    std::vector<fs::path> files;
-    auto add = [&](const auto& entry) {
-        if (entry.is_regular_file(error) && nemo_speech::audio::is_wav_path(entry.path().string()))
-            files.push_back(fs::absolute(entry.path()));
-    };
-    if (options.recursive) {
-        for (const auto& entry : fs::recursive_directory_iterator(options.input)) add(entry);
-    } else {
-        for (const auto& entry : fs::directory_iterator(options.input)) add(entry);
-    }
-    std::sort(files.begin(), files.end());
-    if (files.empty())
-        throw std::invalid_argument(options.input.string() + " contains no WAV files");
-    return files;
-}
-
 Transcript
 transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::path& path) {
     const auto audio = nemo_speech::audio::load_wav_file(path.string());
@@ -483,7 +457,7 @@ command_transcribe(int argc, char** argv) {
             return 0;
         }
         Options options = parse_options(argc, argv);
-        const auto inputs = collect_inputs(options);
+        const auto inputs = collect_wav_inputs(options.input, options.recursive);
         const bool directory = fs::is_directory(options.input);
         if (directory && !options.output.empty())
             throw std::invalid_argument("--output is only valid for one input; use --output-dir");

@@ -51,7 +51,7 @@ class Diarizer {
    public:
     static std::shared_ptr<Diarizer> load(
         int gpu, const std::string& model_path,
-        DiarGeometry geometry = DiarGeometry::preset("streaming"));
+        DiarGeometry geometry = DiarGeometry::preset("streaming"), BatchingConfig batching = {});
 
     Diarizer(std::shared_ptr<DiarModel> model, DiarGeometry geometry);
 
@@ -64,6 +64,7 @@ class Diarizer {
     int sample_rate() const;
     int num_speakers() const;
     double seconds_per_frame() const;
+    BatchMetrics batch_metrics() const;
 
    private:
     std::shared_ptr<DiarModel> model_;

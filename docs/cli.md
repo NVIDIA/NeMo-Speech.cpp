@@ -69,10 +69,16 @@ Standalone diarization does not require an ASR model:
 ```bash
 nemo-speech diarize meeting.wav --model sortformer.gguf
 nemo-speech diarize meeting.wav --format rttm --output meeting.rttm
+nemo-speech diarize recordings/ --model sortformer.gguf \
+  --format rttm --output-dir rttms --concurrency 4
 ```
 
-Streaming geometry is the default. Use `--offline` for full-attention
-processing of short recordings.
+Directory inputs load one shared model and dynamically batch compatible steps.
+Relative paths are preserved. Streaming geometry is the default; use
+`--offline` for full-attention processing of short recordings. Segmentation
+thresholds are dataset-dependent; use `--onset`, `--offset`, `--pad-onset`,
+`--pad-offset`, `--min-duration-on`, and `--min-duration-off` when applying a
+checkpoint's published postprocessing configuration.
 
 ## Translate text
 

@@ -347,8 +347,9 @@ class FastConformerEncoder : public ggml_runtime::Module {
     ggml_runtime::TensorBag build_pre_encode(
         ggml_runtime::Session* session, ggml_runtime::TensorBag input_tensors,
         ggml_runtime::TensorContainer* tc);
-    // build_graph_from_embeddings: (d_model, T) embeddings -> encoder output;
-    // applies xscaling + rel-pos encoding + the conformer stack.
+    // build_graph_from_embeddings: (d_model, T, B) embeddings -> encoder
+    // output. Optional inputs are an additive attention key mask followed by
+    // a multiplicative valid-frame mask used before each convolution.
     ggml_runtime::TensorBag build_graph_from_embeddings(
         ggml_runtime::Session* session, ggml_runtime::TensorBag input_tensors,
         ggml_runtime::TensorContainer* tc);

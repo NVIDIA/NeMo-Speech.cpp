@@ -8,17 +8,16 @@
 //
 //   mel window (n_mels, T_mel)
 //     -> NEST pre_encode (8x dw-striding conv stem)     -> chunk embs (512, T3)
-//   concat over time [ spkcache (512,L1) | fifo (512,L2) | chunk embs ]
+//   concat over time [ compact state (spkcache + fifo) | chunk embs ]
 //     -> xscale + rel-pos + 17 conformer layers (FastConformerEncoder reuse)
 //     -> encoder_proj 512->192
 //     -> 18-layer post-LN transformer
 //     -> head: relu -> Linear(192,192) -> relu -> Linear(192,4) -> sigmoid
 //   outputs: preds (n_spk, L1+L2+T3), chunk embs (512, T3)
 //
-// B=1, exact shapes, no masks: sequence length equals the true
-// spkcache+fifo+chunk lengths, matching NeMo's sync streaming loop where no
-// batch padding exists. Distinct (T_mel, L1, L2) combinations key the
-// Session's run cache; the steady-state FIFO cycle re-uses ~10 cached graphs.
+// A batch right-aligns each compact state prefix to the longest state in that
+// batch and masks the leading padding. Valid state and chunk frames therefore
+// remain contiguous with the same relative positions as a scalar run.
 //
 // Host code in aosc_state.h updates the speaker cache and FIFO between chunks.
 #pragma once
@@ -65,9 +64,10 @@ struct SortformerModelConfig {
 
 // Root Module for the per-chunk graph. Per-call inputs (by name):
 //   input.mel      (n_mels, T_mel)  - required
-//   input.spkcache (512, L1)        - optional (omit when L1 == 0)
-//   input.fifo     (512, L2)        - optional (omit when L2 == 0)
-// Output bag: [0] preds (n_spk, L1+L2+T3), [1] chunk embs (512, T3).
+//   input.state    (512, Lmax, B)   - optional compact, right-aligned state
+//   input.attention_mask            - optional leading-padding key mask
+//   input.valid_mask                - optional leading-padding convolution mask
+// Output bag: [0] preds (n_spk, Lmax+T3, B), [1] chunk embs (512, T3, B).
 class SortformerGraph : public ggml_runtime::Module {
    public:
     explicit SortformerGraph(const SortformerModelConfig& cfg);

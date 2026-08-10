@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -156,6 +158,19 @@ main() {
             relative_output_path(root, root.parent_path() / "outside.wav") ==
                 fs::path("outside.wav"),
             "outside path containment");
+
+        const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+        const fs::path inputs =
+            fs::temp_directory_path() / ("nemo-speech-inputs-" + std::to_string(suffix));
+        fs::create_directories(inputs / "nested");
+        std::ofstream(inputs / "first.wav").put('\0');
+        std::ofstream(inputs / "nested" / "second.WAVE").put('\0');
+        std::ofstream(inputs / "ignored.mp3").put('\0');
+        require(collect_wav_inputs(inputs, false).size() == 1, "non-recursive WAV discovery");
+        require(collect_wav_inputs(inputs, true).size() == 2, "recursive WAV discovery");
+        require(
+            collect_wav_inputs(inputs / "first.wav", false).size() == 1, "single WAV discovery");
+        fs::remove_all(inputs);
         std::cout << "shared utility tests passed\n";
         return 0;
     }

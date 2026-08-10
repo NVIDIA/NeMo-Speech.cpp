@@ -86,6 +86,9 @@ TransformerBlock::build_graph(
     // d_k^0.25; a single 1/sqrt(d_k) on the scores is the same product.
     auto scores = ggml_mul_mat(ctx, k_p, q_p);
     scores = ggml_scale_inplace(ctx, scores, 1.0f / std::sqrt(static_cast<float>(d_k)));
+    if (input_tensors.tensor_count() >= 2) {
+        scores = ggml_add(ctx, scores, input_tensors.get_tensor(1).tensor);
+    }
     auto probs = ggml_soft_max_inplace(ctx, scores);
 
     // context[d_k, q, head] = V^T . probs, with V as (T_kv, d_k, n_head).
@@ -116,7 +119,11 @@ TransformerBlock::build_graph(
     auto o = ggml_add(ctx, ff_out.tensor, h_ln.tensor);
     ggml_runtime::TensorBag ln2_in;
     ln2_in.add_tensor(ggml_runtime::ggml_bf_tensor(o, x.buft));
-    return layer_norm_2_->build_graph(session, ln2_in, tc);
+    auto normalized = layer_norm_2_->build_graph(session, ln2_in, tc);
+    for (size_t i = 1; i < input_tensors.tensor_count(); ++i) {
+        normalized.add_tensor(input_tensors.get_tensor(i));
+    }
+    return normalized;
 }
 
 TransformerEncoderModule::TransformerEncoderModule(

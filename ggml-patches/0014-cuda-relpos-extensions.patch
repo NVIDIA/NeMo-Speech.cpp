@@ -1033,9 +1033,9 @@ index f3c4836a..d5640439 100644
 +            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == batch);
 +            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
 +        } else {
-+            // Offline: shared key vector or one column per query.
++            // Offline: shared/per-batch key vector or one column per query.
 +            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q_len);
-+            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++            GGML_ASSERT(mask->ne[2] == 1 && (mask->ne[3] == 1 || mask->ne[3] == batch));
 +        }
      }
 +    const long m_sq =
@@ -1044,8 +1044,8 @@ index f3c4836a..d5640439 100644
 +            : 0;
      const long m_sb =
 -        (mask != nullptr && mask->ne[1] == batch && batch > 1) ? (long) (mask->nb[1] / sizeof(float)) : 0;
-+        (mask != nullptr && cached && mask->ne[1] == batch && batch > 1)
-+            ? (long) (mask->nb[1] / sizeof(float))
++        (mask != nullptr && batch > 1 && ((cached && mask->ne[1] == batch) || (!cached && mask->ne[3] == batch)))
++            ? (long) ((cached ? mask->nb[1] : mask->nb[3]) / sizeof(float))
 +            : 0;
  
      float scale;
@@ -1413,10 +1413,10 @@ index 80b5802f..ae1b8db3 100644
 +            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q->ne[3]);
 +            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
 +        } else {
-+            // Offline: a shared key vector or a [key,query] local-attention
-+            // mask, broadcast over heads and batch.
++            // Offline: a shared/per-batch key vector or a [key,query]
++            // local-attention mask, broadcast over heads.
 +            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q_len);
-+            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
++            GGML_ASSERT(mask->ne[2] == 1 && (mask->ne[3] == 1 || mask->ne[3] == q->ne[3]));
 +        }
      }
  
