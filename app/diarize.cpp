@@ -285,7 +285,8 @@ command_diarize(int argc, char** argv) {
                 destinations[i] = output_dir / destinations[i];
                 // Normalize to lowercase for collision detection (case-insensitive)
                 std::string normalized = destinations[i].string();
-                std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                std::transform(
+                    normalized.begin(), normalized.end(), normalized.begin(),
                     [](unsigned char c) { return std::tolower(c); });
                 normalized_destinations.push_back(normalized);
                 file_existed_before_run.push_back(fs::exists(destinations[i]));
@@ -294,10 +295,11 @@ command_diarize(int argc, char** argv) {
             for (size_t i = 0; i < normalized_destinations.size(); ++i) {
                 if (errors[i].empty()) {
                     for (size_t j = i + 1; j < normalized_destinations.size(); ++j) {
-                        if (errors[j].empty() && normalized_destinations[i] == normalized_destinations[j]) {
+                        if (errors[j].empty() &&
+                            normalized_destinations[i] == normalized_destinations[j]) {
                             throw std::invalid_argument(
-                                "duplicate output path: " + destinations[i].string() +
-                                " (from " + inputs[i].string() + " and " + inputs[j].string() + ")");
+                                "duplicate output path: " + destinations[i].string() + " (from " +
+                                inputs[i].string() + " and " + inputs[j].string() + ")");
                         }
                     }
                 }
