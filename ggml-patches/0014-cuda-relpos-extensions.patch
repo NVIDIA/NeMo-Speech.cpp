@@ -1095,7 +1095,8 @@ index f3c4836a..d5640439 100644
 @@ -523,6 +1267,114 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
      const bool use_sm100_q2 =
          device_info.cc == RELPOS_ATTN_CC_SM100 && device_info.warp_size == 32 &&
-         d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72;
+-        d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72;
++        d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72 && m_sq == 0;
 +    const bool use_register_q2 =
 +        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
 +        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && q_len == 2 &&
