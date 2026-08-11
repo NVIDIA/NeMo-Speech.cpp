@@ -272,11 +272,9 @@ command_diarize(int argc, char** argv) {
 
         // Precompute all destination paths and check for duplicates in directory mode
         std::vector<fs::path> destinations(inputs.size());
-        std::vector<std::string> normalized_destinations;
-        std::vector<bool> file_existed_before_run;
+        std::vector<std::string> normalized_destinations(inputs.size());
+        std::vector<bool> file_existed_before_run(inputs.size());
         if (directory) {
-            normalized_destinations.reserve(inputs.size());
-            file_existed_before_run.reserve(inputs.size());
             for (size_t i = 0; i < inputs.size(); ++i) {
                 if (!errors[i].empty())
                     continue;
@@ -288,8 +286,8 @@ command_diarize(int argc, char** argv) {
                 std::transform(
                     normalized.begin(), normalized.end(), normalized.begin(),
                     [](unsigned char c) { return std::tolower(c); });
-                normalized_destinations.push_back(normalized);
-                file_existed_before_run.push_back(fs::exists(destinations[i]));
+                normalized_destinations[i] = std::move(normalized);
+                file_existed_before_run[i] = fs::exists(destinations[i]);
             }
             // Check for duplicate destination paths
             for (size_t i = 0; i < normalized_destinations.size(); ++i) {
