@@ -182,6 +182,19 @@ def main() -> int:
         return 1
     print(f"[der] scoring {len(wavs)} files (collar {args.collar})")
 
+    # Preflight validation: check all hypothesis RTTM files exist before scoring
+    if args.hyp_dir:
+        missing_files = []
+        for w in wavs:
+            hyp_file = Path(args.hyp_dir) / f"{w.stem}.rttm"
+            if not hyp_file.exists():
+                missing_files.append(str(hyp_file))
+        if missing_files:
+            print("[der] ERROR: missing hypothesis RTTM files:", file=sys.stderr)
+            for mf in missing_files:
+                print(f"  {mf}", file=sys.stderr)
+            return 1
+
     geom = GEOMETRY_PRESETS[args.preset]
     metric_ours = DiarizationErrorRate(collar=2 * args.collar, skip_overlap=args.skip_overlap)
     uems = {}

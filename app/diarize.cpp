@@ -269,7 +269,43 @@ command_diarize(int argc, char** argv) {
 
         if (directory && output_dir.empty())
             output_dir = fs::current_path() / "diarization";
+
+        // Precompute all destination paths and check for duplicates in directory mode
+        std::vector<fs::path> destinations(inputs.size());
+        std::vector<std::string> normalized_destinations;
+        std::vector<bool> file_existed_before_run;
+        if (directory) {
+            normalized_destinations.reserve(inputs.size());
+            file_existed_before_run.reserve(inputs.size());
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                if (!errors[i].empty())
+                    continue;
+                destinations[i] = relative_output_path(input, inputs[i]);
+                destinations[i].replace_extension(extension_for(format));
+                destinations[i] = output_dir / destinations[i];
+                // Normalize to lowercase for collision detection (case-insensitive)
+                std::string normalized = destinations[i].string();
+                std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+                normalized_destinations.push_back(normalized);
+                file_existed_before_run.push_back(fs::exists(destinations[i]));
+            }
+            // Check for duplicate destination paths
+            for (size_t i = 0; i < normalized_destinations.size(); ++i) {
+                if (errors[i].empty()) {
+                    for (size_t j = i + 1; j < normalized_destinations.size(); ++j) {
+                        if (errors[j].empty() && normalized_destinations[i] == normalized_destinations[j]) {
+                            throw std::invalid_argument(
+                                "duplicate output path: " + destinations[i].string() +
+                                " (from " + inputs[i].string() + " and " + inputs[j].string() + ")");
+                        }
+                    }
+                }
+            }
+        }
+
         int failures = 0;
+        std::vector<bool> written_in_this_run(inputs.size(), false);
         for (size_t i = 0; i < inputs.size(); ++i) {
             if (!errors[i].empty()) {
                 print_cli_error(
@@ -284,15 +320,27 @@ command_diarize(int argc, char** argv) {
                 continue;
             }
             fs::path destination;
+            bool allow_force = force;
             if (!directory) {
                 destination = output;
             } else {
-                destination = relative_output_path(input, inputs[i]);
-                destination.replace_extension(extension_for(format));
-                destination = output_dir / destination;
+                destination = destinations[i];
+                // For directory mode, only allow --force to replace files that existed
+                // before this run, not files written during this run
+                if (force && !file_existed_before_run[i]) {
+                    // Check if this path was already written in this run
+                    for (size_t j = 0; j < i; ++j) {
+                        if (written_in_this_run[j] &&
+                            normalized_destinations[i] == normalized_destinations[j]) {
+                            allow_force = false;
+                            break;
+                        }
+                    }
+                }
             }
             try {
-                write_text_file(destination, rendered, force);
+                write_text_file(destination, rendered, allow_force);
+                written_in_this_run[i] = true;
                 if (!cli_quiet())
                     std::fprintf(
                         stderr, "%s -> %s\n", inputs[i].string().c_str(),

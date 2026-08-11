@@ -76,6 +76,19 @@ def main() -> int:
     ref = SegLST([entry for entry in ref if entry["session_id"] in selected])
     print(f"[cpwer] {len(sessions)} sessions")
 
+    # Preflight validation: check all hypothesis files exist before scoring
+    if args.hyp_dir:
+        missing_files = []
+        for s in sessions:
+            hyp_file = Path(args.hyp_dir) / f"{s}.json"
+            if not hyp_file.exists():
+                missing_files.append(str(hyp_file))
+        if missing_files:
+            print("[cpwer] ERROR: missing hypothesis files:", file=sys.stderr)
+            for mf in missing_files:
+                print(f"  {mf}", file=sys.stderr)
+            return 1
+
     hyp_entries = []
     for s in sessions:
         n_seg = 0

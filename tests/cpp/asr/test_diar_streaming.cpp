@@ -244,7 +244,8 @@ main(int argc, char** argv) {
             heterogeneous_max_rmse = std::max(heterogeneous_max_rmse, rmse);
             // Allow bounded B=1/B>1 Q8 CUDA reduction drift; speaker segments
             // are still checked below for functional parity.
-            if (max_abs > 1e-1 || rmse > 1.2e-2) {
+            // Single-chunk thresholds should be tighter than accumulated streaming thresholds
+            if (max_abs > 1e-1 || rmse > 5e-3) {
                 std::fprintf(
                     stderr, "heterogeneous state batch lane %zu parity delta max=%.3e rmse=%.3e\n",
                     lane, max_abs, rmse);
