@@ -84,7 +84,7 @@ function Assert-SourcePrerequisites {
     }
 }
 
-$arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+$arch = switch ([System.Runtime.InteropServices.RuntimeInformation,mscorlib]::OSArchitecture) {
     "X64" { "x86_64" }
     "Arm64" { "aarch64" }
     default { throw "Unsupported Windows architecture: $_" }
