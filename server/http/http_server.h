@@ -21,6 +21,8 @@ struct ServerConfig {
     bool json_logs = false;
     // Emit per-request TTS runtime timings to stderr.
     bool tts_benchmark = false;
+    // Keep only the latest HTTP TTS request; newer requests cancel older synthesis.
+    bool preempt_tts = false;
     std::string tls_certificate;
     std::string tls_private_key;
     std::string api_key;

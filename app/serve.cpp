@@ -225,6 +225,9 @@ run_server(int argc, char** argv) {
         "tts.enabled",
         [&](const std::string& value) { tts_enabled = parse_enablement("tts.enabled", value); },
         "Enable TTS: auto, true, or false");
+    parser.Register(
+        "tts.preempt", &server_config.preempt_tts,
+        "Cancel older HTTP TTS synthesis when a newer request arrives");
 #endif
     auto value = [&](int& index, const std::string& option) {
         if (++index >= argc)
@@ -619,6 +622,7 @@ print_serve_help(const char* program) {
         "  --read-timeout SEC      Socket read timeout (default: 30)\n"
         "  --write-timeout SEC     Socket write timeout (default: 30)\n"
         "  --access-log            Log completed HTTP requests\n"
+        "  --tts.preempt           Cancel older HTTP TTS synthesis for the newest request\n"
         "  --log-format text|json  Access-log format (--json also selects JSON)\n"
         "  --api-key KEY           Require Authorization: Bearer KEY\n"
         "  --cors-origin ORIGIN    Allow one cross-origin browser origin\n"
