@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -49,6 +50,12 @@ sentence_limit_for_language(
         return limits.hi;
     if (language == "ja")
         return limits.ja;
+    if (language == "ar" || language.rfind("ar-", 0) == 0)
+        return limits.ar;
+    if (language == "ko")
+        return limits.ko;
+    if (language == "pt" || language == "pt-br")
+        return limits.pt;
     return limits.en;
 }
 
@@ -143,6 +150,9 @@ class MagpieNativeTokenizer::Impl {
         if (model_dir_.empty()) {
             throw std::invalid_argument("tokenizer model directory is required");
         }
+        std::ifstream config_file(fs::path(model_dir_) / "model_config.yaml");
+        std::string contents((std::istreambuf_iterator<char>(config_file)), {});
+        v2607_ = contents.find("portuguese_Brazilian_phoneme") != std::string::npos;
     }
 
     MagpieTokenizationResult tokenize(
@@ -156,6 +166,7 @@ class MagpieNativeTokenizer::Impl {
         p.model = model_dir_;
         p.text = text;
         p.language = MagpieNativeTokenizer::normalize_language_code(language_code);
+        p.v2607 = v2607_;
         p.chunk_text_transform = chunk_text_transform;
 
         const std::string tokenizer_name = tokenizer_for_language(p.language);
@@ -170,6 +181,25 @@ class MagpieNativeTokenizer::Impl {
         p.sentence_chunking = should_tokenize_by_sentence(text, p.language, config_.sentence_limit);
 
         tokenizer_result native = tokenize_native(p);
+        if (v2607_) {
+            int offset_delta = 0;
+            if (p.language == "es" || p.language == "de" || p.language == "zh" ||
+                p.language == "ja")
+                offset_delta = 384;
+            else if (p.language == "fr")
+                offset_delta = 1188;
+            else if (p.language == "it" || p.language == "vi")
+                offset_delta = 997;
+            else if (p.language == "hi")
+                offset_delta = 111;
+            for (auto& chunk : native.chunks)
+                for (int& token : chunk.tokens) {
+                    if (token == native.eos_id)
+                        token = 3358;
+                    else
+                        token += offset_delta;
+                }
+        }
         MagpieTokenizationResult out;
         out.language = native.language;
         out.tokenizer_name = native.tokenizer_name;
@@ -186,6 +216,22 @@ class MagpieNativeTokenizer::Impl {
             throw std::invalid_argument("tokenizer produced no text tokens");
         }
         return out;
+    }
+
+    std::vector<std::string> supported_language_codes() const {
+        std::vector<std::string> languages = {"en-US", "es-ES", "de-DE", "fr-FR",
+                                              "it-IT", "vi-VN", "hi-IN"};
+        if (v2607_) {
+            languages.insert(
+                languages.end(), {"ar-AE", "ar-SA", "ar-MSA", "ko-KR", "pt-BR"});
+        }
+#ifdef NEMO_SPEECH_TTS_WITH_ZH
+        languages.emplace_back("zh-CN");
+#endif
+#ifdef NEMO_SPEECH_TTS_WITH_JA
+        languages.emplace_back("ja-JP");
+#endif
+        return languages;
     }
 
    private:
@@ -252,6 +298,7 @@ class MagpieNativeTokenizer::Impl {
 
     std::string model_dir_;
     MagpieTokenizerConfig config_;
+    bool v2607_ = false;
     mutable std::mutex cache_mutex_;
     mutable std::map<std::string, std::unique_ptr<ipa_tokenizer>> ipa_cache_;
 #ifdef NEMO_SPEECH_TTS_WITH_ZH
@@ -299,27 +346,20 @@ MagpieNativeTokenizer::normalize_language_code(const std::string& language_code)
         return "en";
     }
     std::replace(lang.begin(), lang.end(), '_', '-');
-    const size_t dash = lang.find('-');
-    if (dash != std::string::npos) {
-        lang.resize(dash);
-    }
     std::transform(lang.begin(), lang.end(), lang.begin(), [](unsigned char c) {
         return (char)std::tolower(c);
     });
+    if (lang == "ar-ae" || lang == "ar-sa" || lang == "ar-msa" || lang == "pt-br")
+        return lang;
+    const size_t dash = lang.find('-');
+    if (dash != std::string::npos)
+        lang.resize(dash);
     return lang;
 }
 
 std::vector<std::string>
-MagpieNativeTokenizer::supported_language_codes() {
-    std::vector<std::string> languages = {"en-US", "es-ES", "de-DE", "fr-FR",
-                                          "it-IT", "vi-VN", "hi-IN"};
-#ifdef NEMO_SPEECH_TTS_WITH_ZH
-    languages.emplace_back("zh-CN");
-#endif
-#ifdef NEMO_SPEECH_TTS_WITH_JA
-    languages.emplace_back("ja-JP");
-#endif
-    return languages;
+MagpieNativeTokenizer::supported_language_codes() const {
+    return impl_->supported_language_codes();
 }
 
 std::string
@@ -337,7 +377,8 @@ ensure_terminal_punctuation(const std::string& text, const std::string& language
         terminal = "。";
     } else if (
         language == "en" || language == "es" || language == "fr" || language == "de" ||
-        language == "it" || language == "vi") {
+        language == "it" || language == "vi" || language == "pt-br" || language == "ko" ||
+        language.rfind("ar-", 0) == 0) {
         terminal = ".";
     } else {
         return text;

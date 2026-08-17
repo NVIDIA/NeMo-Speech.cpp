@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -130,6 +131,27 @@ main(int argc, char** argv) {
     }
 
     tts::MagpieNativeTokenizer tokenizer(argv[1]);
+    std::ifstream tokenizer_config(std::string(argv[1]) + "/model_config.yaml");
+    const std::string config_text(
+        (std::istreambuf_iterator<char>(tokenizer_config)), std::istreambuf_iterator<char>());
+    const bool v2607 = config_text.find("portuguese_Brazilian_phoneme") != std::string::npos;
+    if (v2607) {
+        bool v2607_ok = true;
+        v2607_ok &= check_tokens(tokenizer, "A", "en-US", {90, 94, 94, 94, 88, 3358});
+        v2607_ok &= check_tokens(tokenizer, "مرحبا", "ar-AE", {1329, 1405, 1391, 1387, 1382,
+                                                                    1381, 1329, 3358});
+        v2607_ok &= check_tokens(tokenizer, "مرحبا", "ar-SA", {1493, 1569, 1555, 1551, 1546,
+                                                                    1545, 1493, 3358});
+        v2607_ok &= check_tokens(tokenizer, "مرحبا", "ar-MSA", {1657, 1733, 1719, 1715, 1710,
+                                                                     1709, 1657, 3358});
+        v2607_ok &= check_tokens(tokenizer, "안녕하세요.", "ko-KR", {3212, 3125, 3112, 3211, 3109,
+                                                                          3125, 3213, 3125, 3128, 3212,
+                                                                          3108, 3160, 3212, 3130, 3124,
+                                                                          3022, 2974, 3358});
+        v2607_ok &= check_tokens(tokenizer, "Olá!", "pt-BR", {1125, 1082, 1079, 1119, 1070,
+                                                                    1017, 1125, 3358});
+        return v2607_ok ? 0 : 1;
+    }
     bool ok = true;
 
     ok &= check_tokens(tokenizer, "A", "en-US", {90, 94, 94, 53, 84, 2361});

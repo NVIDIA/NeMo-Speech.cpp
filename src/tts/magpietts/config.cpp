@@ -22,6 +22,9 @@ MagpieTokenizerSentenceLimits::Register(common::ParameterParser& p) {
     p.Register("zh", &zh, "Mandarin sentence-chunking character threshold");
     p.Register("hi", &hi, "Hindi sentence-chunking word threshold");
     p.Register("ja", &ja, "Japanese sentence-chunking character threshold");
+    p.Register("ar", &ar, "Arabic sentence-chunking word threshold");
+    p.Register("ko", &ko, "Korean sentence-chunking word threshold");
+    p.Register("pt", &pt, "Portuguese sentence-chunking word threshold");
 }
 
 void

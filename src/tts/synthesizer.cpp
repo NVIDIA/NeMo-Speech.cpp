@@ -304,7 +304,8 @@ Synthesizer::speaker_names() const {
 
 std::vector<std::string>
 Synthesizer::supported_language_codes() const {
-    return MagpieNativeTokenizer::supported_language_codes();
+    return impl_->tokenizer ? impl_->tokenizer->supported_language_codes()
+                            : std::vector<std::string>{};
 }
 
 const std::string&
