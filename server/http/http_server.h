@@ -19,6 +19,8 @@ struct ServerConfig {
     size_t max_upload_bytes = 512ULL * 1024ULL * 1024ULL;
     bool access_log = false;
     bool json_logs = false;
+    // Emit per-request TTS runtime timings to stderr.
+    bool tts_benchmark = false;
     std::string tls_certificate;
     std::string tls_private_key;
     std::string api_key;

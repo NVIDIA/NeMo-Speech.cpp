@@ -8,6 +8,9 @@ target_link_libraries(test_magpietts_file PRIVATE nemo_speech_tts_magpietts)
 add_executable(test_magpietts_attention_prior test_magpietts_attention_prior.cpp)
 target_link_libraries(test_magpietts_attention_prior PRIVATE nemo_speech_tts_magpietts)
 
+add_executable(test_magpietts_frame_stacking test_magpietts_frame_stacking.cpp)
+target_link_libraries(test_magpietts_frame_stacking PRIVATE nemo_speech_tts_magpietts)
+
 add_executable(test_magpietts_asr test_magpietts_asr.cpp)
 target_link_libraries(test_magpietts_asr PRIVATE
     tests_cpp_wer

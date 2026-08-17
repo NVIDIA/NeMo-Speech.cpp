@@ -1135,7 +1135,7 @@ stream_magpie_to_audio(
     metrics.begin();
     outputs.metrics = &metrics;
 
-    if (!workspace.beginRequest(params.threads, use_cuda_sampling, h.audio_codebooks)) {
+    if (!workspace.beginRequest(params.threads, use_cuda_sampling, h.stacked_audio_codebooks())) {
         return false;
     }
     LocalCodebookSampler* local_sampler = nullptr;
@@ -1250,7 +1250,7 @@ stream_magpie_to_audio(
             cond_cross_kv.clear();
             std::vector<std::vector<int32_t>> audio_codes(h.audio_codebooks);
             for (int c = 0; c < h.audio_codebooks; ++c) {
-                audio_codes[c].push_back(h.audio_bos_id);
+                audio_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
             }
             attention_prior.beginChunk(
                 h, left_offset, text_len, (int)current_tokens.size(), first_text_chunk);
@@ -1302,7 +1302,9 @@ stream_magpie_to_audio(
             int near_end_frames = 0;
             bool suppress_nonfinal_codec_output = false;
             int suppressed_nonfinal_frames = 0;
-            for (int step = 0; step < h.max_decoder_steps; ++step) {
+            const int max_decoder_positions =
+                (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+            for (int step = 0; step < max_decoder_positions; ++step) {
                 const ggml_nvtx::range nvtx_step("magpietts_stream_generation_step");
                 if (codec_worker.is_failed()) {
                     codec_worker.join();
@@ -1311,12 +1313,12 @@ stream_magpie_to_audio(
                 if (params.verbose && step % 10 == 0) {
                     fprintf(
                         stderr, "%s generating codec frame %d/%d for text chunk %zu/%zu\n", label,
-                        step, h.max_decoder_steps, chunk_index + 1, token_chunks.size());
+                        step, max_decoder_positions, chunk_index + 1, token_chunks.size());
                 }
 
                 decoder_result cond;
                 decoder_result uncond;
-                const bool forbid_eos = step < h.min_generated_frames;
+                const bool forbid_eos = step * h.frame_stacking_factor < h.min_generated_frames;
                 std::vector<int32_t> next_codes;
                 std::vector<int32_t> argmax_codes;
                 std::vector<float> alignment_scores;
@@ -1415,8 +1417,8 @@ stream_magpie_to_audio(
                         next_codes = std::move(cuda_sample.codes);
                         argmax_codes = std::move(cuda_sample.argmax_codes);
                     }
-                    if ((int)next_codes.size() != h.audio_codebooks ||
-                        (int)argmax_codes.size() != h.audio_codebooks) {
+                    if ((int)next_codes.size() != h.stacked_audio_codebooks() ||
+                        (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
                         fprintf(
                             stderr, "CUDA sampler returned an unexpected number of codebooks\n");
                         return cancel_worker();
@@ -1518,8 +1520,15 @@ stream_magpie_to_audio(
                     }
                 }
 
-                const bool has_eos = !forbid_eos && MagpieCodebookSampler::hasEos(
-                                                        next_codes, argmax_codes, h.audio_eos_id);
+                std::vector<std::vector<int32_t>> codec_frames;
+                if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
+                    fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+                    return cancel_worker();
+                }
+                const int eos_lane =
+                    forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
+                const bool has_eos = eos_lane >= 0;
+                bool terminate_after_frame = false;
                 if (has_eos) {
                     ggml_nvtx::mark("magpietts_stream_eos");
                     if (params.verbose) {
@@ -1528,7 +1537,7 @@ stream_magpie_to_audio(
                             step, chunk_index + 1, token_chunks.size());
                     }
                     if (final_text_chunk || reached_chunk_end || !can_catch_up_nonfinal) {
-                        break;
+                        terminate_after_frame = true;
                     }
                     if (!suppress_nonfinal_codec_output) {
                         suppress_nonfinal_codec_output = true;
@@ -1544,31 +1553,30 @@ stream_magpie_to_audio(
                     }
                 }
 
-                const bool emit_frame = !suppress_nonfinal_codec_output;
-                if (emit_frame) {
-                    if (!code_writer.write_frame(next_codes)) {
-                        fprintf(stderr, "failed to write streamed codec frame\n");
-                        return cancel_worker();
-                    }
-                } else {
-                    ++suppressed_nonfinal_frames;
-                }
-
                 bool first_frame = false;
                 metrics.record_decoder_frame(ggml_time_us(), first_frame);
 
                 for (int c = 0; c < h.audio_codebooks; ++c) {
-                    audio_codes[c].push_back(next_codes[c]);
+                    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+                        audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
+                    }
                 }
 
-                ++decoder_frames_generated;
-                if (emit_frame) {
-                    ++frames_generated;
-                    ++chunk_frames_generated;
-                    if (!codec_worker.write_frame(next_codes)) {
-                        codec_worker.join();
-                        return false;
+                decoder_frames_generated += h.frame_stacking_factor;
+                const int frames_to_emit = has_eos ? eos_lane : h.frame_stacking_factor;
+                if (!suppress_nonfinal_codec_output) {
+                    for (int lane = 0; lane < frames_to_emit; ++lane) {
+                        const auto& frame = codec_frames[(size_t)lane];
+                        if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
+                            fprintf(stderr, "failed to write streamed codec frame\n");
+                            codec_worker.join();
+                            return false;
+                        }
+                        ++frames_generated;
+                        ++chunk_frames_generated;
                     }
+                } else {
+                    suppressed_nonfinal_frames += frames_to_emit;
                 }
                 if (start_suppressing_after_frame) {
                     suppress_nonfinal_codec_output = true;
@@ -1591,6 +1599,9 @@ stream_magpie_to_audio(
                             attention_prior.lastAttendedRelative(), text_len,
                             suppressed_nonfinal_frames);
                     }
+                    break;
+                }
+                if (terminate_after_frame) {
                     break;
                 }
             }

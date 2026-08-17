@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -644,6 +645,23 @@ struct Server::Impl {
                         pcm += chunk;
                         return true;
                     });
+                if (this->config.tts_benchmark) {
+                    const auto& stats = result.stats;
+                    std::cerr << "[nemo_http][tts_benchmark]"
+                              << " text_chars=" << result.metadata.original_text.size()
+                              << " frames=" << stats.generated_frames
+                              << " audio_s=" << stats.audio_s
+                              << " decoder_ttft_ms=" << stats.decoder_ttft_ms
+                              << " decoder_itl_avg_ms=" << stats.decoder_itl_avg_ms
+                              << " decoder_itl_p95_ms=" << stats.decoder_itl_p95_ms
+                              << " decoder_itl_p99_ms=" << stats.decoder_itl_p99_ms
+                              << " codec_ttfa_ms=" << stats.codec_ttfa_ms
+                              << " codec_icl_avg_ms=" << stats.codec_icl_avg_ms
+                              << " codec_icl_p95_ms=" << stats.codec_icl_p95_ms
+                              << " codec_icl_p99_ms=" << stats.codec_icl_p99_ms
+                              << " e2e_ttfa_ms=" << stats.e2e_ttfa_ms
+                              << " e2e_rtfx=" << stats.e2e_rtfx << '\n';
+                }
                 if (format == "pcm")
                     response.set_content(std::move(pcm), "audio/pcm");
                 else

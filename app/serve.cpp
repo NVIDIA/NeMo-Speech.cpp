@@ -498,8 +498,13 @@ run_server(int argc, char** argv) {
                 tts_config.runtime.codec_cpu = gpu < 0;
             } else {
                 tts_config.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cuda;
-                tts_config.runtime.sampling_backend =
-                    nemo_speech::tts::MagpieBackendPreference::Cuda;
+                // CUDA decoding does not imply CUDA local-transformer sampling. Keep sampling
+                // on CPU unless the TTS-specific setting explicitly requests CUDA.
+                if (tts_config.runtime.sampling_backend !=
+                    nemo_speech::tts::MagpieBackendPreference::Cuda) {
+                    tts_config.runtime.sampling_backend =
+                        nemo_speech::tts::MagpieBackendPreference::Cpu;
+                }
             }
         }
         tts_config.runtime.magpie_model = magpie_path;
@@ -513,6 +518,9 @@ run_server(int argc, char** argv) {
         config.default_voice_name = tts_config.default_voice_name;
         engines.load_tts(std::move(config));
     }
+    // The HTTP server owns request handling, so carry the existing TTS
+    // benchmark switch across from the TTS server configuration.
+    server_config.tts_benchmark = tts_config.benchmark;
 #endif
     if (!engines.ready())
         throw std::runtime_error(
