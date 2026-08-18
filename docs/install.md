@@ -57,11 +57,40 @@ Select a backend explicitly when needed:
 .\scripts\install.ps1 -Source -Backend cuda
 ```
 
+Select the components to install:
+
+```powershell
+# ASR and diarization only
+.\scripts\install.ps1 -Source -Backend cpu -Profile asr
+
+# Full runtime profile (add -HttpTls for TLS)
+.\scripts\install.ps1 -Source -Backend cuda -Profile full
+```
+
+| Profile | Components |
+|---|---|
+| `core` | ASR, diarization, and TTS |
+| `asr` | ASR and diarization |
+| `server` (default) | `core` plus the HTTP API and playground |
+| `full` | `server` plus NMT, gRPC, Flashlight, and JA/ZH tokenizers |
+
+Use `-Grpc`, `-Nmt`, `-Flashlight`, `-TtsJa`, `-TtsZh`, `-Http`, or `-HttpTls`
+to customize a profile. Binary installation is limited to `server`; other
+selections build from source. Contributors can run
+`.\scripts\windows\build.ps1 -Backend cpu -Profile developer` to build `full`
+plus tests, examples, and diagnostic tools.
+
 The default prefix is `%LOCALAPPDATA%\Programs\NeMoSpeech`, and the installer
 updates only the current user's PATH. A Windows source build requires Git,
 CMake, Ninja, Visual Studio 2022 Build Tools, and the selected backend toolkit.
 It includes the same CLI, HTTP API, and playground as the Linux and macOS source
 installation.
+
+The source installer downloads required C++ libraries automatically. Use
+`-VcpkgRoot` to override its vcpkg location.
+
+CUDA requires the NVIDIA CUDA Toolkit and driver. Vulkan requires the LunarG
+Vulkan SDK and a vendor driver. Text normalization is not supported on Windows.
 
 A later installer run checks for the published binary archive first and
 replaces an existing source build automatically once the matching archive is

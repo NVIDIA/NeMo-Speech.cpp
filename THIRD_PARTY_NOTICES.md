@@ -108,11 +108,13 @@ are explicitly excluded and are not compiled or linked.
 - Copyright The OpenSSL Project Authors and other contributors
 - License: Apache License 2.0
 
-OpenSSL is dynamically linked only when optional HTTP-server TLS is enabled. It
-is not incorporated into the source tree. The default container disables HTTP
-TLS, links gRPC's unsecure libraries, and does not distribute OpenSSL.
-Distributions that enable HTTP TLS must include the applicable OpenSSL
-attribution and Apache 2.0 terms.
+OpenSSL is linked only when HTTP-server TLS is enabled. Windows packages include
+its license. The default Linux container does not include OpenSSL.
+
+### Windows vcpkg dependencies
+
+Windows builds obtain optional dependencies through vcpkg. Installed packages
+include each selected dependency's license.
 
 ### Container system libraries
 
@@ -128,6 +130,15 @@ project notice set is installed under
 `/opt/nemo-speech/share/licenses/nemo-speech/`.
 
 ## Other incorporated third-party code and data
+
+### SentencePiece
+
+- Source: [`google/sentencepiece`](https://github.com/google/sentencepiece)
+- Copyright 2018 Google Inc.
+- License: Apache License 2.0
+
+Default Windows ASR builds link SentencePiece statically and include its license
+notice.
 
 ### whisper.cpp sample audio
 

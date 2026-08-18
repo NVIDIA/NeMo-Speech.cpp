@@ -21,6 +21,10 @@ add_compile_definitions(NEMO_SPEECH_VERSION_STR="${NEMO_SPEECH_VERSION}")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+if(WIN32)
+    # Install the Visual C++ runtime required by Windows packages.
+    include(InstallRequiredSystemLibraries)
+endif()
 set(NEMO_SPEECH_LICENSE_INSTALL_DIR
     "${CMAKE_INSTALL_DATADIR}/licenses/nemo-speech")
 install(FILES LICENSE NOTICE THIRD_PARTY_NOTICES.md
@@ -115,6 +119,27 @@ if(NEMO_SPEECH_WITH_GRPC)
 endif()
 if(NEMO_SPEECH_BUILD_GRPC)
     set(NEMO_SPEECH_WITH_GRPC ON)
+endif()
+
+# Reject invalid component combinations early.
+if(WIN32 AND NEMO_SPEECH_WITH_NORM)
+    message(FATAL_ERROR
+        "NEMO_SPEECH_WITH_NORM is not supported on Windows; disable normalization")
+endif()
+if(NEMO_SPEECH_BUILD_GRPC AND
+   (NOT NEMO_SPEECH_BUILD_ASR OR NOT NEMO_SPEECH_BUILD_TTS))
+    message(FATAL_ERROR
+        "NEMO_SPEECH_BUILD_GRPC currently requires both ASR and TTS")
+endif()
+if(NEMO_SPEECH_WITH_FLASHLIGHT AND NOT NEMO_SPEECH_BUILD_ASR)
+    message(FATAL_ERROR "NEMO_SPEECH_WITH_FLASHLIGHT requires ASR")
+endif()
+if((NEMO_SPEECH_TTS_WITH_JA OR NEMO_SPEECH_TTS_WITH_ZH) AND
+   NOT NEMO_SPEECH_BUILD_TTS)
+    message(FATAL_ERROR "Optional TTS tokenizers require NEMO_SPEECH_BUILD_TTS=ON")
+endif()
+if(NEMO_SPEECH_HTTP_TLS AND NOT NEMO_SPEECH_BUILD_HTTP)
+    message(FATAL_ERROR "NEMO_SPEECH_HTTP_TLS requires NEMO_SPEECH_BUILD_HTTP=ON")
 endif()
 if(NEMO_SPEECH_BUILD_TESTS)
     set(BUILD_TESTING ON CACHE BOOL "Build first-party test executables" FORCE)
@@ -410,6 +435,17 @@ endif()
 
 set(NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR
     "${NEMO_SPEECH_LICENSE_INSTALL_DIR}/third_party")
+if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+    file(GLOB _NEMO_SPEECH_VCPKG_COPYRIGHTS LIST_DIRECTORIES false
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/*/copyright")
+    foreach(_copyright IN LISTS _NEMO_SPEECH_VCPKG_COPYRIGHTS)
+        get_filename_component(_share_dir "${_copyright}" DIRECTORY)
+        get_filename_component(_package "${_share_dir}" NAME)
+        install(FILES "${_copyright}"
+            DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/vcpkg/${_package}"
+            RENAME LICENSE)
+    endforeach()
+endif()
 install(FILES ggml/LICENSE
     DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/ggml")
 if(TARGET nemo_speech_cublas_shim)

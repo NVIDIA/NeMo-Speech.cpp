@@ -26,11 +26,6 @@ compiler on Windows).
 - Warning flags are scoped to C/C++ compilation
   (`$<COMPILE_LANGUAGE:C,CXX>`) so nvcc's `cl` host never receives them - with
   clang-cl as CXX they would otherwise leak into the CUDA compile (`D8021`).
-- **clang-cl + gRPC:** linking clang-cl-compiled code against MSVC-built
-  *shared* protobuf (vcpkg `x64-windows`) can fail on `dllimport` symbols the
-  MSVC DLL doesn't export. For `-Grpc` builds with clang-cl, install the vcpkg
-  deps under the `x64-windows-static-md` triplet (static protobuf/gRPC) and
-  configure with that triplet.
 - **ARM64 specifics.** CUDA 13.4+/CCCL 3.4 requires the `cuda/iterator` include
   fix present in the current ggml pin. On integrated GPUs (e.g. Tegra), Vulkan
   devices enumerate as iGPU (`GGML_BACKEND_DEVICE_TYPE_IGPU`), which the ASR
@@ -56,16 +51,9 @@ ARM64 builds also require the Visual Studio
 `Microsoft.VisualStudio.Component.VC.Tools.ARM64` and
 `Microsoft.VisualStudio.Component.VC.Llvm.Clang` individual components.
 
-For the **gRPC server** or **Flashlight decoder** you also need vcpkg. The
-commands below show gRPC's shared x64 dependencies; Flashlight's architecture-
-specific command is in [Optional features](#optional-features-flashlight-itn).
-
-```powershell
-git clone --depth 1 https://github.com/microsoft/vcpkg C:\vcpkg
-C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-# grpc pulls protobuf and abseil.
-C:\vcpkg\vcpkg.exe install grpc protobuf --triplet x64-windows
-```
+The build driver downloads required vcpkg dependencies under
+`%LOCALAPPDATA%\NeMoSpeech`. Use `-VcpkgRoot` or `-VcpkgTriplet` to override the
+defaults.
 
 > **PATH note:** installers update the *machine* `PATH`, which an already-open
 > shell won't see. Open a new terminal afterward (or let `build.ps1` refresh the
@@ -110,20 +98,28 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend vulk
 powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu
 
 # CPU ASR + TTS + HTTP API, realtime WebSocket, and playground
-powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu -Http
+powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu -Profile server
+
+# Full runtime profile (add -HttpTls for TLS)
+powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu -Profile full
+
+# Full profile plus tests, examples, and diagnostic tools
+powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu -Profile developer
 
 # CPU + Flashlight decoder + dynamically linked KenLM
 powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu -Flashlight
 
 ```
 
-Key parameters: `-Backend cuda|vulkan|cpu`, `-Architecture auto|x64|arm64`,
-`-Grpc`, `-Nmt`, `-AsrOnly`, `-Http`, `-Flashlight`,
+Key parameters: `-Backend cuda|vulkan|cpu`,
+`-Profile core|asr|server|full|developer`,
+`-Architecture auto|x64|arm64`,
+`-Grpc`, `-Nmt`, `-AsrOnly`, `-Http`, `-HttpTls`, `-Flashlight`, `-TtsJa`,
+`-TtsZh`,
 `-Config Release|RelWithDebInfo|Debug`, `-CudaArch <native|89|86|120|…>`,
 `-VcpkgRoot C:\vcpkg`, `-VcpkgTriplet <triplet>`, `-BuildDir <path>`, `-Jobs N`.
-Binaries land in `build-<backend>\bin`; an explicit `-Architecture` uses
-`build-<backend>-<architecture>\bin` by default so x64 and ARM64 caches cannot
-collide.
+Binaries land in `build-<backend>[-<profile>][-<architecture>]\bin`; the default
+`core` and `auto` suffixes are omitted.
 
 ## Build with raw CMake
 
@@ -220,17 +216,11 @@ user-set value of the env var takes precedence over the auto-set.
 
 | Feature (CMake flag) | Windows status |
 |---|---|
-| **Flashlight** (`-DNEMO_SPEECH_WITH_FLASHLIGHT=ON`) | ✅ Builds replaceable `kenlm.dll`. Install `sentencepiece` with vcpkg's `x64-windows-static-md` triplet on x64 or `arm64-windows-static-md` on ARM64, then use `build.ps1 -Flashlight`. |
+| **Flashlight** (`-DNEMO_SPEECH_WITH_FLASHLIGHT=ON`) | ✅ Builds replaceable `kenlm.dll`; SentencePiece and compression libraries are provisioned automatically. |
 | **ITN/TN** (`-DNEMO_SPEECH_WITH_NORM=ON`) | ❌ Not supported on Windows. Requires the OpenFST 1.8 / Sparrowhawk WFST stack, which `scripts/build_itn_deps.sh` builds via Linux autotools (neither is in vcpkg). |
 
-**Combining flashlight + gRPC on Windows:** the instructions above use different
-vcpkg linkage (gRPC with the *shared* triplet, flashlight with *static-md*). For
-one build with both, install **all** vcpkg deps (grpc + sentencepiece)
-under a single static-md triplet matching the host architecture -
-`x64-windows-static-md` on x64, `arm64-windows-static-md` on ARM64 (likewise
-`x64-windows` / `arm64-windows` are the shared analogs elsewhere in this guide,
-which shows x64 commands) - and configure with that triplet, so there's one
-consistent protobuf/abseil.
+Automatic dependencies use one architecture-matched `*-windows-static-md`
+triplet.
 
 ## Next steps
 
@@ -241,9 +231,6 @@ Model conversion and runtime commands are platform-neutral. Continue with:
 - [Server configuration](../server.md)
 - [Client integration](../clients.md)
 
-> **Run-time PATH:** run from a shell that has the CUDA Toolkit `bin` and the MSVC
-> runtime on `PATH` (an *x64 Native Tools* prompt, or after `vcvars64.bat`).
-> `ggml-cuda.dll` loads `cudart`/`cublas` from the toolkit and the binaries link the
-> VC++ runtime; without them Windows reports `STATUS_DLL_NOT_FOUND` (0xC0000135). The
-> component DLLs themselves are already placed next to the `.exe` in
-> `build-<backend>\bin`.
+> **Run-time PATH:** CUDA build-tree binaries need the CUDA Toolkit `bin` on
+> `PATH`. Installed packages place the project DLLs and Visual C++ runtime next
+> to the executable.

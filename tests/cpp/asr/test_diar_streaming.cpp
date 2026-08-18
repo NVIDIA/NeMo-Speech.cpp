@@ -131,7 +131,9 @@ main(int argc, char** argv) {
         std::fprintf(stderr, "--batching-check requires streaming mode\n");
         return 2;
     }
-    ggml_runtime::BackendManager bm({.use_gpu = use_gpu});
+    ggml_runtime::Params backend_params;
+    backend_params.use_gpu = use_gpu;
+    ggml_runtime::BackendManager bm(backend_params);
     BatchingConfig batching;
     batching.enabled = batching_check;
     batching.max_batch_size = 8;

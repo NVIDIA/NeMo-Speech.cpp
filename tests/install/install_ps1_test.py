@@ -62,10 +62,20 @@ install(FILES LICENSE DESTINATION share/licenses/nemo-speech)
         """[CmdletBinding()]
 param(
     [string]$Backend,
+    [string]$Profile,
     [string]$BuildDir,
     [string]$Config,
+    [string]$CudaArch,
+    [string]$VcpkgRoot,
+    [string]$VcpkgTriplet,
+    [switch]$Grpc,
+    [switch]$Nmt,
+    [switch]$Flashlight,
+    [switch]$TtsJa,
+    [switch]$TtsZh,
     [switch]$AsrOnly,
-    [switch]$Http
+    [switch]$Http,
+    [switch]$HttpTls
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -226,7 +236,7 @@ def main() -> None:
             require((source_prefix / "bin" / "nemo-speech.exe").is_file(), "source binary")
             require(
                 (source_prefix / ".nemo-speech-install").read_text(encoding="utf-8")
-                == f"1.2.6 windows {arch} cpu source:v1.2.6 profile:speech-server",
+                == f"1.2.6 windows {arch} cpu source:v1.2.6 profile:server",
                 "source metadata",
             )
             repeated = run(
