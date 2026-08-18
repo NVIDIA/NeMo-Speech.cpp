@@ -75,6 +75,7 @@ cmake_bool_override() { # cmake_bool_override VARIABLE DEFAULT ARGS...
 }
 
 need_nmt=OFF
+need_asr=OFF
 need_grpc=OFF
 need_http=OFF
 need_flashlight=OFF
@@ -82,6 +83,9 @@ need_ja=OFF
 need_zh=OFF
 case "$PRESET" in
     *-nmt|*-speech|*-server|cuda-full|developer) need_nmt=ON ;;
+esac
+case "$PRESET" in
+    *-asr|*-speech|*-server|cuda-full|developer) need_asr=ON ;;
 esac
 case "$PRESET" in
     cuda-full|developer) need_grpc=ON ;;
@@ -97,6 +101,7 @@ fi
 
 need_nmt="$(cmake_bool_override NEMO_SPEECH_BUILD_NMT "$need_nmt" "$@")"
 need_nmt="$(cmake_bool_override NEMO_SPEECH_WITH_NMT "$need_nmt" "$@")"
+need_asr="$(cmake_bool_override NEMO_SPEECH_BUILD_ASR "$need_asr" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_BUILD_GRPC "$need_grpc" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_WITH_GRPC "$need_grpc" "$@")"
 need_http="$(cmake_bool_override NEMO_SPEECH_BUILD_HTTP "$need_http" "$@")"
@@ -128,6 +133,8 @@ if [ "$need_http" = ON ]; then
 fi
 if [ "$need_nmt" = ON ]; then
     require_submodule llama.cpp CMakeLists.txt
+elif [ "$need_asr" = ON ]; then
+    require_submodule llama.cpp vendor/miniaudio/miniaudio.h
 fi
 if [ "$need_grpc" = ON ]; then
     require_submodule proto/riva-common LICENSE

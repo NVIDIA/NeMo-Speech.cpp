@@ -337,7 +337,11 @@ function Initialize-RequiredSubmodule {
 }
 
 Initialize-RequiredSubmodule 'ggml' 'CMakeLists.txt'
-if ($BuildNmt) { Initialize-RequiredSubmodule 'llama.cpp' 'CMakeLists.txt' }
+if ($BuildNmt) {
+    Initialize-RequiredSubmodule 'llama.cpp' 'CMakeLists.txt'
+} elseif ($BuildAsr) {
+    Initialize-RequiredSubmodule 'llama.cpp' 'vendor\miniaudio\miniaudio.h'
+}
 if ($BuildHttp) { Initialize-RequiredSubmodule 'third_party\cpp-httplib' 'httplib.h' }
 if ($BuildGrpc) { Initialize-RequiredSubmodule 'proto\riva-common' 'LICENSE' }
 if ($BuildFlashlight) {

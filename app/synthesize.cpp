@@ -60,12 +60,14 @@ write_audio(const std::filesystem::path& path, const std::string& audio, bool fo
 void
 print_synthesize_help(const char* program) {
     std::printf(
-        "Usage: %s synthesize TEXT --magpie-model MODEL --codec-model MODEL\n"
-        "          --tokenizer-dir DIR [options]\n\n"
+        "Usage: %s synthesize TEXT [options]\n\n"
         "Options:\n"
-        "  --magpie-model PATH       MagpieTTS GGUF\n"
-        "  --codec-model PATH        NanoCodec GGUF\n"
-        "  --tokenizer-dir DIR       Extracted tokenizer assets\n"
+        "  --magpie-model MODEL      MagpieTTS GGUF path or indexed HF repo\n"
+        "                            (default: nvidia/magpie_tts_multilingual_357m)\n"
+        "  --codec-model MODEL       NanoCodec GGUF path or indexed HF repo\n"
+        "                            (default: nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps)\n"
+        "  --tokenizer-dir MODEL     Tokenizer directory or indexed HF repo\n"
+        "                            (default: MagpieTTS repository)\n"
         "  --tn-model-dir DIR        Optional text-normalization grammars\n"
         "  -i, --input PATH          Read text from a UTF-8 file\n"
         "  -o, --output PATH         Output path (default: speech.wav; '-' = stdout)\n"
@@ -190,11 +192,12 @@ command_synthesize(int argc, char** argv) {
             throw std::invalid_argument("--json cannot be combined with --output -");
 
         parsed.runtime.magpie_model =
-            require_model_file(parsed.runtime.magpie_model, "MagpieTTS model").string();
+            resolve_model_file(parsed.runtime.magpie_model, "tts", "MagpieTTS model").string();
         parsed.runtime.codec_model =
-            require_model_file(parsed.runtime.codec_model, "NanoCodec model").string();
+            resolve_model_file(parsed.runtime.codec_model, "codec", "NanoCodec model").string();
         parsed.tokenizer_model_dir =
-            require_model_directory(parsed.tokenizer_model_dir, "tokenizer model").string();
+            resolve_model_directory(parsed.tokenizer_model_dir, "tokenizer", "tokenizer model")
+                .string();
         if (!parsed.tn_model_dir.empty())
             parsed.tn_model_dir =
                 require_model_directory(parsed.tn_model_dir, "text normalization model").string();

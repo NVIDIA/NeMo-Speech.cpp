@@ -92,7 +92,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         protobuf-compiler-grpc \
         libabsl-dev \
         libre2-dev \
-        portaudio19-dev \
         autoconf \
         automake \
         libtool \
@@ -116,6 +115,7 @@ COPY THIRD_PARTY_NOTICES.md /work/
 COPY README.md CONTRIBUTING.md /work/
 COPY docs /work/docs
 COPY config /work/config
+COPY models /work/models
 # Core submodules: ggml (every backend) and llama.cpp (NMT decoder; built only
 # when ENABLE_NMT=ON, copied unconditionally so the layer cache is stable).
 COPY ggml /work/ggml
@@ -178,6 +178,7 @@ RUN cmake -G Ninja -S /work -B /work/build \
         ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}} \
         -DNEMO_SPEECH_BUILD_GRPC=${ENABLE_GRPC} \
         -DNEMO_SPEECH_BUILD_HTTP=${ENABLE_HTTP} \
+        -DNEMO_SPEECH_BUILD_MIC_CAPTURE=OFF \
         -DNEMO_SPEECH_WITH_FLASHLIGHT=${ENABLE_FLASHLIGHT} \
         -DNEMO_SPEECH_WITH_NORM=${ENABLE_NORM} \
         -DNEMO_SPEECH_TTS_WITH_JA=${ENABLE_TTS_JA} \
@@ -195,7 +196,7 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
                | grep -q 'Shared library: \[libkenlm.so\]'; \
        fi \
     && for binary in \
-           nemo-speech riva_server transcribe_file transcribe_live diarize_file synthesize_text \
+           nemo-speech riva_server transcribe_file diarize_file synthesize_text \
            translate_text speech_translate_file; \
        do \
            if [ -f "/work/build/bin/${binary}" ]; then \
@@ -213,6 +214,8 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
        done \
     && cp /work/LICENSE /work/NOTICE /work/THIRD_PARTY_NOTICES.md \
         /out/share/licenses/nemo-speech/ \
+    && install -Dm0644 /work/build/share/nemo-speech/model-index.json \
+        /out/share/nemo-speech/model-index.json \
     && license_dir=/out/share/licenses/nemo-speech/third_party \
     && install -Dm0644 /work/ggml/LICENSE "$license_dir/ggml/LICENSE" \
     && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/llama.cpp/LICENSE" \

@@ -3,10 +3,10 @@
 The installer selects a backend-matched native release containing the ASR,
 diarization, translation, and TTS CLI, HTTP API, realtime WebSocket endpoint,
 browser playground, SDK, and notices. It builds from source when a matching
-archive is unavailable. Models are distributed separately and are never
-downloaded when the server starts. Ready-to-run GGUFs are available from the
-linked Hugging Face repositories in the [ASR](asr/models.md) and
-[TTS](tts/models.md) model guides.
+archive is unavailable. Models are distributed separately; inference commands
+download missing indexed defaults on first use, while the server downloads a
+model only when explicitly enabled with an indexed name. See [models and
+cache](cli.md#models-and-cache).
 
 ## Linux and macOS
 
@@ -48,6 +48,13 @@ needed by the CLI and playground. When run from a checkout without an
 explicit version, it builds that checkout's current branch. Override the source
 for a fork or local mirror with `NEMO_SPEECH_SOURCE_URL` and
 `NEMO_SPEECH_SOURCE_REF`.
+
+Automatic model pulls require the `curl` executable. The Linux/macOS installer
+also uses it for release downloads; the Windows installer uses PowerShell's
+HTTPS support. macOS and current Windows releases include `curl`, while Linux
+users can install it with their distribution package manager. `nemo-speech
+doctor` reports whether model downloads are available. Existing local model
+paths and already cached models still work if `curl` later becomes unavailable.
 
 ## Windows
 
@@ -119,11 +126,14 @@ nemo-speech-<version>-windows-<x86_64|aarch64>-<backend>.zip
 ```
 
 Linux aarch64 CUDA archives use `cuda12` or `cuda13` as the backend suffix.
+On Apple Silicon, both `--backend metal` and `--backend cpu` install the
+`macos-aarch64-metal` archive because it contains both runtime backends.
 
 To uninstall on Linux or macOS, remove the prefix printed during installation
 and `~/.local/bin/nemo-speech`; remove the two-line NeMo-Speech.cpp PATH
 entry from the shell startup file if the installer added it. On Windows,
 remove `%LOCALAPPDATA%\Programs\NeMoSpeech` (or the selected prefix) and that
-prefix's `bin` directory from the current-user PATH. Models downloaded through
-Hugging Face or another artifact tool are stored separately and are not removed
-by uninstalling the runtime.
+prefix's `bin` directory from the current-user PATH. The model cache is stored
+separately and is not removed with the runtime: `~/Library/Caches/NeMoSpeech/models`
+on macOS, `${XDG_CACHE_HOME:-~/.cache}/nemo-speech/models` on Linux, and
+`%LOCALAPPDATA%\NeMoSpeech\models` on Windows.

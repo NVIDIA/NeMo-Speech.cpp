@@ -12,6 +12,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "json.h"
+#include "model_store.h"
 
 namespace {
 namespace fs = std::filesystem;
@@ -41,6 +42,18 @@ require_model_file(const std::string& path, const std::string& description) {
 fs::path
 require_model_directory(const std::string& path, const std::string& description) {
     return require_path(path, description, true);
+}
+
+fs::path
+resolve_model_file(
+    const std::string& reference, const std::string& role, const std::string& description) {
+    return resolve_indexed_model_file(reference, role, description);
+}
+
+fs::path
+resolve_model_directory(
+    const std::string& reference, const std::string& role, const std::string& description) {
+    return resolve_indexed_model_directory(reference, role, description);
 }
 
 std::string

@@ -141,6 +141,19 @@ applicable agreement is installed with the archive under
 
 ## Other incorporated third-party code and data
 
+### miniaudio
+
+- Source: [`mackron/miniaudio`](https://github.com/mackron/miniaudio), version
+  0.11.25, vendored by the pinned llama.cpp checkout
+- Path: `llama.cpp/vendor/miniaudio/miniaudio.h`
+- Copyright 2026 David Reid
+- License: MIT No Attribution (MIT-0); upstream text is reproduced at
+  [`third_party/miniaudio/LICENSE`](third_party/miniaudio/LICENSE)
+
+The command-line microphone capture layer compiles miniaudio directly into
+`nemo-speech`. Release archives install its license under
+`share/licenses/nemo-speech/third_party/miniaudio/`.
+
 ### SentencePiece
 
 - Source: [`google/sentencepiece`](https://github.com/google/sentencepiece),

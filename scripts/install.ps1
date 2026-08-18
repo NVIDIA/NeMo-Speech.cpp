@@ -197,6 +197,9 @@ if (-not $Source -and $binaryCandidate) { Write-Host "Artifact: $url" }
 if (-not $BinaryOnly) { Write-Host "Source:   $sourceUrl#$sourceRef ($Backend/$Profile)" }
 Write-Host "Prefix:   $Prefix"
 if ($DryRun) { return }
+if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+    Write-Warning "curl.exe was not found. Installation can continue, but automatic model downloads will be unavailable; local and already cached models still work. Windows 10 and 11 normally include curl.exe in %SystemRoot%\\System32."
+}
 
 $installIdentity = "$releaseVersion windows $arch $Backend"
 $extraComponents = [Collections.Generic.List[string]]::new()

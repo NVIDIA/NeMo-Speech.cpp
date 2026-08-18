@@ -78,7 +78,11 @@ print_help(const char* program) {
         "Usage: %s <command> [options]\n\n"
         "Commands:\n"
 #if defined(NEMO_SPEECH_CLI_ASR)
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        "  transcribe   Transcribe an audio file, directory, or microphone\n"
+#else
         "  transcribe   Transcribe an audio file or directory\n"
+#endif
 #endif
 #if defined(NEMO_SPEECH_CLI_DIAR)
         "  diarize      Identify speaker segments in an audio file\n"
@@ -92,7 +96,8 @@ print_help(const char* program) {
 #if defined(NEMO_SPEECH_CLI_ASR)
         "  bench        Benchmark an end-to-end ASR workload\n"
 #endif
-        "  model        Inspect local GGUF metadata\n"
+        "  pull         Download a pinned model from Hugging Face\n"
+        "  model        List, pull, or inspect models\n"
         "  doctor       Inspect runtime and device availability\n"
 #if defined(NEMO_SPEECH_CLI_HTTP)
         "  health       Check a running local HTTP server\n"
@@ -184,7 +189,9 @@ main(int argc, char** argv) {
             return 0;
         }
 #endif
-        if (std::strcmp(argv[2], "model") == 0)
+        if (std::strcmp(argv[2], "pull") == 0) {
+            std::printf("Usage: %s pull REPO\n", argv[0]);
+        } else if (std::strcmp(argv[2], "model") == 0)
             print_model_help(argv[0]);
         else if (std::strcmp(argv[2], "doctor") == 0)
             print_doctor_help(argv[0]);
@@ -231,6 +238,8 @@ main(int argc, char** argv) {
 #endif
     if (std::strcmp(argv[1], "model") == 0)
         return command_model(argc - 2, argv + 2);
+    if (std::strcmp(argv[1], "pull") == 0)
+        return command_pull(argc - 2, argv + 2);
     if (std::strcmp(argv[1], "doctor") == 0)
         return command_doctor(argc - 2, argv + 2);
 #if defined(NEMO_SPEECH_CLI_HTTP)

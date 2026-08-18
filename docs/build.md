@@ -55,7 +55,7 @@ Initialize the submodules needed by the selected components:
 ```bash
 git submodule update --init ggml
 git submodule update --init third_party/cpp-httplib  # HTTP server only
-git submodule update --init llama.cpp                # NMT only
+git submodule update --init llama.cpp                # ASR live capture or NMT
 git submodule update --init proto/riva-common        # gRPC only
 ```
 
@@ -122,6 +122,7 @@ runtime tradeoffs.
 | `NEMO_SPEECH_BUILD_TTS` | ON | TTS runtime, C ABI, and CLI |
 | `NEMO_SPEECH_BUILD_NMT` | OFF | NMT through llama.cpp |
 | `NEMO_SPEECH_BUILD_CLI` | ON | Unified `nemo-speech` executable |
+| `NEMO_SPEECH_BUILD_MIC_CAPTURE` | ON | Microphone capture in the CLI and live example |
 | `NEMO_SPEECH_BUILD_HTTP` | OFF | HTTP, realtime WebSocket, and playground |
 | `NEMO_SPEECH_BUILD_GRPC` | OFF | Riva-compatible gRPC adapters |
 | `NEMO_SPEECH_BUILD_EXAMPLES` | OFF | Public in-process C ABI examples |

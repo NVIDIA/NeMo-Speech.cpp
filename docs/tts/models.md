@@ -1,34 +1,26 @@
 # TTS models
 
 The TTS pipeline loads two GGUFs: a **MagpieTTS** token generator and a **NeMo
-NanoCodec** decoder. Ready-to-run F16 GGUFs are published in their Hugging Face
-repositories. Install the Hugging Face CLI if needed:
+NanoCodec** decoder. The CLI downloads the complete default stack, including
+Magpie's tokenizer assets, with one command:
 
 ```bash
-pip install -U huggingface_hub
+nemo-speech pull magpie
+nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 ```
+
+`synthesize` performs the same verified pull automatically when its model
+options are omitted.
 
 ## MagpieTTS token generator
 
 Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidia/magpie_tts_multilingual_357m)
 
-```bash
-# Download the v2602 GGUF and the original archive containing its tokenizer.
-hf download nvidia/magpie_tts_multilingual_357m \
-    --include magpie_tts_multilingual_357m.v2602.f16.gguf \
-    --include magpie_tts_multilingual_357m.nemo \
-    --local-dir models/magpie-tts
-
-# Extract the tokenizer assets loaded by the runtime.
-mkdir -p models/magpie-tts/extracted
-tar -xf models/magpie-tts/magpie_tts_multilingual_357m.nemo \
-    -C models/magpie-tts/extracted
-```
-
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
-they are not part of the GGUF. Extract the `.nemo` and pass that directory to
-the server as `--tts.tokenizer-model-dir` (here
-`models/magpie-tts/extracted`).
+they are not part of the GGUF. The built-in pull extracts only the required,
+pinned tokenizer members and verifies each one. For a custom Magpie checkpoint,
+extract its `.nemo` archive and pass that directory as `--tokenizer-dir` or
+`--tts.tokenizer-model-dir`.
 The model-specific IPA/text tokenizer assets are loaded from this directory.
 Japanese tokenization requires a build with `NEMO_SPEECH_TTS_WITH_JA=ON`
 (disabled by default), which builds Open JTalk, MeCab, and the NAIST dictionary.
@@ -56,20 +48,13 @@ server, YAML, and offline runner examples.
 Hugging Face: [nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps)
 (no tokenizer is needed for the codec decoder).
 
-```bash
-hf download nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps \
-    nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
-    --local-dir models/nano-codec
-```
+Pull it independently with `nemo-speech pull nano-codec`. Pulling `magpie`
+does this automatically because the two models must run together.
 
-Run both models together:
+Run the default stack:
 
 ```bash
-nemo-speech synthesize "Hello from Magpie Multilingual." \
-    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
-    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
-    --tokenizer-dir models/magpie-tts/extracted \
-    --output output.wav
+nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 ```
 
 ## Converting custom TTS checkpoints

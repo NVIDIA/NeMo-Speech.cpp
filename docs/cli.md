@@ -1,23 +1,85 @@
 # Command-line guide
 
-`nemo-speech` is the primary local interface. Inference commands accept
-explicit local model paths.
+`nemo-speech` is the primary local interface. Inference commands accept local
+model paths, indexed Hugging Face repository IDs, or short model names. ASR,
+diarization, and TTS also have ready-to-run defaults.
 
 Run `nemo-speech --help` for the command inventory and
 `nemo-speech help <command>` for the options compiled into the installed
 build.
+
+## Models and cache
+
+List the models built into this CLI release:
+
+```bash
+nemo-speech model list
+nemo-speech --json model list
+```
+
+The human output is grouped by ASR, diarization, and TTS. `*` marks models used
+by default. The JSON form also exposes every alias, artifact role, applicable
+command, companion, pinned revision, and license.
+
+Inference downloads a missing indexed model automatically. You can download it
+ahead of time with either a short name or the full repository ID:
+
+```bash
+nemo-speech pull nemotron-3.5
+nemo-speech pull nvidia/nemotron-3.5-asr-streaming-0.6b
+nemo-speech pull magpie
+```
+
+Pulling `magpie` also installs its tokenizer assets and the required NanoCodec
+companion. Downloads use the system `curl` executable, follow HTTPS only,
+resume interrupted regular-file downloads, and are accepted only after the
+pinned size and SHA-256 match. Concurrent processes share per-artifact cache
+locks. Run `nemo-speech doctor` to confirm that `curl` is available.
+
+The cache location is platform-specific:
+
+| Platform | Default cache |
+|---|---|
+| macOS | `~/Library/Caches/NeMoSpeech/models` |
+| Linux | `${XDG_CACHE_HOME:-~/.cache}/nemo-speech/models` |
+| Windows | `%LOCALAPPDATA%\NeMoSpeech\models` |
+
+Set `NEMO_SPEECH_MODEL_DIR` to use another location. Passing an existing local
+GGUF path or tokenizer directory always takes precedence and does not use the
+network.
 
 ## Transcribe audio
 
 Transcribe one WAV file:
 
 ```bash
+nemo-speech transcribe recording.wav
+nemo-speech transcribe recording.wav --model nemotron-en
 nemo-speech transcribe recording.wav --model ./models/asr.q8_0.gguf
 ```
 
 The file CLI accepts mono or stereo PCM16 and float32 WAV input from 8-96 kHz.
 It downmixes and resamples to the model rate. Unsupported containers or codecs
 produce an error with a conversion command.
+
+### Transcribe a microphone live
+
+```bash
+nemo-speech transcribe --live \
+  --backend auto
+```
+
+The command captures the system's default microphone and prints interim and
+endpointed transcripts to stderr while you speak. Press Ctrl-C once to stop;
+the stream is flushed and the complete final transcript is written to stdout.
+Use `--output transcript.txt` to write it to a file, or select `json`, `srt`,
+or `vtt` with `--format`.
+
+Live capture is compiled directly into the CLI through miniaudio and uses the
+native host audio API: CoreAudio on macOS, WASAPI on Windows, and ALSA or
+PulseAudio on Linux. No PortAudio runtime is required. The operating system may
+ask for microphone permission the first time; grant access to the terminal or
+shell running `nemo-speech`.
 
 ### Subtitles and structured output
 
@@ -73,9 +135,9 @@ Use only the companion models needed by the workflow.
 Standalone diarization does not require an ASR model:
 
 ```bash
-nemo-speech diarize meeting.wav --model sortformer.gguf
+nemo-speech diarize meeting.wav
 nemo-speech diarize meeting.wav --format rttm --output meeting.rttm
-nemo-speech diarize recordings/ --model sortformer.gguf \
+nemo-speech diarize recordings/ \
   --format rttm --output-dir rttms --concurrency 4
 ```
 
@@ -100,11 +162,7 @@ to a file.
 ## Synthesize speech
 
 ```bash
-nemo-speech synthesize "Hello" \
-  --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
-  --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
-  --tokenizer-dir models/magpie-tts/extracted \
-  --output hello.wav
+nemo-speech synthesize "Hello" --output hello.wav
 ```
 
 ## Select a backend
@@ -123,8 +181,8 @@ Run `nemo-speech doctor` to see the compiled backends and detected devices.
 
 ## Convert and inspect models
 
-Published model repositories provide ready-to-run GGUFs. Use the converter when
-working with a custom checkpoint or producing a different quantization:
+The built-in index covers the published ready-to-run GGUFs. Use the converter
+when working with a custom checkpoint or producing a different quantization:
 
 ```bash
 python convert_model.py custom-model.nemo --outfile custom-model.q8_0.gguf
@@ -133,9 +191,9 @@ nemo-speech model info custom-model.q8_0.gguf
 
 The converter can also resolve Hugging Face repository IDs through the standard
 cache. See [model conversion](model-conversion.md) for the isolated Python
-environment and supported model families. Model files remain local; pass their
-paths explicitly or record a reusable multi-model setup in a
-[YAML configuration file](server.md#engine-and-listener-configuration).
+environment and supported model families. Custom files remain local; pass
+their paths explicitly or record a reusable multi-model setup in a [YAML
+configuration file](server.md#engine-and-listener-configuration).
 
 ## Benchmark
 

@@ -96,7 +96,8 @@ print_diarize_help(const char* program) {
         "Diarize one WAV file or every WAV file in a directory. Concurrent\n"
         "directory work shares one model and batches compatible GPU steps.\n\n"
         "Options:\n"
-        "  -m, --model MODEL         Local Sortformer GGUF path\n"
+        "  -m, --model MODEL         Sortformer GGUF path or indexed HF repo\n"
+        "                            (default: nvidia/diar_streaming_sortformer_4spk-v2)\n"
         "  --device, --backend DEVICE\n"
         "                            auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
         "  --offline                 Full-attention mode for short audio\n"
@@ -224,7 +225,8 @@ command_diarize(int argc, char** argv) {
         batching.state_arena_slots = std::max(batching.state_arena_slots, workers);
         const auto geometry = config.resolved_geometry();
         nemo_speech::EngineRegistry engines;
-        config.model_path = require_model_file(config.model_path, "diarization model").string();
+        config.model_path =
+            resolve_model_file(config.model_path, "diarization", "diarization model").string();
         if (cli_verbose())
             std::fprintf(
                 stderr, "diarize: model=%s mode=%s inputs=%zu concurrency=%d device=%d\n",

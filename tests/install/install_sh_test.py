@@ -22,7 +22,10 @@ def require(condition: bool, message: str) -> None:
 
 def archive(version: str, arch: str) -> tuple[str, bytes, str]:
     os_name = "macos" if platform.system() == "Darwin" else "linux"
-    name = f"nemo-speech-{version}-{os_name}-{arch}-cpu.tar.gz"
+    # Apple Silicon uses one Metal package containing both Metal and CPU
+    # backends; requesting --backend cpu selects this same archive.
+    backend = "metal" if os_name == "macos" and arch == "aarch64" else "cpu"
+    name = f"nemo-speech-{version}-{os_name}-{arch}-{backend}.tar.gz"
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as bundle:
         files = {
@@ -99,6 +102,7 @@ def main() -> None:
     installer = source_root / "scripts" / "install.sh"
     os_name = "macos" if platform.system() == "Darwin" else "linux"
     arch = "aarch64" if platform.machine().lower() in {"aarch64", "arm64"} else "x86_64"
+    binary_backend = "metal" if os_name == "macos" and arch == "aarch64" else "cpu"
     releases = {}
     for version in ("1.2.3", "1.2.4", "1.2.5", "nightly"):
         name, contents, checksum = archive(version, arch)
@@ -285,7 +289,7 @@ def main() -> None:
             )
             require(
                 (source_prefix / ".nemo-speech-install").read_text().strip()
-                == f"1.2.6 {os_name} {arch} cpu",
+                == f"1.2.6 {os_name} {arch} {binary_backend}",
                 "published binary did not replace the source installation",
             )
             require(

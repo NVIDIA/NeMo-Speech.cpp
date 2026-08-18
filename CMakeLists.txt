@@ -37,6 +37,14 @@ install(DIRECTORY docs/
     DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/nemo-speech/docs")
 install(DIRECTORY config/
     DESTINATION "${CMAKE_INSTALL_DATADIR}/nemo-speech/config")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/share/nemo-speech")
+configure_file(
+    models/index.json
+    "${CMAKE_BINARY_DIR}/share/nemo-speech/model-index.json"
+    COPYONLY)
+install(FILES models/index.json
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/nemo-speech"
+    RENAME model-index.json)
 
 # Windows: stop <windows.h> - pulled in transitively by the CUDA headers when
 # GGML_CUDA=ON - from defining the min()/max() macros, which otherwise clobber
@@ -95,6 +103,7 @@ option(NEMO_SPEECH_BUILD_DIAR      "Build standalone and ASR-integrated diarizat
 option(NEMO_SPEECH_BUILD_TTS       "Build text-to-speech" ON)
 option(NEMO_SPEECH_BUILD_NMT       "Build text translation (links llama.cpp)" ${NEMO_SPEECH_WITH_NMT})
 option(NEMO_SPEECH_BUILD_CLI       "Build the unified nemo-speech CLI" ON)
+option(NEMO_SPEECH_BUILD_MIC_CAPTURE "Build microphone capture in the CLI and examples" ON)
 option(NEMO_SPEECH_BUILD_HTTP      "Build the HTTP server and local playground" OFF)
 option(NEMO_SPEECH_HTTP_TLS        "Enable TLS support in the HTTP server (requires OpenSSL)" OFF)
 option(NEMO_SPEECH_BUILD_GRPC      "Build Riva-compatible gRPC adapters" ${NEMO_SPEECH_WITH_GRPC})
@@ -455,6 +464,10 @@ if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
 endif()
 install(FILES ggml/LICENSE
     DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/ggml")
+if(NEMO_SPEECH_BUILD_ASR AND NEMO_SPEECH_BUILD_CLI AND NEMO_SPEECH_BUILD_MIC_CAPTURE)
+    install(FILES third_party/miniaudio/LICENSE
+        DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/miniaudio")
+endif()
 if(TARGET nemo_speech_cublas_shim)
     install(TARGETS nemo_speech_cublas_shim
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

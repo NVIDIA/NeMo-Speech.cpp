@@ -1,20 +1,23 @@
 # ASR models
 
 The runtime loads one **GGUF** per ASR model. Ready-to-run Q8 GGUFs are
-published alongside the original checkpoints on Hugging Face. Install the
-Hugging Face CLI if needed:
+published alongside the original checkpoints on Hugging Face and indexed by
+the CLI:
 
 ```bash
-pip install -U huggingface_hub
+nemo-speech model list
+nemo-speech pull nemotron-3.5
 ```
+
+`nemotron-3.5` is the default when `--model` is omitted. A short name, full
+repository ID, or existing local GGUF path can be passed to `--model`.
 
 ## Parakeet CTC (1.1B, offline / buffered streaming)
 
 Hugging Face: [nvidia/parakeet-ctc-1.1b](https://huggingface.co/nvidia/parakeet-ctc-1.1b)
 
 ```bash
-hf download nvidia/parakeet-ctc-1.1b \
-    parakeet-ctc-1.1b.q8_0.gguf --local-dir models
+nemo-speech pull parakeet-ctc
 ```
 
 ## Parakeet TDT (0.6B v3, multilingual, offline transducer)
@@ -24,8 +27,7 @@ frame span. 25 European languages, self-punctuating. Hugging Face:
 [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
 
 ```bash
-hf download nvidia/parakeet-tdt-0.6b-v3 \
-    parakeet-tdt-0.6b-v3.q8_0.gguf --local-dir models
+nemo-speech pull parakeet-tdt
 ```
 
 The model is not cache-aware trained: inference is full-utterance only.
@@ -38,8 +40,7 @@ Streaming requests are rejected with an error; use offline recognition
 Hugging Face: [nvidia/nemotron-speech-streaming-en-0.6b](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b)
 
 ```bash
-hf download nvidia/nemotron-speech-streaming-en-0.6b \
-    nemotron-speech-streaming-en-0.6b.q8_0.gguf --local-dir models
+nemo-speech pull nemotron-en
 ```
 
 ## Nemotron 3.5 (0.6B, multilingual, prompt-conditioned RNNT)
@@ -49,8 +50,7 @@ across 40+ language-locales (`EncDecRNNTBPEModelWithPrompt`). Hugging Face:
 [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)
 
 ```bash
-hf download nvidia/nemotron-3.5-asr-streaming-0.6b \
-    nemotron-3.5-asr-streaming-0.6b.q8_0.gguf --local-dir models
+nemo-speech pull nemotron-3.5
 ```
 
 The GGUF contains the prompt metadata (`asr.rnnt.num_prompts`,

@@ -45,23 +45,27 @@ options.
 
 ## Quick start
 
-Download the ready-to-run Q8 GGUF from the model's Hugging Face repository,
-then transcribe the bundled sample:
+Transcribe the bundled sample. On first use, the CLI downloads the pinned
+default Nemotron 3.5 GGUF from Hugging Face and verifies its size and SHA-256:
 
 ```bash
-hf download nvidia/nemotron-speech-streaming-en-0.6b \
-  nemotron-speech-streaming-en-0.6b.q8_0.gguf \
-  --local-dir models
-
-nemo-speech transcribe test_files/asr/wav/test/jfk.wav \
-  --model models/nemotron-speech-streaming-en-0.6b.q8_0.gguf
+nemo-speech transcribe test_files/asr/wav/test/jfk.wav
 ```
 
-Install the `hf` command with `pip install -U huggingface_hub` if needed. The
-CLI selects an available backend and handles common mono or stereo PCM WAV
-sample rates automatically. Substitute your own WAV file after verifying the
-bundled sample. See [ASR models](docs/asr/models.md) for the other published
-GGUFs and [model conversion](docs/model-conversion.md) for custom checkpoints.
+The same command can transcribe the default microphone on builds that include
+live capture:
+
+```bash
+nemo-speech transcribe --live
+```
+
+Run `nemo-speech model list` to see defaults, short names, and which command
+uses each model. For example, `nemo-speech pull nemotron-en` downloads the
+English-only model ahead of time, and `--model nemotron-en` selects it. Local
+GGUF paths continue to work without downloading anything. The CLI selects an
+available backend and handles common mono or stereo PCM WAV sample rates
+automatically. See the [CLI model guide](docs/cli.md#models-and-cache) and
+[model conversion](docs/model-conversion.md) for custom checkpoints.
 
 ## Command line
 
@@ -76,7 +80,7 @@ Start the same runtime as a local HTTP service and open the playground:
 
 ```bash
 nemo-speech serve \
-  --asr-model models/nemotron-speech-streaming-en-0.6b.q8_0.gguf \
+  --asr-model nemotron-3.5 \
   --open
 ```
 
@@ -106,7 +110,7 @@ Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, and a supported
 CUDA toolkit. For a CUDA ASR and TTS server with the playground:
 
 ```bash
-git submodule update --init ggml third_party/cpp-httplib
+git submodule update --init ggml llama.cpp third_party/cpp-httplib
 scripts/configure.sh cuda-server
 cmake --build --preset cuda-server
 ```
