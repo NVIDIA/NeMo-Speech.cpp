@@ -150,9 +150,8 @@ cmake --build build-vulkan --parallel
 
 ### Windows-specific build behavior
 
-- **cuBLAS shim is auto-skipped** on Windows (it's a Linux `.so` size hack using
-  a GNU-ld version script). ggml-cuda links the toolkit's real cuBLAS instead;
-  `-DNEMO_SPEECH_CUBLAS_SHIM=ON` is a no-op here.
+- **The cuBLAS shim is optional.** Pass `-CublasShim` to the build driver for an
+  app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt.
 - **ggml patches are CUDA-only.** A Vulkan/CPU build uses stock ggml; pass
   `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the encoder uses the portable op path).
 - DLLs export their symbols via `WINDOWS_EXPORT_ALL_SYMBOLS` (the C ABI libs use

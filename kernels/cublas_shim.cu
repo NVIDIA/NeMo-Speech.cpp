@@ -25,6 +25,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,12 @@ typedef int cublasMath_t;
 typedef int cublasSideMode_t;
 typedef int cublasFillMode_t;
 typedef int cublasDiagType_t;
+
+#if defined(_WIN32)
+#define NEMO_SPEECH_CUBLAS_EXPORT __declspec(dllexport)
+#else
+#define NEMO_SPEECH_CUBLAS_EXPORT
+#endif
 
 namespace {
 struct ShimHandle {
@@ -1234,7 +1241,7 @@ host_scalar(const void* p, int ct) {
         else
             bits = (s << 31) | ((e - 15 + 127) << 23) | (m << 13);
         float f;
-        __builtin_memcpy(&f, &bits, 4);
+        std::memcpy(&f, &bits, 4);
         return f;
     }
     return *(const float*)p;
@@ -1372,7 +1379,7 @@ launch(
 
 extern "C" {
 
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasCreate_v2(cublasHandle_t* h) {
     auto* sh = new ShimHandle{};
     if (cudaGetDevice(&sh->device) != cudaSuccess) {
@@ -1382,7 +1389,7 @@ cublasCreate_v2(cublasHandle_t* h) {
     *h = sh;
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasDestroy_v2(cublasHandle_t h) {
     ShimHandle* sh = (ShimHandle*)h;
     if (sh == nullptr) {
@@ -1409,23 +1416,23 @@ cublasDestroy_v2(cublasHandle_t h) {
     delete sh;
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSetStream_v2(cublasHandle_t h, cudaStream_t s) {
     ShimHandle* sh = (ShimHandle*)h;
     std::lock_guard<std::mutex> lock(sh->mutex);
     sh->stream = s;
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSetMathMode(cublasHandle_t, cublasMath_t) {
     return STATUS_SUCCESS;
 }
-const char*
+NEMO_SPEECH_CUBLAS_EXPORT const char*
 cublasGetStatusString(cublasStatus_t) {
     return "EDGE_SHIM_OK";
 }
 
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasGemmEx(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const void* alpha, const void* A, cudaDataType ta, int lda, const void* B, cudaDataType tb,
@@ -1438,7 +1445,7 @@ cublasGemmEx(
         host_scalar(beta, ct), 1, stream, sh);
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasGemmStridedBatchedEx(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const void* alpha, const void* A, cudaDataType ta, int lda, long long sa, const void* B,
@@ -1451,7 +1458,7 @@ cublasGemmStridedBatchedEx(
         host_scalar(beta, ct), batch, stream, sh);
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasGemmBatchedEx(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const void* alpha, const void* const Aarray[], cudaDataType ta, int lda,
@@ -1465,7 +1472,7 @@ cublasGemmBatchedEx(
         host_scalar(alpha, ct), host_scalar(beta, ct), batch);
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSgemm_v2(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const float* alpha, const float* A, int lda, const float* B, int ldb, const float* beta,
@@ -1477,7 +1484,7 @@ cublasSgemm_v2(
         stream, sh);
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSgemmStridedBatched(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const float* alpha, const float* A, int lda, long long sa, const float* B, int ldb,
@@ -1489,7 +1496,7 @@ cublasSgemmStridedBatched(
         batch, stream, sh);
     return STATUS_SUCCESS;
 }
-cublasStatus_t
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasStrsmBatched(
     cublasHandle_t, cublasSideMode_t, cublasFillMode_t, cublasOperation_t, cublasDiagType_t, int,
     int, const float*, const float* const[], int, float* const[], int, int) {

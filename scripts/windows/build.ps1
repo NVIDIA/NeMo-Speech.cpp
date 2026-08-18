@@ -63,6 +63,9 @@
     "89" (Ada/RTX 40xx), "86" (Ampere/RTX 30xx), "120" (Blackwell). Set a concrete
     value (not native) when building to ship to other GPUs.
 
+.PARAMETER CublasShim
+    Build the app-local cuBLAS replacement used by portable CUDA packages.
+
 .PARAMETER Compiler
     C/C++ compiler: auto (default), msvc, or clang-cl. auto picks cl on x64 and
     clang-cl on ARM64 (ggml's ARM CPU backend rejects MSVC). nvcc always uses
@@ -94,6 +97,7 @@ param(
     [ValidateSet('Release', 'RelWithDebInfo', 'Debug')]
     [string]$Config = 'Release',
     [string]$CudaArch = 'native',
+    [switch]$CublasShim,
     [string]$VcpkgRoot,
     [string]$VcpkgTriplet,
     [ValidateSet('auto', 'x64', 'arm64')]
@@ -189,6 +193,9 @@ $CrossCompiling = ($HostArch -eq 'ARM64') -ne ($TargetArch -eq 'arm64')
 if ($Backend -eq 'cuda' -and $CrossCompiling) {
     throw 'CUDA cross-compilation is not supported by this driver; build CUDA natively on the target architecture.'
 }
+if ($CublasShim -and $Backend -ne 'cuda') {
+    throw '-CublasShim requires -Backend cuda.'
+}
 $VcpkgArch = $TargetArch
 if (-not $VcpkgTriplet) {
     # Link vcpkg libraries statically so installed binaries do not depend on the
@@ -205,7 +212,7 @@ if ($BuildExamples) { $VcpkgFeatures.Add('examples') }
 
 Write-Host "==> nemo-speech Windows build" -ForegroundColor Cyan
 Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
-Write-Host "    config=$Config compiler=$Compiler host=$HostArch target=$TargetArch build=$BuildDir jobs=$Jobs"
+Write-Host "    config=$Config compiler=$Compiler host=$HostArch target=$TargetArch build=$BuildDir jobs=$Jobs cublas-shim=$($CublasShim.IsPresent)"
 Write-Host "    vcpkg=$($VcpkgFeatures -join ',') triplet=$VcpkgTriplet"
 if ($DryRun) { return }
 
@@ -420,6 +427,7 @@ switch ($Backend) {
     'cuda'   {
         $cmakeArgs += '-DGGML_CUDA=ON'
         $cmakeArgs += '-DGGML_VULKAN=OFF'
+        $cmakeArgs += "-DNEMO_SPEECH_CUBLAS_SHIM=$(ConvertTo-CMakeBool $CublasShim.IsPresent)"
         $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch"
     }
     'vulkan' {

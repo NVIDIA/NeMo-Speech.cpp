@@ -7,20 +7,20 @@ by an in-tree drop-in `libcublas`.
 
 ## The shim
 
-`kernels/cublas_shim.cu` (with the generated symbol map from
-`kernels/ver_cublas.map`) is a drop-in cuBLAS library: shape-specialized CUDA
-GEMM/GEMV kernels, including WMMA tensor-core paths, but **no cuBLASLt**. It inherits
-`CMAKE_CUDA_ARCHITECTURES` when set and falls back to JIT-portable `compute_80`
-PTX for ad-hoc builds. Dropping real cuBLAS + cuBLASLt is the bulk of the
-container size. The shim is built as a separate library from ggml.
+`kernels/cublas_shim.cu` is a drop-in cuBLAS library: shape-specialized CUDA
+GEMM/GEMV kernels, including WMMA tensor-core paths, but **no cuBLASLt**.
+Linux uses the generated symbol map from `kernels/ver_cublas.map`; Windows exports
+the same ABI from `cublas64_<major>.dll`. The target inherits
+`CMAKE_CUDA_ARCHITECTURES` when set and falls back to JIT-portable
+`compute_80` PTX for ad-hoc builds. Dropping real cuBLAS and cuBLASLt is
+the bulk of the package size. The shim is built separately from ggml.
 
 It's an optional CMake target, **`NEMO_SPEECH_CUBLAS_SHIM` (default `OFF`)**,
-built when explicitly enabled together with `GGML_CUDA` (Linux only,
-auto-skipped on Windows; a no-op for Metal, Vulkan, and CPU builds). Normal
-source builds therefore link the CUDA toolkit's cuBLAS and cuBLASLt. Container
-and release-archive builds enable the shim explicitly and skip those libraries
-in their runtime closure. The generated SONAME and symbol version match the
-CUDA toolkit major used for the build.
+built when explicitly enabled with `GGML_CUDA` (a no-op for Metal, Vulkan,
+and CPU builds). Normal source builds link the CUDA toolkit's cuBLAS and
+cuBLASLt. Portable container and release-archive builds enable the shim and
+omit those libraries from their runtime closure. Linux uses a matching SONAME
+and symbol version; Windows uses the matching versioned DLL name.
 
 To build and exercise the container GEMM path outside the container, enable the
 shim and put its output directory first on the loader path:
@@ -30,6 +30,12 @@ scripts/configure.sh cuda-asr -DNEMO_SPEECH_CUBLAS_SHIM=ON
 cmake --build --preset cuda-asr
 LD_LIBRARY_PATH=$PWD/build/cuda-asr/bin \
   ./build/cuda-asr/bin/nemo-speech transcribe audio.wav --model model.gguf
+```
+
+On Windows:
+
+```powershell
+.\scripts\windows\build.ps1 -Backend cuda -CublasShim
 ```
 
 ## Custom GPU kernels
