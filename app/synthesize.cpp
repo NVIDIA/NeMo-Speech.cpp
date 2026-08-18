@@ -215,7 +215,8 @@ command_synthesize(int argc, char** argv) {
                 // --tts.sampling-backend cuda.
                 if (parsed.runtime.sampling_backend !=
                     nemo_speech::tts::MagpieBackendPreference::Cuda) {
-                    parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
+                    parsed.runtime.sampling_backend =
+                        nemo_speech::tts::MagpieBackendPreference::Cpu;
                 }
                 parsed.runtime.codec_cpu = false;
             } else {

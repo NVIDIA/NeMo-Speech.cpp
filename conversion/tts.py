@@ -109,7 +109,11 @@ def add_metadata(
             f"rows={sd['final_proj.weight'].shape[0]} expected={expected_logits}"
         )
     n_lt_heads = len(
-        [k for k in sd if k.startswith("local_transformer_out_projections.") and k.endswith(".weight")]
+        [
+            k
+            for k in sd
+            if k.startswith("local_transformer_out_projections.") and k.endswith(".weight")
+        ]
     )
     if n_lt_heads != n_stacked_codebooks:
         raise ValueError(

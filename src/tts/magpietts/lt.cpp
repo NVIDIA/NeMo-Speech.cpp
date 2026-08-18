@@ -253,8 +253,10 @@ magpietts_model_init_local_transformer_copy(
     std::vector<std::pair<const ggml_tensor*, ggml_tensor*>> copies;
     if (!magpietts_local_add_tensor_vector(
             dst.ctx, src.audio_embeddings, dst.audio_embeddings, copies, fp32) ||
-        (src.lt_in_w && !magpietts_local_add_tensor(dst.ctx, src.lt_in_w, &dst.lt_in_w, copies, fp32)) ||
-        (src.lt_in_b && !magpietts_local_add_tensor(dst.ctx, src.lt_in_b, &dst.lt_in_b, copies, fp32)) ||
+        (src.lt_in_w &&
+         !magpietts_local_add_tensor(dst.ctx, src.lt_in_w, &dst.lt_in_w, copies, fp32)) ||
+        (src.lt_in_b &&
+         !magpietts_local_add_tensor(dst.ctx, src.lt_in_b, &dst.lt_in_b, copies, fp32)) ||
         !magpietts_local_add_tensor_vector(dst.ctx, src.lt_out_w, dst.lt_out_w, copies, fp32) ||
         !magpietts_local_add_tensor_vector(dst.ctx, src.lt_out_b, dst.lt_out_b, copies, fp32) ||
         !magpietts_local_copy_transformer_layout(dst.ctx, src.local, dst.local, copies, fp32)) {

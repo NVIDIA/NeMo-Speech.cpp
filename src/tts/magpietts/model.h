@@ -53,9 +53,7 @@ struct magpietts_hparams {
     // Number of model prediction slots in one decoder position.  v2602 has
     // one slot per codec codebook, while v2607 predicts two consecutive codec
     // frames at once.
-    int32_t stacked_audio_codebooks() const {
-        return audio_codebooks * frame_stacking_factor;
-    }
+    int32_t stacked_audio_codebooks() const { return audio_codebooks * frame_stacking_factor; }
 
     int32_t n_embd = 768;
     int32_t n_ffn = 3072;

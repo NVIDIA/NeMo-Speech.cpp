@@ -946,8 +946,15 @@ ipa_config_for_language(const std::string& lang) {
             true};
     }
     if (lang == "pt-br") {
-        return {"portuguese_Brazilian_phoneme", 1017, "pt_br_prondict", "", "pt-BR", "upper",
-                "#", true, true};
+        return {"portuguese_Brazilian_phoneme",
+                1017,
+                "pt_br_prondict",
+                "",
+                "pt-BR",
+                "upper",
+                "#",
+                true,
+                true};
     }
     throw std::runtime_error("no native IPA tokenizer for language " + lang);
 }
@@ -992,7 +999,15 @@ exact_ipa_tokens(const std::string& tokenizer_name) {
         };
     }
     if (tokenizer_name == "portuguese_Brazilian_phoneme") {
-        return {"!", "\"", "#A", "#B", "#C", "#D", "#E", "#F", "#G", "#H", "#I", "#J", "#K", "#L", "#M", "#N", "#O", "#P", "#Q", "#R", "#S", "#T", "#U", "#V", "#W", "#X", "#Y", "#Z", "#À", "#Á", "#Â", "#Ã", "#Ç", "#É", "#Ê", "#Í", "#Ó", "#Ô", "#Õ", "#Ú", "#Ü", "'", "(", ")", ",", "-", ".", "/", ":", ";", "?", "[", "]", "a", "b", "d", "e", "f", "h", "i", "j", "k", "l", "m", "n", "o", "p", "r", "s", "t", "u", "v", "w", "x", "y", "z", "{", "}", "ð", "õ", "ĩ", "ŋ", "ũ", "ɐ", "ɑ", "ɒ", "ɔ", "ə", "ɛ", "ɜ", "ɡ", "ɪ", "ɲ", "ɹ", "ɾ", "ʁ", "ʃ", "ʊ", "ʌ", "ʎ", "ʒ", "ʲ", "ˈ", "ˌ", "ː", "̃", "θ", "ẽ", " ", "<pad>", "<oov>"};
+        return {"!",  "\"", "#A", "#B", "#C", "#D",    "#E",   "#F", "#G", "#H", "#I", "#J", "#K",
+                "#L", "#M", "#N", "#O", "#P", "#Q",    "#R",   "#S", "#T", "#U", "#V", "#W", "#X",
+                "#Y", "#Z", "#À", "#Á", "#Â", "#Ã",    "#Ç",   "#É", "#Ê", "#Í", "#Ó", "#Ô", "#Õ",
+                "#Ú", "#Ü", "'",  "(",  ")",  ",",     "-",    ".",  "/",  ":",  ";",  "?",  "[",
+                "]",  "a",  "b",  "d",  "e",  "f",     "h",    "i",  "j",  "k",  "l",  "m",  "n",
+                "o",  "p",  "r",  "s",  "t",  "u",     "v",    "w",  "x",  "y",  "z",  "{",  "}",
+                "ð",  "õ",  "ĩ",  "ŋ",  "ũ",  "ɐ",     "ɑ",    "ɒ",  "ɔ",  "ə",  "ɛ",  "ɜ",  "ɡ",
+                "ɪ",  "ɲ",  "ɹ",  "ɾ",  "ʁ",  "ʃ",     "ʊ",    "ʌ",  "ʎ",  "ʒ",  "ʲ",  "ˈ",  "ˌ",
+                "ː",  "̃",   "θ",  "ẽ",  " ",  "<pad>", "<oov>"};
     }
     return {};
 }
@@ -1441,7 +1456,10 @@ run_hindi_native(const params& p) {
 
 static std::vector<std::string>
 arabic_tokens() {
-    std::vector<std::string> tokens = {" ", "ء", "آ", "أ", "إ", "ؤ", "ئ", "ا", "ب", "ة", "ت", "ث", "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط", "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "ه", "و", "ى", "ي", "ً", "ٌ", "ٍ", "َ", "ُ", "ِ", "ّ", "ٰ", "ْ"};
+    std::vector<std::string> tokens = {" ", "ء", "آ", "أ", "إ", "ؤ", "ئ", "ا", "ب", "ة", "ت", "ث",
+                                       "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط",
+                                       "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "ه", "و", "ى",
+                                       "ي", "ً",  "ٌ",  "ٍ",  "َ",  "ُ",  "ِ",  "ّ",  "ٰ",  "ْ"};
     // v2607 pins NeMo ArabicCharsTokenizer charset_version=1, whose mixed-case
     // Arabic character set deliberately contains this second copy.
     const std::vector<std::string> arabic_chars(tokens.begin() + 1, tokens.end());
@@ -1470,7 +1488,8 @@ run_arabic_native(const params& p, int offset, const std::string& tokenizer_name
         std::vector<std::string> symbols;
         for (const auto& symbol : split_utf8(sentence)) {
             if (symbol == " ") {
-                if (!symbols.empty() && symbols.back() != symbol) symbols.push_back(symbol);
+                if (!symbols.empty() && symbols.back() != symbol)
+                    symbols.push_back(symbol);
             } else if (ids.count(symbol) != 0) {
                 symbols.push_back(symbol);
             }
@@ -1662,7 +1681,8 @@ supports_native(const params& p) {
         return true;
     }
     if ((p.language == "pt-br" || p.language == "ko" || p.language == "ar-ae" ||
-         p.language == "ar-sa" || p.language == "ar-msa") && p.v2607) {
+         p.language == "ar-sa" || p.language == "ar-msa") &&
+        p.v2607) {
         return p.language != "pt-br" || fs::is_directory(p.model);
     }
 #ifdef NEMO_SPEECH_TTS_WITH_JA

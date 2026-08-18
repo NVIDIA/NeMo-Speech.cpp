@@ -222,8 +222,7 @@ class MagpieNativeTokenizer::Impl {
         std::vector<std::string> languages = {"en-US", "es-ES", "de-DE", "fr-FR",
                                               "it-IT", "vi-VN", "hi-IN"};
         if (v2607_) {
-            languages.insert(
-                languages.end(), {"ar-AE", "ar-SA", "ar-MSA", "ko-KR", "pt-BR"});
+            languages.insert(languages.end(), {"ar-AE", "ar-SA", "ar-MSA", "ko-KR", "pt-BR"});
         }
 #ifdef NEMO_SPEECH_TTS_WITH_ZH
         languages.emplace_back("zh-CN");

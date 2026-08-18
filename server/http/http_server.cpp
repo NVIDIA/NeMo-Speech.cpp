@@ -356,7 +356,8 @@ class TtsPreemptionCoordinator {
 
 class TtsPreemptionLease {
    public:
-    explicit TtsPreemptionLease(TtsPreemptionCoordinator* coordinator) : coordinator_(coordinator) {}
+    explicit TtsPreemptionLease(TtsPreemptionCoordinator* coordinator)
+        : coordinator_(coordinator) {}
     ~TtsPreemptionLease() {
         if (coordinator_)
             coordinator_->release();
@@ -716,8 +717,7 @@ struct Server::Impl {
                         });
                 }
                 catch (const std::exception&) {
-                    if (this->config.preempt_tts &&
-                        this->tts_preemption.superseded(generation)) {
+                    if (this->config.preempt_tts && this->tts_preemption.superseded(generation)) {
                         fail(response, 409, "TTS synthesis was canceled by a newer request");
                         return;
                     }

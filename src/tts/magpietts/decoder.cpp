@@ -514,8 +514,7 @@ stack_audio_codes(
     const std::vector<std::vector<int32_t>>& audio_codes, const magpietts_hparams& h,
     std::vector<std::vector<int32_t>>& stacked) {
     if ((int)audio_codes.size() != h.audio_codebooks || audio_codes.empty() ||
-        audio_codes[0].empty() ||
-        (int)audio_codes[0].size() % h.frame_stacking_factor != 0) {
+        audio_codes[0].empty() || (int)audio_codes[0].size() % h.frame_stacking_factor != 0) {
         return false;
     }
     const int raw_len = (int)audio_codes[0].size();
@@ -660,8 +659,8 @@ decoder_eval_impl(
     }
     if (cuda_sample) {
         const bool sampled = MagpieCodebookSampler::runCuda(
-            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats, h.stacked_audio_codebooks(),
-            0);
+            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats,
+            h.stacked_audio_codebooks(), 0);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         return sampled;
@@ -1022,8 +1021,8 @@ decoder_eval_cached_impl(
     }
     if (cuda_sample) {
         const bool sampled = MagpieCodebookSampler::runCuda(
-            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats, h.stacked_audio_codebooks(),
-            0);
+            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats,
+            h.stacked_audio_codebooks(), 0);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         if (sampled) {

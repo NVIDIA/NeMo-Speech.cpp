@@ -721,8 +721,8 @@ magpietts_model_load_impl(
     h.mask_token_id = gguf_i32(model.gguf, "magpietts.mask_token_id", h.mask_token_id);
     h.frame_stacking_factor =
         gguf_i32(model.gguf, "magpietts.frame_stacking_factor", h.frame_stacking_factor);
-    const int32_t stored_stacked_codebooks = gguf_i32(
-        model.gguf, "magpietts.stacked_audio_codebooks", h.stacked_audio_codebooks());
+    const int32_t stored_stacked_codebooks =
+        gguf_i32(model.gguf, "magpietts.stacked_audio_codebooks", h.stacked_audio_codebooks());
     h.n_embd = gguf_i32(model.gguf, "magpietts.embedding_dim", h.n_embd);
     h.n_ffn = gguf_i32(model.gguf, "magpietts.ffn_dim", h.n_ffn);
     h.n_ctx = gguf_i32(model.gguf, "magpietts.context_length", h.n_ctx);
@@ -802,9 +802,7 @@ magpietts_model_load_impl(
     }
 
     if (h.frame_stacking_factor < 1) {
-        fprintf(
-            stderr, "invalid frame_stacking_factor=%d\n",
-            h.frame_stacking_factor);
+        fprintf(stderr, "invalid frame_stacking_factor=%d\n", h.frame_stacking_factor);
         return false;
     }
     if (h.audio_codebooks < 1 || stored_stacked_codebooks != h.stacked_audio_codebooks()) {
@@ -901,7 +899,8 @@ magpietts_model_load_impl(
         return false;
     }
     if (model.lt_in_w == nullptr && h.n_embd != h.lt_hidden) {
-        fprintf(stderr, "local-transformer input projection is missing for incompatible dimensions\n");
+        fprintf(
+            stderr, "local-transformer input projection is missing for incompatible dimensions\n");
         return false;
     }
 
@@ -942,11 +941,12 @@ magpietts_model_load_impl(
 
     fprintf(
         stderr,
-        "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d stacked_slots=%d audio_vocab=%d speakers=%d "
+        "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d stacked_slots=%d audio_vocab=%d "
+        "speakers=%d "
         "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
         "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
-        h.text_vocab_size, h.audio_codebooks, h.stacked_audio_codebooks(), h.audio_vocab_size, h.baked_speakers,
-        h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
+        h.text_vocab_size, h.audio_codebooks, h.stacked_audio_codebooks(), h.audio_vocab_size,
+        h.baked_speakers, h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
         h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
         h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
         format_i32_list(h.estimate_alignment_from_layers).c_str(),
@@ -2149,7 +2149,8 @@ MagpieCodeGenerator::generate(
                     audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
                 }
             }
-            for (int lane = 0; lane < (eos_lane >= 0 ? eos_lane : h.frame_stacking_factor); ++lane) {
+            for (int lane = 0; lane < (eos_lane >= 0 ? eos_lane : h.frame_stacking_factor);
+                 ++lane) {
                 generated_frames.push_back(codec_frames[(size_t)lane]);
             }
             if (eos_lane >= 0) {

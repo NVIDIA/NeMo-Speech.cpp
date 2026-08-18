@@ -143,8 +143,12 @@ def main() -> None:
             if len(missing_paths) >= 2:
                 error = expect_json_error(
                     run(
-                        binary, "--json", "serve", "--tts.preempt", *missing_arguments,
-                        "--no-warmup"
+                        binary,
+                        "--json",
+                        "serve",
+                        "--tts.preempt",
+                        *missing_arguments,
+                        "--no-warmup",
                     ),
                     3,
                     "missing_model",
