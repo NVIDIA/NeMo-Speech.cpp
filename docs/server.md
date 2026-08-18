@@ -6,11 +6,11 @@ The project provides two server executables over the same core C++ engines:
   playground. It loads configured models once into an `EngineRegistry`.
 - `riva_server` hosts the Riva-compatible gRPC services.
 
-They are separate processes and do not share loaded model instances. The
-source installer and `*-server` presets build the HTTP executable for ASR and
-diarization plus TTS without the gRPC dependency chain. `cuda-full`, `developer`,
-or explicit component options add NMT, optional language frontends, and
-`riva_server` (presets: [build guide](build.md)).
+They are separate processes and do not share loaded model instances. The source
+installer and `*-server` presets build the HTTP executable for ASR, diarization,
+NMT, and TTS without the gRPC dependency chain. `cuda-full`, `developer`, or
+explicit component options add optional language frontends and `riva_server`
+(presets: [build guide](build.md)).
 
 ```bash
 nemo-speech serve \

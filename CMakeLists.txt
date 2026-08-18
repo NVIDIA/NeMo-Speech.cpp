@@ -8,15 +8,17 @@ cmake_minimum_required(VERSION 3.26)
 # nemo_speech_tts_version) stay in sync without a hardcoded literal.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _nemo_speech_version_lines)
 foreach(_line ${_nemo_speech_version_lines})
-    if(_line MATCHES "^NEMO_SPEECH_VERSION:[ \t]*([0-9]+\\.[0-9]+\\.[0-9]+)")
-        set(NEMO_SPEECH_VERSION "${CMAKE_MATCH_1}")
+    if(_line MATCHES
+       "^NEMO_SPEECH_VERSION:[ \t]*([0-9]+\\.[0-9]+\\.[0-9]+)([-+][0-9A-Za-z.-]+)?[ \t]*$")
+        set(NEMO_SPEECH_VERSION "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+        set(NEMO_SPEECH_PROJECT_VERSION "${CMAKE_MATCH_1}")
     endif()
 endforeach()
-if(NOT NEMO_SPEECH_VERSION)
+if(NOT NEMO_SPEECH_VERSION OR NOT NEMO_SPEECH_PROJECT_VERSION)
     message(FATAL_ERROR "could not parse NEMO_SPEECH_VERSION from ${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 endif()
 
-project(nemo_speech VERSION ${NEMO_SPEECH_VERSION} LANGUAGES C CXX)
+project(nemo_speech VERSION ${NEMO_SPEECH_PROJECT_VERSION} LANGUAGES C CXX)
 add_compile_definitions(NEMO_SPEECH_VERSION_STR="${NEMO_SPEECH_VERSION}")
 
 include(GNUInstallDirs)
@@ -153,15 +155,14 @@ if(NEMO_SPEECH_BUILD_DIAR AND NOT NEMO_SPEECH_BUILD_ASR)
         "without the transcribe CLI/API surface")
 endif()
 
-# Drop-in cuBLAS shim (native GEMM, no cuBLASLt). When ON, builds
-# libcublas.so.13 from kernels/cublas_shim.cu. The shipping container image
-# substitutes it for real cuBLAS to drop ~564 MB; put it on LD_LIBRARY_PATH
-# ahead of the system cuBLAS to reproduce that GEMM path natively.
+# Drop-in cuBLAS shim (native GEMM, no cuBLASLt). The shipping container image
+# substitutes it for real cuBLAS to reduce its runtime closure; put it on
+# LD_LIBRARY_PATH ahead of the system cuBLAS to reproduce that GEMM path.
 # Disabled by default for source builds, which link the CUDA toolkit's cuBLAS.
 # Container builds enable the shim explicitly to reduce the runtime image size.
 # It is only built when GGML_CUDA is also ON (see the target below), and is a
 # no-op for Metal, Vulkan, and CPU builds.
-option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (libcublas.so.13, native GEMM, no cuBLASLt)" OFF)
+option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (native GEMM, no cuBLASLt)" OFF)
 
 # Whether the linked ggml has the project ASR patches applied (ggml-patches/:
 # the fused rel-pos attention op and the F16 depthwise-conv kernel). The ASR
@@ -279,18 +280,20 @@ if(GGML_METAL)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
-# In-tree cuBLAS shim: a drop-in libcublas.so.13 backed by native GEMM kernels
-# (no cuBLASLt). ggml-cuda links real cuBLAS at build time, but the shim shares
-# its SONAME, so binaries resolve it instead when it is first on LD_LIBRARY_PATH.
-# The container images ship it in place of real cuBLAS (~564 MB saved); this
-# target reproduces that for native builds.
+# In-tree cuBLAS shim backed by native GEMM kernels (no cuBLASLt). ggml-cuda
+# links real cuBLAS at build time, but the shim shares its major-version SONAME,
+# so binaries resolve it instead when it is first on LD_LIBRARY_PATH.
 # The cuBLAS shim is a Linux-only container size optimization. It relies on ELF
-# SONAME versioning (SOVERSION 13 -> libcublas.so.13) plus a GNU-ld
-# --version-script, neither of which exists with MSVC/link.exe. On Windows,
-# ggml-cuda links the real cuBLAS DLL from the CUDA toolkit, so the shim is
-# neither needed nor buildable - skip it.
+# SONAME and symbol versioning plus a GNU-ld --version-script, neither of which
+# exists with MSVC/link.exe. On Windows, ggml-cuda links the real cuBLAS DLL
+# from the CUDA toolkit, so the shim is neither needed nor buildable - skip it.
 if(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM AND NOT WIN32)
     enable_language(CUDA)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+        set(NEMO_SPEECH_CUBLAS_SOVERSION 12)
+    else()
+        set(NEMO_SPEECH_CUBLAS_SOVERSION 13)
+    endif()
     add_library(nemo_speech_cublas_shim SHARED kernels/cublas_shim.cu)
     if(CMAKE_CUDA_ARCHITECTURES)
         set(NEMO_SPEECH_CUBLAS_SHIM_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
@@ -301,11 +304,15 @@ if(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM AND NOT WIN32)
     endif()
     set_target_properties(nemo_speech_cublas_shim PROPERTIES
         OUTPUT_NAME cublas
-        SOVERSION 13
+        SOVERSION "${NEMO_SPEECH_CUBLAS_SOVERSION}"
         CUDA_ARCHITECTURES "${NEMO_SPEECH_CUBLAS_SHIM_ARCHITECTURES}"
         CUDA_SEPARABLE_COMPILATION ON)
+    configure_file(
+        kernels/ver_cublas.map
+        "${CMAKE_CURRENT_BINARY_DIR}/ver_cublas.map"
+        @ONLY)
     target_link_options(nemo_speech_cublas_shim PRIVATE
-        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/kernels/ver_cublas.map")
+        "LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/ver_cublas.map")
 elseif(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM AND WIN32)
     message(STATUS
         "NEMO_SPEECH_CUBLAS_SHIM: skipped on Windows; linking the CUDA "
@@ -500,7 +507,7 @@ configure_package_config_file(
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/NeMoSpeechConfigVersion.cmake
     VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion)
+    COMPATIBILITY SameMinorVersion)
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/NeMoSpeechConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/NeMoSpeechConfigVersion.cmake

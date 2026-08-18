@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-// Drop-in libcublas.so.13 replacement for nemo-speech.
+// Drop-in libcublas replacement for nemo-speech.
 //
 // ggml-cuda calls a small set of cuBLAS GEMM entry points for the matmuls that
 // are not quantized (FastConformer attention scores/context, the subsampling
@@ -9,8 +9,8 @@
 // specialized for the shapes used here (including WMMA tensor-core paths, but
 // no cuBLASLt), so the runtime needs neither real cuBLAS nor cuBLASLt.
 //
-// Built as `libcublas.so.13` (SONAME + symbols versioned `libcublas.so.13`);
-// it is the image's only libcublas. ggml is not modified.
+// Its SONAME and symbol version match the CUDA toolkit used for the build;
+// it is the release archive's only libcublas. ggml is not modified.
 //
 // cublas_v2.h is deliberately not included: it tags these functions
 // __host__ __device__ under nvcc. The cuBLAS enums/handles are passed at fixed

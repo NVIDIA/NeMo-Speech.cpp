@@ -1,9 +1,24 @@
 # NeMo-Speech.cpp
 
-A lightweight native C++ runtime for NVIDIA Nemotron Speech models built on ggml. Runs speech models in realtime and in batch mode across platforms/backends.
+A lightweight native C++ runtime for running NVIDIA speech and voice models locally, with broad hardware support. It supports speech recognition, speaker diarization, translation, and speech synthesis in realtime and batch mode.
+
+It builds on speech models and tooling from [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech). Native inference is powered by ggml.
+
+NVIDIA's official local speech inference solution, with day-0 support for our latest speech models.
+
+## Models and applications
+
+| Application | Supported models |
+|---|---|
+| Speech recognition | [Nemotron 3.5 ASR Streaming 0.6B](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b), [Nemotron Speech Streaming 0.6B](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b), [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), and [Parakeet CTC 1.1B](https://huggingface.co/nvidia/parakeet-ctc-1.1b) |
+| Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2), standalone or combined with ASR |
+| Text and speech translation | [Riva Translate 4B Instruct v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2), with composed ASR-to-NMT-to-TTS speech translation |
+| Speech synthesis | [MagpieTTS Multilingual 357M](https://huggingface.co/nvidia/magpie_tts_multilingual_357m) with [NeMo NanoCodec](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) |
+| Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
 
 ## Contents
 
+- [Models and applications](#models-and-applications)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Command line](#command-line)
@@ -16,18 +31,18 @@ A lightweight native C++ runtime for NVIDIA Nemotron Speech models built on ggml
 
 ## Installation
 
-From a source checkout, install the CLI, HTTP API, and browser playground for
-the detected platform and backend:
+Install the `nemo-speech` CLI for the detected platform and backend:
 
 ```bash
-scripts/install.sh --source
+curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
 ```
 
-The source build requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
-and the toolkit for the selected GPU backend. See
-[Installation](docs/install.md) for platform-specific prerequisites, options,
-and the native release-archive flow.
+The installer prefers a verified native release and falls back to a source
+build when an artifact is unavailable. A source build requires Git, CMake 3.26
+or newer, Ninja, a C++17 compiler, and the selected GPU toolkit. See
+[Installation](docs/install.md) for platform-specific prerequisites and
+options.
 
 ## Quick start
 

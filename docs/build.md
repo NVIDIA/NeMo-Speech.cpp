@@ -82,13 +82,14 @@ landmarks are:
 | `cuda-speech` | CUDA ASR, diarization, NMT, and TTS |
 | `metal-nmt` | Metal-enabled NMT build |
 | `vulkan-diar` | Vulkan standalone diarization build |
-| `<backend>-server` | ASR, diarization, TTS, HTTP API, realtime WebSocket, and playground |
+| `<backend>-server` | ASR, diarization, NMT, TTS, HTTP API, realtime WebSocket, and playground |
 | `cuda-full` | CUDA server plus normalization, Flashlight, and language frontends |
 | `developer` | CPU speech components plus HTTP, gRPC, examples, tests, and tools |
 
-The `<backend>-server` presets are what the source installer uses. They do not
-pull in NMT, protobuf, or gRPC. Use `cuda-full`, `developer`, or explicit CMake options when
-those features and the separate `riva_server` executable are needed.
+The `<backend>-server` presets are used by the source installer and release
+builders. They include NMT but not protobuf or gRPC. Use `cuda-full`,
+`developer`, or explicit CMake options when the Riva-compatible adapters and
+separate `riva_server` executable are needed.
 
 The preset selects which components and ggml backend are compiled.
 

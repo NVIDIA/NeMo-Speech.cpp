@@ -97,7 +97,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend vulk
 # CPU-only, no server
 powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu
 
-# CPU ASR + TTS + HTTP API, realtime WebSocket, and playground
+# CPU ASR + NMT + TTS + HTTP API, realtime WebSocket, and playground
 powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cpu -Profile server
 
 # Full runtime profile (add -HttpTls for TLS)

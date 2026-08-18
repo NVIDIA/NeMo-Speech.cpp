@@ -110,7 +110,9 @@ stock comparison therefore requires both a pristine ggml checkout and
   use with `GGML_SKINNY_Q8_INPLACE=0` under a multi-stream scheduler). Accepts
   serialized tensor-planar Q8 weights
   (`GGML_TENSOR_FLAG_Q8_PLANAR`, see 0006) without a runtime repack. Kill
-  switch: `GGML_SKINNY_Q8=0`. The repack is in-place by default (reuses the
+  switch: `GGML_SKINNY_Q8=0`. Turing and older GPUs retain stock block-Q8
+  matmul; wide planar Q8 fails explicitly because its tensor-wide layout has
+  no stock fallback. The repack is in-place by default (reuses the
   weight buffer, saving the ~1.07 GB cudaMalloc duplicate on parakeet-xxl),
   which is correct and fast for the streaming-ASR encoder runtime. Two
   caveats for the llama.cpp NMT decoder, which the NMT pipeline handles by

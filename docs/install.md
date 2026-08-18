@@ -1,38 +1,46 @@
 # Install NeMo-Speech.cpp
 
-The current public installation path builds and installs the backend-matched
-ASR, diarization, and TTS CLI, HTTP API, realtime WebSocket endpoint, and browser
-playground from a source checkout. Models are distributed separately and are
-never downloaded when the server starts. Ready-to-run GGUFs are available from
-the linked Hugging Face repositories in the [ASR](asr/models.md) and
+The installer selects a backend-matched native release containing the ASR,
+diarization, translation, and TTS CLI, HTTP API, realtime WebSocket endpoint,
+browser playground, SDK, and notices. It builds from source when a matching
+archive is unavailable. Models are distributed separately and are never
+downloaded when the server starts. Ready-to-run GGUFs are available from the
+linked Hugging Face repositories in the [ASR](asr/models.md) and
 [TTS](tts/models.md) model guides.
-
-The installers also contain the native release flow. Once a public release URL
-is configured, they prefer release archives containing the CLI, runtime
-libraries, headers, CMake package files, and license notices, with source as the
-fallback.
 
 ## Linux and macOS
 
 Inspect [`scripts/install.sh`](../scripts/install.sh), then run:
 
 ```bash
-scripts/install.sh --source
+curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
 nemo-speech --version
 ```
 
+With no version argument, the installer reads the current release identifier
+from the repository's `VERSION` file, including prerelease identifiers.
+Native Linux archives require glibc 2.31 or newer (Ubuntu 20.04 or equivalent).
+
 The installer selects CUDA when `nvidia-smi` is available, Metal on Apple
-Silicon, and CPU otherwise. Override that decision for a source build:
+Silicon, and CPU otherwise. Override the backend or force a source build:
 
 ```bash
-scripts/install.sh --source --backend cpu
+curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh |
+  sh -s -- --backend cpu
+curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh |
+  sh -s -- --source
 ```
+
+On Linux aarch64, the CUDA release is selected by platform and driver:
+`cuda12` for Jetson Orin and `cuda13` for Jetson Thor or DGX Spark. Set
+`NEMO_SPEECH_CUDA_SERIES=12` or `13` only when automatic detection is not
+available.
 
 It installs without `sudo` and links the CLI into `~/.local/bin`. Run `--help`
 to see prefix, backend, PATH, and dry-run options. Downloaded archives are
-verified against their published SHA-256 files; an archive with an invalid or
-mismatched checksum always fails rather than falling back to source.
+verified against their published SHA-256 files; a present archive with an
+invalid or mismatched checksum always fails rather than falling back to source.
 
 The source fallback requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
 and the toolkit for the selected GPU backend. It clones only the submodules
@@ -47,7 +55,7 @@ Inspect [`scripts/install.ps1`](../scripts/install.ps1), then run from
 PowerShell:
 
 ```powershell
-.\scripts\install.ps1 -Source
+irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
 nemo-speech --version
 ```
 
@@ -71,8 +79,8 @@ Select the components to install:
 |---|---|
 | `core` | ASR, diarization, and TTS |
 | `asr` | ASR and diarization |
-| `server` (default) | `core` plus the HTTP API and playground |
-| `full` | `server` plus NMT, gRPC, Flashlight, and JA/ZH tokenizers |
+| `server` (default) | `core` plus NMT, the HTTP API, and playground |
+| `full` | `server` plus gRPC, Flashlight, and JA/ZH tokenizers |
 
 Use `-Grpc`, `-Nmt`, `-Flashlight`, `-TtsJa`, `-TtsZh`, `-Http`, or `-HttpTls`
 to customize a profile. Binary installation is limited to `server`; other
@@ -109,6 +117,8 @@ Release archives use this naming contract:
 nemo-speech-<version>-<linux|macos>-<x86_64|aarch64>-<backend>.tar.gz
 nemo-speech-<version>-windows-<x86_64|aarch64>-<backend>.zip
 ```
+
+Linux aarch64 CUDA archives use `cuda12` or `cuda13` as the backend suffix.
 
 To uninstall on Linux or macOS, remove the prefix printed during installation
 and `~/.local/bin/nemo-speech`; remove the two-line NeMo-Speech.cpp PATH

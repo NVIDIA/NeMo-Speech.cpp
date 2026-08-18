@@ -112,13 +112,8 @@ def main() -> None:
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             requests[self.path] = requests.get(self.path, 0) + 1
-            if self.path == "/releases/latest":
-                self.send_response(302)
-                self.send_header("Location", "/releases/tag/v1.2.3")
-                self.end_headers()
-                return
-            if self.path == "/releases/tag/v1.2.3":
-                body = b"latest\n"
+            if self.path == "/VERSION":
+                body = b"NEMO_SPEECH_VERSION: 1.2.3\n"
             else:
                 body = releases.get(self.path)
             if body is None:
@@ -152,6 +147,7 @@ def main() -> None:
                         f"http://127.0.0.1:{server.server_port}/releases"
                     ),
                     "NEMO_SPEECH_SOURCE_URL": str(source),
+                    "NEMO_SPEECH_VERSION_URL": (f"http://127.0.0.1:{server.server_port}/VERSION"),
                 }
             )
 
@@ -323,6 +319,49 @@ def main() -> None:
                 "--dry-run",
             )
             require(not dry_prefix.exists(), "dry run changed the filesystem")
+
+            fake_bin = root / "fake-aarch64-bin"
+            fake_bin.mkdir()
+            fake_uname = fake_bin / "uname"
+            fake_uname.write_text(
+                """#!/bin/sh
+case "$1" in
+    -s) echo Linux ;;
+    -m) echo aarch64 ;;
+    *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_uname.chmod(0o755)
+            for cuda_series in ("12", "13"):
+                cuda_env = env.copy()
+                cuda_env["PATH"] = f"{fake_bin}:{cuda_env['PATH']}"
+                cuda_env["NEMO_SPEECH_CUDA_SERIES"] = cuda_series
+                result = subprocess.run(
+                    [
+                        "sh",
+                        str(installer),
+                        "--prefix",
+                        str(root / f"cuda{cuda_series}-dry-run"),
+                        "--version",
+                        "9.9.9",
+                        "--backend",
+                        "cuda",
+                        "--binary-only",
+                        "--dry-run",
+                    ],
+                    env=cuda_env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                require(result.returncode == 0, f"CUDA selector failed:\n{result.stdout}")
+                require(
+                    f"linux-aarch64-cuda{cuda_series}.tar.gz" in result.stdout,
+                    f"CUDA {cuda_series} artifact was not selected",
+                )
     finally:
         server.shutdown()
         server.server_close()

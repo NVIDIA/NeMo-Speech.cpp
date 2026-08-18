@@ -87,6 +87,12 @@ if(SENTENCEPIECE_STATIC_LIB)
     target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
     target_link_options(
         nemo_speech_asr PRIVATE "LINKER:--exclude-libs,libsentencepiece.a")
+    set(_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR
+        "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/share/licenses/nemo-speech/third_party/sentencepiece")
+    if(EXISTS "${_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR}/LICENSE")
+        install(DIRECTORY "${_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR}/"
+            DESTINATION "${NEMO_SPEECH_LICENSE_INSTALL_DIR}/third_party/sentencepiece")
+    endif()
 elseif(NEMO_SPEECH_WITH_NORM AND UNIX AND NOT APPLE)
     message(FATAL_ERROR
         "ITN + Flashlight requires private static SentencePiece; "

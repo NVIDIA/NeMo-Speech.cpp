@@ -20,7 +20,7 @@
     config), so use a distinct -BuildDir for each.
 
 .PARAMETER Profile
-    Component preset: core, asr, server (core + HTTP), full, or developer
+    Component preset: core, asr, server (core + NMT + HTTP), full, or developer
     (full + tests, examples, and tools). Component switches add features.
 
 .PARAMETER Grpc
@@ -133,7 +133,10 @@ $BuildTools = $false
 switch ($Profile) {
     'core'      { $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true }
     'asr'       { $BuildAsr = $true; $BuildDiar = $true }
-    'server'    { $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true; $BuildHttp = $true }
+    'server'    {
+        $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true
+        $BuildNmt = $true; $BuildHttp = $true
+    }
     'full'      {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true; $BuildNmt = $true
         $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true

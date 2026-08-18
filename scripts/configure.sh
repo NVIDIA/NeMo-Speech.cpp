@@ -81,7 +81,7 @@ need_flashlight=OFF
 need_ja=OFF
 need_zh=OFF
 case "$PRESET" in
-    *-nmt|*-speech|cuda-full|developer) need_nmt=ON ;;
+    *-nmt|*-speech|*-server|cuda-full|developer) need_nmt=ON ;;
 esac
 case "$PRESET" in
     cuda-full|developer) need_grpc=ON ;;
