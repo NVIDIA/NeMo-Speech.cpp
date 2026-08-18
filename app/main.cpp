@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cli_util.h"
@@ -49,6 +50,25 @@ unavailable_command(const std::string& command) {
                "-DNEMO_SPEECH_BUILD_HTTP=ON";
 #endif
     return {};
+}
+
+template <typename Function>
+int
+run_session(const char* command, int argc, char** argv, Function&& function) {
+    if (argc > 2 && is_help_argument(argv[2]))
+        return std::forward<Function>(function)();
+    const bool log_status = !cli_quiet() && !cli_json();
+    if (log_status)
+        std::fprintf(stderr, "[nemo-speech] %s session started\n", command);
+    const int status = std::forward<Function>(function)();
+    if (log_status) {
+        if (status == 0)
+            std::fprintf(stderr, "[nemo-speech] %s session finished\n", command);
+        else
+            std::fprintf(
+                stderr, "[nemo-speech] %s session failed (exit code %d)\n", command, status);
+    }
+    return status;
 }
 
 void
@@ -187,23 +207,27 @@ main(int argc, char** argv) {
     }
 #if defined(NEMO_SPEECH_CLI_ASR)
     if (std::strcmp(argv[1], "transcribe") == 0)
-        return command_transcribe(argc - 2, argv + 2);
+        return run_session(
+            "transcribe", argc, argv, [&] { return command_transcribe(argc - 2, argv + 2); });
 #endif
 #if defined(NEMO_SPEECH_CLI_DIAR)
     if (std::strcmp(argv[1], "diarize") == 0)
-        return command_diarize(argc - 2, argv + 2);
+        return run_session(
+            "diarize", argc, argv, [&] { return command_diarize(argc - 2, argv + 2); });
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
     if (std::strcmp(argv[1], "translate") == 0)
-        return command_translate(argc - 2, argv + 2);
+        return run_session(
+            "translate", argc, argv, [&] { return command_translate(argc - 2, argv + 2); });
 #endif
 #if defined(NEMO_SPEECH_CLI_TTS)
     if (std::strcmp(argv[1], "synthesize") == 0)
-        return command_synthesize(argc - 2, argv + 2);
+        return run_session(
+            "synthesize", argc, argv, [&] { return command_synthesize(argc - 2, argv + 2); });
 #endif
 #if defined(NEMO_SPEECH_CLI_ASR)
     if (std::strcmp(argv[1], "bench") == 0)
-        return command_bench(argc - 2, argv + 2);
+        return run_session("bench", argc, argv, [&] { return command_bench(argc - 2, argv + 2); });
 #endif
     if (std::strcmp(argv[1], "model") == 0)
         return command_model(argc - 2, argv + 2);
@@ -213,7 +237,7 @@ main(int argc, char** argv) {
     if (std::strcmp(argv[1], "health") == 0)
         return command_health(argc - 2, argv + 2);
     if (std::strcmp(argv[1], "serve") == 0)
-        return command_serve(argc - 2, argv + 2);
+        return run_session("serve", argc, argv, [&] { return command_serve(argc - 2, argv + 2); });
 #endif
     const std::string unavailable = unavailable_command(argv[1]);
     if (!unavailable.empty())

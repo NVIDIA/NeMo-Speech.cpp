@@ -33,7 +33,9 @@ overflow within the common 42-character subtitle limit.
 
 Plain results are written to stdout. Progress and diagnostics are written to
 stderr so output can be redirected safely. Global `--json`, `--quiet`, and
-`--verbose` options work across commands.
+`--verbose` options work across commands. The default output keeps command
+lifecycle, effective inference configuration, results, warnings, and errors.
+Model-loader, backend, ggml, and llama.cpp diagnostics require `--verbose`.
 
 ### Transcribe a directory
 

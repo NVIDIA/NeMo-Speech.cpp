@@ -230,6 +230,7 @@ run_bench(int argc, char** argv) {
         std::max(options.config.batching.max_queue_depth, max_concurrency * 2);
     options.config.batching.state_arena_slots =
         std::max(options.config.batching.state_arena_slots, max_concurrency);
+    options.config.log_status = !cli_quiet() && !cli_json();
 
     nemo_speech::EngineRegistry engines;
     const auto load_start = Clock::now();

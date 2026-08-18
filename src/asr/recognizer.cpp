@@ -23,6 +23,19 @@ namespace nemo_speech::asr {
 
 namespace {
 
+const char*
+head_name(HeadKind head) {
+    switch (head) {
+        case HeadKind::Ctc:
+            return "ctc";
+        case HeadKind::Rnnt:
+            return "rnnt";
+        case HeadKind::Tdt:
+            return "tdt";
+    }
+    return "unknown";
+}
+
 std::unique_ptr<ggml_runtime::BackendManager>
 make_backend(int gpu_idx) {
     ggml_runtime::Params p;
@@ -91,7 +104,7 @@ Recognizer::Recognizer(RecognizerConfig cfg)
         (cfg_.vad.masker.mask_enable || (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
     if (need_vad) {
         vad_model_ = std::make_shared<SileroVadModel>(*bm_, cfg_.vad.model_path, cfg_.batching);
-        std::cerr << "[recognizer] VAD weights/session loaded once and shared across streams\n";
+        GGMLF_LOG_INFO("[recognizer] VAD weights/session loaded once and shared across streams\n");
     }
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
     // Share the loaded language model and lexicon trie across streams.
@@ -106,23 +119,84 @@ Recognizer::Recognizer(RecognizerConfig cfg)
         fcfg.embedded_spm = ctc->embedded_tokenizer();
         flashlight_resources_ =
             std::make_shared<const FlashlightResources>(ctc->ctc_config(), ctc->vocab(), fcfg);
-        std::cerr << "[recognizer] flashlight resources loaded (lm + lexicon trie, shared)\n";
+        GGMLF_LOG_INFO("[recognizer] flashlight resources loaded (lm + lexicon trie, shared)\n");
     }
 #endif
-    std::cerr << "[recognizer] streaming cfg: chunk=" << cfg_.streaming.chunk_size
-              << "s left=" << cfg_.streaming.ctc_left_padding
-              << "s right=" << cfg_.streaming.ctc_right_padding << "s\n";
 
     if (!cfg_.diar.model_path.empty()) {
         diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path, cfg_.batching);
         const DiarGeometry geo = cfg_.diar.resolved_geometry();
-        std::cerr << "[recognizer] diarizer loaded: " << cfg_.diar.model_path
-                  << " (spkcache=" << geo.spkcache_len << " fifo=" << geo.fifo_len
-                  << " chunk=" << geo.chunk_len << " rc=" << geo.chunk_right_context << ")\n";
+        GGMLF_LOG_INFO(
+            "[recognizer] diarizer loaded: %s (spkcache=%d fifo=%d chunk=%d rc=%d)\n",
+            cfg_.diar.model_path.c_str(), geo.spkcache_len, geo.fifo_len, geo.chunk_len,
+            geo.chunk_right_context);
     }
+    log_model_status();
 }
 
 Recognizer::~Recognizer() = default;
+
+void
+Recognizer::log_model_status() const {
+    if (!cfg_.log_status)
+        return;
+    const ggml_backend_t gpu = bm_->gpu_backend_handle();
+    std::string summary = "[asr] model=" + model_name_ + " head=" + head_name(model_->head_kind()) +
+                          " backend=" + (gpu != nullptr ? ggml_backend_name(gpu) : "CPU");
+    if (vad_model_)
+        summary += " vad=on";
+    if (diar_model_)
+        summary += " diarization=on";
+#ifdef NEMO_SPEECH_WITH_FLASHLIGHT
+    if (flashlight_resources_)
+        summary += " decoder=flashlight";
+#endif
+    std::fprintf(stderr, "%s\n", summary.c_str());
+}
+
+void
+Recognizer::log_execution_status(bool streaming) const {
+    if (!cfg_.log_status)
+        return;
+    auto emit = [this, streaming] {
+        const HeadKind head = model_->head_kind();
+        if (!streaming) {
+            const auto& enc = model_->encoder_config();
+            if (enc.offline_left_ctx < 0 && enc.offline_right_ctx < 0) {
+                std::fprintf(
+                    stderr, "[asr] mode=offline head=%s attention=full-context\n", head_name(head));
+            } else {
+                std::fprintf(
+                    stderr,
+                    "[asr] mode=offline head=%s attention-left=%d "
+                    "attention-right=%d encoder-frames\n",
+                    head_name(head), enc.offline_left_ctx, enc.offline_right_ctx);
+            }
+            return;
+        }
+        if (head == HeadKind::Ctc) {
+            const float window = cfg_.streaming.ctc_left_padding + cfg_.streaming.chunk_size +
+                                 cfg_.streaming.ctc_right_padding;
+            std::fprintf(
+                stderr,
+                "[asr] mode=streaming head=ctc chunk=%.2fs left=%.2fs right=%.2fs window=%.2fs\n",
+                cfg_.streaming.chunk_size, cfg_.streaming.ctc_left_padding,
+                cfg_.streaming.ctc_right_padding, window);
+            return;
+        }
+        const EncoderConfig enc =
+            make_cache_aware_config(model_->encoder_config(), cfg_.streaming.rnnt_right_context);
+        const int center = enc.cache_chunk_frames - enc.cache_right_ctx;
+        const double step_ms = enc.cache_chunk_frames * model_->ms_per_enc_frame();
+        std::fprintf(
+            stderr,
+            "[asr] mode=streaming head=%s left=%d center=%d right=%d attention=%d "
+            "encoder-frames step=%.0fms\n",
+            head_name(head), enc.cache_left_ctx, center, enc.cache_right_ctx,
+            enc.cache_left_ctx + enc.cache_chunk_frames, step_ms);
+    };
+    std::call_once(streaming ? streaming_status_once_ : offline_status_once_, std::move(emit));
+}
 
 BatchMetrics
 Recognizer::vad_batch_metrics() const {
@@ -227,7 +301,7 @@ Recognizer::warmup() {
 
         run_batch_warmup();
         run_batch_warmup();
-        std::cerr << "[recognizer] warmed streaming batch shape B=" << warmup_batch << "\n";
+        GGMLF_LOG_INFO("[recognizer] warmed streaming batch shape B=%d\n", warmup_batch);
     }
 
     // Warm the diarizer Session's graph shapes too: the streaming warmup
@@ -463,6 +537,7 @@ Recognizer::streaming_recognize(
     AsrRequestOptions opts, const std::string& language_code, bool coordinate_ingress) {
     opts.language_code = language_code;
     auto runner = make_runner();
+    log_execution_status(/*streaming=*/true);
     if (model_->has_prompt())
         runner->set_prompt_index(model_->prompt_index_for_lang(language_code));
     return std::make_unique<RecognitionStream>(
@@ -483,15 +558,21 @@ Recognizer::recognize(
     const bool supports_streaming =
         model_->head_kind() == HeadKind::Ctc ||
         static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
+    // Vulkan RNNT support was originally validated on the cache-aware graph.
+    // Keep that compatibility route until the offline graph has Vulkan parity
+    // coverage; CTC and offline-only TDT remain offline.
+    const bool use_streaming =
+        (exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
+        supports_streaming;
     std::unique_ptr<AsrRunner> runner;
-    if ((exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
-        supports_streaming) {
+    if (use_streaming) {
         runner = make_runner();
     } else {
         // Past the positional-encoding limit OfflineRunner splits the audio at
         // quiet points and decodes segment by segment.
         runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     }
+    log_execution_status(use_streaming);
     if (model_->has_prompt())
         runner->set_prompt_index(model_->prompt_index_for_lang(language_code));
     opts.language_code = language_code;

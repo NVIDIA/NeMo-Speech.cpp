@@ -151,6 +151,14 @@ def main() -> None:
         transcribe_help = run(binary, "transcribe", "--help")
         if transcribe_help.returncode == 0:
             assert "--backend" in transcribe_help.stdout
+            assert "session" not in transcribe_help.stderr
+            lifecycle = run(binary, "transcribe")
+            assert lifecycle.returncode == 2, lifecycle.stdout + lifecycle.stderr
+            assert "[nemo-speech] transcribe session started" in lifecycle.stderr
+            assert "[nemo-speech] transcribe session failed (exit code 2)" in lifecycle.stderr
+            quiet_lifecycle = run(binary, "--quiet", "transcribe")
+            assert "session" not in quiet_lifecycle.stderr
+            expect_json_error(run(binary, "--json", "transcribe"), 2, "invalid_argument")
 
         synthesize_help = run(binary, "synthesize", "--help")
         if synthesize_help.returncode == 0:

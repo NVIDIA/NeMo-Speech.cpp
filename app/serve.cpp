@@ -460,6 +460,7 @@ run_server(int argc, char** argv) {
 
     nemo_speech::EngineRegistryConfig registry_config;
 #if defined(NEMO_SPEECH_CLI_ASR)
+    asr_config.log_status = !cli_quiet() && !cli_json();
     registry_config.asr = !asr_path.empty();
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)

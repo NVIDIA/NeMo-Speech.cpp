@@ -413,6 +413,7 @@ command_transcribe(int argc, char** argv) {
             inputs.size());
 
         asr::RecognizerConfig config = options.engine;
+        config.log_status = !cli_quiet() && !cli_json();
         if (options.device_set)
             config.backend.gpu = options.gpu;
         config.model.path =

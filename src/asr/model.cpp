@@ -13,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
@@ -1268,11 +1269,15 @@ AsrModel::AsrModel(ggml_runtime::BackendManager& bm, Common&& c, const BatchingC
         const auto st = sp->LoadFromSerializedProto(proto);
         if (st.ok()) {
             spm_ = std::move(sp);
-            std::cerr << "[asr_model] embedded SentencePiece tokenizer loaded ("
-                      << spm_->GetPieceSize() << " pieces) for word boosting\n";
+            GGMLF_LOG_INFO(
+                "[asr_model] embedded SentencePiece tokenizer loaded (%d pieces) for word "
+                "boosting\n",
+                spm_->GetPieceSize());
         } else {
-            std::cerr << "[asr_model] failed to load embedded SentencePiece tokenizer: "
-                      << st.ToString() << " (word boosting degraded)\n";
+            GGMLF_LOG_WARN(
+                "[asr_model] failed to load embedded SentencePiece tokenizer: %s "
+                "(word boosting degraded)\n",
+                st.ToString().c_str());
         }
     }
 }
@@ -1353,11 +1358,12 @@ AsrModel::load(
 
     const char* head_name =
         head == HeadKind::Ctc ? "ctc" : (head == HeadKind::Tdt ? "tdt" : "rnnt");
-    std::cerr << "[asr_model] arch=" << arch << " head=" << head_name
-              << " d_model=" << c.enc_cfg.d_model << " n_layers=" << c.enc_cfg.n_layers
-              << " n_heads=" << c.enc_cfg.n_heads << " d_ff=" << c.enc_cfg.d_ff
-              << " k=" << c.enc_cfg.conv_kernel_size << " feat_in=" << c.enc_cfg.feat_in
-              << " sr=" << c.fe_cfg.sample_rate << " vocab=" << c.vocab.size() << "\n";
+    GGMLF_LOG_INFO(
+        "[asr_model] arch=%s head=%s d_model=%d n_layers=%d n_heads=%d d_ff=%d k=%d "
+        "feat_in=%d sr=%d vocab=%zu\n",
+        arch.c_str(), head_name, c.enc_cfg.d_model, c.enc_cfg.n_layers, c.enc_cfg.n_heads,
+        c.enc_cfg.d_ff, c.enc_cfg.conv_kernel_size, c.enc_cfg.feat_in, c.fe_cfg.sample_rate,
+        c.vocab.size());
 
     // `new` rather than make_unique: Common is a protected nested type, which
     // std::make_unique (in namespace std) cannot name for template deduction;
@@ -1473,7 +1479,7 @@ class CtcModel::CtcBatcher {
 CtcModel::CtcModel(ggml_runtime::BackendManager& bm, Common&& c, const BatchingConfig& batching)
     : AsrModel(bm, std::move(c), batching) {
     ctc_cfg_ = load_ctc_cfg(*loader(), ns_, enc_cfg_);
-    std::cerr << "[asr_model] ctc classes=" << ctc_cfg_.num_classes << "\n";
+    GGMLF_LOG_INFO("[asr_model] ctc classes=%d\n", ctc_cfg_.num_classes);
 
     // Full utterances amortize the GPU frontend's launch overhead.
     offline_fe_ = std::make_unique<MelSpectrogramExtractor>(fe_cfg_, &bm, batching);
@@ -1582,14 +1588,15 @@ CtcModel::diagnostic_sessions() const {
 RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const BatchingConfig& batching)
     : AsrModel(bm, std::move(c), batching), batching_cfg_(batching) {
     rnnt_cfg_ = load_rnnt_cfg(*loader(), enc_cfg_);
-    std::cerr << "[asr_model] rnnt vocab=" << rnnt_cfg_.vocab_size
-              << " blank=" << rnnt_cfg_.blank_id << " pred_hidden=" << rnnt_cfg_.pred_hidden
-              << " joint_dim=" << rnnt_cfg_.joint_dim;
+    std::ostringstream model_info;
+    model_info << "[asr_model] rnnt vocab=" << rnnt_cfg_.vocab_size
+               << " blank=" << rnnt_cfg_.blank_id << " pred_hidden=" << rnnt_cfg_.pred_hidden
+               << " joint_dim=" << rnnt_cfg_.joint_dim;
     if (rnnt_cfg_.is_tdt()) {
-        std::cerr << " durations=";
-        for (int duration : rnnt_cfg_.durations) std::cerr << duration << ',';
+        model_info << " durations=";
+        for (int duration : rnnt_cfg_.durations) model_info << duration << ',';
     }
-    std::cerr << "\n";
+    GGMLF_LOG_INFO("%s\n", model_info.str().c_str());
 
     // Prompt fusion and joint.enc execute together once per encoder chunk.
     num_prompts_ = static_cast<int>(loader()->get_u32("asr.rnnt.num_prompts", 0));
@@ -1603,8 +1610,9 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
         }
     }
     if (num_prompts_ > 0 && loader()->has_tensor("prompt_kernel.0.weight")) {
-        std::cerr << "[asr_model] prompt fusion enabled: num_prompts=" << num_prompts_
-                  << " languages=" << prompt_dictionary_.size() << "\n";
+        GGMLF_LOG_INFO(
+            "[asr_model] prompt fusion enabled: num_prompts=%d languages=%zu\n", num_prompts_,
+            prompt_dictionary_.size());
         prompt_fusion_ = std::make_unique<PromptFusionModule>(rnnt_cfg_.d_model, num_prompts_);
     } else {
         num_prompts_ = 0;  // no prompt_kernel in this GGUF -> disable fusion

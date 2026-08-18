@@ -1,10 +1,9 @@
 # NeMo-Speech.cpp
 
-A lightweight native C++ runtime for running NVIDIA speech and voice models locally, with broad hardware support. It supports speech recognition, speaker diarization, translation, and speech synthesis in realtime and batch mode.
+A lightweight native C++ runtime for running NVIDIA Nemotron Speech model family locally, with broad hardware support. It supports multilingual speech recognition, speaker diarization, translation, and speech synthesis in realtime and batch mode.
 
-It builds on speech models and tooling from [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech). Native inference is powered by ggml.
 
-NVIDIA's official local speech inference solution, with day-0 support for our latest speech models.
+NeMo-Speech.cpp is NVIDIA's official local speech inference solution, with day-0 support for our latest speech models. It builds on models from [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech), with native inference powered by [ggml](https://github.com/ggerganov/ggml).
 
 ## Models and applications
 

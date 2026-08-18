@@ -108,7 +108,7 @@ class MagpieTtsRuntime::Impl {
         stream_ = std::make_unique<MagpieStreamingRuntime>();
         if (!stream_->load(
                 config_.magpie_model, config_.codec_model, to_internal(config_.uma_mode),
-                config_.magpie_cpu, config_.codec_cpu)) {
+                config_.magpie_cpu, config_.codec_cpu, config_.verbose)) {
             throw std::runtime_error("failed to load MagpieTTS/NanoCodec GGUFs");
         }
 
