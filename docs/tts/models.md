@@ -25,6 +25,22 @@ tar -xf models/magpie-tts/magpie_tts_multilingual_357m.nemo \
     -C models/magpie-tts/extracted
 ```
 
+MagpieTTS v2607 uses factor-2 frame stacking and must currently be converted
+locally before use:
+
+```bash
+hf download nvidia/magpie_tts_multilingual_357m \
+    magpie_tts_multilingual_357m.nemo \
+    --revision v2607 --local-dir models/magpie-tts-v2607
+python3 convert_model.py models/magpie-tts-v2607/magpie_tts_multilingual_357m.nemo \
+    --outfile models/magpie-tts-v2607/magpie_tts_multilingual_357m.v2607.f16.gguf
+mkdir -p models/magpie-tts-v2607/extracted
+tar -xf models/magpie-tts-v2607/magpie_tts_multilingual_357m.nemo \
+    -C models/magpie-tts-v2607/extracted
+```
+
+Both v2602 (factor 1) and v2607 (factor 2) use the same NanoCodec decoder.
+
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
 they are not part of the GGUF. Extract the `.nemo` and pass that directory to
 the server as `--tts.tokenizer-model-dir` (here

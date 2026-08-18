@@ -42,7 +42,8 @@ when present. The older split layout (`classify/tokenize_and_classify.far`,
 The optional `riva_server` adapter implements `RivaSpeechSynthesis.Synthesize`,
 `SynthesizeOnline`, and `GetRivaSynthesisConfig`. It takes plain text in
 `SynthesizeSpeechRequest.text`, supports native Magpie tokenizers for `en`,
-`es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, and `ja`, and returns `LINEAR_PCM`
+`es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, `ja`, `ar-AE`, `ar-SA`, `ar-MSA`,
+`ko`, and `pt-BR`, and returns `LINEAR_PCM`
 s16le at the NanoCodec sample rate. Japanese and Mandarin are included when
 `NEMO_SPEECH_TTS_WITH_JA` and `NEMO_SPEECH_TTS_WITH_ZH`, respectively, are
 enabled at build time; both default to `OFF`. Native tokenizers are cached by
@@ -127,7 +128,7 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.magpie-model` | - | - | MagpieTTS GGUF token generator (required) |
 | `tts.codec-model` | - | - | NanoCodec decoder GGUF (required) |
 | `tts.tokenizer-model-dir` | - | - | extracted Magpie `.nemo` dir (required) |
-| `tts.tokenizer.sentence-limit.<lang>` | - | per language (`en` 45 ... `ja` 40) | sentence-chunking threshold in words (characters for `zh`/`ja`); subkeys `en`, `es`, `fr`, `vi`, `it`, `de`, `zh`, `hi`, `ja` |
+| `tts.tokenizer.sentence-limit.<lang>` | - | per language (`en` 45 ... `ja` 40) | sentence-chunking threshold in words (characters for `zh`/`ja`); subkeys `en`, `es`, `fr`, `vi`, `it`, `de`, `zh`, `hi`, `ja`, `ar`, `ko`, `pt` |
 | `tts.tn-model-dir` | - | - | enables Sparrowhawk TN with this grammar dir; requires `NEMO_SPEECH_WITH_NORM=ON` |
 | `tts.language-code` | - | `en-US` | default Riva language code |
 | `tts.voice-name` | - | - | default voice name or speaker index |

@@ -93,10 +93,33 @@ def add_metadata(
     decoder = cfg["decoder"]
     lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
     frame_stacking = int(cfg.get("frame_stacking_factor", 1))
-    n_codebooks = int(
+    n_stacked_codebooks = int(
         len([k for k in sd if k.startswith("audio_embeddings.") and k.endswith(".weight")])
     )
-    n_codebooks //= frame_stacking
+    if frame_stacking < 1 or n_stacked_codebooks == 0 or n_stacked_codebooks % frame_stacking:
+        raise ValueError(
+            "audio embedding count must be a positive multiple of frame_stacking_factor: "
+            f"embeddings={n_stacked_codebooks} frame_stacking_factor={frame_stacking}"
+        )
+    n_codebooks = n_stacked_codebooks // frame_stacking
+    expected_logits = n_stacked_codebooks * audio_vocab
+    if int(sd["final_proj.weight"].shape[0]) != expected_logits:
+        raise ValueError(
+            "final_proj rows do not match stacked audio layout: "
+            f"rows={sd['final_proj.weight'].shape[0]} expected={expected_logits}"
+        )
+    n_lt_heads = len(
+        [
+            k
+            for k in sd
+            if k.startswith("local_transformer_out_projections.") and k.endswith(".weight")
+        ]
+    )
+    if n_lt_heads != n_stacked_codebooks:
+        raise ValueError(
+            "local transformer output heads do not match audio embeddings: "
+            f"heads={n_lt_heads} embeddings={n_stacked_codebooks}"
+        )
 
     inf = cfg.get("inference_parameters", {})
 
@@ -108,6 +131,7 @@ def add_metadata(
         "codec_model": cfg.get("codecmodel_path"),
         "text_vocab_size": text_vocab,
         "audio_codebooks": n_codebooks,
+        "stacked_audio_codebooks": n_stacked_codebooks,
         "audio_codebook_size": codebook_size,
         "audio_vocab_size": audio_vocab,
         "frame_stacking_factor": frame_stacking,
@@ -135,6 +159,7 @@ def add_metadata(
 
     add_i32(writer, "magpietts.text_vocab_size", text_vocab)
     add_i32(writer, "magpietts.audio_codebooks", n_codebooks)
+    add_i32(writer, "magpietts.stacked_audio_codebooks", n_stacked_codebooks)
     add_i32(writer, "magpietts.audio_codebook_size", codebook_size)
     add_i32(writer, "magpietts.audio_vocab_size", audio_vocab)
     add_i32(writer, "magpietts.audio_bos_id", codebook_size + 0)
@@ -308,9 +333,9 @@ def convert(
 
         if cfg.get("target") != "nemo.collections.tts.models.magpietts.MagpieTTSModel":
             raise RuntimeError(f"unsupported target: {cfg.get('target')}")
-        if cfg.get("model_type") != "decoder_ce" or not cfg.get(
-            "has_baked_context_embedding", False
-        ):
+        # v2602 records this in the config while v2607 retains the baked
+        # tensor but omits the legacy config flag.
+        if cfg.get("model_type") != "decoder_ce" or "baked_context_embedding.weight" not in sd:
             raise RuntimeError(
                 "this GGML example expects MagpieTTS decoder_ce with baked context embeddings"
             )

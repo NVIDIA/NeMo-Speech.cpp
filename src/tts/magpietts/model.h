@@ -50,6 +50,11 @@ struct magpietts_hparams {
     int32_t mask_token_id = 2020;
     int32_t frame_stacking_factor = 1;
 
+    // Number of model prediction slots in one decoder position.  v2602 has
+    // one slot per codec codebook, while v2607 predicts two consecutive codec
+    // frames at once.
+    int32_t stacked_audio_codebooks() const { return audio_codebooks * frame_stacking_factor; }
+
     int32_t n_embd = 768;
     int32_t n_ffn = 3072;
     int32_t n_ctx = 2048;
@@ -86,6 +91,42 @@ struct magpietts_hparams {
     std::vector<int32_t> estimate_alignment_from_layers;
     std::vector<int32_t> apply_prior_to_layers;
 };
+
+inline bool
+magpietts_unstack_codes(
+    const std::vector<int32_t>& stacked_codes, const magpietts_hparams& h,
+    std::vector<std::vector<int32_t>>& frames) {
+    if ((int)stacked_codes.size() != h.stacked_audio_codebooks()) {
+        return false;
+    }
+    frames.assign((size_t)h.frame_stacking_factor, std::vector<int32_t>(h.audio_codebooks));
+    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+        for (int codebook = 0; codebook < h.audio_codebooks; ++codebook) {
+            frames[(size_t)lane][(size_t)codebook] =
+                stacked_codes[(size_t)(codebook + lane * h.audio_codebooks)];
+        }
+    }
+    return true;
+}
+
+inline int
+magpietts_first_eos_lane(
+    const std::vector<int32_t>& sampled, const std::vector<int32_t>& greedy,
+    const magpietts_hparams& h) {
+    if ((int)sampled.size() != h.stacked_audio_codebooks() ||
+        (int)greedy.size() != h.stacked_audio_codebooks()) {
+        return -1;
+    }
+    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+        for (int codebook = 0; codebook < h.audio_codebooks; ++codebook) {
+            const size_t index = (size_t)(codebook + lane * h.audio_codebooks);
+            if (sampled[index] == h.audio_eos_id || greedy[index] == h.audio_eos_id) {
+                return lane;
+            }
+        }
+    }
+    return -1;
+}
 
 struct magpietts_layer {
     ggml_tensor* norm_self = nullptr;

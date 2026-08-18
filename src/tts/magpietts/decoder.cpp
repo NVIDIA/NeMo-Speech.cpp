@@ -502,11 +502,39 @@ build_audio_embedding(
     ggml_context* ctx, const magpietts_model& model,
     const std::vector<ggml_tensor*>& audio_tok_inputs) {
     ggml_tensor* sum = nullptr;
-    for (int c = 0; c < model.hparams.audio_codebooks; ++c) {
+    for (int c = 0; c < model.hparams.stacked_audio_codebooks(); ++c) {
         ggml_tensor* emb = ggml_get_rows(ctx, model.audio_embeddings[c], audio_tok_inputs[c]);
         sum = sum ? ggml_add(ctx, sum, emb) : emb;
     }
-    return ggml_scale(ctx, sum, 1.0f / (float)model.hparams.audio_codebooks);
+    return ggml_scale(ctx, sum, 1.0f / (float)model.hparams.stacked_audio_codebooks());
+}
+
+static bool
+stack_audio_codes(
+    const std::vector<std::vector<int32_t>>& audio_codes, const magpietts_hparams& h,
+    std::vector<std::vector<int32_t>>& stacked) {
+    if ((int)audio_codes.size() != h.audio_codebooks || audio_codes.empty() ||
+        audio_codes[0].empty() || (int)audio_codes[0].size() % h.frame_stacking_factor != 0) {
+        return false;
+    }
+    const int raw_len = (int)audio_codes[0].size();
+    for (const auto& codes : audio_codes) {
+        if ((int)codes.size() != raw_len) {
+            return false;
+        }
+    }
+    const int stacked_len = raw_len / h.frame_stacking_factor;
+    stacked.assign((size_t)h.stacked_audio_codebooks(), std::vector<int32_t>(stacked_len));
+    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+        for (int codebook = 0; codebook < h.audio_codebooks; ++codebook) {
+            auto& dst = stacked[(size_t)(codebook + lane * h.audio_codebooks)];
+            const auto& src = audio_codes[(size_t)codebook];
+            for (int pos = 0; pos < stacked_len; ++pos) {
+                dst[(size_t)pos] = src[(size_t)(pos * h.frame_stacking_factor + lane)];
+            }
+        }
+    }
+    return true;
 }
 
 static bool
@@ -519,17 +547,18 @@ decoder_eval_impl(
     const ggml_nvtx::range nvtx_range(
         conditional ? "magpietts_decoder_eval_cond" : "magpietts_decoder_eval_uncond");
     const auto& h = model.hparams;
-    const int audio_len = audio_codes.empty() ? 0 : (int)audio_codes[0].size();
-    if (audio_len <= 0) {
+    std::vector<std::vector<int32_t>> stacked_audio;
+    if (!stack_audio_codes(audio_codes, h, stacked_audio)) {
         fprintf(stderr, "decoder_eval requires at least one audio token\n");
         return false;
     }
+    const int audio_len = (int)stacked_audio[0].size();
     const int total_len = h.baked_context_length + audio_len;
 
     ggml_context* ctx = new_graph_context();
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAGPIETTS_MAX_NODES, false);
 
-    std::vector<ggml_tensor*> audio_tok_inputs(h.audio_codebooks);
+    std::vector<ggml_tensor*> audio_tok_inputs(h.stacked_audio_codebooks());
     std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
     std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
 
@@ -538,12 +567,12 @@ decoder_eval_impl(
     ggml_set_input(speaker_in);
     i32_inputs.push_back({"magpietts_decoder_speaker", {speaker}});
 
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         const std::string name = "magpietts_decoder_audio_tokens_" + std::to_string(c);
         audio_tok_inputs[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, audio_len);
         ggml_set_name(audio_tok_inputs[c], name.c_str());
         ggml_set_input(audio_tok_inputs[c]);
-        i32_inputs.push_back({name, audio_codes[c]});
+        i32_inputs.push_back({name, stacked_audio[c]});
     }
 
     ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, total_len);
@@ -623,15 +652,15 @@ decoder_eval_impl(
         return false;
     }
 
-    const size_t logits_last_size = (size_t)h.audio_codebooks * h.audio_vocab_size;
+    const size_t logits_last_size = (size_t)h.stacked_audio_codebooks() * h.audio_vocab_size;
     const size_t logits_off_floats = logits_last_size * (total_len - 1);
     if (hidden_out && hidden_last) {
         ggml_backend_tensor_copy(hidden_last, hidden_out->tensor);
     }
     if (cuda_sample) {
         const bool sampled = MagpieCodebookSampler::runCuda(
-            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats, h.audio_codebooks,
-            0);
+            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats,
+            h.stacked_audio_codebooks(), 0);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         return sampled;
@@ -666,17 +695,18 @@ decoder_eval_pair_impl(
     MagpiePinnedHostScratch& output_staging, const magpietts_decoder_attention* attention) {
     const ggml_nvtx::range nvtx_range("magpietts_decoder_eval_pair");
     const auto& h = model.hparams;
-    const int audio_len = audio_codes.empty() ? 0 : (int)audio_codes[0].size();
-    if (audio_len <= 0) {
+    std::vector<std::vector<int32_t>> stacked_audio;
+    if (!stack_audio_codes(audio_codes, h, stacked_audio)) {
         fprintf(stderr, "decoder_eval_pair requires at least one audio token\n");
         return false;
     }
+    const int audio_len = (int)stacked_audio[0].size();
     const int total_len = h.baked_context_length + audio_len;
 
     ggml_context* ctx = new_graph_context();
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAGPIETTS_MAX_NODES, false);
 
-    std::vector<ggml_tensor*> audio_tok_inputs(h.audio_codebooks);
+    std::vector<ggml_tensor*> audio_tok_inputs(h.stacked_audio_codebooks());
     std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
     std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
 
@@ -685,12 +715,12 @@ decoder_eval_pair_impl(
     ggml_set_input(speaker_in);
     i32_inputs.push_back({"magpietts_decoder_speaker", {speaker}});
 
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         const std::string name = "magpietts_decoder_audio_tokens_" + std::to_string(c);
         audio_tok_inputs[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, audio_len);
         ggml_set_name(audio_tok_inputs[c], name.c_str());
         ggml_set_input(audio_tok_inputs[c]);
-        i32_inputs.push_back({name, audio_codes[c]});
+        i32_inputs.push_back({name, stacked_audio[c]});
     }
 
     ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, total_len);
@@ -786,7 +816,7 @@ decoder_eval_pair_impl(
         return false;
     }
 
-    const size_t logits_last_size = (size_t)h.audio_codebooks * h.audio_vocab_size;
+    const size_t logits_last_size = (size_t)h.stacked_audio_codebooks() * h.audio_vocab_size;
     const size_t logits_off_floats = logits_last_size * (total_len - 1);
     if (cond_hidden_out && cond_hidden_last) {
         ggml_backend_tensor_copy(cond_hidden_last, cond_hidden_out->tensor);
@@ -797,7 +827,7 @@ decoder_eval_pair_impl(
     if (cuda_sample) {
         const bool sampled = MagpieCodebookSampler::runCuda(
             model.backend, h, cuda_sample, logits_cond, logits_uncond, logits_off_floats,
-            h.audio_codebooks, 0);
+            h.stacked_audio_codebooks(), 0);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         return sampled;
@@ -842,11 +872,12 @@ decoder_eval_cached_impl(
         conditional ? "magpietts_decoder_eval_cached_cond"
                     : "magpietts_decoder_eval_cached_uncond");
     const auto& h = model.hparams;
-    const int audio_len = audio_codes.empty() ? 0 : (int)audio_codes[0].size();
-    if (audio_len <= 0) {
+    std::vector<std::vector<int32_t>> stacked_audio;
+    if (!stack_audio_codes(audio_codes, h, stacked_audio)) {
         fprintf(stderr, "decoder_eval_cached requires at least one audio token\n");
         return false;
     }
+    const int audio_len = (int)stacked_audio[0].size();
     if (h.dec_kernel != 1) {
         return decoder_eval_impl(
             model, text_cond, text_len, audio_codes, speaker, conditional, threads, result,
@@ -878,7 +909,7 @@ decoder_eval_cached_impl(
     ggml_context* ctx = new_graph_context();
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAGPIETTS_MAX_NODES, false);
 
-    std::vector<ggml_tensor*> audio_tok_inputs(h.audio_codebooks);
+    std::vector<ggml_tensor*> audio_tok_inputs(h.stacked_audio_codebooks());
     std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
     std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
 
@@ -895,22 +926,22 @@ decoder_eval_cached_impl(
             ctx_emb = ggml_scale(ctx, ctx_emb, 0.0f);
         }
 
-        for (int c = 0; c < h.audio_codebooks; ++c) {
+        for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             const std::string name = "magpietts_decoder_audio_tokens_" + std::to_string(c);
             audio_tok_inputs[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_audio_in);
             ggml_set_name(audio_tok_inputs[c], name.c_str());
             ggml_set_input(audio_tok_inputs[c]);
-            i32_inputs.push_back({name, audio_codes[c]});
+            i32_inputs.push_back({name, stacked_audio[c]});
         }
         ggml_tensor* audio_emb = build_audio_embedding(ctx, model, audio_tok_inputs);
         dec_in = ggml_concat(ctx, ctx_emb, audio_emb, 1);
     } else {
-        for (int c = 0; c < h.audio_codebooks; ++c) {
+        for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             const std::string name = "magpietts_decoder_audio_tokens_" + std::to_string(c);
             audio_tok_inputs[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_audio_in);
             ggml_set_name(audio_tok_inputs[c], name.c_str());
             ggml_set_input(audio_tok_inputs[c]);
-            i32_inputs.push_back({name, {audio_codes[c].back()}});
+            i32_inputs.push_back({name, {stacked_audio[c].back()}});
         }
         dec_in = build_audio_embedding(ctx, model, audio_tok_inputs);
     }
@@ -983,15 +1014,15 @@ decoder_eval_cached_impl(
         return false;
     }
 
-    const size_t logits_last_size = (size_t)h.audio_codebooks * h.audio_vocab_size;
+    const size_t logits_last_size = (size_t)h.stacked_audio_codebooks() * h.audio_vocab_size;
     const size_t logits_off_floats = logits_last_size * (n_graph_tokens - 1);
     if (hidden_out && hidden_last) {
         ggml_backend_tensor_copy(hidden_last, hidden_out->tensor);
     }
     if (cuda_sample) {
         const bool sampled = MagpieCodebookSampler::runCuda(
-            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats, h.audio_codebooks,
-            0);
+            model.backend, h, cuda_sample, logits, nullptr, logits_off_floats,
+            h.stacked_audio_codebooks(), 0);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         if (sampled) {
@@ -1033,11 +1064,12 @@ decoder_eval_cached_pair_impl(
     MagpiePinnedHostScratch& output_staging, const magpietts_decoder_attention* attention) {
     const ggml_nvtx::range nvtx_range("magpietts_decoder_eval_cached_pair");
     const auto& h = model.hparams;
-    const int audio_len = audio_codes.empty() ? 0 : (int)audio_codes[0].size();
-    if (audio_len <= 0) {
+    std::vector<std::vector<int32_t>> stacked_audio;
+    if (!stack_audio_codes(audio_codes, h, stacked_audio)) {
         fprintf(stderr, "decoder_eval_cached_pair requires at least one audio token\n");
         return false;
     }
+    const int audio_len = (int)stacked_audio[0].size();
     if (h.dec_kernel != 1) {
         return decoder_eval_pair_impl(
             model, text_cond, text_len, audio_codes, speaker, threads, cond_result, uncond_result,
@@ -1090,7 +1122,7 @@ decoder_eval_cached_pair_impl(
     ggml_context* ctx = new_graph_context();
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAGPIETTS_MAX_NODES, false);
 
-    std::vector<ggml_tensor*> audio_tok_inputs(h.audio_codebooks);
+    std::vector<ggml_tensor*> audio_tok_inputs(h.stacked_audio_codebooks());
     std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
     std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
 
@@ -1102,12 +1134,12 @@ decoder_eval_cached_pair_impl(
         ggml_set_input(speaker_in);
         i32_inputs.push_back({"magpietts_decoder_speaker", {speaker}});
 
-        for (int c = 0; c < h.audio_codebooks; ++c) {
+        for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             const std::string name = "magpietts_decoder_audio_tokens_" + std::to_string(c);
             audio_tok_inputs[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_audio_in);
             ggml_set_name(audio_tok_inputs[c], name.c_str());
             ggml_set_input(audio_tok_inputs[c]);
-            i32_inputs.push_back({name, audio_codes[c]});
+            i32_inputs.push_back({name, stacked_audio[c]});
         }
 
         ggml_tensor* ctx_flat = ggml_get_rows(ctx, model.baked_context, speaker_in);
@@ -1118,12 +1150,12 @@ decoder_eval_cached_pair_impl(
         dec_in_cond = ggml_concat(ctx, ctx_emb_cond, audio_emb, 1);
         dec_in_uncond = ggml_concat(ctx, ctx_emb_uncond, audio_emb, 1);
     } else {
-        for (int c = 0; c < h.audio_codebooks; ++c) {
+        for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             const std::string name = "magpietts_decoder_audio_tokens_" + std::to_string(c);
             audio_tok_inputs[c] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_audio_in);
             ggml_set_name(audio_tok_inputs[c], name.c_str());
             ggml_set_input(audio_tok_inputs[c]);
-            i32_inputs.push_back({name, {audio_codes[c].back()}});
+            i32_inputs.push_back({name, {stacked_audio[c].back()}});
         }
         ggml_tensor* audio_emb = build_audio_embedding(ctx, model, audio_tok_inputs);
         dec_in_cond = audio_emb;
@@ -1219,7 +1251,7 @@ decoder_eval_cached_pair_impl(
         return false;
     }
 
-    const size_t logits_last_size = (size_t)h.audio_codebooks * h.audio_vocab_size;
+    const size_t logits_last_size = (size_t)h.stacked_audio_codebooks() * h.audio_vocab_size;
     const size_t logits_off_floats = logits_last_size * (n_graph_tokens - 1);
     if (cond_hidden_out && cond_hidden_last) {
         ggml_backend_tensor_copy(cond_hidden_last, cond_hidden_out->tensor);
@@ -1230,7 +1262,7 @@ decoder_eval_cached_pair_impl(
     if (cuda_sample) {
         const bool sampled = MagpieCodebookSampler::runCuda(
             model.backend, h, cuda_sample, logits_cond, logits_uncond, logits_off_floats,
-            h.audio_codebooks, 0);
+            h.stacked_audio_codebooks(), 0);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         if (sampled) {
@@ -1374,14 +1406,14 @@ MagpieCodebookSampler::sampleParallel(
     const magpietts_hparams& h, bool use_cfg, float cfg_scale, float temperature, int top_k,
     bool forbid_audio_eos, std::mt19937& rng, std::vector<int32_t>* argmax_codes) {
     const ggml_nvtx::range nvtx_range("magpietts_sample_parallel_codebooks");
-    std::vector<int32_t> codes(h.audio_codebooks);
+    std::vector<int32_t> codes(h.stacked_audio_codebooks());
     if (argmax_codes) {
-        argmax_codes->assign(h.audio_codebooks, 0);
+        argmax_codes->assign(h.stacked_audio_codebooks(), 0);
     }
 
     std::vector<std::future<prepared_codebook_sample>> futures;
-    futures.reserve(h.audio_codebooks);
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    futures.reserve(h.stacked_audio_codebooks());
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         futures.push_back(std::async(std::launch::async, [&, c]() {
             std::vector<float> logits = slice_codebook_logits(cond_logits, h, c);
             if (use_cfg) {
@@ -1395,11 +1427,11 @@ MagpieCodebookSampler::sampleParallel(
         }));
     }
 
-    std::vector<prepared_codebook_sample> prepared((size_t)h.audio_codebooks);
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    std::vector<prepared_codebook_sample> prepared((size_t)h.stacked_audio_codebooks());
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         prepared[(size_t)c] = futures[(size_t)c].get();
     }
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         codes[c] = sample_from_prepared_codebook(prepared[(size_t)c], temperature, rng);
         if (argmax_codes) {
             (*argmax_codes)[c] = prepared[(size_t)c].greedy;

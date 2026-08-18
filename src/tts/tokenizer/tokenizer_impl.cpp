@@ -53,6 +53,7 @@ struct params {
     fs::path model;
     std::string text;
     std::string language = "en";
+    bool v2607 = false;
     bool sentence_chunking = true;
     std::function<std::string(const std::string&, bool)> chunk_text_transform;
 };
@@ -864,6 +865,16 @@ tokenizer_for_language(const std::string& lang) {
         return "italian_phoneme";
     if (lang == "vi")
         return "vietnamese_phoneme";
+    if (lang == "pt-br")
+        return "portuguese_Brazilian_phoneme";
+    if (lang == "ko")
+        return "korean_chartokenizer";
+    if (lang == "ar-ae")
+        return "arabic_AE_chartokenizer";
+    if (lang == "ar-sa")
+        return "arabic_SA_chartokenizer";
+    if (lang == "ar-msa")
+        return "arabic_MSA_chartokenizer";
 #ifdef NEMO_SPEECH_TTS_WITH_ZH
     if (lang == "zh")
         return "mandarin_phoneme";
@@ -934,6 +945,17 @@ ipa_config_for_language(const std::string& lang) {
             true,
             true};
     }
+    if (lang == "pt-br") {
+        return {"portuguese_Brazilian_phoneme",
+                1017,
+                "pt_br_prondict",
+                "",
+                "pt-BR",
+                "upper",
+                "#",
+                true,
+                true};
+    }
     throw std::runtime_error("no native IPA tokenizer for language " + lang);
 }
 
@@ -975,6 +997,17 @@ exact_ipa_tokens(const std::string& tokenizer_name) {
             "ʊ",  "ʌ",  "ʒ",  "ˈ",  "ˌ",  "ː",     "̃",      "θ",  "‒",  "–",  "—",  "‘",  "‚",
             "“",  "„",  "‹",  "›",  " ",  "<pad>", "<oov>",
         };
+    }
+    if (tokenizer_name == "portuguese_Brazilian_phoneme") {
+        return {"!",  "\"", "#A", "#B", "#C", "#D",    "#E",   "#F", "#G", "#H", "#I", "#J", "#K",
+                "#L", "#M", "#N", "#O", "#P", "#Q",    "#R",   "#S", "#T", "#U", "#V", "#W", "#X",
+                "#Y", "#Z", "#À", "#Á", "#Â", "#Ã",    "#Ç",   "#É", "#Ê", "#Í", "#Ó", "#Ô", "#Õ",
+                "#Ú", "#Ü", "'",  "(",  ")",  ",",     "-",    ".",  "/",  ":",  ";",  "?",  "[",
+                "]",  "a",  "b",  "d",  "e",  "f",     "h",    "i",  "j",  "k",  "l",  "m",  "n",
+                "o",  "p",  "r",  "s",  "t",  "u",     "v",    "w",  "x",  "y",  "z",  "{",  "}",
+                "ð",  "õ",  "ĩ",  "ŋ",  "ũ",  "ɐ",     "ɑ",    "ɒ",  "ɔ",  "ə",  "ɛ",  "ɜ",  "ɡ",
+                "ɪ",  "ɲ",  "ɹ",  "ɾ",  "ʁ",  "ʃ",     "ʊ",    "ʌ",  "ʎ",  "ʒ",  "ʲ",  "ˈ",  "ˌ",
+                "ː",  "̃",   "θ",  "ẽ",  " ",  "<pad>", "<oov>"};
     }
     return {};
 }
@@ -1421,6 +1454,57 @@ run_hindi_native(const params& p) {
     return result;
 }
 
+static std::vector<std::string>
+arabic_tokens() {
+    std::vector<std::string> tokens = {" ", "ء", "آ", "أ", "إ", "ؤ", "ئ", "ا", "ب", "ة", "ت", "ث",
+                                       "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط",
+                                       "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "ه", "و", "ى",
+                                       "ي", "ً",  "ٌ",  "ٍ",  "َ",  "ُ",  "ِ",  "ّ",  "ٰ",  "ْ"};
+    // v2607 pins NeMo ArabicCharsTokenizer charset_version=1, whose mixed-case
+    // Arabic character set deliberately contains this second copy.
+    const std::vector<std::string> arabic_chars(tokens.begin() + 1, tokens.end());
+    tokens.insert(tokens.end(), arabic_chars.begin(), arabic_chars.end());
+    for (char c = 'a'; c <= 'z'; ++c) tokens.emplace_back(1, c);
+    for (char c = 'A'; c <= 'Z'; ++c) tokens.emplace_back(1, c);
+    tokens.push_back("'");
+    const auto punct = default_punct();
+    tokens.insert(tokens.end(), punct.begin(), punct.end());
+    tokens.insert(tokens.end(), {"،", "؛", "؟", "<pad>", "<oov>"});
+    return tokens;
+}
+
+static tokenizer_result
+run_arabic_native(const params& p, int offset, const std::string& tokenizer_name) {
+    const auto tokens = arabic_tokens();
+    std::unordered_map<std::string, int> ids;
+    for (size_t i = 0; i < tokens.size(); ++i) ids[tokens[i]] = (int)i;
+    tokenizer_result result;
+    result.language = p.language;
+    result.tokenizer_name = tokenizer_name;
+    const int pad_id = token_id_for_symbol(tokens, offset, "<pad>");
+    for (const std::string& sentence : tokenizer_input_units(p, p.text)) {
+        chunk ch;
+        ch.text = sentence;
+        std::vector<std::string> symbols;
+        for (const auto& symbol : split_utf8(sentence)) {
+            if (symbol == " ") {
+                if (!symbols.empty() && symbols.back() != symbol)
+                    symbols.push_back(symbol);
+            } else if (ids.count(symbol) != 0) {
+                symbols.push_back(symbol);
+            }
+        }
+        while (!symbols.empty() && symbols.back() == " ") symbols.pop_back();
+        symbols.insert(symbols.begin(), " ");
+        symbols.push_back(" ");
+        for (const auto& symbol : symbols) ch.tokens.push_back(offset + ids[symbol]);
+        ch.tokens.push_back(result.eos_id);
+        pad_short_text_chunk_before_eos(ch, result.eos_id, pad_id);
+        result.chunks.push_back(std::move(ch));
+    }
+    return result;
+}
+
 #ifdef NEMO_SPEECH_TTS_WITH_ZH
 static tokenizer_result
 run_mandarin_native(const params& p, const mandarin_tokenizer& tok) {
@@ -1596,6 +1680,11 @@ supports_native(const params& p) {
     if (p.language == "hi") {
         return true;
     }
+    if ((p.language == "pt-br" || p.language == "ko" || p.language == "ar-ae" ||
+         p.language == "ar-sa" || p.language == "ar-msa") &&
+        p.v2607) {
+        return p.language != "pt-br" || fs::is_directory(p.model);
+    }
 #ifdef NEMO_SPEECH_TTS_WITH_JA
     if (p.language == "ja") {
         return !find_openjtalk_dictionary_dir(p.model).empty();
@@ -1626,6 +1715,21 @@ run_native(const params& p) {
     }
     if (p.language == "hi") {
         return run_hindi_native(p);
+    }
+    if (p.language == "pt-br") {
+        return run_ipa_native(p);
+    }
+    if (p.language == "ko") {
+        return run_byt5_native(p, 2973, "korean_chartokenizer");
+    }
+    if (p.language == "ar-ae") {
+        return run_arabic_native(p, 1329, "arabic_AE_chartokenizer");
+    }
+    if (p.language == "ar-sa") {
+        return run_arabic_native(p, 1493, "arabic_SA_chartokenizer");
+    }
+    if (p.language == "ar-msa") {
+        return run_arabic_native(p, 1657, "arabic_MSA_chartokenizer");
     }
 #ifdef NEMO_SPEECH_TTS_WITH_JA
     if (p.language == "ja") {

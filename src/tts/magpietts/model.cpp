@@ -721,6 +721,8 @@ magpietts_model_load_impl(
     h.mask_token_id = gguf_i32(model.gguf, "magpietts.mask_token_id", h.mask_token_id);
     h.frame_stacking_factor =
         gguf_i32(model.gguf, "magpietts.frame_stacking_factor", h.frame_stacking_factor);
+    const int32_t stored_stacked_codebooks =
+        gguf_i32(model.gguf, "magpietts.stacked_audio_codebooks", h.stacked_audio_codebooks());
     h.n_embd = gguf_i32(model.gguf, "magpietts.embedding_dim", h.n_embd);
     h.n_ffn = gguf_i32(model.gguf, "magpietts.ffn_dim", h.n_ffn);
     h.n_ctx = gguf_i32(model.gguf, "magpietts.context_length", h.n_ctx);
@@ -799,10 +801,15 @@ magpietts_model_load_impl(
         return false;
     }
 
-    if (h.frame_stacking_factor != 1) {
+    if (h.frame_stacking_factor < 1) {
+        fprintf(stderr, "invalid frame_stacking_factor=%d\n", h.frame_stacking_factor);
+        return false;
+    }
+    if (h.audio_codebooks < 1 || stored_stacked_codebooks != h.stacked_audio_codebooks()) {
         fprintf(
-            stderr, "unsupported frame_stacking_factor=%d; this example currently supports 1\n",
-            h.frame_stacking_factor);
+            stderr,
+            "invalid stacked audio layout: codebooks=%d frame_stacking_factor=%d stored_slots=%d\n",
+            h.audio_codebooks, h.frame_stacking_factor, stored_stacked_codebooks);
         return false;
     }
 
@@ -882,11 +889,23 @@ magpietts_model_load_impl(
     model.baked_context = require_tensor(model, "baked_context_embedding.weight");
     model.final_proj_w = require_tensor(model, "final_proj.weight");
     model.final_proj_b = require_tensor(model, "final_proj.bias");
-    model.lt_in_w = require_tensor(model, "local_transformer_in_projection.weight");
-    model.lt_in_b = require_tensor(model, "local_transformer_in_projection.bias");
+    // v2602 projects decoder/audio embeddings into the local-transformer
+    // dimension.  In v2607 those dimensions are both 768 and the checkpoint
+    // intentionally omits the projection (identity input).
+    model.lt_in_w = ggml_get_tensor(model.ctx, "local_transformer_in_projection.weight");
+    model.lt_in_b = ggml_get_tensor(model.ctx, "local_transformer_in_projection.bias");
+    if ((model.lt_in_w == nullptr) != (model.lt_in_b == nullptr)) {
+        fprintf(stderr, "local-transformer input projection must include both weight and bias\n");
+        return false;
+    }
+    if (model.lt_in_w == nullptr && h.n_embd != h.lt_hidden) {
+        fprintf(
+            stderr, "local-transformer input projection is missing for incompatible dimensions\n");
+        return false;
+    }
 
-    model.audio_embeddings.resize(h.audio_codebooks);
-    for (int i = 0; i < h.audio_codebooks; ++i) {
+    model.audio_embeddings.resize(h.stacked_audio_codebooks());
+    for (int i = 0; i < h.stacked_audio_codebooks(); ++i) {
         model.audio_embeddings[i] =
             require_tensor(model, "audio_embeddings." + std::to_string(i) + ".weight");
     }
@@ -911,9 +930,9 @@ magpietts_model_load_impl(
     }
 #endif
 
-    model.lt_out_w.resize(h.audio_codebooks);
-    model.lt_out_b.resize(h.audio_codebooks);
-    for (int i = 0; i < h.audio_codebooks; ++i) {
+    model.lt_out_w.resize(h.stacked_audio_codebooks());
+    model.lt_out_b.resize(h.stacked_audio_codebooks());
+    for (int i = 0; i < h.stacked_audio_codebooks(); ++i) {
         model.lt_out_w[i] = require_tensor(
             model, "local_transformer_out_projections." + std::to_string(i) + ".weight");
         model.lt_out_b[i] = require_tensor(
@@ -922,11 +941,12 @@ magpietts_model_load_impl(
 
     fprintf(
         stderr,
-        "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d audio_vocab=%d speakers=%d "
+        "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d stacked_slots=%d audio_vocab=%d "
+        "speakers=%d "
         "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
         "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
-        h.text_vocab_size, h.audio_codebooks, h.audio_vocab_size, h.baked_speakers,
-        h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
+        h.text_vocab_size, h.audio_codebooks, h.stacked_audio_codebooks(), h.audio_vocab_size,
+        h.baked_speakers, h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
         h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
         h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
         format_i32_list(h.estimate_alignment_from_layers).c_str(),
@@ -1905,7 +1925,7 @@ MagpieCodeGenerator::generate(
 
     std::vector<std::vector<int32_t>> audio_codes(h.audio_codebooks);
     for (int c = 0; c < h.audio_codebooks; ++c) {
-        audio_codes[c].push_back(h.audio_bos_id);
+        audio_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
     }
 
     std::vector<std::vector<int32_t>> generated_frames;
@@ -1942,7 +1962,7 @@ MagpieCodeGenerator::generate(
             }
         }
 #if defined(MAGPIETTS_CUDA_SAMPLING)
-        cuda_sampler.reset(magpietts_cuda_sampler_create(h.audio_codebooks));
+        cuda_sampler.reset(magpietts_cuda_sampler_create(h.stacked_audio_codebooks()));
         if (!cuda_sampler) {
             fprintf(stderr, "failed to create CUDA sampler\n");
             return false;
@@ -1958,14 +1978,16 @@ MagpieCodeGenerator::generate(
     const int64_t generation_start_us = ggml_time_us();
     {
         const ggml_nvtx::range nvtx_loop("magpietts_generate_loop");
-        for (int step = 0; step < h.max_decoder_steps; ++step) {
+        const int max_decoder_positions =
+            (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+        for (int step = 0; step < max_decoder_positions; ++step) {
             const ggml_nvtx::range nvtx_step("magpietts_generate_step");
             const int64_t frame_start_us = ggml_time_us();
             if (step % 10 == 0) {
-                fprintf(stderr, "%s decoding frame %d/%d\n", label, step, h.max_decoder_steps);
+                fprintf(stderr, "%s decoding frame %d/%d\n", label, step, max_decoder_positions);
             }
 
-            const bool forbid_eos = step < h.min_generated_frames;
+            const bool forbid_eos = step * h.frame_stacking_factor < h.min_generated_frames;
             std::vector<int32_t> next_codes;
             std::vector<int32_t> argmax_codes;
             std::vector<float> alignment_scores;
@@ -2062,8 +2084,8 @@ MagpieCodeGenerator::generate(
                     next_codes = std::move(cuda_sample.codes);
                     argmax_codes = std::move(cuda_sample.argmax_codes);
                 }
-                if ((int)next_codes.size() != h.audio_codebooks ||
-                    (int)argmax_codes.size() != h.audio_codebooks) {
+                if ((int)next_codes.size() != h.stacked_audio_codebooks() ||
+                    (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
                     fprintf(stderr, "CUDA sampler returned an unexpected number of codebooks\n");
                     return false;
                 }
@@ -2115,16 +2137,26 @@ MagpieCodeGenerator::generate(
                 attention_prior.update(h, step, (int)tokens.size(), alignment_scores);
             }
 
-            if (!forbid_eos &&
-                MagpieCodebookSampler::hasEos(next_codes, argmax_codes, h.audio_eos_id)) {
+            std::vector<std::vector<int32_t>> codec_frames;
+            if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
+                fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+                return false;
+            }
+            const int eos_lane =
+                forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
+            for (int c = 0; c < h.audio_codebooks; ++c) {
+                for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+                    audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
+                }
+            }
+            for (int lane = 0; lane < (eos_lane >= 0 ? eos_lane : h.frame_stacking_factor);
+                 ++lane) {
+                generated_frames.push_back(codec_frames[(size_t)lane]);
+            }
+            if (eos_lane >= 0) {
                 ggml_nvtx::mark("magpietts_eos");
                 fprintf(stderr, "%s EOS detected at frame %d\n", label, step);
                 break;
-            }
-
-            generated_frames.push_back(next_codes);
-            for (int c = 0; c < h.audio_codebooks; ++c) {
-                audio_codes[c].push_back(next_codes[c]);
             }
 
             bool first_frame = false;

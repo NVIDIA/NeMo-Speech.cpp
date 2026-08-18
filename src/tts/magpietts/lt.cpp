@@ -253,8 +253,10 @@ magpietts_model_init_local_transformer_copy(
     std::vector<std::pair<const ggml_tensor*, ggml_tensor*>> copies;
     if (!magpietts_local_add_tensor_vector(
             dst.ctx, src.audio_embeddings, dst.audio_embeddings, copies, fp32) ||
-        !magpietts_local_add_tensor(dst.ctx, src.lt_in_w, &dst.lt_in_w, copies, fp32) ||
-        !magpietts_local_add_tensor(dst.ctx, src.lt_in_b, &dst.lt_in_b, copies, fp32) ||
+        (src.lt_in_w &&
+         !magpietts_local_add_tensor(dst.ctx, src.lt_in_w, &dst.lt_in_w, copies, fp32)) ||
+        (src.lt_in_b &&
+         !magpietts_local_add_tensor(dst.ctx, src.lt_in_b, &dst.lt_in_b, copies, fp32)) ||
         !magpietts_local_add_tensor_vector(dst.ctx, src.lt_out_w, dst.lt_out_w, copies, fp32) ||
         !magpietts_local_add_tensor_vector(dst.ctx, src.lt_out_b, dst.lt_out_b, copies, fp32) ||
         !magpietts_local_copy_transformer_layout(dst.ctx, src.local, dst.local, copies, fp32)) {
@@ -462,7 +464,7 @@ local_transformer_graph_init(
     graph.reset();
 
     const auto& h = model.hparams;
-    if (codebook_idx < 0 || codebook_idx >= h.audio_codebooks) {
+    if (codebook_idx < 0 || codebook_idx >= h.stacked_audio_codebooks()) {
         fprintf(stderr, "invalid local-transformer codebook index: %d\n", codebook_idx);
         return false;
     }
@@ -509,12 +511,16 @@ local_transformer_graph_init(
                 graph.dec_cond, pair ? "magpietts_local_transformer_dec_cond"
                                      : "magpietts_local_transformer_dec_last");
             ggml_set_input(graph.dec_cond);
-            cur_cond = linear(graph.ctx, model.lt_in_w, graph.dec_cond, model.lt_in_b);
+            cur_cond = model.lt_in_w
+                           ? linear(graph.ctx, model.lt_in_w, graph.dec_cond, model.lt_in_b)
+                           : graph.dec_cond;
             if (pair) {
                 graph.dec_uncond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
                 ggml_set_name(graph.dec_uncond, "magpietts_local_transformer_dec_uncond");
                 ggml_set_input(graph.dec_uncond);
-                cur_uncond = linear(graph.ctx, model.lt_in_w, graph.dec_uncond, model.lt_in_b);
+                cur_uncond = model.lt_in_w
+                                 ? linear(graph.ctx, model.lt_in_w, graph.dec_uncond, model.lt_in_b)
+                                 : graph.dec_uncond;
             }
         } else {
             const std::string name = "magpietts_local_transformer_prev_code";
@@ -523,7 +529,7 @@ local_transformer_graph_init(
             ggml_set_input(graph.prev_token);
             ggml_tensor* emb = ggml_get_rows(
                 graph.ctx, model.audio_embeddings[codebook_idx - 1], graph.prev_token);
-            cur_cond = linear(graph.ctx, model.lt_in_w, emb, model.lt_in_b);
+            cur_cond = model.lt_in_w ? linear(graph.ctx, model.lt_in_w, emb, model.lt_in_b) : emb;
             if (pair) {
                 cur_uncond = cur_cond;
             }
@@ -843,7 +849,7 @@ sample_local_codebooks_impl(
     codes.clear();
     argmax_codes.clear();
     std::vector<int32_t> prev;
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         std::vector<float> logits;
         if (use_cfg) {
             std::vector<float> uncond;
@@ -864,7 +870,7 @@ sample_local_codebooks_impl(
             logits, h, temperature, top_k, rng, forbid_audio_eos);
         const int greedy = MagpieCodebookSampler::argmaxFromLogits(logits, h, forbid_audio_eos);
         dump_local_codebook_logits(logit_dump, c, sampled, greedy, logits);
-        const int emitted = forced_codes && (int)forced_codes->size() == h.audio_codebooks
+        const int emitted = forced_codes && (int)forced_codes->size() == h.stacked_audio_codebooks()
                                 ? (*forced_codes)[c]
                                 : sampled;
         codes.push_back(emitted);
@@ -889,7 +895,7 @@ sample_local_codebooks_cuda_impl(
     }
     codes.clear();
     argmax_codes.clear();
-    for (int c = 0; c < h.audio_codebooks; ++c) {
+    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
         magpietts_cuda_sample_request cuda_sample;
 #if defined(MAGPIETTS_CUDA_SAMPLING)
         cuda_sample.sampler = cuda_sampler;
@@ -909,11 +915,11 @@ sample_local_codebooks_cuda_impl(
             return false;
         }
     }
-    codes.assign((size_t)h.audio_codebooks, 0);
-    argmax_codes.assign((size_t)h.audio_codebooks, 0);
+    codes.assign((size_t)h.stacked_audio_codebooks(), 0);
+    argmax_codes.assign((size_t)h.stacked_audio_codebooks(), 0);
     char error[256] = {};
     if (!magpietts_cuda_copy_sampled_codebooks(
-            cuda_sampler, h.audio_codebooks, codes.data(), argmax_codes.data(), error,
+            cuda_sampler, h.stacked_audio_codebooks(), codes.data(), argmax_codes.data(), error,
             sizeof(error))) {
         fprintf(
             stderr, "CUDA local-transformer sampled-code host copy failed: %s\n",
