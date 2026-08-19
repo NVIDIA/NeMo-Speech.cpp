@@ -10,7 +10,9 @@ cache](cli.md#models-and-cache).
 
 ## Linux and macOS
 
-Inspect [`scripts/install.sh`](../scripts/install.sh), then run:
+Inspect
+[`scripts/install.sh`](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/scripts/install.sh),
+then run:
 
 ```bash
 curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
@@ -21,6 +23,13 @@ nemo-speech --version
 With no version argument, the installer reads the current release identifier
 from the repository's `VERSION` file, including prerelease identifiers.
 Native Linux archives require glibc 2.31 or newer (Ubuntu 20.04 or equivalent).
+
+Prebuilt CPU archives require no GPU toolkit. Linux CUDA archives include the
+required user-space CUDA libraries but still need a compatible NVIDIA driver.
+Vulkan archives use the host's Vulkan loader and vendor driver. The Linux
+x86_64 CUDA archive supports Turing-class GPUs (compute capability 7.5,
+including RTX 20-series) and newer. On an older GPU, select `--backend cpu` or
+`--backend vulkan`, or build from source with a compatible CUDA toolkit.
 
 The installer selects CUDA when `nvidia-smi` is available, Metal on Apple
 Silicon, and CPU otherwise. Override the backend or force a source build:
@@ -43,11 +52,15 @@ verified against their published SHA-256 files; a present archive with an
 invalid or mismatched checksum always fails rather than falling back to source.
 
 The source fallback requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
-and the toolkit for the selected GPU backend. It clones only the submodules
-needed by the CLI and playground. When run from a checkout without an
-explicit version, it builds that checkout's current branch. Override the source
-for a fork or local mirror with `NEMO_SPEECH_SOURCE_URL` and
-`NEMO_SPEECH_SOURCE_REF`.
+SentencePiece development files, and any toolkit required by the selected
+backend. On Ubuntu/Debian install `libsentencepiece-dev`; on Fedora install
+`sentencepiece-devel`; on macOS install `sentencepiece` with Homebrew.
+
+Source installs use `main` by default. To install a fork or the current
+checkout, set `NEMO_SPEECH_SOURCE_URL` to its URL or path (`$PWD` on Linux or
+macOS, or `(Get-Location).Path` in PowerShell). Set
+`NEMO_SPEECH_SOURCE_REF` to select another branch or tag. Local installs clone
+the committed branch state and do not include uncommitted changes.
 
 Automatic model pulls require the `curl` executable. The Linux/macOS installer
 also uses it for release downloads; the Windows installer uses PowerShell's
@@ -58,28 +71,36 @@ paths and already cached models still work if `curl` later becomes unavailable.
 
 ## Windows
 
-Inspect [`scripts/install.ps1`](../scripts/install.ps1), then run from
-PowerShell:
+Inspect
+[`scripts/install.ps1`](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/scripts/install.ps1),
+then run from PowerShell:
 
 ```powershell
 irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
-nemo-speech --version
 ```
+
+The installer updates the current user's `PATH`. Open a new PowerShell window,
+then run `nemo-speech --version`.
 
 Select a backend explicitly when needed:
 
 ```powershell
-.\scripts\install.ps1 -Source -Backend cuda
+irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 `
+  -OutFile .\install-nemo-speech.ps1
+powershell -ExecutionPolicy Bypass -File .\install-nemo-speech.ps1 `
+  -Source -Backend cuda
 ```
 
 Select the components to install:
 
 ```powershell
 # ASR and diarization only
-.\scripts\install.ps1 -Source -Backend cpu -Profile asr
+powershell -ExecutionPolicy Bypass -File .\install-nemo-speech.ps1 `
+  -Source -Backend cpu -Profile asr
 
 # Full runtime profile (add -HttpTls for TLS)
-.\scripts\install.ps1 -Source -Backend cuda -Profile full
+powershell -ExecutionPolicy Bypass -File .\install-nemo-speech.ps1 `
+  -Source -Backend cuda -Profile full
 ```
 
 | Profile | Components |
@@ -135,5 +156,5 @@ entry from the shell startup file if the installer added it. On Windows,
 remove `%LOCALAPPDATA%\Programs\NeMoSpeech` (or the selected prefix) and that
 prefix's `bin` directory from the current-user PATH. The model cache is stored
 separately and is not removed with the runtime: `~/Library/Caches/NeMoSpeech/models`
-on macOS, `${XDG_CACHE_HOME:-~/.cache}/nemo-speech/models` on Linux, and
+on macOS, `${XDG_CACHE_HOME:-$HOME/.cache}/nemo-speech/models` on Linux, and
 `%LOCALAPPDATA%\NeMoSpeech\models` on Windows.

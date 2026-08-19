@@ -95,7 +95,7 @@ if(SENTENCEPIECE_STATIC_LIB)
     endif()
 elseif(NEMO_SPEECH_WITH_NORM AND UNIX AND NOT APPLE)
     message(FATAL_ERROR
-        "ITN + Flashlight requires private static SentencePiece; "
+        "normalization requires private static SentencePiece; "
         "run scripts/build_sentencepiece_static.sh")
 else()
     # vcpkg's imported target carries its platform-specific usage requirements.

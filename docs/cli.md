@@ -41,7 +41,7 @@ The cache location is platform-specific:
 | Platform | Default cache |
 |---|---|
 | macOS | `~/Library/Caches/NeMoSpeech/models` |
-| Linux | `${XDG_CACHE_HOME:-~/.cache}/nemo-speech/models` |
+| Linux | `$XDG_CACHE_HOME/nemo-speech/models`, or `~/.cache/nemo-speech/models` when unset |
 | Windows | `%LOCALAPPDATA%\NeMoSpeech\models` |
 
 Set `NEMO_SPEECH_MODEL_DIR` to use another location. Passing an existing local
@@ -56,7 +56,13 @@ Transcribe one WAV file:
 nemo-speech transcribe recording.wav
 nemo-speech transcribe recording.wav --model nemotron-en
 nemo-speech transcribe recording.wav --model ./models/asr.q8_0.gguf
+nemo-speech transcribe recording.wav --stream
 ```
+
+File transcription submits the complete recording as one offline request by
+default. Add `--stream` to feed a recorded WAV through the streaming recognizer
+in 160 ms input chunks. `--live` also uses the streaming recognizer.
+Offline-only models such as Parakeet TDT reject `--stream` and `--live`.
 
 The file CLI accepts mono or stereo PCM16 and float32 WAV input from 8-96 kHz.
 It downmixes and resamples to the model rate. Unsupported containers or codecs
@@ -66,14 +72,16 @@ produce an error with a conversion command.
 
 ```bash
 nemo-speech transcribe --live \
-  --backend auto
+  --backend auto \
+  --endpointing
 ```
 
-The command captures the system's default microphone and prints interim and
-endpointed transcripts to stderr while you speak. Press Ctrl-C once to stop;
-the stream is flushed and the complete final transcript is written to stdout.
-Use `--output transcript.txt` to write it to a file, or select `json`, `srt`,
-or `vtt` with `--format`.
+The command captures the system's default microphone and prints interim
+transcripts to stderr while you speak. With `--endpointing`, trailing silence
+also finalizes utterances without ending the capture. Press Ctrl-C once to
+stop; the stream is flushed and the complete final transcript is written to
+stdout. Use `--output transcript.txt` to write it to a file, or select `json`,
+`srt`, or `vtt` with `--format`.
 
 Live capture is compiled directly into the CLI through miniaudio and uses the
 native host audio API: CoreAudio on macOS, WASAPI on Windows, and ALSA or
@@ -86,8 +94,12 @@ shell running `nemo-speech`.
 ```bash
 nemo-speech transcribe recording.wav --format srt --output recording.srt
 nemo-speech transcribe recording.wav --format vtt --output recording.vtt
-nemo-speech transcribe recording.wav --json --word-times
+nemo-speech transcribe recording.wav --json
 ```
+
+JSON, SRT, and WebVTT output request word timestamps automatically. Plain-text
+output remains transcript-only. `--word-times` is retained for compatibility
+but does not change the rendered output of any current CLI format.
 
 SRT and WebVTT cues prefer sentence, clause, and pause boundaries. Cues use up
 to two lines, target 37 characters per line, and allow small whole-word
@@ -95,9 +107,10 @@ overflow within the common 42-character subtitle limit.
 
 Plain results are written to stdout. Progress and diagnostics are written to
 stderr so output can be redirected safely. Global `--json`, `--quiet`, and
-`--verbose` options work across commands. The default output keeps command
-lifecycle, effective inference configuration, results, warnings, and errors.
-Model-loader, backend, ggml, and llama.cpp diagnostics require `--verbose`.
+`--verbose` options work across commands. Inference and server commands show
+their lifecycle, effective configuration, results, warnings, and errors by
+default. Model-loader, backend, ggml, and llama.cpp diagnostics require
+`--verbose`.
 
 ### Transcribe a directory
 
@@ -120,7 +133,8 @@ one pass:
 ```bash
 nemo-speech transcribe meeting.wav \
   --vad-model silero.gguf \
-  --diar-model sortformer.gguf \
+  --vad-masking \
+  --diarize \
   --pnc-model punctuation.gguf \
   --itn-model-dir grammars/en-US \
   --nmt-model translate.q8_0.gguf \
@@ -128,7 +142,20 @@ nemo-speech transcribe meeting.wav \
   --json
 ```
 
-Use only the companion models needed by the workflow.
+Loading a VAD model alone does not alter recognition; the example enables VAD
+feature masking explicitly. `--diarize` downloads and uses the indexed default
+Sortformer model, while `--diar-model MODEL` selects a different one and also
+enables speaker tags. Use only the companion models needed by the workflow.
+
+For ASR plus speaker labels without the other stages:
+
+```bash
+nemo-speech transcribe meeting.wav --diarize --json
+```
+
+Sortformer v2 supports up to four speakers. Diarization enables
+word timestamps automatically and places a 1-based `speaker` value on each
+word in JSON output.
 
 ## Diarize audio
 
@@ -142,11 +169,17 @@ nemo-speech diarize recordings/ \
 ```
 
 Directory inputs load one shared model and dynamically batch compatible steps.
-Relative paths are preserved. Streaming geometry is the default; use
-`--offline` for full-attention processing of short recordings. Segmentation
-thresholds are dataset-dependent; use `--onset`, `--offset`, `--pad-onset`,
-`--pad-offset`, `--min-duration-on`, and `--min-duration-off` when applying a
-checkpoint's published postprocessing configuration.
+Relative paths are preserved. A stateful streaming pass is the default and is
+appropriate for long recordings. `--preset offline` selects larger streaming
+chunks and caches; it does not enable full attention. Use `--offline` for one
+full-attention pass over a short recording. The indexed model's positional
+table limits that path to about 6.6 minutes, so use the default streaming pass
+for longer audio.
+
+Sortformer v2 supports up to four speakers. Segmentation thresholds
+are dataset-dependent; use `--onset`, `--offset`, `--pad-onset`, `--pad-offset`,
+`--min-duration-on`, and `--min-duration-off` when applying a checkpoint's
+published postprocessing configuration.
 
 ## Translate text
 
@@ -181,13 +214,17 @@ Run `nemo-speech doctor` to see the compiled backends and detected devices.
 
 ## Convert and inspect models
 
-The built-in index covers the published ready-to-run GGUFs. Use the converter
-when working with a custom checkpoint or producing a different quantization:
+The built-in index covers the published ready-to-run GGUFs. From a source
+checkout, use the Python converter when working with a custom checkpoint or
+producing a different quantization:
 
 ```bash
 python convert_model.py custom-model.nemo --outfile custom-model.q8_0.gguf
 nemo-speech model info custom-model.q8_0.gguf
 ```
+
+Conversion tools are not included in the native binary archives; the installed
+runtime itself does not require Python.
 
 The converter can also resolve Hugging Face repository IDs through the standard
 cache. See [model conversion](model-conversion.md) for the isolated Python

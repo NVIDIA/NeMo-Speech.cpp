@@ -185,7 +185,7 @@ typedef struct nemo_speech_asr_recognition_options {
     // (nemo_speech_asr_result_word_speaker_tag). Requires the recognizer to have been
     // created with a diar model (nemo_speech_asr_diar_config.model_path), else the
     // request fails with INVALID_ARGUMENT. max_speaker_count is accepted for
-    // riva compatibility; the Sortformer model's capacity (4) caps it.
+    // compatibility but is ignored; Sortformer v2 supports up to four speakers.
     bool enable_speaker_diarization;
     int32_t max_speaker_count;
 } nemo_speech_asr_recognition_options;

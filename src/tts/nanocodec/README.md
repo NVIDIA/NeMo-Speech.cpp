@@ -1,38 +1,38 @@
 # NeMo NanoCodec GGUF
 
-This runner converts the NVIDIA NeMo NanoCodec 22 kHz checkpoint to a GGUF
-decoder and runs the token-to-audio path used by MagpieTTS.
+This directory covers converting the NVIDIA NeMo NanoCodec 22 kHz checkpoint
+to a GGUF decoder and running the token-to-audio path used by MagpieTTS.
 
 Model: <https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps>
 
 ## Convert
 
+Run the converter from a source checkout after following
+[`docs/model-conversion.md`](../../../docs/model-conversion.md):
+
 ```bash
-python convert_model.py models/nemo_nano_codec_22khz_1.89kbps_21.5fps/extracted \
-  --outfile models/nemo_nano_codec_22khz_1.89kbps_21.5fps/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
-  --metadata-json models/nemo_nano_codec_22khz_1.89kbps_21.5fps/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.gguf.json
+python convert_model.py models/nano-codec/extracted \
+  --outfile models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+  --metadata-json models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.gguf.json
 ```
 
-The converter writes only the inference decoder needed for codec tokens to
-audio. It folds PyTorch weight norm into plain convolution weights, stores
-Conv1d tensors in GGML layout, expands grouped ConvTranspose1d kernels into
-GGML-compatible dense kernels, and records the deterministic FSQ quantizer
-metadata/codebook.
+The converter writes the inference decoder and FSQ codebook metadata required
+to turn codec tokens into audio.
 
 ## Decode
 
 Build the decoder:
 
 ```bash
-cmake -S . -B build -DNEMO_SPEECH_BUILD_TOOLS=ON
-cmake --build build --target nanocodec -j
+scripts/configure.sh cpu-tts -DNEMO_SPEECH_BUILD_TOOLS=ON
+cmake --build --preset cpu-tts --target nanocodec
 ```
 
 Provide a text file containing codec tokens, then run:
 
 ```bash
-build/bin/nanocodec \
-  -m models/nemo_nano_codec_22khz_1.89kbps_21.5fps/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+build/cpu-tts/bin/nanocodec \
+  -m models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
   --codes magpie_codes.txt \
   -o magpie.wav
 ```

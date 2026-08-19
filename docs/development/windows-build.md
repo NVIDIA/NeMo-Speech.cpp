@@ -1,4 +1,4 @@
-# Building on Windows (CUDA/Vulkan)
+# Building on Windows
 
 Native Windows build with **MSVC + Ninja**, covering the CUDA, Vulkan, and CPU
 backends plus the optional Riva-compatible gRPC server. For other platforms,
@@ -6,30 +6,17 @@ see [Build from source](../build.md).
 
 ## Toolchain
 
-One policy across Windows architectures. Visual Studio 2022 Build Tools are
-required in every configuration (`cl.exe` is `nvcc`'s only supported CUDA host
-compiler on Windows).
+Visual Studio 2022 Build Tools are required in every configuration (`cl.exe` is
+`nvcc`'s supported CUDA host compiler on Windows).
 
 | Host arch | C/C++ compiler | CUDA host compiler |
 |---|---|---|
 | x64 | `cl` (default; `clang-cl` selectable) | `cl` |
 | ARM64 (e.g. Tegra) | `clang-cl` (required - ggml's ARM CPU backend rejects MSVC) | `cl` |
 
-`build.ps1` picks this automatically (`-Compiler auto`); override with
-`-Compiler msvc|clang-cl`. Notes:
-
-- `clang-cl` targets the same MSVC ABI (same STL/CRT/linker), so the Windows
-  handling in the tree (DLL export via `WINDOWS_EXPORT_ALL_SYMBOLS`, no POSIX
-  APIs) applies to both compilers. Install it via the VS "C++ Clang tools"
-  component or `choco install llvm`. MinGW (gcc/clang in GNU mode) is not
-  supported - it cannot drive `nvcc`.
-- Warning flags are scoped to C/C++ compilation
-  (`$<COMPILE_LANGUAGE:C,CXX>`) so nvcc's `cl` host never receives them - with
-  clang-cl as CXX they would otherwise leak into the CUDA compile (`D8021`).
-- **ARM64 specifics.** CUDA 13.4+/CCCL 3.4 requires the `cuda/iterator` include
-  fix present in the current ggml pin. On integrated GPUs (e.g. Tegra), Vulkan
-  devices enumerate as iGPU (`GGML_BACKEND_DEVICE_TYPE_IGPU`), which the ASR
-  backend picker accepts.
+`build.ps1` selects the compiler with `-Compiler auto`; override it with
+`-Compiler msvc|clang-cl`. `clang-cl` uses the MSVC ABI. MinGW is not supported
+and cannot drive `nvcc`.
 
 ## Prerequisites
 
@@ -64,19 +51,16 @@ defaults.
 ```powershell
 git submodule update --init ggml                            # required (all backends)
 git submodule update --init proto/riva-common               # gRPC server
-git submodule update --init llama.cpp                       # NMT (-DNEMO_SPEECH_BUILD_NMT=ON)
+git submodule update --init llama.cpp                       # ASR live capture or NMT
 git submodule update --init third_party/flashlight-text third_party/kenlm # only for LM-fused CTC decoding
 git submodule update --init third_party/open_jtalk          # optional TTS JA tokenizer (-TtsJa)
 git submodule update --init --recursive third_party/cppjieba  # optional TTS ZH tokenizer (-TtsZh)
 # or: git submodule update --init --recursive
 ```
 
-The JA/ZH TTS tokenizers are gated by `NEMO_SPEECH_TTS_WITH_JA` /
-`NEMO_SPEECH_TTS_WITH_ZH` (both default OFF). JA builds Open JTalk/MeCab from
-the `third_party/open_jtalk` submodule and compiles its dictionary during the build
-(`build-<backend>\open_jtalk_dic`); ZH uses the header-only `third_party/cppjieba` submodule
-(recursive - it nests `limonp`). Pass `-TtsJa` / `-TtsZh` to `build.ps1`, or
-enable the corresponding CMake options directly.
+The JA/ZH TTS tokenizers are disabled by default. Enable them with `-TtsJa` or
+`-TtsZh`; the Mandarin dependency must be initialized recursively as shown
+above.
 
 ## Build with `build.ps1` (recommended)
 
@@ -116,7 +100,7 @@ Key parameters: `-Backend cuda|vulkan|cpu`,
 `-Architecture auto|x64|arm64`,
 `-Grpc`, `-Nmt`, `-AsrOnly`, `-Http`, `-HttpTls`, `-Flashlight`, `-TtsJa`,
 `-TtsZh`,
-`-Config Release|RelWithDebInfo|Debug`, `-CudaArch <native|89|86|120|…>`,
+`-Config Release|RelWithDebInfo|Debug`, `-CudaArch <native|75|86|89|120|…>`,
 `-VcpkgRoot C:\vcpkg`, `-VcpkgTriplet <triplet>`, `-BuildDir <path>`, `-Jobs N`.
 Binaries land in `build-<backend>[-<profile>][-<architecture>]\bin`; the default
 `core` and `auto` suffixes are omitted.
@@ -154,29 +138,15 @@ cmake --build build-vulkan --parallel
   app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt.
 - **ggml patches are CUDA-only.** A Vulkan/CPU build uses stock ggml; pass
   `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the encoder uses the portable op path).
-- DLLs export their symbols via `WINDOWS_EXPORT_ALL_SYMBOLS` (the C ABI libs use
-  `__declspec(dllexport)`); at runtime, dependent DLLs must be next to the `.exe`
-  or on `PATH` (Ninja places them together in `build-<backend>\bin`).
-- Flashlight builds the replaceable `kenlm.dll` from a runtime-only source
-  allowlist. Flashlight and its static-md vcpkg dependencies remain private in
-  the ASR DLL.
-- **`NOMINMAX` is defined globally on Windows** so `<windows.h>` (pulled in by the
-  CUDA headers when `GGML_CUDA=ON`) doesn't clobber `std::min`/`std::max`.
-- **ggml patch files are forced to LF** via `.gitattributes`. On a CRLF checkout,
-  `git apply` rejects some hunks as "corrupt patch"; the Windows patch script
-  (`scripts/windows/apply-ggml-patches.ps1`) also strips all CR bytes defensively.
-- **Open JTalk/MeCab** (TTS tokenizer, vendored via the `third_party/open_jtalk` submodule)
-  builds on MSVC with adjusted flags in `src/tts/tokenizer/CMakeLists.txt`: the
-  POSIX `HAVE_*` defines are swapped for `HAVE_WINDOWS_H` (mecab's own Win32
-  mmap/dirent paths), and `<functional>` is force-included with
-  `_HAS_AUTO_PTR_ETC=1` so `std::binary_function` (removed in C++17) resolves.
-  No vendored sources are modified.
+- Dependent DLLs must be next to the executable or on `PATH`. Ninja places them
+  together in `build-<backend>\bin`.
+- Flashlight builds install the replaceable `kenlm.dll` alongside the runtime
+  libraries.
 
-### After pulling new changes
+### Reset a partially patched ggml checkout
 
-If `apply-ggml-patches` reports a patch "does NOT apply cleanly" after a pull
-(commonly a mixed line-ending or half-applied state in the ggml worktree), reset
-the submodule to pristine and re-apply:
+If `apply-ggml-patches` reports that a patch does not apply cleanly, reset the
+submodule and re-apply it:
 
 ```powershell
 git -C ggml reset -q
@@ -193,23 +163,15 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\apply-ggml-patches.ps1
 | **CUDA** | ✅ Supported | ✅ Supported | ✅ Supported |
 | **Vulkan** | ✅ Supported | ✅ Supported | ✅ Supported |
 
-NMT runs through llama.cpp linked against the in-tree patched ggml, so it inherits the build's
-backend. TTS uses generic ggml graphs on Vulkan; CUDA builds additionally use
-specialized sampling and local-transformer kernels.
-
 Use the unified `nemo-speech` CLI for local ASR, NMT, and TTS commands; see
 the [CLI guide](../cli.md). Stock Riva clients work against `riva_server` when
 the build includes `-Grpc`. A CPU-only build selects the CPU automatically, or
 you can pass `--device cpu` explicitly.
 
-**Vulkan graph-optimization workaround.** ggml-vulkan's graph-optimization pass
-reorders graph nodes in a way that breaks this runtime's **in-place persistent
-cache tensors** (the streaming FastConformer/RNNT K/V/conv cache): the decode
-degenerates into a single repeated token after the first chunk. The runtime
-auto-sets `GGML_VK_DISABLE_GRAPH_OPTIMIZE` for Vulkan builds
-(`src/runtime/ggml/backend.cpp`), which fixes it at a small Vulkan-perf cost.
-This is a platform-independent ggml-vulkan issue, not a Windows one. An explicit
-user-set value of the env var takes precedence over the auto-set.
+**Vulkan graph optimization.** The runtime disables ggml-vulkan graph
+optimization because it is incompatible with the persistent caches used by
+streaming ASR. An explicit user value for `GGML_VK_DISABLE_GRAPH_OPTIMIZE`
+takes precedence; enabling the pass can produce incorrect streaming output.
 
 ### Optional features (flashlight, ITN)
 
@@ -217,9 +179,6 @@ user-set value of the env var takes precedence over the auto-set.
 |---|---|
 | **Flashlight** (`-DNEMO_SPEECH_WITH_FLASHLIGHT=ON`) | ✅ Builds replaceable `kenlm.dll`; SentencePiece and compression libraries are provisioned automatically. |
 | **ITN/TN** (`-DNEMO_SPEECH_WITH_NORM=ON`) | ❌ Not supported on Windows. Requires the OpenFST 1.8 / Sparrowhawk WFST stack, which `scripts/build_itn_deps.sh` builds via Linux autotools (neither is in vcpkg). |
-
-Automatic dependencies use one architecture-matched `*-windows-static-md`
-triplet.
 
 ## Next steps
 

@@ -521,7 +521,8 @@ run_server(int argc, char** argv) {
 #endif
     if (!engines.ready())
         throw std::runtime_error(
-            "no models were loaded; pass --asr-model, --tts-model, --nmt-model, or --config");
+            "no models were loaded; pass --asr-model, --diar-model, --tts-model, --nmt-model, "
+            "or --config");
     if (!no_warmup) {
         nemo_speech::WarmupOptions warmup;
 #if defined(NEMO_SPEECH_CLI_TTS)
@@ -606,8 +607,9 @@ void
 print_serve_help(const char* program) {
     std::printf(
         "Usage: %s serve [options]\n\n"
-        "Start the OpenAI-compatible HTTP API and browser playground. Models are\n"
-        "provided as local paths, indexed names, or through a YAML configuration.\n\n"
+        "Start the local speech HTTP API and browser playground. The transcription\n"
+        "and speech routes expose OpenAI-compatible subsets. Models are provided as\n"
+        "local paths, indexed names, or through a YAML configuration.\n\n"
         "Server:\n"
         "  --host ADDRESS          Bind address (default: 127.0.0.1)\n"
         "  --port N                HTTP port (default: 8080)\n"

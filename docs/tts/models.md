@@ -62,22 +62,16 @@ nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 The unified [`convert_model.py`](../../convert_model.py) entry point accepts
 compatible local `.nemo` archives and extracted NeMo checkpoints. It defaults
 to `--outtype f16` for MagpieTTS and NanoCodec; pass `--outtype f32` to retain
-full precision.
+full precision. The converter is a source-tree Python tool and is not included
+in native release archives; see [Model conversion](../model-conversion.md) for
+environment setup.
 
 ```bash
-pip install -r requirements.txt
 python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.f16.gguf
 ```
 
-The converter reads `.nemo` archives directly with PyTorch and does not require
-`nemo_toolkit`. The optional `scripts/tts/tokenize-magpietts.py` debugging
-helper does use NeMo's Python tokenizer implementation.
+Conversion does not require `nemo_toolkit`. The optional
+`scripts/tts/tokenize-magpietts.py` debugging helper does.
 
-## Notes
-
-For CUDA builds, the MagpieTTS and NanoCodec operations require the ggml
-patches applied by `scripts/configure.sh`; see
-[ggml patches](../development/ggml-patches.md).
-
-Once converted, point the server at them - see
+Once converted, point the server at them; see
 [TTS configuration](configuration.md).

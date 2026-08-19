@@ -44,9 +44,6 @@ tts:
   uma-mode: auto                # auto | off | on
   longform: auto                # auto | off | on
 
-  benchmark: false
-  verbose: false
-
   # Server defaults and startup warmup:
   # voice-name: John
   # warmup-enabled: true

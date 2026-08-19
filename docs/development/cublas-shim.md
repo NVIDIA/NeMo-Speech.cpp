@@ -14,19 +14,25 @@ the same ABI from `cublas64_<major>.dll`. The target inherits
 `CMAKE_CUDA_ARCHITECTURES` when set and falls back to JIT-portable
 `compute_80` PTX for ad-hoc builds. Dropping real cuBLAS and cuBLASLt is
 the bulk of the package size. The shim is built separately from ggml.
+Prebuilt releases include Turing (SM75) code. Local Turing builds must set
+`CMAKE_CUDA_ARCHITECTURES=75` or `native`, because `compute_80` PTX cannot run
+on SM75.
 
 It's an optional CMake target, **`NEMO_SPEECH_CUBLAS_SHIM` (default `OFF`)**,
 built when explicitly enabled with `GGML_CUDA` (a no-op for Metal, Vulkan,
-and CPU builds). Normal source builds link the CUDA toolkit's cuBLAS and
-cuBLASLt. Portable container and release-archive builds enable the shim and
-omit those libraries from their runtime closure. Linux uses a matching SONAME
-and symbol version; Windows uses the matching versioned DLL name.
+and CPU builds). Normal shared-library source builds link the CUDA toolkit's
+cuBLAS; static ggml builds may also link cuBLASLt. Portable container and
+release-archive builds enable the shim and do not require those libraries at
+run time. Linux uses a matching SONAME and symbol version; Windows uses the
+matching versioned DLL name.
 
 To build and exercise the container GEMM path outside the container, enable the
 shim and put its output directory first on the loader path:
 
 ```bash
-scripts/configure.sh cuda-asr -DNEMO_SPEECH_CUBLAS_SHIM=ON
+scripts/configure.sh cuda-asr \
+  -DNEMO_SPEECH_CUBLAS_SHIM=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=native
 cmake --build --preset cuda-asr
 LD_LIBRARY_PATH=$PWD/build/cuda-asr/bin \
   ./build/cuda-asr/bin/nemo-speech transcribe audio.wav --model model.gguf
