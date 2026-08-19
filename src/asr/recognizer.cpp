@@ -422,9 +422,8 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
 
     // Build one Alternative from a decoder hypothesis. Postproc (PnC/ITN/
     // profanity) may remap word spans, so it runs before frame->ms conversion;
-    // word offsets are produced only when requested. Speaker tags: riva
-    // semantics - mean diarizer frame probability over the word's span,
-    // argmax, 1-based; only the top alternative is tagged.
+    // word offsets are produced only when requested. Speaker tags are 1-based;
+    // only the top alternative is tagged.
     auto make_alt = [&](const std::string& transcript, float confidence,
                         const std::vector<WordTiming>& words_in, bool tag_speakers) {
         Alternative alt;
@@ -446,8 +445,11 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
                 ww.confidence = w.confidence;
                 ww.language_code = lang0;
                 if (tag_speakers && diar_) {
+                    // Transducer punctuation can extend a word timestamp into
+                    // the next turn. Anchor attribution to the word onset and
+                    // average two diar frames to reject single-frame noise.
                     const int spk =
-                        diar_->speaker_for_time(ww.start_time / 1000.0, ww.end_time / 1000.0);
+                        diar_->speaker_for_word_time(ww.start_time / 1000.0, ww.end_time / 1000.0);
                     ww.speaker_tag = spk >= 0 ? spk + 1 : 0;
                 }
                 alt.words.push_back(std::move(ww));

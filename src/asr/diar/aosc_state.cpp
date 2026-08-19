@@ -17,6 +17,16 @@ constexpr float kPosInf = std::numeric_limits<float>::infinity();
 // NeMo's placeholder for disabled top-k picks (sortformer_modules.max_index).
 constexpr int64_t kMaxIndex = 99999;
 
+constexpr float kBirthSpeech = 0.30f;
+constexpr float kBirthClean = 0.95f;
+constexpr float kEstablishedQuiet = 0.02f;
+constexpr float kBirthFading = 0.90f;
+constexpr float kEstablishedFading = 0.15f;
+constexpr int kBirthCleanFrames = 4;
+constexpr int kBirthFadingFrames = 20;
+constexpr int kBirthEpisodeGapFrames = 25;
+constexpr int kBirthRevisionFrames = 128;
+
 // Indices of the k largest values in column `spk` of `scores` (n x n_spk).
 // Ties break toward the lower frame index (deterministic; torch's order for
 // exact ties is unspecified, and exact float ties among finite scores are
@@ -37,6 +47,109 @@ topk_column(const std::vector<float>& scores, int n, int n_spk, int spk, int k) 
     return idx;
 }
 }  // namespace
+
+ChannelBirthGate::ChannelBirthGate(int n_spk) : n_spk_(n_spk) {
+    if (n_spk_ <= 0)
+        throw std::invalid_argument("ChannelBirthGate: n_spk must be positive");
+    reset();
+}
+
+void
+ChannelBirthGate::reset() {
+    frame_ = 0;
+    established_.assign(n_spk_, false);
+    clean_frames_.assign(n_spk_, 0);
+    fading_frames_.assign(n_spk_, 0);
+    last_win_.assign(n_spk_, std::numeric_limits<int64_t>::min() / 2);
+    raw_ring_.clear();
+}
+
+bool
+ChannelBirthGate::observe(const float* probs) {
+    int winner = 0;
+    for (int s = 1; s < n_spk_; s++)
+        if (probs[s] > probs[winner])
+            winner = s;
+
+    bool changed = false;
+    if (probs[winner] >= kBirthSpeech && !established_[winner]) {
+        if (frame_ - last_win_[winner] > kBirthEpisodeGapFrames) {
+            clean_frames_[winner] = 0;
+            fading_frames_[winner] = 0;
+        }
+        last_win_[winner] = frame_;
+
+        float established_prob = 0.0f;
+        for (int s = 0; s < n_spk_; s++)
+            if (established_[s])
+                established_prob = std::max(established_prob, probs[s]);
+        if (probs[winner] >= kBirthClean && established_prob <= kEstablishedQuiet)
+            clean_frames_[winner]++;
+        if (probs[winner] >= kBirthFading && established_prob <= kEstablishedFading)
+            fading_frames_[winner]++;
+        if (clean_frames_[winner] >= kBirthCleanFrames ||
+            fading_frames_[winner] >= kBirthFadingFrames) {
+            established_[winner] = true;
+            changed = true;
+        }
+    }
+    frame_++;
+    return changed;
+}
+
+void
+ChannelBirthGate::relabel(float* probs) const {
+    int target = -1;
+    for (int s = 0; s < n_spk_; s++)
+        if (established_[s] && (target < 0 || probs[s] > probs[target]))
+            target = s;
+    if (target < 0)
+        return;
+
+    for (int s = 0; s < n_spk_; s++) {
+        if (!established_[s] && probs[s] > 0.0f) {
+            probs[target] = std::max(probs[target], probs[s]);
+            probs[s] = 0.0f;
+        }
+    }
+}
+
+void
+ChannelBirthGate::push_raw(const float* probs) {
+    raw_ring_.insert(raw_ring_.end(), probs, probs + n_spk_);
+    const size_t cap = static_cast<size_t>(kBirthRevisionFrames) * n_spk_;
+    if (raw_ring_.size() > cap)
+        raw_ring_.erase(raw_ring_.begin(), raw_ring_.begin() + n_spk_);
+}
+
+void
+ChannelBirthGate::append(const std::vector<float>& raw, std::vector<float>& timeline) {
+    if (raw.size() % n_spk_ != 0)
+        throw std::invalid_argument("ChannelBirthGate: incomplete probability frame");
+
+    bool changed = false;
+    for (size_t i = 0; i < raw.size(); i += n_spk_) {
+        push_raw(raw.data() + i);
+        changed |= observe(raw.data() + i);
+    }
+
+    const size_t old_size = timeline.size();
+    timeline.insert(timeline.end(), raw.begin(), raw.end());
+    for (size_t i = old_size; i < timeline.size(); i += n_spk_) relabel(timeline.data() + i);
+
+    if (!changed)
+        return;
+    const size_t window = std::min(raw_ring_.size(), timeline.size());
+    const size_t ring_offset = raw_ring_.size() - window;
+    const size_t timeline_offset = timeline.size() - window;
+    std::copy(raw_ring_.begin() + ring_offset, raw_ring_.end(), timeline.begin() + timeline_offset);
+    for (size_t i = timeline_offset; i < timeline.size(); i += n_spk_) relabel(timeline.data() + i);
+}
+
+bool
+ChannelBirthGate::is_established(int speaker) const {
+    return speaker >= 0 && speaker < n_spk_ && established_[speaker];
+}
 
 DiarGeometry
 DiarGeometry::preset(const std::string& name) {

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #if defined(NEMO_SPEECH_CLI_LIVE)
 #include <chrono>
 #include <csignal>
@@ -408,6 +409,11 @@ timestamp(int milliseconds, bool vtt) {
     return output.str();
 }
 
+float
+json_number(float value) {
+    return std::isfinite(value) ? value : 0.0f;
+}
+
 std::string
 render(const Transcript& t, OutputFormat format, const fs::path& source) {
     std::ostringstream output;
@@ -416,8 +422,8 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
     } else if (format == OutputFormat::Json) {
         output << "{\n  \"file\": \"" << json_escape(source.string()) << "\",\n"
                << "  \"text\": \"" << json_escape(t.text) << "\",\n"
-               << "  \"confidence\": " << t.confidence << ",\n"
-               << "  \"duration\": " << t.audio_seconds << ",\n  \"languages\": [";
+               << "  \"confidence\": " << json_number(t.confidence) << ",\n"
+               << "  \"duration\": " << json_number(t.audio_seconds) << ",\n  \"languages\": [";
         for (size_t i = 0; i < t.languages.size(); ++i)
             output << (i ? ", " : "") << '"' << json_escape(t.languages[i]) << '"';
         output << "],";
@@ -429,7 +435,7 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
             const auto& w = t.words[i];
             output << (i ? "," : "") << "\n    {\"word\": \"" << json_escape(w.text)
                    << "\", \"start\": " << w.start_ms / 1000.0 << ", \"end\": " << w.end_ms / 1000.0
-                   << ", \"confidence\": " << w.confidence;
+                   << ", \"confidence\": " << json_number(w.confidence);
             if (w.speaker > 0)
                 output << ", \"speaker\": " << w.speaker;
             output << '}';
