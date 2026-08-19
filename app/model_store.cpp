@@ -192,7 +192,7 @@ sha256_file(const fs::path& path) {
     if (!input)
         throw std::runtime_error("cannot read downloaded artifact " + path_utf8(path));
     Sha256 digest;
-    std::array<unsigned char, 1024 * 1024> buffer{};
+    std::vector<unsigned char> buffer(1024 * 1024);
     while (input) {
         input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
         const auto count = input.gcount();

@@ -32,9 +32,17 @@ NeMo-Speech.cpp is NVIDIA's official local speech inference solution, with day-0
 
 Install the `nemo-speech` CLI for the detected platform and backend:
 
+On Linux or macOS, run:
+
 ```bash
 curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
+```
+
+On Windows, run from PowerShell:
+
+```powershell
+irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
 ```
 
 The installer prefers a verified native release and falls back to a source

@@ -23,6 +23,7 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $releaseBase = if ($env:NEMO_SPEECH_RELEASE_BASE_URL) {
     $env:NEMO_SPEECH_RELEASE_BASE_URL.TrimEnd('/')
 } else {
@@ -52,7 +53,7 @@ function Invoke-DownloadWithRetry {
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            Invoke-WebRequest -Uri $Uri -OutFile $OutFile
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile
             return
         } catch {
             if ($attempt -eq 3) { throw }
@@ -162,7 +163,7 @@ if ($Version -eq "latest") {
         Write-Host "No release endpoint is configured; building from the current source branch."
     } else {
         try {
-            $manifest = (Invoke-WebRequest -Uri $versionUrl).Content
+            $manifest = (Invoke-WebRequest -UseBasicParsing -Uri $versionUrl).Content
             if ($manifest -notmatch '(?m)^NEMO_SPEECH_VERSION:\s*([^\s]+)\s*$') {
                 throw "VERSION does not contain NEMO_SPEECH_VERSION"
             }
