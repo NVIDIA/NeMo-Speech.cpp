@@ -778,9 +778,9 @@ verification_marker_path(const fs::path& path) {
 
 std::string
 file_time_string(fs::file_time_type value) {
-    std::ostringstream output;
-    output << value.time_since_epoch().count();
-    return output.str();
+    const auto nanoseconds =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(value.time_since_epoch());
+    return std::to_string(nanoseconds.count());
 }
 
 bool
