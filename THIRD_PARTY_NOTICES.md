@@ -161,9 +161,9 @@ The command-line microphone capture layer compiles miniaudio directly into
 - Copyright 2018 Google Inc.
 - License: Apache License 2.0
 
-Default Windows ASR and Linux release builds statically link the SentencePiece
-runtime and its bundled Abseil, protobuf-lite, and Darts-clone components. Their
-Apache 2.0 and BSD license texts are installed under
+Default Windows ASR, macOS, and Linux release builds statically link the
+SentencePiece runtime and its bundled Abseil, protobuf-lite, and Darts-clone
+components. Their Apache 2.0 and BSD license texts are installed under
 `share/licenses/nemo-speech/third_party/sentencepiece/`.
 
 ### whisper.cpp sample audio
