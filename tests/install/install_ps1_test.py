@@ -188,6 +188,17 @@ def main() -> None:
                     raise RuntimeError(f"installer unexpectedly succeeded:\n{result.stdout}")
                 return result
 
+            remote_source = "https://github.com/NVIDIA/NeMo-Speech.cpp.git"
+            environment["NEMO_SPEECH_SOURCE_URL"] = remote_source
+            environment.pop("NEMO_SPEECH_SOURCE_REF", None)
+            remote_plan = run("-Source", "-Backend", "cpu", "-DryRun")
+            require(f"{remote_source}#main" in remote_plan.stdout, "remote source ref")
+            environment["NEMO_SPEECH_SOURCE_REF"] = "review-test"
+            override_plan = run("-Source", "-Backend", "cpu", "-DryRun")
+            require(f"{remote_source}#review-test" in override_plan.stdout, "source ref override")
+            environment["NEMO_SPEECH_SOURCE_URL"] = str(source)
+            environment.pop("NEMO_SPEECH_SOURCE_REF")
+
             run("-Prefix", str(prefix), "-Backend", "cpu", "-NoModifyPath")
             metadata = prefix / ".nemo-speech-install"
             require(

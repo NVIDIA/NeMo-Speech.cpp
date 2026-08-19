@@ -184,7 +184,9 @@ $sourceRef = if ($env:NEMO_SPEECH_SOURCE_REF) {
     $env:NEMO_SPEECH_SOURCE_REF
 } elseif ($releaseVersion -eq 'source' -and
           (Get-Command git -ErrorAction SilentlyContinue) -and
-          (Test-Path (Join-Path $sourceUrl '.git'))) {
+          ($sourceUrl -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') -and
+          (Test-Path -LiteralPath $sourceUrl -PathType Container) -and
+          (Test-Path -LiteralPath (Join-Path $sourceUrl '.git'))) {
     $localSourceRef = (& git -C $sourceUrl symbolic-ref --quiet --short HEAD 2>$null)
     if ($LASTEXITCODE -eq 0 -and $localSourceRef) { $localSourceRef } else { 'main' }
 } elseif ($releaseVersion -in @("nightly", "source")) {

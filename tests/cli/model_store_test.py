@@ -213,12 +213,24 @@ def main() -> None:
             assert artifact["repo"] == "acme/tiny-asr"
             assert artifact["cached"] is False
             assert destination.read_bytes() == PAYLOAD
+            marker = pathlib.Path(f"{destination}.verified")
+            marker_lines = marker.read_text(encoding="utf-8").splitlines()
+            assert marker_lines[0] == f"sha256={hashlib.sha256(PAYLOAD).hexdigest()}"
+            assert marker_lines[1] == f"size={len(PAYLOAD)}"
+            assert marker_lines[2].startswith("mtime=")
             requests_after_pull = ArtifactHandler.requests
 
             cached = run(binary, environment, "--json", "model", "pull", "acme/tiny-asr")
             assert cached.returncode == 0, cached.stderr
             assert json.loads(cached.stdout)["artifacts"][0]["cached"] is True
             assert ArtifactHandler.requests == requests_after_pull
+
+            marker.write_text("invalid\n", encoding="utf-8")
+            refreshed = run(binary, environment, "--json", "pull", "tiny-asr")
+            assert refreshed.returncode == 0, refreshed.stderr
+            assert json.loads(refreshed.stdout)["artifacts"][0]["cached"] is True
+            assert ArtifactHandler.requests == requests_after_pull
+            assert marker.read_text(encoding="utf-8").splitlines() == marker_lines
 
             tts = run(binary, environment, "--json", "pull", "tiny-tts")
             assert tts.returncode == 0, tts.stderr
@@ -242,11 +254,14 @@ def main() -> None:
             assert ArtifactHandler.request_counts["tiny-tts.nemo"] == 1
             assert ArtifactHandler.request_counts["tiny-codec.gguf"] == 1
 
+            previous_mtime = destination.stat().st_mtime_ns
             destination.write_bytes(b"x" * len(PAYLOAD))
+            os.utime(destination, ns=(previous_mtime + 2_000_000_000,) * 2)
             repaired = run(binary, environment, "--json", "pull", "tiny-asr")
             assert repaired.returncode == 0, repaired.stderr
             assert json.loads(repaired.stdout)["artifacts"][0]["cached"] is False
             assert destination.read_bytes() == PAYLOAD
+            assert marker.read_text(encoding="utf-8").splitlines() != marker_lines
 
             unknown = expect_json_error(
                 run(binary, environment, "--json", "pull", "unknown/repository"), 3

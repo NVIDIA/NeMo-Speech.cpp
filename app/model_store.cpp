@@ -628,17 +628,17 @@ run_curl(const std::vector<std::string>& arguments) {
     const intptr_t status = _wspawnv(_P_WAIT, executable.c_str(), argv.data());
     return status < 0 ? 127 : static_cast<int>(status);
 #else
+    const std::string executable_string = executable.string();
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 2);
+    argv.push_back(const_cast<char*>(executable_string.c_str()));
+    for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
+    argv.push_back(nullptr);
     const pid_t child = fork();
     if (child < 0)
         throw std::runtime_error("could not start curl");
     if (child == 0) {
-        std::vector<char*> argv;
-        argv.reserve(arguments.size() + 2);
-        const std::string executable_string = executable.string();
-        argv.push_back(const_cast<char*>(executable_string.c_str()));
-        for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
-        argv.push_back(nullptr);
-        execv(executable.c_str(), argv.data());
+        execv(executable_string.c_str(), argv.data());
         _exit(127);
     }
     int status = 0;
@@ -749,13 +749,100 @@ download(const Model& model, const Artifact& artifact, const fs::path& output) {
     fs::remove(curl_errors, error);
 }
 
+struct FileState {
+    uint64_t size;
+    fs::file_time_type modified;
+};
+
 bool
-valid_file(const fs::path& path, const Artifact& artifact) {
+file_state(const fs::path& path, uint64_t expected_size, FileState& state) {
     std::error_code error;
-    if (!fs::is_regular_file(path, error) || error || fs::file_size(path, error) != artifact.size ||
-        error)
+    if (!fs::is_regular_file(path, error) || error)
         return false;
-    return sha256_file(path) == artifact.sha256;
+    const uintmax_t size = fs::file_size(path, error);
+    if (error || size != expected_size)
+        return false;
+    const fs::file_time_type modified = fs::last_write_time(path, error);
+    if (error)
+        return false;
+    state = {static_cast<uint64_t>(size), modified};
+    return true;
+}
+
+fs::path
+verification_marker_path(const fs::path& path) {
+    fs::path marker = path;
+    marker += ".verified";
+    return marker;
+}
+
+std::string
+file_time_string(fs::file_time_type value) {
+    std::ostringstream output;
+    output << value.time_since_epoch().count();
+    return output.str();
+}
+
+bool
+verification_marker_matches(
+    const fs::path& path, const Artifact& artifact, const FileState& state) {
+    const fs::path marker = verification_marker_path(path);
+    std::error_code error;
+    if (!fs::is_regular_file(marker, error) || error || fs::file_size(marker, error) > 256 || error)
+        return false;
+    std::ifstream input(marker, std::ios::binary);
+    std::array<std::string, 3> lines;
+    for (auto& line : lines)
+        if (!std::getline(input, line))
+            return false;
+    std::string extra;
+    if (std::getline(input, extra))
+        return false;
+    return lines[0] == "sha256=" + artifact.sha256 &&
+           lines[1] == "size=" + std::to_string(state.size) &&
+           lines[2] == "mtime=" + file_time_string(state.modified);
+}
+
+void
+write_verification_marker(const fs::path& path, const Artifact& artifact, const FileState& state) {
+    const fs::path marker = verification_marker_path(path);
+    fs::path temporary = marker;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output << "sha256=" << artifact.sha256 << '\n'
+               << "size=" << state.size << '\n'
+               << "mtime=" << file_time_string(state.modified) << '\n';
+        if (!output) {
+            std::error_code error;
+            fs::remove(temporary, error);
+            return;
+        }
+    }
+    std::error_code error;
+    fs::remove(marker, error);
+    error.clear();
+    fs::rename(temporary, marker, error);
+    if (error)
+        fs::remove(temporary, error);
+}
+
+bool
+valid_file(const fs::path& path, const Artifact& artifact, bool cache_hit = false) {
+    FileState before{};
+    if (!file_state(path, artifact.size, before))
+        return false;
+    if (cache_hit && verification_marker_matches(path, artifact, before))
+        return true;
+    if (sha256_file(path) != artifact.sha256)
+        return false;
+    FileState after{};
+    if (!file_state(path, artifact.size, after) || before.size != after.size ||
+        before.modified != after.modified)
+        return false;
+    if (cache_hit)
+        write_verification_marker(path, artifact, after);
+    return true;
 }
 
 bool
@@ -900,7 +987,7 @@ materialize(const Model& model, const Artifact& artifact) {
     fs::path lock_path = destination;
     lock_path += ".lock";
     ArtifactLock lock(lock_path);
-    if (artifact.type == "file" && valid_file(destination, artifact)) {
+    if (artifact.type == "file" && valid_file(destination, artifact, true)) {
         if (cli_verbose())
             std::fprintf(stderr, "[model] cached: %s\n", path_utf8(destination).c_str());
         return {model.repo, artifact.role, destination, true};
@@ -954,6 +1041,9 @@ materialize(const Model& model, const Artifact& artifact) {
         fs::rename(partial, destination, error);
         if (error)
             throw std::runtime_error("cannot install model artifact: " + error.message());
+        FileState state{};
+        if (file_state(destination, artifact.size, state))
+            write_verification_marker(destination, artifact, state);
     } else {
         const fs::path extracting = directory / (artifact.directory + ".extracting");
         fs::remove_all(extracting, error);

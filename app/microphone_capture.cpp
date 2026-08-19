@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "microphone_capture.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
-#include <mutex>
+#include <cstring>
 #include <stdexcept>
 
 // miniaudio is already vendored by the repository. Compiling its capture-only
@@ -23,13 +25,14 @@ namespace nemo_speech::cli {
 
 struct MicrophoneCapture::Impl {
     static constexpr int kSampleRate = 16000;
+    static constexpr size_t kQueueCapacity = kSampleRate * 2;
 
     ma_device device{};
     bool initialized = false;
     bool running = false;
-    std::atomic<bool> callback_failed{false};
-    std::mutex mutex;
-    std::vector<float> pending;
+    std::array<float, kQueueCapacity> pending{};
+    std::atomic<size_t> read_position{0};
+    std::atomic<size_t> write_position{0};
     std::string name = "default microphone";
 
     static void data_callback(
@@ -38,14 +41,17 @@ struct MicrophoneCapture::Impl {
             return;
         auto* self = static_cast<Impl*>(device->pUserData);
         const auto* samples = static_cast<const float*>(input);
-        try {
-            std::lock_guard<std::mutex> lock(self->mutex);
-            self->pending.insert(self->pending.end(), samples, samples + frame_count);
-        }
-        catch (...) {
-            // Exceptions must never escape the operating system's audio callback.
-            self->callback_failed.store(true, std::memory_order_release);
-        }
+        const size_t write = self->write_position.load(std::memory_order_relaxed);
+        const size_t read = self->read_position.load(std::memory_order_acquire);
+        const size_t count = std::min<size_t>(frame_count, kQueueCapacity - (write - read));
+
+        // Preserve queued audio and drop newest samples on overflow. The callback
+        // never waits for space or allocates memory.
+        const size_t offset = write % kQueueCapacity;
+        const size_t first = std::min(count, kQueueCapacity - offset);
+        std::memcpy(self->pending.data() + offset, samples, first * sizeof(float));
+        std::memcpy(self->pending.data(), samples + first, (count - first) * sizeof(float));
+        self->write_position.store(write + count, std::memory_order_release);
     }
 
     void dispose() noexcept {
@@ -78,8 +84,8 @@ MicrophoneCapture::start() {
     config.periodSizeInMilliseconds = 40;
     config.dataCallback = Impl::data_callback;
     config.pUserData = impl_.get();
-    impl_->pending.reserve(Impl::kSampleRate * 2);
-    impl_->callback_failed.store(false, std::memory_order_release);
+    impl_->read_position.store(0, std::memory_order_relaxed);
+    impl_->write_position.store(0, std::memory_order_relaxed);
 
     ma_result result = ma_device_init(nullptr, &config, &impl_->device);
     if (result != MA_SUCCESS)
@@ -106,11 +112,18 @@ MicrophoneCapture::stop() {
 
 std::vector<float>
 MicrophoneCapture::drain() {
-    if (impl_->callback_failed.load(std::memory_order_acquire))
-        throw std::runtime_error("microphone capture ran out of buffer memory");
-    std::vector<float> samples;
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    samples.swap(impl_->pending);
+    const size_t read = impl_->read_position.load(std::memory_order_relaxed);
+    const size_t write = impl_->write_position.load(std::memory_order_acquire);
+    const size_t count = write - read;
+    if (count == 0)
+        return {};
+    std::vector<float> samples(count);
+
+    const size_t offset = read % Impl::kQueueCapacity;
+    const size_t first = std::min(count, Impl::kQueueCapacity - offset);
+    std::memcpy(samples.data(), impl_->pending.data() + offset, first * sizeof(float));
+    std::memcpy(samples.data() + first, impl_->pending.data(), (count - first) * sizeof(float));
+    impl_->read_position.store(read + count, std::memory_order_release);
     return samples;
 }
 
