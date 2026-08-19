@@ -245,8 +245,9 @@ RnntJointModule::build_joint_tail(
     auto logits = out_proj_->build_graph(session, act_bag, tc);
     if (B > 1) {
         auto l = logits.get_tensor(0);
-        logits.set_first_tensor(ggml_runtime::ggml_bf_tensor(
-            ggml_reshape_3d(bf_ctx.ctx, l.tensor, l.tensor->ne[0], T, B), l.buft));
+        logits.set_first_tensor(
+            ggml_runtime::ggml_bf_tensor(
+                ggml_reshape_3d(bf_ctx.ctx, l.tensor, l.tensor->ne[0], T, B), l.buft));
     }
     if (argmax_only) {
         auto l = logits.get_tensor(0);
