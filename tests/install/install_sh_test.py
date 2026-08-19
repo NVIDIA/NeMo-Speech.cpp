@@ -22,9 +22,7 @@ def require(condition: bool, message: str) -> None:
 
 def archive(version: str, arch: str) -> tuple[str, bytes, str]:
     os_name = "macos" if platform.system() == "Darwin" else "linux"
-    # Apple Silicon uses one Metal package containing both Metal and CPU
-    # backends; requesting --backend cpu selects this same archive.
-    backend = "metal" if os_name == "macos" and arch == "aarch64" else "cpu"
+    backend = "cpu"
     name = f"nemo-speech-{version}-{os_name}-{arch}-{backend}.tar.gz"
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as bundle:
@@ -102,7 +100,7 @@ def main() -> None:
     installer = source_root / "scripts" / "install.sh"
     os_name = "macos" if platform.system() == "Darwin" else "linux"
     arch = "aarch64" if platform.machine().lower() in {"aarch64", "arm64"} else "x86_64"
-    binary_backend = "metal" if os_name == "macos" and arch == "aarch64" else "cpu"
+    binary_backend = "cpu"
     releases = {}
     for version in ("1.2.3", "1.2.4", "1.2.5", "nightly"):
         name, contents, checksum = archive(version, arch)
@@ -327,6 +325,45 @@ def main() -> None:
             fake_bin = root / "fake-aarch64-bin"
             fake_bin.mkdir()
             fake_uname = fake_bin / "uname"
+            fake_uname.write_text(
+                """#!/bin/sh
+case "$1" in
+    -s) echo Darwin ;;
+    -m) echo arm64 ;;
+    *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_uname.chmod(0o755)
+            mac_env = env.copy()
+            mac_env["PATH"] = f"{fake_bin}:{mac_env['PATH']}"
+            for backend, artifact_backend in (("cpu", "cpu"), ("auto", "metal")):
+                result = subprocess.run(
+                    [
+                        "sh",
+                        str(installer),
+                        "--prefix",
+                        str(root / f"macos-{backend}-dry-run"),
+                        "--version",
+                        "9.9.9",
+                        "--backend",
+                        backend,
+                        "--binary-only",
+                        "--dry-run",
+                    ],
+                    env=mac_env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                require(result.returncode == 0, f"macOS selector failed:\n{result.stdout}")
+                require(
+                    f"macos-aarch64-{artifact_backend}.tar.gz" in result.stdout,
+                    f"macOS {backend} artifact was not selected",
+                )
+
             fake_uname.write_text(
                 """#!/bin/sh
 case "$1" in

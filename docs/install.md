@@ -126,8 +126,8 @@ nemo-speech-<version>-windows-<x86_64|aarch64>-<backend>.zip
 ```
 
 Linux aarch64 CUDA archives use `cuda12` or `cuda13` as the backend suffix.
-On Apple Silicon, both `--backend metal` and `--backend cpu` install the
-`macos-aarch64-metal` archive because it contains both runtime backends.
+On Apple Silicon, automatic selection installs `macos-aarch64-metal`; pass
+`--backend cpu` to install the smaller `macos-aarch64-cpu` archive.
 
 To uninstall on Linux or macOS, remove the prefix printed during installation
 and `~/.local/bin/nemo-speech`; remove the two-line NeMo-Speech.cpp PATH

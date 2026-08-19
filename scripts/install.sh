@@ -130,11 +130,7 @@ if [ "$backend" = auto ]; then
 fi
 
 artifact_backend=$backend
-if [ "$os" = macos ] && [ "$arch" = aarch64 ] && [ "$backend" = cpu ]; then
-    # The Apple Silicon Metal package also contains the general CPU backend.
-    # Keep one portable arm64 archive while allowing CPU-only execution.
-    artifact_backend=metal
-elif [ "$os" = linux ] && [ "$arch" = aarch64 ] && [ "$backend" = cuda ]; then
+if [ "$os" = linux ] && [ "$arch" = aarch64 ] && [ "$backend" = cuda ]; then
     cuda_series=${NEMO_SPEECH_CUDA_SERIES:-}
     if [ -z "$cuda_series" ]; then
         case "$device_model" in
