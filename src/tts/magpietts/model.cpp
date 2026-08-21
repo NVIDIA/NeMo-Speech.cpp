@@ -1146,11 +1146,11 @@ cross_attention(
     return linear(ctx, layer.cross_o, out);
 }
 
-static ggml_tensor*
+ggml_tensor*
 cross_attention_cached(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x, ggml_tensor* attn_prior,
-    ggml_tensor** last_attn) {
+    ggml_tensor** last_attn, bool prior_is_log) {
     const int64_t d_head = tr.n_cross_dhead;
     const int64_t n_head = tr.n_cross_head;
     const int64_t cross_dim = d_head * n_head;
@@ -1170,8 +1170,13 @@ cross_attention_cached(
         0, 2, 1, 3);
     ggml_tensor* kq = ggml_mul_mat(ctx, kh, qh);
     kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
-    ggml_tensor* kq_soft = ggml_soft_max(ctx, kq);
-    if (attn_prior) {
+    ggml_tensor* kq_soft = nullptr;
+    if (attn_prior && prior_is_log) {
+        kq_soft = ggml_soft_max(ctx, ggml_add(ctx, kq, ggml_repeat(ctx, attn_prior, kq)));
+    } else {
+        kq_soft = ggml_soft_max(ctx, kq);
+    }
+    if (attn_prior && !prior_is_log) {
         ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
         kq_soft = ggml_mul(ctx, kq_soft, prior);
         ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
@@ -2002,6 +2007,8 @@ MagpieCodeGenerator::generate(
 
             decoder_result cond;
             decoder_result uncond;
+            cond.logits_required = !params.use_local_transformer;
+            uncond.logits_required = !params.use_local_transformer;
             if (use_cuda_sampling) {
                 if (params.use_local_transformer) {
                     const bool decode_ok =

@@ -6,9 +6,13 @@
 #include <cmath>
 #include <cstdio>
 #include <future>
+#include <memory>
 #include <random>
+#include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
+#include "../../runtime/ggml/runtime.h"
 #include "graph.h"
 #include "nvtx_utils.h"
 
@@ -399,6 +403,385 @@ read_alignment_outputs(
     return true;
 }
 
+namespace {
+
+constexpr int kMagpieCfgLanes = 2;
+
+bool
+runtime_layer_selected(const std::vector<int32_t>& layers, int layer) {
+    return layers.empty() ||
+           std::find(layers.begin(), layers.end(), static_cast<int32_t>(layer)) != layers.end();
+}
+
+std::string
+runtime_kv_name(int layer) {
+    return "magpietts.decoder.runtime.kv." + std::to_string(layer);
+}
+
+// Single-token decoder graph with external cross-K/V and persistent self-K/V storage.
+class PersistentDecoderModule final : public ggml_runtime::Module {
+   public:
+    PersistentDecoderModule(
+        const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
+        int cache_len)
+        : model_(model), cross_kv_(cross_kv), text_len_(text_len), cache_len_(cache_len) {
+        for (int layer = 0; layer < static_cast<int>(model_.decoder.layers.size()); ++layer) {
+            if (model_.decoder.layers[layer].has_cross &&
+                runtime_layer_selected(model_.decoder.estimate_alignment_from_layers, layer)) {
+                ++alignment_count_;
+            }
+        }
+    }
+
+    void define_tensors(ggml_runtime::Session* session) override {
+        std::unordered_set<const ggml_tensor*> seen;
+        int imported = 0;
+        auto import = [&](ggml_tensor* tensor) {
+            if (!tensor || !seen.insert(tensor).second) {
+                return;
+            }
+            session->import_model_tensor(
+                "magpietts.decoder.external." + std::to_string(imported++), tensor);
+        };
+
+        for (ggml_tensor* embedding : model_.audio_embeddings) import(embedding);
+        import(model_.decoder.pos_emb);
+        import(model_.decoder.norm_out);
+        for (const magpietts_layer& layer : model_.decoder.layers) {
+            import(layer.norm_self);
+            import(layer.self_qkv);
+            import(layer.self_o);
+            import(layer.norm_xattn_query);
+            import(layer.cross_q);
+            import(layer.cross_o);
+            import(layer.norm_ff);
+            for (ggml_tensor* tensor : layer.ff_proj) import(tensor);
+            for (ggml_tensor* tensor : layer.ff_out) import(tensor);
+        }
+        import(cross_kv_.memory_k);
+        import(cross_kv_.memory_v);
+
+        session->model_tensor_container->create_tensor_1d(
+            "magpietts.decoder.runtime.slot_ids", GGML_TYPE_I32, kMagpieCfgLanes);
+        for (int layer = 0; layer < model_.hparams.n_dec_layer; ++layer) {
+            session->model_tensor_container->create_tensor_3d(
+                runtime_kv_name(layer), GGML_TYPE_F32,
+                static_cast<int64_t>(model_.hparams.n_embd) * cache_len_, kMagpieCfgLanes, 2);
+        }
+    }
+
+    ggml_runtime::TensorBag build_graph(
+        ggml_runtime::Session* session, ggml_runtime::TensorBag inputs,
+        ggml_runtime::TensorContainer* tc) override {
+        if (inputs.tensor_count() != 4) {
+            throw std::runtime_error("Magpie persistent decoder expects four inputs");
+        }
+        const auto tokens = inputs.get_tensor(0);
+        const auto position = inputs.get_tensor(1);
+        const auto cache_meta = inputs.get_tensor(2);
+        const auto prior = inputs.get_tensor(3);
+        const auto bf_ctx = tc->get_ctx_of_buffer_type(tokens.buft);
+        ggml_context* ctx = bf_ctx.ctx;
+        const magpietts_hparams& h = model_.hparams;
+        const magpietts_transformer& tr = model_.decoder;
+
+        ggml_tensor* audio = nullptr;
+        for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
+            ggml_tensor* token = ggml_view_1d(
+                ctx, tokens.tensor, 1, static_cast<size_t>(codebook) * sizeof(int32_t));
+            ggml_tensor* embedding = ggml_get_rows(ctx, model_.audio_embeddings[codebook], token);
+            audio = audio ? ggml_add(ctx, audio, embedding) : embedding;
+        }
+        audio = ggml_scale(ctx, audio, 1.0f / static_cast<float>(h.stacked_audio_codebooks()));
+        audio = ggml_add(ctx, audio, ggml_get_rows(ctx, tr.pos_emb, position.tensor));
+        // Store CFG lanes as projection columns for two-column MMVF.
+        ggml_tensor* x = ggml_concat(ctx, audio, audio, 1);  // [E,CFG=2]
+
+        const int64_t d_head = tr.n_embd / tr.n_head;
+        auto slots = session->model_tensor_container->get_tensor_by_name(
+            "magpietts.decoder.runtime.slot_ids");
+        std::vector<ggml_tensor*> alignment_outputs;
+
+        for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size());
+             ++layer_index) {
+            const magpietts_layer& layer = tr.layers[layer_index];
+            ggml_tensor* residual = x;
+            ggml_tensor* cur = layer_norm(ctx, x, layer.norm_self);
+            ggml_tensor* qkv = linear(ctx, layer.self_qkv, cur);
+            const size_t element = ggml_element_size(qkv);
+            auto split_heads = [&](size_t offset) {
+                // Expose Q/K/V as [d_head,1,n_head,B] views without staging copies.
+                return ggml_view_4d(
+                    ctx, qkv, d_head, 1, tr.n_head, kMagpieCfgLanes, qkv->nb[1],
+                    static_cast<size_t>(d_head) * element, qkv->nb[1], offset);
+            };
+            ggml_tensor* q = split_heads(0);
+            ggml_tensor* k = split_heads(static_cast<size_t>(tr.n_embd) * element);
+            ggml_tensor* v = split_heads(static_cast<size_t>(2 * tr.n_embd) * element);
+            auto kv = session->model_tensor_container->get_tensor_by_name(
+                runtime_kv_name(layer_index));
+            ggml_tensor* heads = ggml_fused_attn_cached(
+                ctx, q, k, v, nullptr, kv.tensor, slots.tensor, cache_meta.tensor, cache_len_,
+                1.0f / std::sqrt(static_cast<float>(d_head)), true);
+            ggml_tensor* merged = ggml_reshape_2d(
+                ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), tr.n_embd,
+                kMagpieCfgLanes);
+            x = ggml_add(ctx, residual, linear(ctx, layer.self_o, merged));
+
+            // Text cross-attention applies only to the conditional lane.
+            if (tr.has_cross && layer.has_cross) {
+                ggml_tensor* cond = ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0);
+                ggml_tensor* uncond =
+                    ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]);
+                ggml_tensor* cross_in = layer_norm(ctx, cond, layer.norm_xattn_query);
+                ggml_tensor* last_attn = nullptr;
+                const bool apply_prior = tr.apply_attention_prior &&
+                                         runtime_layer_selected(tr.apply_prior_to_layers, layer_index);
+                const bool collect = runtime_layer_selected(
+                    tr.estimate_alignment_from_layers, layer_index);
+                ggml_tensor* cross = cross_attention_cached(
+                    ctx, tr, layer, cross_kv_, layer_index, cross_in,
+                    apply_prior ? prior.tensor : nullptr, collect ? &last_attn : nullptr, true);
+                cond = ggml_add(ctx, cond, cross);
+                x = ggml_concat(ctx, cond, uncond, 1);
+                if (last_attn) {
+                    alignment_outputs.push_back(last_attn);
+                }
+            }
+
+            residual = x;
+            cur = layer_norm(ctx, x, layer.norm_ff);
+            cur = causal_conv1d(ctx, cur, layer.ff_proj);
+            cur = ggml_gelu(ctx, cur);
+            cur = causal_conv1d(ctx, cur, layer.ff_out);
+            x = ggml_add(ctx, residual, cur);
+        }
+        if (tr.norm_out) x = layer_norm(ctx, x, tr.norm_out);
+
+        ggml_tensor* cond = ggml_cont_2d(
+            ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0), tr.n_embd, 1);
+        ggml_tensor* uncond = ggml_cont_2d(
+            ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]), tr.n_embd, 1);
+        ggml_set_name(cond, "magpietts_decoder_runtime_hidden_cond");
+        ggml_set_name(uncond, "magpietts_decoder_runtime_hidden_uncond");
+        ggml_runtime::TensorBag outputs;
+        outputs.add_tensor({cond, bf_ctx.buft});
+        outputs.add_tensor({uncond, bf_ctx.buft});
+        if (alignment_outputs.size() != alignment_count_) {
+            throw std::runtime_error("Magpie persistent decoder alignment topology changed");
+        }
+        if (!alignment_outputs.empty()) {
+            ggml_tensor* sum = nullptr;
+            for (ggml_tensor* alignment : alignment_outputs) {
+                ggml_tensor* per_layer = alignment;
+                if (tr.n_cross_head > 1) {
+                    per_layer = ggml_reshape_1d(
+                        ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, alignment))),
+                        text_len_);
+                } else {
+                    per_layer = ggml_reshape_1d(ctx, alignment, text_len_);
+                }
+                sum = sum ? ggml_add(ctx, sum, per_layer) : per_layer;
+            }
+            ggml_tensor* mean = ggml_scale(
+                ctx, sum,
+                1.0f /
+                    static_cast<float>(alignment_outputs.size() * tr.n_cross_head));
+            ggml_set_name(mean, "magpietts_decoder_runtime_alignment_mean");
+            outputs.add_tensor({mean, bf_ctx.buft});
+        }
+        return outputs;
+    }
+
+    void set_data(ggml_runtime::Session* session) override {
+        const int32_t slots[kMagpieCfgLanes] = {0, 1};
+        auto slot_ids = session->model_tensor_container->get_tensor_by_name(
+            "magpietts.decoder.runtime.slot_ids");
+        ggml_backend_tensor_set(slot_ids.tensor, slots, 0, sizeof(slots));
+        for (int layer = 0; layer < model_.hparams.n_dec_layer; ++layer) {
+            auto kv = session->model_tensor_container->get_tensor_by_name(runtime_kv_name(layer));
+            ggml_backend_tensor_memset(kv.tensor, 0, 0, ggml_nbytes(kv.tensor));
+        }
+    }
+
+    size_t alignment_count() const { return alignment_count_; }
+
+   private:
+    const magpietts_model& model_;
+    const DecoderCrossKvCache& cross_kv_;
+    int text_len_ = 0;
+    int cache_len_ = 0;
+    size_t alignment_count_ = 0;
+};
+
+}  // namespace
+
+class MagpieDecoder::PersistentDecoderRuntime {
+   public:
+    PersistentDecoderRuntime(
+        const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len)
+        : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
+          cache_len_(
+              model.hparams.baked_context_length +
+              (model.hparams.max_decoder_steps + model.hparams.frame_stacking_factor - 1) /
+                  model.hparams.frame_stacking_factor -
+              1),
+          backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
+          module_(model, cross_kv, text_len, cache_len_),
+          session_(backend_manager_, &module_, nullptr) {
+        if (cache_len_ <= 0 || cache_len_ >= model.hparams.n_ctx) {
+            throw std::runtime_error("invalid persistent Magpie decoder cache length");
+        }
+        session_.set_run_cache_capacity(1);
+        session_.setup();
+    }
+
+    bool matches(const DecoderCrossKvCache* cross_kv, int text_len) const {
+        return cross_kv == cross_kv_ && text_len == text_len_;
+    }
+
+    bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_; }
+
+    void seed(const DecoderKvCache& cond, const DecoderKvCache& uncond) {
+        if (cond.n_tokens <= 0 || cond.n_tokens != uncond.n_tokens || cond.n_tokens > cache_len_) {
+            throw std::runtime_error("cannot seed persistent decoder from incompatible KV caches");
+        }
+        ggml_context* ctx = new_graph_context();
+        const size_t element = sizeof(float);
+        const size_t source_layer_bytes =
+            static_cast<size_t>(cond.n_ctx) * cond.n_embd * element;
+        const size_t copy_elements = static_cast<size_t>(cond.n_tokens) * cond.n_embd;
+        const size_t destination_token = static_cast<size_t>(cache_len_ - cond.n_tokens);
+        for (int layer = 0; layer < cond.n_layers; ++layer) {
+            auto arena = session_.model_tensor_container->get_tensor_by_name(runtime_kv_name(layer));
+            for (int plane = 0; plane < 2; ++plane) {
+                ggml_tensor* dst_base = arena.tensor;
+                ggml_tensor* cond_src_base = plane == 0 ? cond.memory_k : cond.memory_v;
+                ggml_tensor* uncond_src_base = plane == 0 ? uncond.memory_k : uncond.memory_v;
+                const ggml_tensor* sources[kMagpieCfgLanes] = {cond_src_base, uncond_src_base};
+                for (int lane = 0; lane < kMagpieCfgLanes; ++lane) {
+                    ggml_tensor* src = ggml_view_1d(
+                        ctx, const_cast<ggml_tensor*>(sources[lane]), copy_elements,
+                        static_cast<size_t>(layer) * source_layer_bytes);
+                    const size_t dst_offset =
+                        static_cast<size_t>(plane) * dst_base->nb[2] +
+                        static_cast<size_t>(lane) * dst_base->nb[1] +
+                        destination_token * cond.n_embd * element;
+                    ggml_tensor* dst = ggml_view_1d(ctx, dst_base, copy_elements, dst_offset);
+                    ggml_backend_tensor_copy_async(model_.backend, model_.backend, src, dst);
+                }
+            }
+        }
+        ggml_backend_synchronize(model_.backend);
+        ggml_free(ctx);
+        n_tokens_ = cond.n_tokens;
+        valid_tokens_ = cond.n_tokens;
+        ring_head_ = 0;
+    }
+
+    bool eval(
+        const std::vector<std::vector<int32_t>>& audio_codes, DecoderKvCache& cond_kv,
+        DecoderKvCache& uncond_kv, decoder_result& cond_result, decoder_result& uncond_result,
+        magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out,
+        const magpietts_decoder_attention* attention) {
+        const ggml_nvtx::range nvtx_range("magpietts_persistent_decoder_eval");
+        const magpietts_hparams& h = model_.hparams;
+        if (!cond_hidden_out || !uncond_hidden_out || !cond_hidden_out->tensor ||
+            !uncond_hidden_out->tensor || static_cast<int>(audio_codes.size()) != h.audio_codebooks ||
+            audio_codes.empty()) {
+            return false;
+        }
+        const size_t raw_len = audio_codes[0].size();
+        if (raw_len == 0 || raw_len % h.frame_stacking_factor != 0) return false;
+        for (const auto& codes : audio_codes) {
+            if (codes.size() != raw_len) return false;
+        }
+        const int total_len = h.baked_context_length +
+                              static_cast<int>(raw_len / h.frame_stacking_factor);
+        if (total_len != n_tokens_ + 1 || n_tokens_ >= cache_len_) return false;
+
+        std::vector<int32_t> tokens(static_cast<size_t>(h.stacked_audio_codebooks()));
+        const size_t frame_start = raw_len - static_cast<size_t>(h.frame_stacking_factor);
+        for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+            for (int codebook = 0; codebook < h.audio_codebooks; ++codebook) {
+                tokens[static_cast<size_t>(codebook + lane * h.audio_codebooks)] =
+                    audio_codes[static_cast<size_t>(codebook)][frame_start + lane];
+            }
+        }
+        const int32_t position = n_tokens_;
+        // Column-major [CFG lane, {ring head, valid length}]. The fused attention kernel reads
+        // only the active suffix while the graph and arena shapes remain constant.
+        const int32_t cache_meta[kMagpieCfgLanes * 2] = {
+            ring_head_, ring_head_, valid_tokens_, valid_tokens_};
+        std::vector<float> log_prior(static_cast<size_t>(text_len_), 0.0f);
+        if (attention && attention->prior) {
+            if (static_cast<int>(attention->prior->size()) != text_len_) return false;
+            for (int i = 0; i < text_len_; ++i) {
+                log_prior[static_cast<size_t>(i)] =
+                    std::log(std::max((*attention->prior)[static_cast<size_t>(i)], 1.0e-20f));
+            }
+        }
+
+        std::vector<ggml_runtime::Session::Input> inputs = {
+            {"magpietts.decoder.runtime.tokens", GGML_TYPE_I32, tokens.data(),
+             {h.stacked_audio_codebooks()}},
+            {"magpietts.decoder.runtime.position", GGML_TYPE_I32, &position, {1}},
+            {"magpietts.decoder.runtime.cache_meta", GGML_TYPE_I32, cache_meta,
+             {kMagpieCfgLanes, 2}},
+            {"magpietts.decoder.runtime.prior", GGML_TYPE_F32, log_prior.data(), {text_len_}}};
+
+        ggml_runtime::DeviceTensor cond_device;
+        ggml_runtime::DeviceTensor uncond_device;
+        std::vector<float> alignment(static_cast<size_t>(text_len_));
+        const bool has_alignment = module_.alignment_count() > 0;
+        std::vector<ggml_runtime::Session::Output> outputs(has_alignment ? 3 : 2);
+        outputs[0].index = 0;
+        outputs[0].device_tensor = &cond_device;
+        outputs[1].index = 1;
+        outputs[1].device_tensor = &uncond_device;
+        if (has_alignment) {
+            outputs[2].index = 2;
+            outputs[2].host_buffer = alignment.data();
+            outputs[2].nbytes = alignment.size() * sizeof(float);
+        }
+        session_.run(inputs, outputs);
+        ggml_backend_tensor_copy_async(
+            model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
+        ggml_backend_tensor_copy_async(
+            model_.backend, model_.backend, uncond_device.tensor, uncond_hidden_out->tensor);
+
+        if (attention && attention->alignment_scores) {
+            *attention->alignment_scores = alignment;
+        }
+
+        ++n_tokens_;
+        valid_tokens_ = std::min(cache_len_, valid_tokens_ + 1);
+        ring_head_ = (ring_head_ + 1) % cache_len_;
+        cond_kv.n_tokens = n_tokens_;
+        uncond_kv.n_tokens = n_tokens_;
+        cond_result.hidden_last.clear();
+        uncond_result.hidden_last.clear();
+        return true;
+    }
+
+   private:
+    const magpietts_model& model_;
+    const DecoderCrossKvCache* cross_kv_ = nullptr;
+    int text_len_ = 0;
+    int cache_len_ = 0;
+    int n_tokens_ = 0;
+    int valid_tokens_ = 0;
+    int ring_head_ = 0;
+    ggml_runtime::BackendManager backend_manager_;
+    PersistentDecoderModule module_;
+    ggml_runtime::Session session_;
+};
+
+MagpieDecoder::MagpieDecoder(const magpietts_model& model) : model_(model) {}
+
+MagpieDecoder::~MagpieDecoder() = default;
+
 bool
 MagpieDecoder::eval(
     const std::vector<float>& text_cond, int text_len,
@@ -447,6 +830,48 @@ MagpieDecoder::evalCachedPair(
     const magpietts_backend_tensor* text_cond_device, magpietts_backend_tensor* cond_hidden_out,
     magpietts_backend_tensor* uncond_hidden_out, DecoderCrossKvCache* cond_cross_kv,
     const magpietts_decoder_attention* attention) const {
+    const bool persistent_candidate =
+        cuda_sample == nullptr && cond_hidden_out != nullptr && uncond_hidden_out != nullptr &&
+        cond_cross_kv != nullptr && cond_cross_kv->validFor(model_, text_len) &&
+        model_.hparams.dec_kernel == 1 && magpietts_backend_is_cuda(model_.backend) &&
+        cond_kv.n_tokens > 0 && cond_kv.n_tokens == uncond_kv.n_tokens;
+    if (persistent_candidate) {
+        try {
+            if (persistent_runtime_ && !persistent_runtime_->matches(cond_cross_kv, text_len)) {
+                // Cross-cache address or shape changes require a new graph.
+                persistent_runtime_.reset();
+                cond_kv.clear();
+                uncond_kv.clear();
+            }
+            if (cond_kv.n_tokens > 0 && !persistent_runtime_) {
+                persistent_runtime_ =
+                    std::make_unique<PersistentDecoderRuntime>(model_, *cond_cross_kv, text_len);
+                persistent_runtime_->seed(cond_kv, uncond_kv);
+                fprintf(
+                    stderr,
+                    "MagpieTTS decoder runtime: fixed-shape CUDA graph, CFG batch=2, "
+                    "device K/V arena enabled\n");
+            }
+            if (persistent_runtime_ &&
+                !persistent_runtime_->sequence_matches(cond_kv.n_tokens)) {
+                // Reuse the graph and reseed the cache suffix.
+                persistent_runtime_->seed(cond_kv, uncond_kv);
+            }
+            if (persistent_runtime_ && persistent_runtime_->eval(
+                                           audio_codes, cond_kv, uncond_kv, cond_result,
+                                           uncond_result, cond_hidden_out, uncond_hidden_out,
+                                           attention)) {
+                return true;
+            }
+            persistent_runtime_.reset();
+            cond_kv.clear();
+            uncond_kv.clear();
+        }
+        catch (const std::exception& e) {
+            fprintf(stderr, "MagpieTTS persistent decoder failed: %s\n", e.what());
+            return false;
+        }
+    }
     return decoder_eval_cached_pair_impl(
         model_, text_cond, text_len, audio_codes, speaker, threads, cond_kv, uncond_kv, cond_result,
         uncond_result, cuda_sample, text_cond_device, cond_hidden_out, uncond_hidden_out,
@@ -617,10 +1042,14 @@ decoder_eval_impl(
     ggml_set_name(dec_out, "magpietts_decoder_out");
     ggml_set_output(dec_out);
 
-    ggml_tensor* logits = linear(ctx, model.final_proj_w, dec_out, model.final_proj_b);
-    logits = ggml_cont(ctx, ggml_cast(ctx, logits, GGML_TYPE_F32));
-    ggml_set_name(logits, "magpietts_decoder_logits");
-    ggml_set_output(logits);
+    const bool compute_logits = cuda_sample || result.logits_required;
+    ggml_tensor* logits = nullptr;
+    if (compute_logits) {
+        logits = linear(ctx, model.final_proj_w, dec_out, model.final_proj_b);
+        logits = ggml_cont(ctx, ggml_cast(ctx, logits, GGML_TYPE_F32));
+        ggml_set_name(logits, "magpietts_decoder_logits");
+        ggml_set_output(logits);
+    }
 
     ggml_gallocr_t allocr = nullptr;
     const size_t hidden_off = (size_t)h.n_embd * (total_len - 1) * sizeof(float);
@@ -630,7 +1059,9 @@ decoder_eval_impl(
         ggml_set_name(hidden_last, "magpietts_decoder_hidden_last");
         ggml_set_output(hidden_last);
     }
-    ggml_build_forward_expand(gf, logits);
+    if (logits) {
+        ggml_build_forward_expand(gf, logits);
+    }
     ggml_build_forward_expand(gf, dec_out);
     if (hidden_last) {
         ggml_build_forward_expand(gf, hidden_last);
@@ -671,12 +1102,16 @@ decoder_eval_impl(
         return true;
     }
 
-    result.logits_last.resize(logits_last_size);
+    if (result.logits_required) {
+        result.logits_last.resize(logits_last_size);
+    }
     result.hidden_last.resize(h.n_embd);
     const size_t logits_off = logits_off_floats * sizeof(float);
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, logits, result.logits_last.data(), logits_off,
-        result.logits_last.size() * sizeof(float));
+    if (result.logits_required) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, logits, result.logits_last.data(), logits_off,
+            result.logits_last.size() * sizeof(float));
+    }
     magpietts_backend_tensor_get_staged(
         model, output_staging, dec_out, result.hidden_last.data(), hidden_off,
         result.hidden_last.size() * sizeof(float));
@@ -761,10 +1196,15 @@ decoder_eval_pair_impl(
     ggml_set_name(dec_out_cond, "magpietts_decoder_out_cond");
     ggml_set_output(dec_out_cond);
 
-    ggml_tensor* logits_cond = linear(ctx, model.final_proj_w, dec_out_cond, model.final_proj_b);
-    logits_cond = ggml_cont(ctx, ggml_cast(ctx, logits_cond, GGML_TYPE_F32));
-    ggml_set_name(logits_cond, "magpietts_decoder_logits_cond");
-    ggml_set_output(logits_cond);
+    const bool compute_logits =
+        cuda_sample || cond_result.logits_required || uncond_result.logits_required;
+    ggml_tensor* logits_cond = nullptr;
+    if (compute_logits) {
+        logits_cond = linear(ctx, model.final_proj_w, dec_out_cond, model.final_proj_b);
+        logits_cond = ggml_cont(ctx, ggml_cast(ctx, logits_cond, GGML_TYPE_F32));
+        ggml_set_name(logits_cond, "magpietts_decoder_logits_cond");
+        ggml_set_output(logits_cond);
+    }
 
     ggml_tensor* dec_out_uncond =
         transformer_forward(ctx, model.decoder, dec_in_uncond, pos, nullptr);
@@ -772,15 +1212,21 @@ decoder_eval_pair_impl(
     ggml_set_name(dec_out_uncond, "magpietts_decoder_out_uncond");
     ggml_set_output(dec_out_uncond);
 
-    ggml_tensor* logits_uncond =
-        linear(ctx, model.final_proj_w, dec_out_uncond, model.final_proj_b);
-    logits_uncond = ggml_cont(ctx, ggml_cast(ctx, logits_uncond, GGML_TYPE_F32));
-    ggml_set_name(logits_uncond, "magpietts_decoder_logits_uncond");
-    ggml_set_output(logits_uncond);
+    ggml_tensor* logits_uncond = nullptr;
+    if (compute_logits) {
+        logits_uncond = linear(ctx, model.final_proj_w, dec_out_uncond, model.final_proj_b);
+        logits_uncond = ggml_cont(ctx, ggml_cast(ctx, logits_uncond, GGML_TYPE_F32));
+        ggml_set_name(logits_uncond, "magpietts_decoder_logits_uncond");
+        ggml_set_output(logits_uncond);
+    }
 
-    ggml_build_forward_expand(gf, logits_cond);
+    if (logits_cond) {
+        ggml_build_forward_expand(gf, logits_cond);
+    }
     ggml_build_forward_expand(gf, dec_out_cond);
-    ggml_build_forward_expand(gf, logits_uncond);
+    if (logits_uncond) {
+        ggml_build_forward_expand(gf, logits_uncond);
+    }
     ggml_build_forward_expand(gf, dec_out_uncond);
     for (ggml_tensor* t : alignment_outputs) {
         ggml_build_forward_expand(gf, t);
@@ -838,20 +1284,28 @@ decoder_eval_pair_impl(
         return true;
     }
 
-    cond_result.logits_last.resize(logits_last_size);
+    if (cond_result.logits_required) {
+        cond_result.logits_last.resize(logits_last_size);
+    }
     cond_result.hidden_last.resize(h.n_embd);
-    uncond_result.logits_last.resize(logits_last_size);
+    if (uncond_result.logits_required) {
+        uncond_result.logits_last.resize(logits_last_size);
+    }
     uncond_result.hidden_last.resize(h.n_embd);
     const size_t logits_off = logits_off_floats * sizeof(float);
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, logits_cond, cond_result.logits_last.data(), logits_off,
-        cond_result.logits_last.size() * sizeof(float));
+    if (cond_result.logits_required) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, logits_cond, cond_result.logits_last.data(), logits_off,
+            cond_result.logits_last.size() * sizeof(float));
+    }
     magpietts_backend_tensor_get_staged(
         model, output_staging, dec_out_cond, cond_result.hidden_last.data(), hidden_off,
         cond_result.hidden_last.size() * sizeof(float));
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, logits_uncond, uncond_result.logits_last.data(), logits_off,
-        uncond_result.logits_last.size() * sizeof(float));
+    if (uncond_result.logits_required) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, logits_uncond, uncond_result.logits_last.data(), logits_off,
+            uncond_result.logits_last.size() * sizeof(float));
+    }
     magpietts_backend_tensor_get_staged(
         model, output_staging, dec_out_uncond, uncond_result.hidden_last.data(), hidden_off,
         uncond_result.hidden_last.size() * sizeof(float));
@@ -981,11 +1435,15 @@ decoder_eval_cached_impl(
     ggml_set_name(dec_out, "magpietts_decoder_out_cached");
     ggml_set_output(dec_out);
 
-    ggml_tensor* logits = linear(ctx, model.final_proj_w, dec_out, model.final_proj_b);
-    logits = ggml_cont(ctx, ggml_cast(ctx, logits, GGML_TYPE_F32));
-    ggml_set_name(logits, "magpietts_decoder_logits_cached");
-    ggml_set_output(logits);
-    ggml_build_forward_expand(gf, logits);
+    const bool compute_logits = cuda_sample || result.logits_required;
+    ggml_tensor* logits = nullptr;
+    if (compute_logits) {
+        logits = linear(ctx, model.final_proj_w, dec_out, model.final_proj_b);
+        logits = ggml_cont(ctx, ggml_cast(ctx, logits, GGML_TYPE_F32));
+        ggml_set_name(logits, "magpietts_decoder_logits_cached");
+        ggml_set_output(logits);
+        ggml_build_forward_expand(gf, logits);
+    }
     ggml_build_forward_expand(gf, dec_out);
     for (ggml_tensor* t : alignment_outputs) {
         ggml_build_forward_expand(gf, t);
@@ -1037,12 +1495,16 @@ decoder_eval_cached_impl(
         return true;
     }
 
-    result.logits_last.resize(logits_last_size);
+    if (result.logits_required) {
+        result.logits_last.resize(logits_last_size);
+    }
     result.hidden_last.resize(h.n_embd);
     const size_t logits_off = logits_off_floats * sizeof(float);
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, logits, result.logits_last.data(), logits_off,
-        result.logits_last.size() * sizeof(float));
+    if (result.logits_required) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, logits, result.logits_last.data(), logits_off,
+            result.logits_last.size() * sizeof(float));
+    }
     magpietts_backend_tensor_get_staged(
         model, output_staging, dec_out, result.hidden_last.data(), hidden_off,
         result.hidden_last.size() * sizeof(float));
@@ -1196,10 +1658,15 @@ decoder_eval_cached_pair_impl(
     ggml_set_name(dec_out_cond, "magpietts_decoder_out_cond_cached");
     ggml_set_output(dec_out_cond);
 
-    ggml_tensor* logits_cond = linear(ctx, model.final_proj_w, dec_out_cond, model.final_proj_b);
-    logits_cond = ggml_cont(ctx, ggml_cast(ctx, logits_cond, GGML_TYPE_F32));
-    ggml_set_name(logits_cond, "magpietts_decoder_logits_cond_cached");
-    ggml_set_output(logits_cond);
+    const bool compute_logits =
+        cuda_sample || cond_result.logits_required || uncond_result.logits_required;
+    ggml_tensor* logits_cond = nullptr;
+    if (compute_logits) {
+        logits_cond = linear(ctx, model.final_proj_w, dec_out_cond, model.final_proj_b);
+        logits_cond = ggml_cont(ctx, ggml_cast(ctx, logits_cond, GGML_TYPE_F32));
+        ggml_set_name(logits_cond, "magpietts_decoder_logits_cond_cached");
+        ggml_set_output(logits_cond);
+    }
 
     ggml_tensor* dec_out_uncond = transformer_forward_cached(
         ctx, gf, model.decoder, dec_in_uncond, pos, nullptr, uncond_kv, nullptr, n_past);
@@ -1207,15 +1674,21 @@ decoder_eval_cached_pair_impl(
     ggml_set_name(dec_out_uncond, "magpietts_decoder_out_uncond_cached");
     ggml_set_output(dec_out_uncond);
 
-    ggml_tensor* logits_uncond =
-        linear(ctx, model.final_proj_w, dec_out_uncond, model.final_proj_b);
-    logits_uncond = ggml_cont(ctx, ggml_cast(ctx, logits_uncond, GGML_TYPE_F32));
-    ggml_set_name(logits_uncond, "magpietts_decoder_logits_uncond_cached");
-    ggml_set_output(logits_uncond);
+    ggml_tensor* logits_uncond = nullptr;
+    if (compute_logits) {
+        logits_uncond = linear(ctx, model.final_proj_w, dec_out_uncond, model.final_proj_b);
+        logits_uncond = ggml_cont(ctx, ggml_cast(ctx, logits_uncond, GGML_TYPE_F32));
+        ggml_set_name(logits_uncond, "magpietts_decoder_logits_uncond_cached");
+        ggml_set_output(logits_uncond);
+    }
 
-    ggml_build_forward_expand(gf, logits_cond);
+    if (logits_cond) {
+        ggml_build_forward_expand(gf, logits_cond);
+    }
     ggml_build_forward_expand(gf, dec_out_cond);
-    ggml_build_forward_expand(gf, logits_uncond);
+    if (logits_uncond) {
+        ggml_build_forward_expand(gf, logits_uncond);
+    }
     ggml_build_forward_expand(gf, dec_out_uncond);
     for (ggml_tensor* t : alignment_outputs) {
         ggml_build_forward_expand(gf, t);
@@ -1279,20 +1752,28 @@ decoder_eval_cached_pair_impl(
         return true;
     }
 
-    cond_result.logits_last.resize(logits_last_size);
+    if (cond_result.logits_required) {
+        cond_result.logits_last.resize(logits_last_size);
+    }
     cond_result.hidden_last.resize(h.n_embd);
-    uncond_result.logits_last.resize(logits_last_size);
+    if (uncond_result.logits_required) {
+        uncond_result.logits_last.resize(logits_last_size);
+    }
     uncond_result.hidden_last.resize(h.n_embd);
     const size_t logits_off = logits_off_floats * sizeof(float);
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, logits_cond, cond_result.logits_last.data(), logits_off,
-        cond_result.logits_last.size() * sizeof(float));
+    if (cond_result.logits_required) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, logits_cond, cond_result.logits_last.data(), logits_off,
+            cond_result.logits_last.size() * sizeof(float));
+    }
     magpietts_backend_tensor_get_staged(
         model, output_staging, dec_out_cond, cond_result.hidden_last.data(), hidden_off,
         cond_result.hidden_last.size() * sizeof(float));
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, logits_uncond, uncond_result.logits_last.data(), logits_off,
-        uncond_result.logits_last.size() * sizeof(float));
+    if (uncond_result.logits_required) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, logits_uncond, uncond_result.logits_last.data(), logits_off,
+            uncond_result.logits_last.size() * sizeof(float));
+    }
     magpietts_backend_tensor_get_staged(
         model, output_staging, dec_out_uncond, uncond_result.hidden_last.data(), hidden_off,
         uncond_result.hidden_last.size() * sizeof(float));

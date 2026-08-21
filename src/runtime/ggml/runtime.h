@@ -171,6 +171,10 @@ struct Params {
 class BackendManager {
    public:
     explicit BackendManager(Params params);
+    // Reuse an already initialized GPU backend owned by another pipeline object. The manager
+    // creates/owns only its auxiliary backends (for example CPU fallback); the borrowed handle
+    // must outlive this manager and every Session created from it.
+    BackendManager(Params params, ggml_backend_t borrowed_gpu_backend);
     // Out-of-line so ggml_backend_ptr's deleter is instantiated in the implementation TU.
     ~BackendManager();
 
@@ -194,6 +198,7 @@ class BackendManager {
 
    private:
     Params params;
+    ggml_backend_t borrowed_gpu_backend_ = nullptr;
     std::vector<ggml_backend_ptr> backends;
     // Non-owning alias into `backends`.
     ggml_backend_t gpu_backend = nullptr;
@@ -233,6 +238,10 @@ class TensorContainer {
     ggml_bf_tensor get_tensor_by_name(const std::string& name);
     bool has_tensor_by_name(const std::string& name);
     void cache_tensor(std::string name, ggml_bf_tensor tensor);
+
+    // Register storage owned outside this TensorContainer. Imported tensors participate in graph
+    // construction like ordinary model tensors but are never allocated or freed by the runtime.
+    ggml_bf_tensor import_tensor(std::string name, ggml_tensor* tensor);
 
     // Declares tensors on the primary device's main buffer type.
     ggml_bf_tensor create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0);
@@ -284,6 +293,10 @@ class Session {
 
     // Allows exact dtype copies and F32-to-F16 conversion.
     void load_weight(const std::string& gguf_key);
+
+    // Import a model tensor whose storage is owned by the embedding pipeline. Call only from
+    // Module::define_tensors(); the tensor and its backend buffer must outlive this Session.
+    ggml_bf_tensor import_model_tensor(const std::string& name, ggml_tensor* tensor);
 
     // Invoked before upload so model code can annotate destination storage.
     // Install before setup(), which loads the model weights.

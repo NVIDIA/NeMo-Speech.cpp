@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index fb823571..5cfa65e0 100644
+index fb823571..4671c80d 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -2436,8 +2436,9 @@ extern "C" {
@@ -14,15 +14,16 @@ index fb823571..5cfa65e0 100644
      // Q/K/V/P may be non-contiguous views as long as each d_k row is
      // contiguous — e.g. Q sliced from a fused-QKV projection and K/V read
      // head-split from a feat-major [n_feat, kv] window (the CUDA op derives
-@@ -2460,6 +2461,27 @@ extern "C" {
+@@ -2460,6 +2461,46 @@ extern "C" {
              float                 scale,
              bool                  merge_heads);
  
 +    // Streaming CUDA variant. K/V contain only the current chunk; cached K/V
 +    // are read directly from a persistent [n_feat*cache_len, slots, 2] F32
-+    // arena using one I32 slot id and circular-cache head per batch item. The
-+    // op appends the current chunk at the head and leaves advancing that head
-+    // to the caller after the graph run succeeds.
++    // arena using one I32 slot id and circular-cache head per batch item.
++    // ring_heads may be [batch] or [batch,2]; the optional second column is
++    // the number of valid past entries, allowing a fixed graph to skip unused
++    // cache rows. The caller advances the head after a successful graph run.
 +    GGML_API struct ggml_tensor * ggml_fused_relpos_attn_cached(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * q,
@@ -39,11 +40,29 @@ index fb823571..5cfa65e0 100644
 +            float                 scale,
 +            bool                  merge_heads);
 +
++    // Absolute-position streaming attention. This shares the same persistent
++    // [n_feat*cache_len, slots, 2] F32 K/V arena and fused cache-update kernel
++    // as ggml_fused_relpos_attn_cached, but omits relative-position operands
++    // and biases. Q/K/V are [d_k, chunk_len, n_head, batch]; the current K/V
++    // chunk is attended and appended to the circular cache by the same op.
++    GGML_API struct ggml_tensor * ggml_fused_attn_cached(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * mask,
++            struct ggml_tensor  * kv_cache,
++            struct ggml_tensor  * slot_ids,
++            struct ggml_tensor  * ring_heads,
++            int64_t               cache_len,
++            float                 scale,
++            bool                  merge_heads);
++
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
 diff --git a/src/ggml-cuda/fused-relpos-attn.cu b/src/ggml-cuda/fused-relpos-attn.cu
-index f3c4836a..d5640439 100644
+index f3c4836a..e0c0ec27 100644
 --- a/src/ggml-cuda/fused-relpos-attn.cu
 +++ b/src/ggml-cuda/fused-relpos-attn.cu
 @@ -3,6 +3,8 @@
@@ -853,7 +872,7 @@ index f3c4836a..d5640439 100644
  static int relpos_attn_warp_128_max_blocks_per_sm(int device, size_t shmem) {
      // The target shape fixes dynamic shared memory, so occupancy is invariant
      // for a given compiled kernel and device. Avoid repeating the CUDA runtime
-@@ -310,27 +993,31 @@ static int relpos_attn_warp_128_max_blocks_per_sm(int device, size_t shmem) {
+@@ -310,27 +993,32 @@ static int relpos_attn_warp_128_max_blocks_per_sm(int device, size_t shmem) {
      int blocks = cached[device].load(std::memory_order_relaxed);
      if (blocks == 0) {
          CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -876,7 +895,8 @@ index f3c4836a..d5640439 100644
 +        const float * __restrict__ Kcache, const float * __restrict__ Vcache,
 +        const int32_t * __restrict__ slot_ids,
 +        const int32_t * __restrict__ ring_heads,
-+        int q, int kv, int n_head, int cache_len, float scale,
++        const int32_t * __restrict__ active_lengths,
++        int q, int kv, int n_head, int cache_len, float scale, bool relative,
          // element strides: x_sq = between queries/keys, x_sh = between heads,
          // x_sb = between batch items
          long q_sq, long q_sh, long q_sb,
@@ -889,31 +909,40 @@ index f3c4836a..d5640439 100644
      extern __shared__ float sh[];
      const int dk  = blockDim.x;
      float * Qu  = sh;             // [dk]
-@@ -346,8 +1033,16 @@ static __global__ void fused_relpos_attn_kernel(
+@@ -346,11 +1034,20 @@ static __global__ void fused_relpos_attn_kernel(
      const float * Qhi = Q + (size_t) b * q_sb + (size_t) h * q_sh + (size_t) i * q_sq;
      const T *     Kh  = K + (size_t) b * k_sb + (size_t) h * k_sh;
      const T *     Vh  = V + (size_t) b * v_sb + (size_t) h * v_sh;
+-    const T *     Ph  = Ppos + (size_t) h * p_sh;
+-    const float * Mb  = mask ? mask + (size_t) b * m_sb : nullptr;
 +    const int slot = Cached ? slot_ids[b] : 0;
 +    const int ring_head = Cached ? ring_heads[b] : 0;
++    const int key_begin = active_lengths ? cache_len - active_lengths[b] : 0;
 +    const float * Kch = Cached
 +        ? Kcache + (size_t) slot * cache_ss + (size_t) h * dk
 +        : nullptr;
 +    const float * Vch = Cached
 +        ? Vcache + (size_t) slot * cache_ss + (size_t) h * dk
 +        : nullptr;
-     const T *     Ph  = Ppos + (size_t) h * p_sh;
--    const float * Mb  = mask ? mask + (size_t) b * m_sb : nullptr;
++    const T *     Ph  = relative ? Ppos + (size_t) h * p_sh : nullptr;
 +    const float * Mb  = mask ? mask + (size_t) b * m_sb + (size_t) i * m_sq : nullptr;
  
-     Qu[d] = Qhi[d] + bu[h * dk + d];
-     Qv[d] = Qhi[d] + bv[h * dk + d];
-@@ -364,32 +1059,17 @@ static __global__ void fused_relpos_attn_kernel(
+-    Qu[d] = Qhi[d] + bu[h * dk + d];
+-    Qv[d] = Qhi[d] + bv[h * dk + d];
++    Qu[d] = Qhi[d] + (relative ? bu[h * dk + d] : 0.0f);
++    Qv[d] = Qhi[d] + (relative ? bv[h * dk + d] : 0.0f);
+     __syncthreads();
+ 
+     // scores. Two layouts:
+@@ -363,32 +1060,19 @@ static __global__ void fused_relpos_attn_kernel(
+     //  * otherwise: legacy thread-per-key scalar loop.
      if (dk == 128) {
          const int warp = d >> 5, lane = d & 31, nw = dk >> 5;
-         for (int j = warp; j < kv; j += nw) {
+-        for (int j = warp; j < kv; j += nw) {
 -            const T * Kj  = Kh + (size_t) j * k_sj + lane * 4;
++        for (int j = key_begin + warp; j < kv; j += nw) {
              const int row = (q - 1) + j - i;  // rel-shift index
-             const T * Pr  = Ph + (size_t) row * p_sr + lane * 4;
+-            const T * Pr  = Ph + (size_t) row * p_sr + lane * 4;
 -            float     k4[4], p4[4];
 -            if (sizeof(T) == 2) {
 -                const int2 kr = *(const int2 *) Kj;
@@ -936,48 +965,96 @@ index f3c4836a..d5640439 100644
 -#pragma unroll
 -            for (int e = 0; e < 4; e++) {
 -                s += k4[e] * Qu[lane * 4 + e] + p4[e] * Qv[lane * 4 + e];
--            }
 +            const float4 k4 =
 +                relpos_load_kv4<T, Cached>(
 +                    Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, lane * 4);
-+            const float4 p4 = relpos_load4(Pr);
 +            float s =
-+                k4.x * Qu[lane * 4 + 0] + p4.x * Qv[lane * 4 + 0] +
-+                k4.y * Qu[lane * 4 + 1] + p4.y * Qv[lane * 4 + 1] +
-+                k4.z * Qu[lane * 4 + 2] + p4.z * Qv[lane * 4 + 2] +
-+                k4.w * Qu[lane * 4 + 3] + p4.w * Qv[lane * 4 + 3];
++                k4.x * Qu[lane * 4 + 0] + k4.y * Qu[lane * 4 + 1] +
++                k4.z * Qu[lane * 4 + 2] + k4.w * Qu[lane * 4 + 3];
++            if (relative) {
++                const T * Pr = Ph + (size_t) row * p_sr + lane * 4;
++                const float4 p4 = relpos_load4(Pr);
++                s += p4.x * Qv[lane * 4 + 0] + p4.y * Qv[lane * 4 + 1] +
++                     p4.z * Qv[lane * 4 + 2] + p4.w * Qv[lane * 4 + 3];
+             }
  #pragma unroll
              for (int off = 16; off > 0; off >>= 1) {
-                 s += __shfl_xor_sync(0xffffffff, s, off);
-@@ -400,12 +1080,13 @@ static __global__ void fused_relpos_attn_kernel(
+@@ -398,15 +1082,39 @@ static __global__ void fused_relpos_attn_kernel(
+                 sc[j] = s * scale + (Mb ? Mb[j] : 0.0f);
+             }
          }
++    } else if (dk == 64) {
++        // Preserve one thread per key (important for Magpie's long cache) while reducing each
++        // dot product from 64 scalar loads/instructions to 16 aligned float4 operations.
++        for (int j = key_begin + d; j < kv; j += dk) {
++            const int row = (q - 1) + j - i;
++            float ac = 0.0f;
++            float bd = 0.0f;
++#pragma unroll
++            for (int dd = 0; dd < 64; dd += 4) {
++                const float4 k4 = relpos_load_kv4<T, Cached>(
++                    Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, dd);
++                const float4 qu4 = relpos_load4(Qu + dd);
++                ac += k4.x * qu4.x + k4.y * qu4.y + k4.z * qu4.z + k4.w * qu4.w;
++                if (relative) {
++                    const float4 p4 = relpos_load4(Ph + (size_t) row * p_sr + dd);
++                    const float4 qv4 = relpos_load4(Qv + dd);
++                    bd += p4.x * qv4.x + p4.y * qv4.y + p4.z * qv4.z + p4.w * qv4.w;
++                }
++            }
++            sc[j] = (ac + bd) * scale + (Mb ? Mb[j] : 0.0f);
++        }
      } else {
-         for (int j = d; j < kv; j += dk) {
+-        for (int j = d; j < kv; j += dk) {
 -            const T * Kj  = Kh + (size_t) j * k_sj;
++        for (int j = key_begin + d; j < kv; j += dk) {
              const int row = (q - 1) + j - i;  // rel-shift index
-             const T * Pr  = Ph + (size_t) row * p_sr;
+-            const T * Pr  = Ph + (size_t) row * p_sr;
              float ac = 0.0f, bd = 0.0f;
              for (int dd = 0; dd < dk; dd++) {
 -                ac += (float) Kj[dd] * Qu[dd];
+-                bd += (float) Pr[dd] * Qv[dd];
 +                ac += relpos_load_kv<T, Cached>(
 +                          Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, dd) *
 +                      Qu[dd];
-                 bd += (float) Pr[dd] * Qv[dd];
++                if (relative) {
++                    const T * Pr = Ph + (size_t) row * p_sr;
++                    bd += (float) Pr[dd] * Qv[dd];
++                }
              }
              sc[j] = (ac + bd) * scale + (Mb ? Mb[j] : 0.0f);
-@@ -443,7 +1124,10 @@ static __global__ void fused_relpos_attn_kernel(
+         }
+@@ -415,7 +1123,7 @@ static __global__ void fused_relpos_attn_kernel(
+ 
+     // block max over sc[0..kv)
+     float lm = -INFINITY;
+-    for (int j = d; j < kv; j += dk) lm = fmaxf(lm, sc[j]);
++    for (int j = key_begin + d; j < kv; j += dk) lm = fmaxf(lm, sc[j]);
+     red[d] = lm;
+     __syncthreads();
+     for (int s = dk / 2; s > 0; s >>= 1) {
+@@ -427,7 +1135,7 @@ static __global__ void fused_relpos_attn_kernel(
+ 
+     // exp + block sum
+     float ls = 0.0f;
+-    for (int j = d; j < kv; j += dk) {
++    for (int j = key_begin + d; j < kv; j += dk) {
+         const float e = __expf(sc[j] - m);
+         sc[j] = e;
+         ls += e;
+@@ -443,7 +1151,10 @@ static __global__ void fused_relpos_attn_kernel(
  
      // ctx[d] = inv * sum_j softmax(sc[j]) * V[j,d]   (thread d owns output dim d)
      float c = 0.0f;
 -    for (int j = 0; j < kv; j++) c += sc[j] * (float) Vh[(size_t) j * v_sj + d];
-+    for (int j = 0; j < kv; j++) {
++    for (int j = key_begin; j < kv; j++) {
 +        c += sc[j] * relpos_load_kv<T, Cached>(
 +                         Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d);
 +    }
      ctx[(size_t) b * o_sb + (size_t) i * o_si + (size_t) h * o_sh + d] = c * inv;
  }
  
-@@ -455,6 +1139,10 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+@@ -455,38 +1166,76 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
      const ggml_tensor * bias_u = dst->src[4];
      const ggml_tensor * bias_v = dst->src[5];
      const ggml_tensor * mask   = dst->src[6];  // may be null
@@ -985,10 +1062,19 @@ index f3c4836a..d5640439 100644
 +    const ggml_tensor * slot_ids = dst->src[8];
 +    const ggml_tensor * ring_heads = dst->src[9];
 +    const bool cached = kv_cache != nullptr;
++    const bool relative = p != nullptr;
  
      GGML_ASSERT(q->type == GGML_TYPE_F32);
      // K/V/P may be F32 or (all together) F16 — see the kernel comment.
-@@ -467,26 +1155,54 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+-    GGML_ASSERT(k->type == v->type && k->type == p->type);
++    GGML_ASSERT(k->type == v->type);
++    GGML_ASSERT(!relative || k->type == p->type);
+     GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+-    GGML_ASSERT(bias_u->type == GGML_TYPE_F32 && bias_v->type == GGML_TYPE_F32);
++    GGML_ASSERT(!relative || (bias_u->type == GGML_TYPE_F32 && bias_v->type == GGML_TYPE_F32));
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+ 
+     const int d_k     = q->ne[0];
      const int q_len   = q->ne[1];
      const int n_head  = q->ne[2];
      const int batch   = q->ne[3];
@@ -998,13 +1084,20 @@ index f3c4836a..d5640439 100644
 +    const int kv_len  = cache_len + chunk_len;
  
      GGML_ASSERT((d_k & (d_k - 1)) == 0 && "fused_relpos_attn: d_k must be a power of two");
-     GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k && p->ne[0] == d_k);
+-    GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k && p->ne[0] == d_k);
 -    GGML_ASSERT(k->ne[1] == kv_len && v->ne[1] == kv_len);
+-    GGML_ASSERT(k->ne[2] == n_head && v->ne[2] == n_head && p->ne[2] == n_head);
++    GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k);
 +    GGML_ASSERT(k->ne[1] == chunk_len && v->ne[1] == chunk_len);
-     GGML_ASSERT(k->ne[2] == n_head && v->ne[2] == n_head && p->ne[2] == n_head);
++    GGML_ASSERT(k->ne[2] == n_head && v->ne[2] == n_head);
      GGML_ASSERT(k->ne[3] == batch && v->ne[3] == batch);
-     GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
-     GGML_ASSERT(bias_u->ne[1] == n_head && bias_v->ne[1] == n_head);
+-    GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
+-    GGML_ASSERT(bias_u->ne[1] == n_head && bias_v->ne[1] == n_head);
++    if (relative) {
++        GGML_ASSERT(p->ne[0] == d_k && p->ne[2] == n_head);
++        GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
++        GGML_ASSERT(bias_u->ne[1] == n_head && bias_v->ne[1] == n_head);
++    }
 +    if (cached) {
 +        GGML_ASSERT(slot_ids != nullptr);
 +        GGML_ASSERT(ring_heads != nullptr);
@@ -1015,6 +1108,7 @@ index f3c4836a..d5640439 100644
 +        GGML_ASSERT(slot_ids->ne[0] == batch);
 +        GGML_ASSERT(ring_heads->type == GGML_TYPE_I32 && ggml_is_contiguous(ring_heads));
 +        GGML_ASSERT(ring_heads->ne[0] == batch);
++        GGML_ASSERT(ring_heads->ne[1] == 1 || ring_heads->ne[1] == 2);
 +    } else {
 +        GGML_ASSERT(slot_ids == nullptr);
 +        GGML_ASSERT(ring_heads == nullptr);
@@ -1050,17 +1144,20 @@ index f3c4836a..d5640439 100644
  
      float scale;
      memcpy(&scale, dst->op_params, sizeof(scale));
-@@ -501,6 +1217,9 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+@@ -501,7 +1250,11 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
                 k_sb = (long)(k->nb[3] / ke);
      const long v_sj = (long)(v->nb[1] / ke), v_sh = (long)(v->nb[2] / ke),
                 v_sb = (long)(v->nb[3] / ke);
+-    const long p_sr = (long)(p->nb[1] / ke), p_sh = (long)(p->nb[2] / ke);
 +    const long cache_sj = (long) d_k * n_head;
 +    const long cache_ss = cached ? (long) (kv_cache->nb[1] / sizeof(float)) : 0;
 +    const long cache_sp = cached ? (long) (kv_cache->nb[2] / sizeof(float)) : 0;
-     const long p_sr = (long)(p->nb[1] / ke), p_sh = (long)(p->nb[2] / ke);
++    const long p_sr = relative ? (long)(p->nb[1] / ke) : 0;
++    const long p_sh = relative ? (long)(p->nb[2] / ke) : 0;
      const size_t oe = ggml_type_size(dst->type);
      const long o_si = (long)(dst->nb[1] / oe), o_sh = (long)(dst->nb[2] / oe),
-@@ -513,6 +1232,31 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+                o_sb = (long)(dst->nb[3] / oe);
+@@ -513,6 +1266,35 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
      GGML_ASSERT(shmem <= max_shmem && "fused_relpos_attn: kv window too large for shared memory");
  
      cudaStream_t stream = ctx.stream();
@@ -1069,6 +1166,10 @@ index f3c4836a..d5640439 100644
 +    const int32_t * active_slots = cached ? (const int32_t *) slot_ids->data : nullptr;
 +    const int32_t * active_ring_heads =
 +        cached ? (const int32_t *) ring_heads->data : nullptr;
++    const int32_t * active_lengths =
++        cached && ring_heads->ne[1] == 2
++            ? active_ring_heads + ring_heads->ne[0]
++            : nullptr;
 +
 +    auto update_cache = [&]() {
 +        if (!cached) {
@@ -1092,24 +1193,28 @@ index f3c4836a..d5640439 100644
  
      // The cache-aware Nemotron streaming geometry is Q=2, KV=72, H=8,
      // d_k=128. On SM100 the one-query warp kernel is fastest while its grid
-@@ -523,6 +1267,114 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
-     const bool use_sm100_q2 =
+@@ -520,9 +1302,117 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+     // fuse both query rows: halving the block count and reusing K/V then wins.
+     // cudaOccupancyMaxActiveBlocksPerMultiprocessor uses the compiled kernel's
+     // actual register count, avoiding a hard-coded batch-size threshold.
+-    const bool use_sm100_q2 =
++    const bool use_sm100_q2 = relative &&
          device_info.cc == RELPOS_ATTN_CC_SM100 && device_info.warp_size == 32 &&
 -        d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72;
 +        d_k == RELPOS_ATTN_DK_128 && q_len == 2 && kv_len == 72 && m_sq == 0;
-+    const bool use_register_q2 =
++    const bool use_register_q2 = relative &&
 +        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
 +        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && q_len == 2 &&
 +        kv_len == 72 && cached && cache_len == 70 && chunk_len == 2 && n_head == 8 &&
 +        relpos_attn_register_resident_enabled();
-+    const bool use_register_q4 =
++    const bool use_register_q4 = relative &&
 +        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
 +        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && q_len == 4 &&
 +        kv_len == 60 && cached && cache_len == 56 && chunk_len == 4 && n_head == 8 &&
 +        relpos_attn_register_resident_enabled();
 +    const bool common_q =
 +        q_len == 1 || q_len == 2 || q_len == 4 || q_len == 7 || q_len == 14;
-+    const bool use_register_common =
++    const bool use_register_common = relative &&
 +        GGML_CUDA_CC_IS_NVIDIA(device_info.cc) && device_info.cc >= GGML_CUDA_CC_AMPERE &&
 +        device_info.warp_size == 32 && d_k == RELPOS_ATTN_DK_128 && common_q &&
 +        (cache_len == 56 || cache_len == 70) && cached && chunk_len == q_len && n_head == 8 &&
@@ -1208,7 +1313,7 @@ index f3c4836a..d5640439 100644
      if (use_sm100_q2) {
          const size_t warp_shmem =
              ((size_t) 2 * RELPOS_ATTN_DK_128 + kv_len + RELPOS_ATTN_WARPS_128) * sizeof(float);
-@@ -531,70 +1383,86 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
+@@ -531,70 +1421,88 @@ void ggml_cuda_op_fused_relpos_attn(ggml_backend_cuda_context & ctx, ggml_tensor
               (size_t) 2 * RELPOS_ATTN_WARPS_128) * sizeof(float);
          GGML_ASSERT(q2_shmem <= max_shmem);
  
@@ -1308,13 +1413,15 @@ index f3c4836a..d5640439 100644
 +        constexpr bool Cached = decltype(cache_tag)::value;
 +        fused_relpos_attn_kernel<T, Cached><<<grid, d_k, shmem, stream>>>(
 +            (const float *) q->data, (const T *) k->data, (const T *) v->data,
-+            (const T *) p->data, (const float *) bias_u->data, (const float *) bias_v->data,
++            relative ? (const T *) p->data : nullptr,
++            relative ? (const float *) bias_u->data : nullptr,
++            relative ? (const float *) bias_v->data : nullptr,
              mask ? (const float *) mask->data : nullptr, (float *) dst->data,
 -            q_len, kv_len, n_head, scale,
 -            q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb, p_sr, p_sh, o_si, o_sh, o_sb,
 -            m_sb);
-+            cache_k, cache_v, active_slots, active_ring_heads, q_len, kv_len, n_head, cache_len,
-+            scale,
++            cache_k, cache_v, active_slots, active_ring_heads, active_lengths, q_len, kv_len,
++            n_head, cache_len, scale, relative,
 +            q_sq, q_sh, q_sb, k_sj, k_sh, k_sb, v_sj, v_sh, v_sb, cache_sj, cache_ss,
 +            p_sr, p_sh, o_si, o_sh, o_sb, m_sq, m_sb);
 +    };
@@ -1341,7 +1448,7 @@ index f3c4836a..d5640439 100644
 +    update_cache();
  }
 diff --git a/src/ggml.c b/src/ggml.c
-index 80b5802f..ae1b8db3 100644
+index 80b5802f..09b36241 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -5377,7 +5377,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
@@ -1364,27 +1471,48 @@ index 80b5802f..ae1b8db3 100644
          float                 scale,
          bool                  merge_heads) {
      // Q/K/V/P may be arbitrary-strided views; the CUDA op derives addressing
-@@ -5398,10 +5402,11 @@ struct ggml_tensor * ggml_fused_relpos_attn(
-     GGML_ASSERT(ggml_is_contiguous(bias_u));
-     GGML_ASSERT(ggml_is_contiguous(bias_v));
- 
+@@ -5394,30 +5398,62 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+     GGML_ASSERT(q->nb[0] == ggml_type_size(q->type));
+     GGML_ASSERT(k->nb[0] == ggml_type_size(k->type));
+     GGML_ASSERT(v->nb[0] == ggml_type_size(v->type));
+-    GGML_ASSERT(p->nb[0] == ggml_type_size(p->type));
+-    GGML_ASSERT(ggml_is_contiguous(bias_u));
+-    GGML_ASSERT(ggml_is_contiguous(bias_v));
+-
 -    const int64_t d_k    = q->ne[0];
 -    const int64_t kv_len = k->ne[1];
 -    const int64_t q_len  = q->ne[1];
 -    const int64_t n_head = q->ne[2];
+-
+-    GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k && p->ne[0] == d_k);
+-    GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
++    const bool relative = p != NULL;
++    GGML_ASSERT(relative == (bias_u != NULL));
++    GGML_ASSERT(relative == (bias_v != NULL));
++    if (relative) {
++        GGML_ASSERT(p->nb[0] == ggml_type_size(p->type));
++        GGML_ASSERT(ggml_is_contiguous(bias_u));
++        GGML_ASSERT(ggml_is_contiguous(bias_v));
++    }
++
 +    const int64_t d_k      = q->ne[0];
 +    const int64_t chunk_len = k->ne[1];
 +    const int64_t kv_len   = cache_len + chunk_len;
 +    const int64_t q_len    = q->ne[1];
 +    const int64_t n_head   = q->ne[2];
- 
-     GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k && p->ne[0] == d_k);
-     GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
-@@ -5410,14 +5415,36 @@ struct ggml_tensor * ggml_fused_relpos_attn(
++
++    GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k);
+     // The kernel reads rel-pos rows (q_len-1)+j-i for j in [0,kv_len), i in
+     // [0,q_len) — i.e. rows [0, kv_len+q_len-1) — and takes its head stride
      // from p->nb, so a longer table (e.g. precomputed for the full chunk
      // length and reused by shorter tail chunks) is safe.
-     GGML_ASSERT(p->ne[1] >= kv_len + q_len - 1);  // rel-pos length
+-    GGML_ASSERT(p->ne[1] >= kv_len + q_len - 1);  // rel-pos length
 -    GGML_ASSERT(v->ne[1] == kv_len);
++    if (relative) {
++        GGML_ASSERT(p->ne[0] == d_k);
++        GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
++        GGML_ASSERT(p->ne[1] >= kv_len + q_len - 1);  // rel-pos length
++    }
 +    GGML_ASSERT(v->ne[1] == chunk_len);
 +    GGML_ASSERT(cache_len >= 0);
 +    GGML_ASSERT((kv_cache == NULL) == (slot_ids == NULL));
@@ -1398,6 +1526,7 @@ index 80b5802f..ae1b8db3 100644
 +        GGML_ASSERT(slot_ids->ne[0] == q->ne[3]);
 +        GGML_ASSERT(ring_heads->type == GGML_TYPE_I32 && ggml_is_contiguous(ring_heads));
 +        GGML_ASSERT(ring_heads->ne[0] == q->ne[3]);
++        GGML_ASSERT(ring_heads->ne[1] == 1 || ring_heads->ne[1] == 2);
 +    } else {
 +        GGML_ASSERT(cache_len == 0);
 +    }
@@ -1422,7 +1551,7 @@ index 80b5802f..ae1b8db3 100644
      }
  
      // Output mirrors q logically: [d_k, q_len, n_head, batch]. With
-@@ -5434,6 +5461,7 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+@@ -5434,6 +5470,7 @@ struct ggml_tensor * ggml_fused_relpos_attn(
      }
  
      ggml_set_op_params(result, &scale, sizeof(scale));
@@ -1430,7 +1559,7 @@ index 80b5802f..ae1b8db3 100644
  
      result->op     = GGML_OP_FUSED_RELPOS_ATTN;
      result->src[0] = q;
-@@ -5443,10 +5471,48 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+@@ -5443,10 +5480,65 @@ struct ggml_tensor * ggml_fused_relpos_attn(
      result->src[4] = bias_u;
      result->src[5] = bias_v;
      result->src[6] = mask;
@@ -1473,6 +1602,23 @@ index 80b5802f..ae1b8db3 100644
 +        bool                  merge_heads) {
 +    return ggml_fused_relpos_attn_impl(
 +        ctx, q, k, v, p, bias_u, bias_v, mask, kv_cache, slot_ids, ring_heads, cache_len, scale,
++        merge_heads);
++}
++
++struct ggml_tensor * ggml_fused_attn_cached(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * mask,
++        struct ggml_tensor  * kv_cache,
++        struct ggml_tensor  * slot_ids,
++        struct ggml_tensor  * ring_heads,
++        int64_t               cache_len,
++        float                 scale,
++        bool                  merge_heads) {
++    return ggml_fused_relpos_attn_impl(
++        ctx, q, k, v, NULL, NULL, NULL, mask, kv_cache, slot_ids, ring_heads, cache_len, scale,
 +        merge_heads);
 +}
 +

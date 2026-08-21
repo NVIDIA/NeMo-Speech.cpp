@@ -1318,6 +1318,8 @@ stream_magpie_to_audio(
 
                 decoder_result cond;
                 decoder_result uncond;
+                cond.logits_required = !params.use_local_transformer;
+                uncond.logits_required = !params.use_local_transformer;
                 const bool forbid_eos = step * h.frame_stacking_factor < h.min_generated_frames;
                 std::vector<int32_t> next_codes;
                 std::vector<int32_t> argmax_codes;

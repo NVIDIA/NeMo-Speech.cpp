@@ -15,7 +15,7 @@ index b54d4a6b..07a94052 100644
 @@ -36,6 +37,10 @@ if (CUDAToolkit_FOUND)
                  list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real)
              endif()
-
+ 
 +            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
 +                list(APPEND CMAKE_CUDA_ARCHITECTURES 110a-real)
 +            endif()
@@ -26,7 +26,7 @@ index b54d4a6b..07a94052 100644
 @@ -71,16 +76,16 @@ if (CUDAToolkit_FOUND)
          FetchContent_MakeAvailable(CCCL)
      endif()
-
+ 
 -    # Replace any plain 12X CUDA architectures with their "architecture-specific" equivalents 12Xa.
 -    # 12X is forwards-compatible, 12Xa is not.
 -    # Notably the Blackwell FP4 tensor core instructions are not forwards compatible and therefore need 12Xa.
@@ -49,7 +49,7 @@ index b54d4a6b..07a94052 100644
 @@ -90,8 +95,8 @@ if (CUDAToolkit_FOUND)
          set(${ARCHS} ${FIXED_ARCHS})
      endforeach()
-
+ 
 -    # If we try to compile a "native" build it will use the 12X architectures and fail.
 -    # So we should instead use the native architectures as determined by CMake after replacing 12X with 12Xa.
 +    # If we try to compile a "native" build it may use plain Blackwell architectures and fail.
@@ -58,7 +58,7 @@ index b54d4a6b..07a94052 100644
      if (CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "^[0-9]+(a|f)?(-real|-virtual)?(;[0-9]+(a|f)?(-real|-virtual)?|;)*$")
          set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
 diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
-index 10817505..e69e710b 100644
+index 9bd40faa..56fe1bb7 100644
 --- a/src/ggml-cuda/common.cuh
 +++ b/src/ggml-cuda/common.cuh
 @@ -25,6 +25,7 @@
@@ -84,7 +84,7 @@ index 10817505..e69e710b 100644
 @@ -315,6 +319,10 @@ static bool amd_wmma_available(const int cc) {
      return (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
  }
-
+ 
 +static bool thor_mma_available(const int cc) {
 +    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_THOR;
 +}
@@ -93,9 +93,9 @@ index 10817505..e69e710b 100644
      return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA;
  }
 @@ -1379,14 +1387,34 @@ struct ggml_backend_cuda_context {
-
+ 
      int64_t last_graph_eviction_sweep = 0;
-
+ 
 +    static int64_t cuda_graph_env_ms_to_us(const char * name, int64_t default_ms) {
 +        const char * value = getenv(name);
 +        if (value == nullptr || value[0] == '\0') {
@@ -138,7 +138,7 @@ index 8418ba66..20a84516 100644
 @@ -1,34 +1,38 @@
  #include "conv-transpose-1d.cuh"
 +#include "convert.cuh"
-
+ 
 -static  __global__ void conv_transpose_1d_kernel(
 +#include <cstring>
 +
@@ -154,25 +154,25 @@ index 8418ba66..20a84516 100644
      if (global_index >= output_size) {
          return;
      }
-
+ 
 -    int out_index = global_index / dst_ne0;
 +    const int out_t = global_index % dst_ne0;
 +    const int out_c = (global_index / dst_ne0) % dst_ne1;
 +    const int out_b = global_index / (dst_ne0 * dst_ne1);
-
+ 
      float accumulator = 0;
-
+ 
 -    for (int c = 0; c < src0_ne2; c++) {
 -        int idx = global_index % dst_ne0;
 +    const int in_end = min(src1_ne0 - 1, out_t / s0);
 +    const int in_start = max(0, (out_t - src0_ne0 + s0) / s0);
-
+ 
 -        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
 -        int input_offset = src1_ne0 * c;
 +    for (int c = 0; c < src0_ne2; c++) {
 +        const int kernel_offset = src0_ne0 * (out_c + src0_ne1 * c);
 +        const int input_offset = src1_ne0 * (c + src1_ne1 * out_b);
-
+ 
 -        for (int i = 0; i < src1_ne0; i++) {
 -            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
 -                continue;
@@ -180,18 +180,18 @@ index 8418ba66..20a84516 100644
 -            int weight_idx = idx - i*s0;
 +        for (int i = in_start; i <= in_end; i++) {
 +            const int weight_idx = out_t - i*s0;
-
+ 
 -            float kernel_weight = src0[kernel_offset + weight_idx];
 -            float input_value =  src1[input_offset+i];
 +            const float kernel_weight = ggml_cuda_cast<float>(src0[kernel_offset + weight_idx]);
 +            const float input_value = src1[input_offset+i];
-
+ 
              accumulator += kernel_weight * input_value;
          }
 @@ -37,26 +41,96 @@ static  __global__ void conv_transpose_1d_kernel(
      GGML_UNUSED_VARS(p0, d0, src0_ne3, src1_ne3, dst_ne3, src1_ne1, dst_ne1, src1_ne2, dst_ne2);
  }
-
+ 
 -static void conv_transpose_1d_f32_f32_cuda(
 +template <typename T>
 +static __global__ void conv_transpose_1d_grouped2_kernel(
@@ -243,7 +243,7 @@ index 8418ba66..20a84516 100644
 +        const T * src0, const float * src1,  float * dst,
 +        const bool use_grouped2,
          cudaStream_t stream) {
-
+ 
      const int num_blocks = (output_size + CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE - 1) / CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE;
 -    conv_transpose_1d_kernel<<<num_blocks,CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE, 0, stream>>>(
 -        s0,p0,d0,output_size,
@@ -286,27 +286,27 @@ index 8418ba66..20a84516 100644
 +
 +    return shape_matches && is_nanocodec_up_weight;
  }
-
+ 
  void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
 -    const float * src0_d = (const float *)src0->data;
 +    const void * src0_d = src0->data;
-
+ 
      const ggml_tensor * src1 = dst->src[1];
      const float * src1_d = (const float *)src1->data;
 @@ -64,7 +138,8 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
      float * dst_d = (float *)dst->data;
      cudaStream_t stream = ctx.stream();
-
+ 
 -    GGML_ASSERT(src0->type == GGML_TYPE_F32);
 +    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
 +    GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT( dst->type == GGML_TYPE_F32);
-
+ 
      GGML_ASSERT(ggml_is_contiguous(src0));
 @@ -77,10 +152,19 @@ void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor
      const int d0 = 1;//opts[4];
-
+ 
      const int64_t output_size = ggml_nelements(dst);
 -
 -    conv_transpose_1d_f32_f32_cuda(s0, p0, d0, output_size,
@@ -331,13 +331,24 @@ index 8418ba66..20a84516 100644
 +    }
  }
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index e25be359..ebdd1451 100644
+index a531ce07..4b4a8488 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -3284,6 +3284,23 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+@@ -2485,8 +2485,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+         return false;
+     }
+ 
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    // MMVF supports a two-column epilogue so paired CFG lanes can share each weight-row load.
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > 2) {
+         return false;
+     }
+ 
+@@ -3310,6 +3310,23 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
      return cgraph->nodes[0];
  }
-
+ 
 +static const char * ggml_cuda_graph_tensor_name(const ggml_tensor * tensor) {
 +    return tensor && tensor->name[0] ? tensor->name : "(unnamed)";
 +}
@@ -357,19 +368,19 @@ index e25be359..ebdd1451 100644
 +
  static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
      bool res = false;
-
-@@ -3292,7 +3309,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
-
+ 
+@@ -3318,7 +3335,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+ 
      if (cgraph->uid != 0 &&
          cgraph->uid == graph->uid) {
 -        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
          GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
          return false;
      }
-@@ -3820,6 +3837,88 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3891,6 +3907,88 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
-
+ 
 +static bool ggml_cuda_node_can_be_elided(const struct ggml_cgraph * cgraph, int node_idx, int32_t expected_uses) {
 +    const ggml_tensor * node = cgraph->nodes[node_idx];
 +    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
@@ -454,11 +465,11 @@ index e25be359..ebdd1451 100644
 +
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
-
-@@ -3830,6 +3929,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-
+ 
+@@ -3901,6 +3999,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
      ggml_tensor * node = cgraph->nodes[i];
-
+ 
 +    if (int n_fused = ggml_cuda_try_fuse_half_snake(cuda_ctx, cgraph, i)) {
 +        return n_fused;
 +    }
@@ -466,7 +477,7 @@ index e25be359..ebdd1451 100644
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -4475,7 +4578,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4623,7 +4725,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                  // Warmup: need at least 2 calls with no property change on the 2nd call
                  if (!properties_changed) {
                      graph->warmup_complete = true;
@@ -475,7 +486,7 @@ index e25be359..ebdd1451 100644
                      use_cuda_graph = true;
                      cuda_graph_update_required = true;
                  }
-@@ -4485,7 +4588,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4633,7 +4735,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                  if (properties_changed) {
                      // Properties changed - reset warmup, execute directly until stable again
                      graph->warmup_complete = false;
@@ -484,7 +495,7 @@ index e25be359..ebdd1451 100644
                  } else {
                      use_cuda_graph = true;
                      cuda_graph_update_required = graph->instance == nullptr;
-@@ -5286,7 +5389,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5434,7 +5536,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              {
                  ggml_type src0_type = op->src[0]->type;
                  ggml_type src1_type = op->src[1]->type;
@@ -493,8 +504,8 @@ index e25be359..ebdd1451 100644
                      return true;
                  }
                  return false;
-@@ -5555,6 +5658,12 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
-
+@@ -5705,6 +5807,12 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ 
      {
          const auto & info = ggml_cuda_info();
 +        for (int id = 0; id < info.device_count; ++id) {
@@ -513,7 +524,7 @@ index aad4c34a..628d8718 100644
 @@ -159,6 +159,11 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const
          return false;
      }
-
+ 
 +    // Thor's tcgen05 paths are provided by CUDA libraries today; avoid ggml's warp-level matrix kernels there.
 +    if (thor_mma_available(cc) && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
 +        return false;
@@ -523,13 +534,43 @@ index aad4c34a..628d8718 100644
          if (src0_ne[1] <= 1024 && src1_ncols > 512) {
              return false;
 diff --git a/src/ggml-cuda/mmvf.cu b/src/ggml-cuda/mmvf.cu
-index d9147202..97900cd8 100644
+index d9147202..0c974164 100644
 --- a/src/ggml-cuda/mmvf.cu
 +++ b/src/ggml-cuda/mmvf.cu
-@@ -793,9 +793,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -383,7 +383,10 @@ static void mul_mat_vec_f_switch_fusion(
+         const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+-    if constexpr (ncols_dst == 1) {
++    // The same epilogue addressing works for two adjacent columns.  This is especially useful
++    // for classifier-free guidance: both lanes share the weight-row load and still fold the
++    // residual/bias writeback into the projection kernel.
++    if constexpr (ncols_dst <= 2) {
+         if (has_fusion) {
+             mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
+                 (x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+@@ -393,7 +396,7 @@ static void mul_mat_vec_f_switch_fusion(
+        }
+     }
+ 
+-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
++    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=2");
+ 
+     mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
+         (x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+@@ -650,7 +653,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+ 
+     if (fusion) {
+         GGML_ASSERT( !ids || dst->ne[2] == 1);
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] <= 2);
+         if (fusion->x_bias) {
+             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+@@ -793,9 +796,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
          }
      }
-
+ 
 +    // Thor's tcgen05 paths are provided by CUDA libraries today; avoid ggml's warp-level vector kernels there.
 +    const bool prefer_cublas_tcgen05 = thor_mma_available(cc);
 +
@@ -542,7 +583,7 @@ index d9147202..97900cd8 100644
                  if (ampere_mma_available(cc)) {
                      return ne11 <= 3;
                  }
-@@ -812,6 +818,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -812,9 +821,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
              return ne11 <= 8;
          case GGML_TYPE_F16:
              if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -551,8 +592,12 @@ index d9147202..97900cd8 100644
 +                }
                  const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                  if (ampere_mma_available(cc)) {
-                     return src0_small && ne11 == 1;
-@@ -838,6 +847,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+-                    return src0_small && ne11 == 1;
++                    return src0_small && ne11 <= 2;
+                 }
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                     return src0_small && ne11 <= 4;
+@@ -838,6 +850,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
              return ne11 <= 8;
          case GGML_TYPE_BF16:
              if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -569,7 +614,7 @@ index 384638c1..6f4b219c 100644
 @@ -1,6 +1,8 @@
  #include "snake.cuh"
  #include "convert.cuh"
-
+ 
 +#include <cstring>
 +
  // Fused Snake activation: y = x + sin^2(a * x) * inv_b

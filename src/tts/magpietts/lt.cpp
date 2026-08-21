@@ -13,6 +13,10 @@
 #include "graph.h"
 #include "nvtx_utils.h"
 
+#if defined(MAGPIETTS_CUDA_SAMPLING)
+#include "ggml-cuda.h"
+#endif
+
 namespace nemo_speech::tts {
 
 class LocalTransformerGraph {
@@ -454,6 +458,107 @@ local_transformer_forward_cached_fixed_pos(
     return tr.norm_out ? layer_norm(ctx, x, tr.norm_out) : x;
 }
 
+static ggml_tensor*
+local_self_attention_cached_pair(
+    ggml_context* ctx, ggml_cgraph* gf, const magpietts_transformer& tr,
+    const magpietts_layer& layer, DecoderKvCache& cond_cache, DecoderKvCache& uncond_cache,
+    int layer_index, int n_past, ggml_tensor* x) {
+    constexpr int kCfgLanes = 2;
+    const int64_t n_embd = tr.n_embd;
+    const int64_t n_head = tr.n_head;
+    const int64_t d_head = n_embd / n_head;
+    const int64_t n_tok = x->ne[1];
+    const int64_t n_total = n_past + n_tok;
+
+    ggml_tensor* qkv = linear(ctx, layer.self_qkv, x);
+    const size_t element = ggml_element_size(qkv);
+    auto qkv_slice = [&](size_t offset) {
+        return ggml_view_3d(
+            ctx, qkv, n_embd, n_tok, kCfgLanes, qkv->nb[1], qkv->nb[2], offset);
+    };
+    ggml_tensor* qcur = qkv_slice(0);
+    ggml_tensor* kcur = qkv_slice(static_cast<size_t>(n_embd) * element);
+    ggml_tensor* vcur = qkv_slice(static_cast<size_t>(2 * n_embd) * element);
+
+    const size_t cache_element = ggml_element_size(cond_cache.memory_k);
+    const size_t layer_offset =
+        static_cast<size_t>(layer_index) * cond_cache.n_ctx * n_embd * cache_element;
+    const size_t write_offset =
+        layer_offset + static_cast<size_t>(n_past) * n_embd * cache_element;
+    DecoderKvCache* caches[kCfgLanes] = {&cond_cache, &uncond_cache};
+    for (int lane = 0; lane < kCfgLanes; ++lane) {
+        ggml_tensor* k_lane = ggml_view_2d(
+            ctx, kcur, n_embd, n_tok, kcur->nb[1], static_cast<size_t>(lane) * kcur->nb[2]);
+        ggml_tensor* v_lane = ggml_view_2d(
+            ctx, vcur, n_embd, n_tok, vcur->nb[1], static_cast<size_t>(lane) * vcur->nb[2]);
+        ggml_tensor* k_dst =
+            ggml_view_1d(ctx, caches[lane]->memory_k, n_tok * n_embd, write_offset);
+        ggml_tensor* v_dst =
+            ggml_view_1d(ctx, caches[lane]->memory_v, n_tok * n_embd, write_offset);
+        ggml_tensor* k_copy = ggml_cpy(ctx, k_lane, k_dst);
+        ggml_set_name(k_copy, "magpietts_local_pair_kv_copy_k");
+        ggml_build_forward_expand(gf, k_copy);
+        ggml_tensor* v_copy = ggml_cpy(ctx, v_lane, v_dst);
+        ggml_set_name(v_copy, "magpietts_local_pair_kv_copy_v");
+        ggml_build_forward_expand(gf, v_copy);
+    }
+
+    ggml_tensor* q = ggml_permute(
+        ctx, ggml_cont_4d(ctx, qcur, d_head, n_head, n_tok, kCfgLanes), 0, 2, 1, 3);
+    ggml_tensor* k_cond = ggml_view_2d(
+        ctx, cond_cache.memory_k, n_embd, n_total, n_embd * cache_element, layer_offset);
+    ggml_tensor* k_uncond = ggml_view_2d(
+        ctx, uncond_cache.memory_k, n_embd, n_total, n_embd * cache_element, layer_offset);
+    ggml_tensor* k_pair = ggml_concat(ctx, k_cond, k_uncond, 2);
+    ggml_tensor* k = ggml_permute(
+        ctx, ggml_reshape_4d(ctx, k_pair, d_head, n_head, n_total, kCfgLanes), 0, 2, 1, 3);
+    ggml_tensor* scores = ggml_scale(
+        ctx, ggml_mul_mat(ctx, k, q), 1.0f / std::sqrt(static_cast<float>(d_head)));
+    // Each local graph evaluates exactly one new position and exposes only the populated cache
+    // prefix, so all keys are causal-valid and no diagonal mask is needed.
+    ggml_tensor* probs = ggml_soft_max(ctx, scores);
+
+    ggml_tensor* v_cond = ggml_view_2d(
+        ctx, cond_cache.memory_v, n_embd, n_total, n_embd * cache_element, layer_offset);
+    ggml_tensor* v_uncond = ggml_view_2d(
+        ctx, uncond_cache.memory_v, n_embd, n_total, n_embd * cache_element, layer_offset);
+    ggml_tensor* v_pair = ggml_concat(ctx, v_cond, v_uncond, 2);
+    ggml_tensor* v_trans = ggml_cont_4d(
+        ctx,
+        ggml_permute(
+            ctx, ggml_reshape_4d(ctx, v_pair, d_head, n_head, n_total, kCfgLanes), 1, 2, 0,
+            3),
+        n_total, d_head, n_head, kCfgLanes);
+    ggml_tensor* weighted = ggml_mul_mat(ctx, v_trans, probs);
+    ggml_tensor* merged = ggml_permute(ctx, weighted, 0, 2, 1, 3);
+    ggml_tensor* out = ggml_cont_3d(ctx, merged, n_embd, n_tok, kCfgLanes);
+    return linear(ctx, layer.self_o, out);
+}
+
+static ggml_tensor*
+local_transformer_forward_cached_pair_fixed_pos(
+    ggml_context* ctx, ggml_cgraph* gf, const magpietts_transformer& tr, ggml_tensor* x,
+    ggml_tensor* pos_emb, DecoderKvCache& cond_cache, DecoderKvCache& uncond_cache, int n_past) {
+    pos_emb = ggml_cont(ctx, ggml_cast(ctx, pos_emb, GGML_TYPE_F32));
+    x = ggml_add(ctx, x, pos_emb);
+    for (int il = 0; il < static_cast<int>(tr.layers.size()); ++il) {
+        const magpietts_layer& layer = tr.layers[static_cast<size_t>(il)];
+        ggml_tensor* residual = x;
+        ggml_tensor* cur = layer_norm(ctx, x, layer.norm_self);
+        cur = local_self_attention_cached_pair(
+            ctx, gf, tr, layer, cond_cache, uncond_cache, il, n_past, cur);
+        x = ggml_add(ctx, residual, cur);
+
+        residual = x;
+        cur = layer_norm(ctx, x, layer.norm_ff);
+        cur = causal_conv1d(ctx, cur, layer.ff_proj);
+        cur = ggml_gelu(ctx, cur);
+        cur = causal_conv1d(ctx, cur, layer.ff_out);
+        x = ggml_add(ctx, residual, cur);
+    }
+    return tr.norm_out ? layer_norm(ctx, x, tr.norm_out) : x;
+}
+
 static bool
 local_transformer_graph_init(
     const magpietts_model& model, bool pair, int codebook_idx, local_transformer_graph_bank& bank,
@@ -503,24 +608,20 @@ local_transformer_graph_init(
             pair ? "magpietts_build_local_transformer_pair_graph"
                  : "magpietts_build_local_transformer_graph");
 
-        ggml_tensor* cur_cond = nullptr;
-        ggml_tensor* cur_uncond = nullptr;
+        ggml_tensor* input_cond = nullptr;
+        ggml_tensor* input_uncond = nullptr;
         if (codebook_idx == 0) {
             graph.dec_cond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
             ggml_set_name(
                 graph.dec_cond, pair ? "magpietts_local_transformer_dec_cond"
                                      : "magpietts_local_transformer_dec_last");
             ggml_set_input(graph.dec_cond);
-            cur_cond = model.lt_in_w
-                           ? linear(graph.ctx, model.lt_in_w, graph.dec_cond, model.lt_in_b)
-                           : graph.dec_cond;
+            input_cond = graph.dec_cond;
             if (pair) {
                 graph.dec_uncond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
                 ggml_set_name(graph.dec_uncond, "magpietts_local_transformer_dec_uncond");
                 ggml_set_input(graph.dec_uncond);
-                cur_uncond = model.lt_in_w
-                                 ? linear(graph.ctx, model.lt_in_w, graph.dec_uncond, model.lt_in_b)
-                                 : graph.dec_uncond;
+                input_uncond = graph.dec_uncond;
             }
         } else {
             const std::string name = "magpietts_local_transformer_prev_code";
@@ -529,10 +630,8 @@ local_transformer_graph_init(
             ggml_set_input(graph.prev_token);
             ggml_tensor* emb = ggml_get_rows(
                 graph.ctx, model.audio_embeddings[codebook_idx - 1], graph.prev_token);
-            cur_cond = model.lt_in_w ? linear(graph.ctx, model.lt_in_w, emb, model.lt_in_b) : emb;
-            if (pair) {
-                cur_uncond = cur_cond;
-            }
+            input_cond = emb;
+            if (pair) input_uncond = emb;
         }
 
         graph.pos_emb = ggml_view_2d(
@@ -540,30 +639,45 @@ local_transformer_graph_init(
             (size_t)codebook_idx * model.local.pos_emb->nb[1]);
         ggml_set_name(graph.pos_emb, "magpietts_local_transformer_pos_emb");
 
-        DecoderKvCache& cond_cache = pair ? bank.cond_cache : bank.single_cache;
-        ggml_tensor* out_cond = local_transformer_forward_cached_fixed_pos(
-            graph.ctx, graph.gf, model.local, cur_cond, graph.pos_emb, cond_cache, codebook_idx);
-        graph.logits_cond =
-            linear(graph.ctx, model.lt_out_w[codebook_idx], out_cond, model.lt_out_b[codebook_idx]);
-        graph.logits_cond =
-            ggml_cont(graph.ctx, ggml_cast(graph.ctx, graph.logits_cond, GGML_TYPE_F32));
-        ggml_set_name(
-            graph.logits_cond, pair ? "magpietts_local_transformer_logits_cond"
-                                    : "magpietts_local_transformer_logits");
-        ggml_set_output(graph.logits_cond);
-        ggml_build_forward_expand(graph.gf, graph.logits_cond);
-
         if (pair) {
-            ggml_tensor* out_uncond = local_transformer_forward_cached_fixed_pos(
-                graph.ctx, graph.gf, model.local, cur_uncond, graph.pos_emb, bank.uncond_cache,
-                codebook_idx);
-            graph.logits_uncond = linear(
-                graph.ctx, model.lt_out_w[codebook_idx], out_uncond, model.lt_out_b[codebook_idx]);
-            graph.logits_uncond =
-                ggml_cont(graph.ctx, ggml_cast(graph.ctx, graph.logits_uncond, GGML_TYPE_F32));
+            ggml_tensor* pair_input = ggml_concat(graph.ctx, input_cond, input_uncond, 2);
+            ggml_tensor* cur_pair = model.lt_in_w
+                                        ? linear(
+                                              graph.ctx, model.lt_in_w, pair_input, model.lt_in_b)
+                                        : pair_input;
+            ggml_tensor* out_pair = local_transformer_forward_cached_pair_fixed_pos(
+                graph.ctx, graph.gf, model.local, cur_pair, graph.pos_emb, bank.cond_cache,
+                bank.uncond_cache, codebook_idx);
+            ggml_tensor* logits_pair = linear(
+                graph.ctx, model.lt_out_w[codebook_idx], out_pair, model.lt_out_b[codebook_idx]);
+            logits_pair =
+                ggml_cont(graph.ctx, ggml_cast(graph.ctx, logits_pair, GGML_TYPE_F32));
+            graph.logits_cond = ggml_view_2d(
+                graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1], 0);
+            graph.logits_uncond = ggml_view_2d(
+                graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1],
+                logits_pair->nb[2]);
+            ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits_cond");
             ggml_set_name(graph.logits_uncond, "magpietts_local_transformer_logits_uncond");
+            ggml_set_output(graph.logits_cond);
             ggml_set_output(graph.logits_uncond);
+            ggml_build_forward_expand(graph.gf, graph.logits_cond);
             ggml_build_forward_expand(graph.gf, graph.logits_uncond);
+        } else {
+            ggml_tensor* cur_cond = model.lt_in_w
+                                        ? linear(
+                                              graph.ctx, model.lt_in_w, input_cond, model.lt_in_b)
+                                        : input_cond;
+            ggml_tensor* out_cond = local_transformer_forward_cached_fixed_pos(
+                graph.ctx, graph.gf, model.local, cur_cond, graph.pos_emb, bank.single_cache,
+                codebook_idx);
+            graph.logits_cond = linear(
+                graph.ctx, model.lt_out_w[codebook_idx], out_cond, model.lt_out_b[codebook_idx]);
+            graph.logits_cond =
+                ggml_cont(graph.ctx, ggml_cast(graph.ctx, graph.logits_cond, GGML_TYPE_F32));
+            ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits");
+            ggml_set_output(graph.logits_cond);
+            ggml_build_forward_expand(graph.gf, graph.logits_cond);
         }
         tag_graph_first_node(graph.gf);
     }
@@ -710,13 +824,41 @@ local_transformer_graph_eval_cuda(
         fprintf(stderr, "CUDA local-transformer eval requires a CUDA sampler\n");
         return false;
     }
+    const bool building_sequence =
+        magpietts_cuda_sampler_sequence_build_active(cuda_sample.sampler);
 
     {
         const ggml_nvtx::range nvtx_inputs("magpietts_local_transformer_graph_set_device_inputs");
         if (graph.codebook_idx == 0) {
-            ggml_backend_tensor_copy(cond_hidden, graph.dec_cond);
+            if (building_sequence) {
+                char error[256] = {};
+                if (!magpietts_cuda_sampler_sequence_add_device_copy(
+                        cuda_sample.sampler, cond_hidden->data, graph.dec_cond->data,
+                        ggml_nbytes(graph.dec_cond), error, sizeof(error))) {
+                    fprintf(
+                        stderr, "CUDA local-transformer conditional input node failed: %s\n",
+                        error[0] ? error : "unknown error");
+                    return false;
+                }
+            } else {
+                ggml_backend_tensor_copy_async(
+                    model.backend, model.backend, cond_hidden, graph.dec_cond);
+            }
             if (graph.pair) {
-                ggml_backend_tensor_copy(uncond_hidden, graph.dec_uncond);
+                if (building_sequence) {
+                    char error[256] = {};
+                    if (!magpietts_cuda_sampler_sequence_add_device_copy(
+                            cuda_sample.sampler, uncond_hidden->data, graph.dec_uncond->data,
+                            ggml_nbytes(graph.dec_uncond), error, sizeof(error))) {
+                        fprintf(
+                            stderr, "CUDA local-transformer unconditional input node failed: %s\n",
+                            error[0] ? error : "unknown error");
+                        return false;
+                    }
+                } else {
+                    ggml_backend_tensor_copy_async(
+                        model.backend, model.backend, uncond_hidden, graph.dec_uncond);
+                }
             }
         } else {
             if (!graph.prev_token->data) {
@@ -743,7 +885,21 @@ local_transformer_graph_eval_cuda(
     ggml_status status = GGML_STATUS_FAILED;
     {
         const ggml_nvtx::range nvtx_compute("magpietts_local_transformer_graph_compute_cuda");
-        status = ggml_backend_graph_compute(model.backend, graph.gf);
+        if (building_sequence) {
+            void* graph_template =
+                ggml_backend_cuda_get_graph_template(model.backend, graph.gf);
+            char error[256] = {};
+            if (!graph_template || !magpietts_cuda_sampler_sequence_add_ggml_graph(
+                                       cuda_sample.sampler, graph_template, error, sizeof(error))) {
+                fprintf(
+                    stderr, "CUDA local-transformer child graph is unavailable: %s\n",
+                    error[0] ? error : "GGML graph has not completed warm-up");
+                return false;
+            }
+            status = GGML_STATUS_SUCCESS;
+        } else {
+            status = ggml_backend_graph_compute_async(model.backend, graph.gf);
+        }
     }
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(
@@ -760,18 +916,15 @@ local_transformer_graph_eval_cuda(
         return false;
     }
 
-    ggml_backend_synchronize(model.backend);
     const size_t off = 0;
     const float* logits_cond = (const float*)graph.logits_cond->data + off;
     const float* logits_uncond =
         graph.pair ? (const float*)graph.logits_uncond->data + off : nullptr;
     char error[256] = {};
-    const bool ok = magpietts_cuda_sample_codebooks_device(
+    const bool ok = magpietts_cuda_sample_codebooks_device_configured(
         cuda_sample.sampler, logits_cond, logits_uncond, 1, model.hparams.audio_vocab_size,
-        model.hparams.audio_codebook_size, model.hparams.audio_eos_id, cuda_sample.use_cfg,
-        cuda_sample.cfg_scale, cuda_sample.temperature, cuda_sample.top_k,
-        cuda_sample.forbid_audio_eos, cuda_sample.seed, cuda_sample.frame_index, codebook_idx,
-        codebook_idx, error, sizeof(error));
+        model.hparams.audio_codebook_size, model.hparams.audio_eos_id, codebook_idx, codebook_idx,
+        error, sizeof(error));
     if (!ok) {
         fprintf(
             stderr, "CUDA local-transformer sampling failed: %s\n",
@@ -893,31 +1046,102 @@ sample_local_codebooks_cuda_impl(
     if (!local_graphs.beginFrame(model, use_cfg)) {
         return false;
     }
+    char stream_error[256] = {};
+    if (!magpietts_cuda_sampler_bind_stream(
+            cuda_sampler, ggml_backend_cuda_get_stream(model.backend), stream_error,
+            sizeof(stream_error))) {
+        fprintf(
+            stderr, "CUDA local-transformer stream binding failed: %s\n",
+            stream_error[0] ? stream_error : "unknown error");
+        return false;
+    }
     codes.clear();
     argmax_codes.clear();
-    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
-        magpietts_cuda_sample_request cuda_sample;
-#if defined(MAGPIETTS_CUDA_SAMPLING)
-        cuda_sample.sampler = cuda_sampler;
-#else
-        (void)cuda_sampler;
-#endif
-        cuda_sample.use_cfg = use_cfg;
-        cuda_sample.cfg_scale = cfg_scale;
-        cuda_sample.temperature = temperature;
-        cuda_sample.top_k = top_k;
-        cuda_sample.forbid_audio_eos = forbid_audio_eos;
-        cuda_sample.seed = seed;
-        cuda_sample.frame_index = frame_index;
-        const bool ok = local_transformer_graph_bank_eval_cuda(
-            model, local_graphs, use_cfg, cond_hidden, uncond_hidden, c, c, threads, cuda_sample);
-        if (!ok) {
-            return false;
+    char error[256] = {};
+    if (!magpietts_cuda_sampler_configure(
+            cuda_sampler, use_cfg, cfg_scale, temperature, top_k, forbid_audio_eos, seed,
+            frame_index, error, sizeof(error))) {
+        fprintf(
+            stderr, "CUDA local-transformer sampler config failed: %s\n",
+            error[0] ? error : "unknown error");
+        return false;
+    }
+
+    magpietts_cuda_sample_request cuda_sample;
+    cuda_sample.sampler = cuda_sampler;
+    cuda_sample.use_cfg = use_cfg;
+    cuda_sample.cfg_scale = cfg_scale;
+    cuda_sample.temperature = temperature;
+    cuda_sample.top_k = top_k;
+    cuda_sample.forbid_audio_eos = forbid_audio_eos;
+    cuda_sample.seed = seed;
+    cuda_sample.frame_index = frame_index;
+    auto run_chain = [&]() {
+        for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
+            if (!local_transformer_graph_bank_eval_cuda(
+                    model, local_graphs, use_cfg, cond_hidden, uncond_hidden, c, c, threads,
+                    cuda_sample)) {
+                return false;
+            }
         }
+        return true;
+    };
+
+    bool chain_ok = false;
+    if (magpietts_cuda_sampler_sequence_is_ready(cuda_sampler)) {
+        chain_ok = magpietts_cuda_sampler_sequence_launch(
+            cuda_sampler, error, sizeof(error));
+    } else if (
+        magpietts_cuda_sampler_sequence_is_warm(cuda_sampler) &&
+        !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
+        // Compose the codebook graphs, sampling, and token feedback.
+        bool build_ok = magpietts_cuda_sampler_sequence_begin_build(
+            cuda_sampler, error, sizeof(error));
+        if (build_ok) {
+            build_ok = magpietts_cuda_sampler_upload_config(
+                           cuda_sampler, error, sizeof(error)) &&
+                       run_chain();
+        }
+        if (build_ok) {
+            build_ok = magpietts_cuda_sampler_sequence_finish_build_and_launch(
+                cuda_sampler, error, sizeof(error));
+        } else {
+            magpietts_cuda_sampler_sequence_abort_build(cuda_sampler);
+        }
+        if (build_ok) {
+            fprintf(
+                stderr,
+                "MagpieTTS local codebook chain: composed one reusable CUDA graph (%d "
+                "codebooks)\n",
+                h.stacked_audio_codebooks());
+            chain_ok = true;
+        } else {
+            fprintf(
+                stderr, "warning: CUDA local graph composition unavailable; using async chain: %s\n",
+                error[0] ? error : "unknown error");
+            magpietts_cuda_sampler_sequence_disable(cuda_sampler);
+            chain_ok = magpietts_cuda_sampler_upload_config(
+                           cuda_sampler, error, sizeof(error)) &&
+                       run_chain();
+        }
+    } else {
+        chain_ok = magpietts_cuda_sampler_upload_config(
+                       cuda_sampler, error, sizeof(error)) &&
+                   run_chain();
+        if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
+            // Initialize the per-codebook graphs before composing them.
+            magpietts_cuda_sampler_sequence_mark_warm(cuda_sampler);
+        }
+    }
+    if (!chain_ok) {
+        fprintf(
+            stderr, "CUDA local-transformer chain failed: %s\n",
+            error[0] ? error : "unknown error");
+        return false;
     }
     codes.assign((size_t)h.stacked_audio_codebooks(), 0);
     argmax_codes.assign((size_t)h.stacked_audio_codebooks(), 0);
-    char error[256] = {};
+    error[0] = '\0';
     if (!magpietts_cuda_copy_sampled_codebooks(
             cuda_sampler, h.stacked_audio_codebooks(), codes.data(), argmax_codes.data(), error,
             sizeof(error))) {

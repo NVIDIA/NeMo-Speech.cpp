@@ -140,6 +140,8 @@ stock comparison therefore requires both a pristine ggml checkout and
 
 - **0007-magpietts-nanocodec.patch** - adds the CUDA operations used by
   MagpieTTS and NanoCodec, including grouped transposed convolution and Snake;
+  extends F16 MMVF and its bias/residual epilogue to two-column inputs for
+  paired CFG execution;
   bounds the keyed CUDA graph cache with configurable sweep and idle-eviction
   intervals; and adds SM110/Jetson Thor architecture handling.
 
@@ -186,12 +188,16 @@ stock comparison therefore requires both a pristine ggml checkout and
   the performance crossover depends on the GPU and physical batch size.
 
 - **0014-cuda-relpos-extensions.patch** - extends fused relative-position
-  attention for the cache-aware and offline FastConformer paths. The
+  attention for cache-aware and offline FastConformer paths, and generalizes
+  the cached op to absolute attention without dummy relative-position
+  operands. A `[batch,2]` cache metadata tensor carries both circular heads and
+  active lengths so fixed-shape graphs skip unused cache rows. The `d_k=64`
+  score path uses aligned `float4` loads. The
   cache-aware path reads persistent K/V rows directly by state slot and
   circular head, then overwrites only the rows replaced by the current chunk.
   Register-resident NVIDIA SM80+ kernels cover the common R=0, 1, 3, 6, and 13
-  streaming shapes for both Nemotron cache geometries, with exact-shape kernels
-  retained where they are faster. The offline mask contract accepts both
+  streaming shapes for both Nemotron cache geometries, with exact-shape
+  fallbacks. The offline mask contract accepts both
   per-batch key-padding masks and `[key, query]` L/R masks. Set
   `GGML_CUDA_RELPOS_REGISTER_RESIDENT=0` before process start to
   disable the register-resident specializations without changing the direct
@@ -208,6 +214,10 @@ stock comparison therefore requires both a pristine ggml checkout and
   axes after the flattened Conv1D matrix multiplication. The upstream direct
   reshape interleaves those axes for batches larger than one; batch one keeps
   its original zero-copy path.
+
+- **0017-cuda-stream-interop.patch** - exposes borrowed access to the CUDA
+  backend's active stream and stable graph templates for composition with
+  external CUDA work. Both handles remain backend-owned.
 
 ## Regenerating after editing ggml
 

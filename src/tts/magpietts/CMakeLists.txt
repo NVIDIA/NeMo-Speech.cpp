@@ -36,6 +36,7 @@ target_include_directories(nemo_speech_tts PUBLIC
 target_link_libraries(nemo_speech_tts PUBLIC
     ggml
     nemo_speech_common
+    nemo_speech_runtime_ggml
     nemo_speech_tts_nanocodec_obj
     nemo_speech_tts_preproc
     nemo_speech_tts_tokenizer_obj

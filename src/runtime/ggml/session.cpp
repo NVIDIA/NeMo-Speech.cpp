@@ -303,6 +303,14 @@ Session::load_weight(const std::string& gguf_key) {
     }
 }
 
+ggml_bf_tensor
+Session::import_model_tensor(const std::string& name, ggml_tensor* tensor) {
+    if (!model_tensor_container) {
+        throw std::logic_error("import_model_tensor must be called during Session::setup");
+    }
+    return model_tensor_container->import_tensor(name, tensor);
+}
+
 int
 Session::setup() {
     std::lock_guard<std::mutex> compute_lock(backend_manager_->compute_mutex());
