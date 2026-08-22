@@ -3,7 +3,9 @@
 
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -109,8 +111,27 @@ print_help(const char* program) {
         "  --version        Show version\n"
         "  --json           Emit machine-readable results and errors\n"
         "  --quiet          Suppress non-result progress messages\n"
-        "  --verbose        Emit additional diagnostics on stderr\n",
+        "  --verbose        Emit additional diagnostics on stderr\n"
+        "  --suppress-cuda-graph-log\n"
+        "                   Suppress only the repeated CUDA-graph architecture message\n"
+        "  --skinny-q8 MODE Skinny Q8: auto, on, or off (CLI overrides GGML_SKINNY_Q8)\n",
         NEMO_SPEECH_VERSION_STR, program);
+}
+
+void
+set_process_environment(const char* name, const char* value) {
+#if defined(_WIN32)
+    if (_putenv_s(name, value) != 0)
+        throw std::runtime_error(std::string("failed to set environment variable ") + name);
+#else
+    if (setenv(name, value, 1) != 0)
+        throw std::runtime_error(std::string("failed to set environment variable ") + name);
+#endif
+}
+
+bool
+parse_skinny_q8_mode(const std::string& value) {
+    return value == "auto" || value == "on" || value == "off";
 }
 
 }  // namespace
@@ -125,6 +146,8 @@ main(int argc, char** argv) {
     bool json = false;
     bool quiet = false;
     bool verbose = false;
+    bool suppress_cuda_graph_log = false;
+    std::string skinny_q8_mode;
     std::vector<char*> filtered;
     filtered.reserve(static_cast<size_t>(argc));
     filtered.push_back(argv[0]);
@@ -136,13 +159,30 @@ main(int argc, char** argv) {
             quiet = true;
         else if (arg == "--verbose")
             verbose = true;
-        else
+        else if (arg == "--suppress-cuda-graph-log")
+            suppress_cuda_graph_log = true;
+        else if (arg.rfind("--skinny-q8=", 0) == 0)
+            skinny_q8_mode = arg.substr(std::strlen("--skinny-q8="));
+        else if (arg == "--skinny-q8") {
+            if (++i >= argc)
+                return print_cli_error(
+                    "", "--skinny-q8 requires auto, on, or off", 2, "invalid_argument");
+            skinny_q8_mode = argv[i];
+        } else
             filtered.push_back(argv[i]);
     }
     configure_cli_output(json, quiet, verbose);
     if (quiet && verbose)
         return print_cli_error(
             "", "--quiet and --verbose cannot be used together", 2, "invalid_argument");
+    if (!skinny_q8_mode.empty() && !parse_skinny_q8_mode(skinny_q8_mode))
+        return print_cli_error("", "--skinny-q8 must be auto, on, or off", 2, "invalid_argument");
+    if (suppress_cuda_graph_log)
+        set_process_environment("NEMO_SPEECH_SUPPRESS_CUDA_GRAPH_LOG", "1");
+    if (!skinny_q8_mode.empty()) {
+        set_process_environment("NEMO_SPEECH_SKINNY_Q8_MODE", skinny_q8_mode.c_str());
+        set_process_environment("NEMO_SPEECH_SKINNY_Q8_SOURCE", "cli");
+    }
     argc = static_cast<int>(filtered.size());
     argv = filtered.data();
 
