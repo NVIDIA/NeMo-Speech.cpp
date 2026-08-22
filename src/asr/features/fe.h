@@ -48,6 +48,11 @@ struct MelSpecConfig {
     // false = symmetric (cos(2*pi*i/(N-1)) - torch.hann_window(periodic=False),
     // what NeMo's FilterbankFeatures actually uses).
     bool hann_periodic = true;
+    // Centered STFT emits floor(samples / hop) + 1 frames. Transformers keeps
+    // that static shape but masks the final frame whose center is at/past the
+    // audio boundary. Cache-aware ASR models with normalize="NA" need this
+    // explicitly because the normalization path does not otherwise mask it.
+    bool mask_invalid_frames = false;
 };
 
 namespace ggml_runtime {

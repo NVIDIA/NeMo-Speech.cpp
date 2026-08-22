@@ -35,10 +35,12 @@ namespace nemo_speech::asr {
 struct FlashlightCtcCfg {
     std::string lm_path;
     std::string lexicon_path;
-    // SentencePiece tokenizer.model (the model's own tokenizer). Optional; only
-    // used to encode OOV / multi-word boost phrases into token pieces. Empty =
-    // OOV phrases are skipped (in-vocab single-word boosting still works).
+    // Tokenizer for encoding OOV / multi-word boost phrases into token pieces.
+    // Default source is the model's embedded tokenizer (`embedded_spm`, borrowed
+    // from AsrModel, outlives the decoder); `tokenizer_path` explicitly overrides
+    // it. Neither set = OOV phrases are skipped (in-vocab boosting still works).
     std::string tokenizer_path;
+    const sentencepiece::SentencePieceProcessor* embedded_spm = nullptr;
 
     int beam_size = 32;
     int beam_size_token = 16;
@@ -201,7 +203,8 @@ class FlashlightDecoder : public Decoder {
 
     // SentencePiece encoder for OOV boost words, lazily loaded from
     // cfg_.tokenizer_path on first need (null if no tokenizer is configured).
-    std::unique_ptr<sentencepiece::SentencePieceProcessor> spm_;
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> spm_;  // owned (path override)
+    const sentencepiece::SentencePieceProcessor* active_spm_ = nullptr;
     int base_word_count_ = 0;
     float oov_lm_score_ = 0.0f;
 

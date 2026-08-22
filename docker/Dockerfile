@@ -6,7 +6,7 @@
 #             packages, and CMake. Builds nemo-speech, riva_server, the ggml
 #             backend .so files, and optional developer targets.
 #   rootfs  - assembles a FROM scratch root with the binaries, ggml .so files,
-#             and exact ldd-resolved library closure. The CUDA driver
+#             and the exact shared libraries reported by ldd. The CUDA driver
 #             (libcuda.so.1) is not bundled; it is injected at run time by the
 #             NVIDIA Container Toolkit.
 #   runtime - FROM scratch; model-free, mount the GGUF at run time.
@@ -92,7 +92,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         protobuf-compiler-grpc \
         libabsl-dev \
         libre2-dev \
-        portaudio19-dev \
         autoconf \
         automake \
         libtool \
@@ -116,6 +115,7 @@ COPY THIRD_PARTY_NOTICES.md /work/
 COPY README.md CONTRIBUTING.md /work/
 COPY docs /work/docs
 COPY config /work/config
+COPY models /work/models
 # Core submodules: ggml (every backend) and llama.cpp (NMT decoder; built only
 # when ENABLE_NMT=ON, copied unconditionally so the layer cache is stable).
 COPY ggml /work/ggml
@@ -165,8 +165,8 @@ RUN if [ "${ENABLE_GGML_PATCHES}" = "ON" ]; then bash /work/scripts/apply-ggml-p
 
 # NCCL disabled: single-GPU inference does not use multi-GPU collectives,
 # and the linked libnccl is otherwise dead runtime weight.
-# NEMO_SPEECH_CUBLAS_SHIM=ON builds the drop-in libcublas.so.13 (native GEMM,
-# no cuBLASLt) as a normal build target.
+# NEMO_SPEECH_CUBLAS_SHIM=ON builds the drop-in libcublas.so.<CUDA-major>
+# (native GEMM, no cuBLASLt) as a normal build target.
 RUN cmake -G Ninja -S /work -B /work/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=${ENABLE_CUDA} \
@@ -178,6 +178,7 @@ RUN cmake -G Ninja -S /work -B /work/build \
         ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}} \
         -DNEMO_SPEECH_BUILD_GRPC=${ENABLE_GRPC} \
         -DNEMO_SPEECH_BUILD_HTTP=${ENABLE_HTTP} \
+        -DNEMO_SPEECH_BUILD_MIC_CAPTURE=OFF \
         -DNEMO_SPEECH_WITH_FLASHLIGHT=${ENABLE_FLASHLIGHT} \
         -DNEMO_SPEECH_WITH_NORM=${ENABLE_NORM} \
         -DNEMO_SPEECH_TTS_WITH_JA=${ENABLE_TTS_JA} \
@@ -195,7 +196,7 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
                | grep -q 'Shared library: \[libkenlm.so\]'; \
        fi \
     && for binary in \
-           nemo-speech riva_server transcribe_file transcribe_live diarize_file synthesize_text \
+           nemo-speech riva_server transcribe_file diarize_file synthesize_text \
            translate_text speech_translate_file; \
        do \
            if [ -f "/work/build/bin/${binary}" ]; then \
@@ -213,6 +214,8 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
        done \
     && cp /work/LICENSE /work/NOTICE /work/THIRD_PARTY_NOTICES.md \
         /out/share/licenses/nemo-speech/ \
+    && install -Dm0644 /work/build/share/nemo-speech/model-index.json \
+        /out/share/nemo-speech/model-index.json \
     && license_dir=/out/share/licenses/nemo-speech/third_party \
     && install -Dm0644 /work/ggml/LICENSE "$license_dir/ggml/LICENSE" \
     && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/llama.cpp/LICENSE" \
@@ -230,10 +233,6 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
         "$license_dir/kenlm/COPYING.LESSER.3" \
     && install -Dm0644 /work/third_party/cpp-httplib/LICENSE \
         "$license_dir/cpp-httplib/LICENSE" \
-    && openssl_notice="$(find /usr/share/doc -path '*/libssl*/copyright' -type f -print -quit)" \
-    && if [ -n "$openssl_notice" ]; then \
-           install -Dm0644 "$openssl_notice" "$license_dir/openssl/copyright"; \
-       fi \
     && if [ "${ENABLE_TTS_JA}" = "ON" ]; then \
            install -Dm0644 /work/third_party/open_jtalk/src/COPYING \
                "$license_dir/open_jtalk/COPYING"; \
@@ -262,26 +261,30 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
        fi
 
 ############################################################################
-# Stage 2: assemble a scratch rootfs from the ldd closure
+# Stage 2: assemble a scratch rootfs from dependencies reported by ldd
 ############################################################################
 FROM builder AS rootfs
 
 RUN set -eux; \
     root=/opt/nemo-speech-scratch-rootfs; \
     mkdir -p \
-        "$root/etc/ssl/certs" \
+        "$root/etc" \
         "$root/home/nemo" \
         "$root/models" \
         "$root/opt/nemo-speech/bin" \
         "$root/opt/nemo-speech/lib" \
         "$root/opt/nemo-speech/share"; \
-    cp /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/ca-certificates.crt"; \
     printf 'nemo:x:1000:1000:NeMo-Speech.cpp:/home/nemo:/sbin/nologin\n' > "$root/etc/passwd"; \
     printf 'nemo:x:1000:\n' > "$root/etc/group"; \
     printf 'hosts: files dns\npasswd: files\ngroup: files\n' > "$root/etc/nsswitch.conf"; \
     cp -a /out/bin/. "$root/opt/nemo-speech/bin/"; \
     cp -a /out/lib/. "$root/opt/nemo-speech/lib/"; \
     cp -a /out/share/. "$root/opt/nemo-speech/share/"; \
+    system_license_dir="$root/opt/nemo-speech/share/licenses/nemo-speech/third_party/system"; \
+    mkdir -p "$system_license_dir"; \
+    if [ -d /usr/share/common-licenses ]; then \
+        cp -a /usr/share/common-licenses "$system_license_dir/debian-common-licenses"; \
+    fi; \
     # Strip the build-tree rpath (/work/build/bin). In-tree shared libraries,
     # including ggml and KenLM, resolve from /opt/nemo-speech/lib at run time.
     apt-get update -qq && apt-get install -y --no-install-recommends patchelf >/dev/null; \
@@ -289,17 +292,27 @@ RUN set -eux; \
     for f in "$root"/opt/nemo-speech/bin/* "$root"/opt/nemo-speech/lib/*.so*; do \
         if [ -f "$f" ] && [ ! -L "$f" ]; then patchelf --remove-rpath "$f" || true; fi; \
     done; \
+    copy_package_notice() { \
+        dep="$1"; \
+        owner="$(dpkg-query -S "$dep" 2>/dev/null | head -n 1 || true)"; \
+        [ -n "$owner" ] || return 0; \
+        package="${owner%%:*}"; \
+        notice="/usr/share/doc/${package}/copyright"; \
+        [ -f "$notice" ] || return 0; \
+        install -Dm0644 "$notice" "$system_license_dir/${package}/copyright"; \
+    }; \
     copy_dep() { \
         dep="$1"; \
         # Skip the CUDA driver (toolkit-injected at run time) and real cuBLAS/
         # cuBLASLt: the in-tree shim in /opt/nemo-speech/lib provides
-        # libcublas.so.13, and nothing else needs cuBLASLt.
+        # libcublas.so.<CUDA-major>, and nothing else needs cuBLASLt.
         case "$dep" in \
             */libcuda.so*|*/libcublas.so*|*/libcublasLt.so*) return 0;; \
         esac; \
         dest="$root${dep}"; \
         mkdir -p "$(dirname "$dest")"; \
         cp -L "$dep" "$dest"; \
+        copy_package_notice "$dep"; \
     }; \
     copy_ldd_deps() { \
         LD_LIBRARY_PATH="$root/opt/nemo-speech/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -320,7 +333,7 @@ RUN set -eux; \
         fi; \
     done; \
     # The cuBLAS shim (CMake target -DNEMO_SPEECH_CUBLAS_SHIM=ON, staged via
-    # /out/lib) is the only libcublas.so.13 in the image and is first on
+    # /out/lib) is the only libcublas.so.<CUDA-major> in the image and is first on
     # LD_LIBRARY_PATH; real cuBLAS/cuBLASLt were skipped by copy_dep above.
     for b in "$root"/opt/nemo-speech/bin/*; do [ -f "$b" ] && strip --strip-unneeded "$b" || true; done; \
     chmod 0755 "$root"/opt/nemo-speech/bin/*; \

@@ -75,13 +75,17 @@ cmake_bool_override() { # cmake_bool_override VARIABLE DEFAULT ARGS...
 }
 
 need_nmt=OFF
+need_asr=OFF
 need_grpc=OFF
 need_http=OFF
 need_flashlight=OFF
 need_ja=OFF
 need_zh=OFF
 case "$PRESET" in
-    *-nmt|*-speech|cuda-full|developer) need_nmt=ON ;;
+    *-nmt|*-speech|*-server|cuda-full|developer) need_nmt=ON ;;
+esac
+case "$PRESET" in
+    *-asr|*-speech|*-server|cuda-full|developer) need_asr=ON ;;
 esac
 case "$PRESET" in
     cuda-full|developer) need_grpc=ON ;;
@@ -97,12 +101,25 @@ fi
 
 need_nmt="$(cmake_bool_override NEMO_SPEECH_BUILD_NMT "$need_nmt" "$@")"
 need_nmt="$(cmake_bool_override NEMO_SPEECH_WITH_NMT "$need_nmt" "$@")"
+need_asr="$(cmake_bool_override NEMO_SPEECH_BUILD_ASR "$need_asr" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_BUILD_GRPC "$need_grpc" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_WITH_GRPC "$need_grpc" "$@")"
 need_http="$(cmake_bool_override NEMO_SPEECH_BUILD_HTTP "$need_http" "$@")"
 need_flashlight="$(cmake_bool_override NEMO_SPEECH_WITH_FLASHLIGHT "$need_flashlight" "$@")"
 need_ja="$(cmake_bool_override NEMO_SPEECH_TTS_WITH_JA "$need_ja" "$@")"
 need_zh="$(cmake_bool_override NEMO_SPEECH_TTS_WITH_ZH "$need_zh" "$@")"
+
+lfs_pointer="$(git grep -Il '^version https://git-lfs.github.com/spec/v1$' -- . 2>/dev/null \
+    | while read -r path; do
+        if [[ "$path" != src/tts/tokenizer/mandarin_data/* || "$need_zh" = ON ]]; then
+            printf '%s\n' "$path"
+        fi
+    done | head -n 1 || true)"
+if [ -n "$lfs_pointer" ]; then
+    echo "error: required Git LFS content has not been materialized (for example: $lfs_pointer)" >&2
+    echo "       run: git lfs install && git lfs pull" >&2
+    exit 1
+fi
 
 missing=()
 require_submodule() { # require_submodule PATH SENTINEL
@@ -116,6 +133,8 @@ if [ "$need_http" = ON ]; then
 fi
 if [ "$need_nmt" = ON ]; then
     require_submodule llama.cpp CMakeLists.txt
+elif [ "$need_asr" = ON ]; then
+    require_submodule llama.cpp vendor/miniaudio/miniaudio.h
 fi
 if [ "$need_grpc" = ON ]; then
     require_submodule proto/riva-common LICENSE

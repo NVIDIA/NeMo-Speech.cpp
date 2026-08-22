@@ -4,7 +4,9 @@
 // thread-safe; each RecognitionStream is driven by one caller thread.
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -42,6 +44,9 @@ struct RecognizerConfig {
     VadEndpointerCfg endpointing;
     DiarConfig diar;  // speaker diarization sidecar (Sortformer)
     postproc::PostprocConfig postproc;
+    // Human-readable model and execution summaries. The CLI disables these
+    // for --quiet and --json; verbose implementation logs are separate.
+    bool log_status = true;
 
     void Register(common::ParameterParser& p) {
         p.Register("backend", backend);
@@ -61,7 +66,8 @@ class RecognitionStream {
    public:
     RecognitionStream(
         Recognizer* recognizer, std::unique_ptr<AsrRunner> runner, AsrRequestOptions options,
-        bool coordinate_ingress = true);
+        bool coordinate_ingress);
+    ~RecognitionStream();
 
     // Buffer mono float32 audio (no decode); next() drives decoding. A zero
     // sample rate means the model rate. The first non-empty push fixes the
@@ -110,9 +116,11 @@ class Recognizer {
     Recognizer(const Recognizer&) = delete;
     Recognizer& operator=(const Recognizer&) = delete;
 
-    // An empty language code selects the model default prompt.
+    // An empty language code selects the model default prompt. Network
+    // transports can opt into ingress coordination; direct/library callers
+    // avoid its queue-delay cost by default.
     std::unique_ptr<RecognitionStream> streaming_recognize(
-        AsrRequestOptions opts, const std::string& language_code);
+        AsrRequestOptions opts, const std::string& language_code, bool coordinate_ingress = false);
     Result recognize(
         const float* samples, size_t n, AsrRequestOptions opts, const std::string& language_code,
         int sample_rate = 0);
@@ -125,6 +133,7 @@ class Recognizer {
 
     AsrModel* model() const { return model_.get(); }
     DiarModel* diar_model() const { return diar_model_.get(); }
+    BatchMetrics vad_batch_metrics() const;
     int sample_rate() const;
     const std::string& model_name() const { return model_name_; }
     std::vector<std::string> supported_languages() const;
@@ -134,7 +143,18 @@ class Recognizer {
 
    private:
     friend class RecognitionStream;
-    int arrive_streaming_ingress() { return ingress_batches_.arrive(); }
+    void log_model_status() const;
+    void log_execution_status(bool streaming) const;
+    void register_streaming_ingress() {
+        active_streaming_ingress_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void unregister_streaming_ingress() {
+        active_streaming_ingress_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    int arrive_streaming_ingress() {
+        return streaming_ingress_batches_.arrive(
+            active_streaming_ingress_.load(std::memory_order_relaxed));
+    }
 
     // BackendManager first (model + postproc load against it; reverse-order
     // destruction). model_ is built in the ctor body after bm_.
@@ -143,12 +163,17 @@ class Recognizer {
     std::unique_ptr<DiarModel> diar_model_;  // loaded iff cfg_.diar.model_path set
     std::string model_name_;
     RecognizerConfig cfg_;
-    IngressBatchCoordinator ingress_batches_;
+    IngressBatchCoordinator streaming_ingress_batches_;
+    IngressBatchCoordinator offline_ingress_batches_;
+    std::atomic<int> active_offline_requests_{0};
+    std::atomic<int> active_streaming_ingress_{0};
     // Shared by CTC flashlight streams; null for other decoders.
     std::shared_ptr<const FlashlightResources> flashlight_resources_;
     std::unique_ptr<postproc::Postprocessor> postproc_;
     // Shared immutable VAD model; each stream owns recurrent state.
     std::shared_ptr<SileroVadModel> vad_model_;
+    mutable std::once_flag offline_status_once_;
+    mutable std::once_flag streaming_status_once_;
 };
 
 }  // namespace nemo_speech::asr

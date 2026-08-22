@@ -6,23 +6,61 @@ param(
     [ValidateSet("stable", "nightly")][string]$Channel = "stable",
     [string]$Prefix = "$env:LOCALAPPDATA\Programs\NeMoSpeech",
     [ValidateSet("auto", "cpu", "cuda", "vulkan")][string]$Backend = "auto",
+    [ValidateSet("core", "asr", "server", "full")][string]$Profile = "server",
+    [switch]$Grpc,
+    [switch]$Nmt,
+    [switch]$Flashlight,
+    [switch]$TtsJa,
+    [switch]$TtsZh,
+    [switch]$Http,
+    [switch]$HttpTls,
+    [string]$CudaArch = "native",
+    [string]$VcpkgRoot,
+    [string]$VcpkgTriplet,
     [switch]$Source,
     [switch]$BinaryOnly,
     [switch]$NoModifyPath,
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $releaseBase = if ($env:NEMO_SPEECH_RELEASE_BASE_URL) {
     $env:NEMO_SPEECH_RELEASE_BASE_URL.TrimEnd('/')
 } else {
-    ""
+    "https://github.com/NVIDIA/NeMo-Speech.cpp/releases"
 }
 $sourceUrl = if ($env:NEMO_SPEECH_SOURCE_URL) {
     $env:NEMO_SPEECH_SOURCE_URL
 } else {
-    (Get-Location).Path
+    "https://github.com/NVIDIA/NeMo-Speech.cpp.git"
+}
+$versionUrl = if ($env:NEMO_SPEECH_VERSION_URL) {
+    $env:NEMO_SPEECH_VERSION_URL
+} else {
+    "https://raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/main/VERSION"
 }
 if ($Source -and $BinaryOnly) { throw "-Source and -BinaryOnly are mutually exclusive" }
+$profileIncludesTts = $Profile -ne 'asr'
+if ($Grpc -and -not $profileIncludesTts) {
+    throw 'The gRPC server requires both ASR and TTS. Use -Profile server or full.'
+}
+if (($TtsJa -or $TtsZh) -and -not $profileIncludesTts) {
+    throw 'The Japanese and Mandarin tokenizers require TTS. Use a profile that includes TTS.'
+}
+
+function Invoke-DownloadWithRetry {
+    param([string]$Uri, [string]$OutFile)
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile
+            return
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Seconds $attempt
+        }
+    }
+}
 
 function Assert-SourcePrerequisites {
     param([string]$SelectedBackend, [string]$Architecture)
@@ -65,7 +103,8 @@ function Assert-SourcePrerequisites {
         $vulkanSdk = if ($env:VULKAN_SDK) {
             $env:VULKAN_SDK
         } else {
-            [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+            $machineVulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+            if ($machineVulkan) { $machineVulkan } else { [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'User') }
         }
         if (-not $vulkanSdk -or -not (Test-Path (Join-Path $vulkanSdk 'Bin\glslc.exe'))) {
             throw "The Vulkan SDK (including glslc and SPIR-V headers) was not found. Install the LunarG Vulkan SDK, or select -Backend cpu."
@@ -84,15 +123,33 @@ function Assert-SourcePrerequisites {
     }
 }
 
-$arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+$arch = switch ([System.Runtime.InteropServices.RuntimeInformation,mscorlib]::OSArchitecture) {
     "X64" { "x86_64" }
     "Arm64" { "aarch64" }
     default { throw "Unsupported Windows architecture: $_" }
 }
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$env:Path = "$machinePath;$userPath;$env:Path"
 if ($Backend -eq "auto") {
-    $Backend = if (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) { "cuda" } else { "cpu" }
+    $Backend = "cpu"
+    $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if ($smi) {
+        $gpu = & $smi.Source --query-gpu=name --format=csv,noheader 2>$null
+        if ($LASTEXITCODE -eq 0 -and $gpu) {
+            $Backend = "cuda"
+        } else {
+            Write-Host 'nvidia-smi is present but the NVIDIA driver is not working; selecting the CPU backend.'
+        }
+    }
 }
-$binaryCandidate = -not $Source -and [bool]$releaseBase
+$customSourceProfile = $Profile -ne 'server' -or
+    $Grpc -or $Nmt -or $Flashlight -or $TtsJa -or $TtsZh -or
+    $HttpTls
+if ($BinaryOnly -and $customSourceProfile) {
+    throw '-BinaryOnly supports only the server profile without extra components.'
+}
+$binaryCandidate = -not $Source -and -not $customSourceProfile -and [bool]$releaseBase
 if ($BinaryOnly -and -not $releaseBase) {
     throw "-BinaryOnly requires NEMO_SPEECH_RELEASE_BASE_URL"
 }
@@ -106,13 +163,11 @@ if ($Version -eq "latest") {
         Write-Host "No release endpoint is configured; building from the current source branch."
     } else {
         try {
-            $response = Invoke-WebRequest -Uri "$releaseBase/latest" -MaximumRedirection 10
-            $location = if ($response.BaseResponse.RequestMessage) {
-                $response.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
-            } else {
-                $response.BaseResponse.ResponseUri.AbsoluteUri
+            $manifest = (Invoke-WebRequest -UseBasicParsing -Uri $versionUrl).Content
+            if ($manifest -notmatch '(?m)^NEMO_SPEECH_VERSION:\s*([^\s]+)\s*$') {
+                throw "VERSION does not contain NEMO_SPEECH_VERSION"
             }
-            $Version = ($location.TrimEnd('/') -split '/')[-1]
+            $Version = $Matches[1]
         } catch {
             if ($BinaryOnly) { throw "Could not resolve the latest release. $($_.Exception.Message)" }
             $binaryCandidate = $false
@@ -129,7 +184,9 @@ $sourceRef = if ($env:NEMO_SPEECH_SOURCE_REF) {
     $env:NEMO_SPEECH_SOURCE_REF
 } elseif ($releaseVersion -eq 'source' -and
           (Get-Command git -ErrorAction SilentlyContinue) -and
-          (Test-Path (Join-Path $sourceUrl '.git'))) {
+          ($sourceUrl -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') -and
+          (Test-Path -LiteralPath $sourceUrl -PathType Container) -and
+          (Test-Path -LiteralPath (Join-Path $sourceUrl '.git'))) {
     $localSourceRef = (& git -C $sourceUrl symbolic-ref --quiet --short HEAD 2>$null)
     if ($LASTEXITCODE -eq 0 -and $localSourceRef) { $localSourceRef } else { 'main' }
 } elseif ($releaseVersion -in @("nightly", "source")) {
@@ -138,14 +195,27 @@ $sourceRef = if ($env:NEMO_SPEECH_SOURCE_REF) {
     $tag
 }
 
-Write-Host "NeMo-Speech.cpp $releaseVersion (windows/$arch, $Backend)"
+Write-Host "NeMo-Speech.cpp $releaseVersion (windows/$arch, $Backend, $Profile)"
 if (-not $Source -and $binaryCandidate) { Write-Host "Artifact: $url" }
-if (-not $BinaryOnly) { Write-Host "Source:   $sourceUrl#$sourceRef ($Backend speech server fallback)" }
+if (-not $BinaryOnly) { Write-Host "Source:   $sourceUrl#$sourceRef ($Backend/$Profile)" }
 Write-Host "Prefix:   $Prefix"
 if ($DryRun) { return }
+if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+    Write-Warning "curl.exe was not found. Installation can continue, but automatic model downloads will be unavailable; local and already cached models still work. Windows 10 and 11 normally include curl.exe in %SystemRoot%\\System32."
+}
 
 $installIdentity = "$releaseVersion windows $arch $Backend"
-$sourceIdentity = "$installIdentity source:$sourceRef profile:speech-server"
+$extraComponents = [Collections.Generic.List[string]]::new()
+foreach ($component in @(
+    @{ Name = 'grpc'; Enabled = $Grpc }, @{ Name = 'nmt'; Enabled = $Nmt },
+    @{ Name = 'flashlight'; Enabled = $Flashlight }, @{ Name = 'tts-ja'; Enabled = $TtsJa },
+    @{ Name = 'tts-zh'; Enabled = $TtsZh }, @{ Name = 'http'; Enabled = $Http },
+    @{ Name = 'http-tls'; Enabled = $HttpTls }
+)) {
+    if ($component.Enabled) { $extraComponents.Add($component.Name) }
+}
+$componentIdentity = if ($extraComponents.Count) { " components:$($extraComponents -join ',')" } else { '' }
+$sourceIdentity = "$installIdentity source:$sourceRef profile:$Profile$componentIdentity"
 $installMetadata = Join-Path $Prefix ".nemo-speech-install"
 $installedBinary = Join-Path $Prefix "bin\nemo-speech.exe"
 if (-not $Source -and $binaryCandidate -and (Test-Path $installedBinary) -and (Test-Path $installMetadata) -and
@@ -155,15 +225,15 @@ if (-not $Source -and $binaryCandidate -and (Test-Path $installedBinary) -and (T
     return
 }
 
-$temp = Join-Path ([IO.Path]::GetTempPath()) ("nemo-speech-install-" + [guid]::NewGuid())
+$temp = Join-Path ([IO.Path]::GetTempPath()) ("nsi-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $temp | Out-Null
 try {
     $archivePath = Join-Path $temp $archive
     $binaryReady = $false
     if (-not $Source -and $binaryCandidate) {
         try {
-            Invoke-WebRequest -Uri $url -OutFile $archivePath
-            Invoke-WebRequest -Uri "$url.sha256" -OutFile "$archivePath.sha256"
+            Invoke-DownloadWithRetry -Uri $url -OutFile $archivePath
+            Invoke-DownloadWithRetry -Uri "$url.sha256" -OutFile "$archivePath.sha256"
             $binaryReady = $true
         } catch {
             if ($BinaryOnly) { throw "Release artifact or checksum is unavailable. $($_.Exception.Message)" }
@@ -195,29 +265,40 @@ try {
         & git clone --depth 1 --single-branch --branch $sourceRef $sourceUrl $sourceDir
         if ($LASTEXITCODE -ne 0) { throw "git clone failed ($LASTEXITCODE)" }
 
-        if (Test-Path (Join-Path $sourceDir ".gitmodules")) {
-            foreach ($submodule in @("ggml", "third_party/cpp-httplib")) {
-                $configuredPath = & git -C $sourceDir config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>$null |
-                    ForEach-Object { ($_ -split '\s+', 2)[1] } |
-                    Where-Object { $_ -eq $submodule }
-                if ($configuredPath) {
-                    & git -C $sourceDir submodule update --init $submodule
-                    if ($LASTEXITCODE -ne 0) { throw "git submodule update failed for $submodule" }
-                }
-            }
-        }
         $buildDir = Join-Path $temp "b"
         $buildScript = Join-Path $sourceDir "scripts\windows\build.ps1"
-        & $buildScript -Backend $Backend -BuildDir $buildDir -Config Release -Http
+        $buildParameters = @{
+            Backend = $Backend
+            Profile = $Profile
+            BuildDir = $buildDir
+            Config = 'Release'
+            CudaArch = $CudaArch
+        }
+        foreach ($switchParameter in @(
+            @{ Name = 'Grpc'; Enabled = $Grpc }, @{ Name = 'Nmt'; Enabled = $Nmt },
+            @{ Name = 'Flashlight'; Enabled = $Flashlight }, @{ Name = 'TtsJa'; Enabled = $TtsJa },
+            @{ Name = 'TtsZh'; Enabled = $TtsZh }, @{ Name = 'Http'; Enabled = $Http },
+            @{ Name = 'HttpTls'; Enabled = $HttpTls }
+        )) {
+            if ($switchParameter.Enabled) { $buildParameters[$switchParameter.Name] = $true }
+        }
+        if ($VcpkgRoot) { $buildParameters.VcpkgRoot = $VcpkgRoot }
+        if ($VcpkgTriplet) { $buildParameters.VcpkgTriplet = $VcpkgTriplet }
+        & $buildScript @buildParameters
         if ($LASTEXITCODE -ne 0) { throw "Source build failed ($LASTEXITCODE)" }
         $root = Join-Path $temp source-install
         & cmake --install $buildDir --config Release --prefix $root
         if ($LASTEXITCODE -ne 0) { throw "Source install failed ($LASTEXITCODE)" }
         $installIdentity = $sourceIdentity
     }
-    if (-not (Test-Path (Join-Path $root "bin\nemo-speech.exe"))) {
+    $stagedBinary = Join-Path $root "bin\nemo-speech.exe"
+    if (-not (Test-Path $stagedBinary)) {
         throw "Installation does not contain bin\nemo-speech.exe"
     }
+    & $stagedBinary --version
+    if ($LASTEXITCODE -ne 0) { throw "Installed binary failed its version check ($LASTEXITCODE)" }
+    & $stagedBinary --json doctor
+    if ($LASTEXITCODE -ne 0) { throw "Installed binary failed its runtime health check ($LASTEXITCODE)" }
     Set-Content -Path (Join-Path $root ".nemo-speech-install") -Value $installIdentity -NoNewline
     $parent = Split-Path -Parent $Prefix
     New-Item -ItemType Directory -Force -Path $parent | Out-Null

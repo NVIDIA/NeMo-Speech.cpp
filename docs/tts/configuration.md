@@ -2,10 +2,10 @@
 
 Configuration for MagpieTTS + NanoCodec. `nemo-speech serve` hosts HTTP; the
 separate `riva_server` hosts Riva-compatible gRPC.
-Either process can load ASR and TTS together. For how keys are set (YAML,
+Either process can load ASR, TTS, and NMT together. For how keys are set (YAML,
 environment, and CLI precedence), see
 [Server configuration](../server.md#engine-and-listener-configuration). To
-obtain and convert the models, see [TTS models](models.md).
+download the models and extract the tokenizer, see [TTS models](models.md).
 
 ## Serving
 
@@ -17,11 +17,11 @@ or with flags for HTTP:
 
 ```bash
 nemo-speech serve \
-    --tts.magpie-model magpie-tts/magpie.f16.gguf \
-    --tts.codec-model nano-codec/nano-codec.decoder.f16.gguf \
-    --tts.tokenizer-model-dir magpie-tts/extracted \
+    --tts.magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --tts.codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tts.tokenizer-model-dir models/magpie-tts/extracted \
     --host 127.0.0.1 --port 8080 \
-    --tts.language-code en-US --tts.voice-name John --tts.benchmark true
+    --tts.language-code en-US --tts.voice-name John
 ```
 
 For Riva-compatible gRPC, use the same engine options with `riva_server` and
@@ -39,24 +39,34 @@ as `en/`, `fr/`, and `vi/`, each with those two FARs; `post_process.far` is used
 when present. The older split layout (`classify/tokenize_and_classify.far`,
 `verbalize/verbalize.far`) remains supported.
 
-The optional `riva_server` adapter implements `RivaSpeechSynthesis.Synthesize`,
-`SynthesizeOnline`, and `GetRivaSynthesisConfig`; accept
-`SynthesizeSpeechRequest.text` as real text; support native Magpie tokenizers for
-`en`, `es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, and `ja`; and return `LINEAR_PCM`
+The optional `riva_server` supports `RivaSpeechSynthesis.Synthesize`,
+`SynthesizeOnline`, and `GetRivaSynthesisConfig`. It takes plain text in
+`SynthesizeSpeechRequest.text`, supports native Magpie tokenizers for `en`,
+`es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, and `ja`, and returns `LINEAR_PCM`
 s16le at the NanoCodec sample rate. Japanese and Mandarin are included when
 `NEMO_SPEECH_TTS_WITH_JA` and `NEMO_SPEECH_TTS_WITH_ZH`, respectively, are
-enabled at build time; both default to `OFF`. Native tokenizers are cached by
-language. Mandarin uses bundled Jieba and pypinyin-compatible data together
-with the model's pinyin-to-phoneme dictionary. Set `MAGPIE_MANDARIN_G2P_DIR`
-only to override the bundled Mandarin data directory.
+enabled at build time; both default to `OFF`. Mandarin uses bundled Jieba and
+pypinyin-compatible data together with the model's pinyin-to-phoneme
+dictionary. Set `MAGPIE_MANDARIN_G2P_DIR` only to override the bundled Mandarin
+data directory.
 
-`GetRivaSynthesisConfig` advertises every compiled-in TTS language in
-`language_code` and exposes the per-language dotted voice names in
-`voices_by_language`. The legacy `voice_name`, `subvoices`, and `voices`
-parameters remain available for clients that assemble voice names themselves.
+`GetRivaSynthesisConfig` advertises the compiled-in TTS languages and the
+dotted voice names accepted by synthesis requests.
 
 TTS auto-enables when `tts.magpie-model`, `tts.codec-model`, and
 `tts.tokenizer-model-dir` are all set; force with `tts.enabled`.
+
+## Voices
+
+Voice names are case-insensitive. The runtime accepts a local speaker name, a
+zero-based speaker index, or a model-qualified name such as
+`magpietts.John`. `tts.voice-name` selects the default; otherwise
+`tts.speaker` is used.
+
+The HTTP model inventory lists the available local names. On
+`/v1/audio/speech`, `default` and supported OpenAI voice aliases such as
+`alloy` select that configured local default; they are not additional voices. See the
+[HTTP API reference](../api.md#post-v1audiospeech).
 
 ## Text normalization
 
@@ -64,17 +74,17 @@ Install the shared Sparrowhawk/OpenFST normalizer and enable it in the build:
 
 ```bash
 scripts/build_itn_deps.sh
-scripts/configure.sh cpu -DNEMO_SPEECH_WITH_NORM=ON
-cmake --build build -j
+scripts/configure.sh cpu-tts -DNEMO_SPEECH_WITH_NORM=ON
+cmake --build --preset cpu-tts
 ```
 
 Pass the grammar directory to the CLI or server:
 
 ```bash
 nemo-speech synthesize "I have 2 apples." \
-    --magpie-model models/magpie.f16.gguf \
-    --codec-model models/nano-codec.decoder.f16.gguf \
-    --tokenizer-dir models/magpie/extracted \
+    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tokenizer-dir models/magpie-tts/extracted \
     --tn-model-dir models/tn_configs \
     --output normalized.wav
 ```
@@ -83,8 +93,8 @@ The equivalent YAML setting is:
 
 ```yaml
 tts:
-  magpie-model: /models/magpie.f16.gguf
-  codec-model: /models/nano-codec.decoder.f16.gguf
+  magpie-model: /models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf
+  codec-model: /models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf
   tokenizer-model-dir: /models/magpie-tts/extracted
   tn-model-dir: /models/tn_configs
   language-code: en-US
@@ -105,9 +115,9 @@ Use the unified CLI for synthesis without a server:
 
 ```bash
 nemo-speech synthesize "Hello from Magpie." \
-    --magpie-model models/magpie.f16.gguf \
-    --codec-model models/nano-codec.decoder.f16.gguf \
-    --tokenizer-dir models/magpie/extracted \
+    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
+    --tokenizer-dir models/magpie-tts/extracted \
     --speaker 0 --output magpie.wav
 ```
 
@@ -127,9 +137,9 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.magpie-model` | - | - | MagpieTTS GGUF token generator (required) |
 | `tts.codec-model` | - | - | NanoCodec decoder GGUF (required) |
 | `tts.tokenizer-model-dir` | - | - | extracted Magpie `.nemo` dir (required) |
-| `tts.tokenizer.sentence-limit.*` | - | language-specific | per-sentence token limit for the MagpieTTS tokenizer (integer, tunable) |
+| `tts.tokenizer.sentence-limit.<lang>` | - | per language (`en` 45 ... `ja` 40) | sentence-chunking threshold in words (characters for `zh`/`ja`); subkeys `en`, `es`, `fr`, `vi`, `it`, `de`, `zh`, `hi`, `ja` |
 | `tts.tn-model-dir` | - | - | enables Sparrowhawk TN with this grammar dir; requires `NEMO_SPEECH_WITH_NORM=ON` |
-| `tts.language-code` | - | `en-US` | default Riva language code |
+| `tts.language-code` | - | `en-US` | default text language code |
 | `tts.voice-name` | - | - | default voice name or speaker index |
 | `tts.speaker` | - | `0` | default baked speaker index |
 
@@ -163,9 +173,10 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 
 | key | CLI alias | default | meaning |
 |---|---|---|---|
-| `tts.threads` | `--threads` | `4` | CPU threads for Magpie + codec |
+| `tts.threads` | `--threads` | `4` | CPU threads for Magpie + codec; use the dotted key with HTTP, where `--threads` controls request workers |
 | `tts.codec-threads` | - | `0` | codec CPU threads; `0` = use `threads` |
 | `tts.lt-backend` | - | `auto` | local-transformer backend: `auto`/`cpu`/`cuda` |
+| `tts.lt-fp32` | `--tts.local-transformer-fp32` | `false` | run the local transformer in FP32 |
 | `tts.sampling-backend` | - | `auto` | sampling backend: `auto`/`cpu`/`cuda` |
 | `tts.uma-mode` | - | `auto` | CUDA managed memory: `auto`/`off`/`on` |
 | `tts.longform` | - | `auto` | sentence-chunk longform mode: `auto`/`off`/`on` |
@@ -174,16 +185,8 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 
 | key | CLI alias | default | meaning |
 |---|---|---|---|
-| `tts.benchmark` | `--benchmark` | `false` | print tokenizer/runtime timing per request |
-| `tts.verbose` | `--verbose` | `false` | detailed Magpie/NanoCodec chunk logs |
+| `tts.benchmark` | `--benchmark` | `false` | emit per-request metrics from `riva_server` |
+| `tts.verbose` | `--verbose` | `false` | detailed Magpie/NanoCodec logs; use global `--verbose` with `nemo-speech` |
 | `tts.warmup-enabled` / `tts.no-warmup` | - | on | startup tokenizer/runtime warmup |
 | `tts.warmup-text` | - | (built-in) | text used for startup warmup |
 | `tts.warmup-steps` | - | `8` | decoder frames used for startup warmup |
-
-## Notes
-
-- With CUDA Graphs enabled, the shared TTS host defaults
-  `GGML_CUDA_GRAPH_EVICT_AFTER_MS=0` so captured graphs stay resident across idle
-  request gaps; set that env var before launch to restore eviction.
-- CUDA builds require the ggml patches applied before compiling - see
-  [ggml patches](../development/ggml-patches.md).

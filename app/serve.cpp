@@ -51,15 +51,18 @@ request_shutdown(int) {
 
 [[maybe_unused]] std::string
 optional_model(
-    const std::string& reference, const std::string& description, bool required,
-    bool directory = false) {
+    const std::string& reference, const std::string& role, const std::string& description,
+    bool required, bool directory = false) {
     if (reference.empty()) {
-        if (required)
+        if (!required)
+            return {};
+        if (role.empty())
             throw MissingModelError(description + " path is required");
-        return {};
     }
-    return (directory ? require_model_directory(reference, description)
-                      : require_model_file(reference, description))
+    return (role.empty() ? (directory ? require_model_directory(reference, description)
+                                      : require_model_file(reference, description))
+                         : (directory ? resolve_model_directory(reference, role, description)
+                                      : resolve_model_file(reference, role, description)))
         .string();
 }
 
@@ -124,6 +127,7 @@ run_server(int argc, char** argv) {
 #if defined(NEMO_SPEECH_CLI_ASR)
     nemo_speech::asr::RecognizerConfig asr_config;
     asr_config.backend.gpu = default_gpu_index();
+    asr_config.batching.enabled = true;
     std::string asr_model, vad_model, pnc_model, itn_model;
     int asr_enabled = -1;
 #endif
@@ -355,36 +359,36 @@ run_server(int argc, char** argv) {
                                !pnc_model.empty() || !itn_model.empty();
     const auto asr_path = asr_enabled == 0 ? std::string() : resolve("ASR model", [&] {
         return optional_model(
-            asr_model.empty() ? asr_config.model.path : asr_model, "ASR model", asr_requested);
+            asr_model.empty() ? asr_config.model.path : asr_model, "asr", "ASR model",
+            asr_requested);
     });
     if (!asr_path.empty()) {
         if (device_set)
             asr_config.backend.gpu = gpu;
         asr_config.model.path = asr_path;
-        asr_config.batching.enabled = true;
     }
     if (asr_enabled != 0 && (asr_requested || !asr_path.empty())) {
         asr_config.vad.model_path = resolve("VAD model", [&] {
             return optional_model(
-                vad_model.empty() ? asr_config.vad.model_path : vad_model, "VAD model", false);
+                vad_model.empty() ? asr_config.vad.model_path : vad_model, "", "VAD model", false);
         });
 #if defined(NEMO_SPEECH_CLI_DIAR)
         if (asr_config.diar.model_path.empty() && !diar_config.model_path.empty())
             asr_config.diar = diar_config;
         asr_config.diar.model_path = resolve("diarization model", [&] {
             return optional_model(
-                diar_model.empty() ? asr_config.diar.model_path : diar_model, "diarization model",
-                false);
+                diar_model.empty() ? asr_config.diar.model_path : diar_model, "diarization",
+                "diarization model", false);
         });
 #endif
         asr_config.postproc.pnc_model_path = resolve("punctuation model", [&] {
             return optional_model(
-                pnc_model.empty() ? asr_config.postproc.pnc_model_path : pnc_model,
+                pnc_model.empty() ? asr_config.postproc.pnc_model_path : pnc_model, "",
                 "punctuation and capitalization model", false);
         });
         asr_config.postproc.itn_model_dir = resolve("ITN grammar", [&] {
             return optional_model(
-                itn_model.empty() ? asr_config.postproc.itn_model_dir : itn_model, "ITN model",
+                itn_model.empty() ? asr_config.postproc.itn_model_dir : itn_model, "", "ITN model",
                 false, true);
         });
     }
@@ -396,8 +400,8 @@ run_server(int argc, char** argv) {
 #endif
         standalone_diar = resolve("diarization model", [&] {
             return optional_model(
-                diar_model.empty() ? diar_config.model_path : diar_model, "diarization model",
-                false);
+                diar_model.empty() ? diar_config.model_path : diar_model, "diarization",
+                "diarization model", false);
         });
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
@@ -405,7 +409,7 @@ run_server(int argc, char** argv) {
         nmt_enabled > 0 || !nmt_model.empty() || !nmt_config.model.path.empty();
     const auto nmt_path = nmt_enabled == 0 ? std::string() : resolve("NMT model", [&] {
         return optional_model(
-            nmt_model.empty() ? nmt_config.model.path : nmt_model, "translation model",
+            nmt_model.empty() ? nmt_config.model.path : nmt_model, "", "translation model",
             nmt_requested);
     });
     if (!nmt_path.empty()) {
@@ -420,24 +424,24 @@ run_server(int argc, char** argv) {
                                !tokenizer_model.empty() || !tn_model.empty();
     const auto magpie_path = tts_enabled == 0 ? std::string() : resolve("TTS model", [&] {
         return optional_model(
-            tts_model.empty() ? tts_config.runtime.magpie_model : tts_model, "MagpieTTS model",
-            tts_requested);
+            tts_model.empty() ? tts_config.runtime.magpie_model : tts_model, "tts",
+            "MagpieTTS model", tts_requested);
     });
     if (tts_enabled != 0 && (tts_requested || !magpie_path.empty())) {
         tts_config.runtime.codec_model = resolve("TTS codec model", [&] {
             return optional_model(
-                codec_model.empty() ? tts_config.runtime.codec_model : codec_model,
+                codec_model.empty() ? tts_config.runtime.codec_model : codec_model, "codec",
                 "NanoCodec model", true);
         });
         tts_config.tokenizer_model_dir = resolve("TTS tokenizer", [&] {
             return optional_model(
                 tokenizer_model.empty() ? tts_config.tokenizer_model_dir : tokenizer_model,
-                "tokenizer model", true, true);
+                "tokenizer", "tokenizer model", true, true);
         });
         tts_config.tn_model_dir = resolve("TTS normalization grammar", [&] {
             return optional_model(
-                tn_model.empty() ? tts_config.tn_model_dir : tn_model, "text normalization model",
-                false, true);
+                tn_model.empty() ? tts_config.tn_model_dir : tn_model, "",
+                "text normalization model", false, true);
         });
     }
 #endif
@@ -460,6 +464,7 @@ run_server(int argc, char** argv) {
 
     nemo_speech::EngineRegistryConfig registry_config;
 #if defined(NEMO_SPEECH_CLI_ASR)
+    asr_config.log_status = !cli_quiet() && !cli_json();
     registry_config.asr = !asr_path.empty();
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
@@ -516,7 +521,8 @@ run_server(int argc, char** argv) {
 #endif
     if (!engines.ready())
         throw std::runtime_error(
-            "no models were loaded; pass --asr-model, --tts-model, --nmt-model, or --config");
+            "no models were loaded; pass --asr-model, --diar-model, --tts-model, --nmt-model, "
+            "or --config");
     if (!no_warmup) {
         nemo_speech::WarmupOptions warmup;
 #if defined(NEMO_SPEECH_CLI_TTS)
@@ -601,8 +607,9 @@ void
 print_serve_help(const char* program) {
     std::printf(
         "Usage: %s serve [options]\n\n"
-        "Start the OpenAI-compatible HTTP API and browser playground. Models are\n"
-        "provided as explicit local paths or through a YAML configuration file.\n\n"
+        "Start the local speech HTTP API and browser playground. The transcription\n"
+        "and speech routes expose OpenAI-compatible subsets. Models are provided as\n"
+        "local paths, indexed names, or through a YAML configuration.\n\n"
         "Server:\n"
         "  --host ADDRESS          Bind address (default: 127.0.0.1)\n"
         "  --port N                HTTP port (default: 8080)\n"
@@ -622,18 +629,18 @@ print_serve_help(const char* program) {
         "                          Realtime ASR: WebSocket /v1/realtime\n\n"
         "Models:\n"
 #if defined(NEMO_SPEECH_CLI_ASR)
-        "  --asr-model MODEL       ASR GGUF path\n"
+        "  --asr-model MODEL       ASR GGUF path or indexed model\n"
         "  --vad-model MODEL       Optional VAD model\n"
         "  --pnc-model MODEL       Optional punctuation model\n"
         "  --itn-model-dir MODEL   Optional ITN grammar directory\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_DIAR)
-        "  --diar-model MODEL      Optional Sortformer model\n"
+        "  --diar-model MODEL      Optional Sortformer path or indexed model\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_TTS)
-        "  --tts-model MODEL       Optional MagpieTTS model\n"
-        "  --codec-model MODEL     NanoCodec model used by TTS\n"
-        "  --tokenizer-dir MODEL   TTS tokenizer assets\n"
+        "  --tts-model MODEL       Optional MagpieTTS path or indexed model\n"
+        "  --codec-model MODEL     NanoCodec path or indexed model\n"
+        "  --tokenizer-dir MODEL   TTS tokenizer directory or indexed model\n"
         "  --tn-model-dir MODEL    Optional TTS text-normalization assets\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)

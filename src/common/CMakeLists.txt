@@ -12,6 +12,7 @@ add_library(nemo_speech_common STATIC
     audio_resampler.cpp
     json.cpp
     parameter_parser.cpp
+    subtitles.cpp
 )
 
 # Public so config headers' `#include "parameter_parser.h"` reaches every
@@ -73,4 +74,14 @@ if(NEMO_SPEECH_WITH_NORM)
         ${RE2_LIB})
     set_target_properties(
         nemo_speech_text_normalization PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    file(GLOB _NEMO_SPEECH_NORM_RUNTIME_LIBS
+        "${_NEMO_SPEECH_ITN_PREFIX}/lib/libsparrowhawk${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+        "${_NEMO_SPEECH_ITN_PREFIX}/lib/libfst${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+        "${_NEMO_SPEECH_ITN_PREFIX}/lib/libfstfar${CMAKE_SHARED_LIBRARY_SUFFIX}*"
+        "${_NEMO_SPEECH_ITN_PREFIX}/lib/libsparrowhawk.*${CMAKE_SHARED_LIBRARY_SUFFIX}"
+        "${_NEMO_SPEECH_ITN_PREFIX}/lib/libfst.*${CMAKE_SHARED_LIBRARY_SUFFIX}"
+        "${_NEMO_SPEECH_ITN_PREFIX}/lib/libfstfar.*${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    install(FILES ${_NEMO_SPEECH_NORM_RUNTIME_LIBS}
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()

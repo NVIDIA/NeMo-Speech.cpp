@@ -39,8 +39,9 @@ EngineRegistry::EngineRegistry(EngineRegistryConfig config) {
 #if defined(NEMO_SPEECH_REGISTRY_DIAR)
 std::shared_ptr<asr::Diarizer>
 EngineRegistry::load_diarization(
-    int gpu, const std::string& model_path, asr::DiarGeometry geometry) {
-    auto engine = asr::Diarizer::load(gpu, model_path, std::move(geometry));
+    int gpu, const std::string& model_path, asr::DiarGeometry geometry,
+    asr::BatchingConfig batching) {
+    auto engine = asr::Diarizer::load(gpu, model_path, std::move(geometry), std::move(batching));
     std::lock_guard<std::mutex> lock(mutex_);
     diar_ = engine;
     diar_from_asr_ = false;

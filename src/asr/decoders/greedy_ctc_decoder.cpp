@@ -32,8 +32,8 @@ CtcHeadModule::define_tensors(ggml_runtime::Session* session) {
     session->model_tensor_container->create_tensor_2d(argmax_eye_name_, GGML_TYPE_F32, C, C);
 }
 
-ggml_runtime::TensorBag
-CtcHeadModule::build_graph(
+ggml_runtime::ggml_bf_tensor
+CtcHeadModule::build_probs(
     ggml_runtime::Session* session, ggml_runtime::TensorBag input_tensors,
     ggml_runtime::TensorContainer* tc) {
     // Input: encoder features (d_model=C, T, 1, 1).
@@ -49,11 +49,18 @@ CtcHeadModule::build_graph(
 
     // (T, num_classes+1, 1, 1) -> (num_classes+1, T, 1, 1)
     auto logits_t = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, logits.tensor, 1, 0, 2, 3));
-    auto sm = ggml_soft_max(bf_ctx.ctx, logits_t);
-    auto log_sm = ggml_log(bf_ctx.ctx, sm);
+    return ggml_runtime::ggml_bf_tensor(ggml_soft_max(bf_ctx.ctx, logits_t), x.buft);
+}
+
+ggml_runtime::TensorBag
+CtcHeadModule::build_graph(
+    ggml_runtime::Session* session, ggml_runtime::TensorBag input_tensors,
+    ggml_runtime::TensorContainer* tc) {
+    auto probs = build_probs(session, input_tensors, tc);
+    auto bf_ctx = tc->get_ctx_of_buffer_type(probs.buft);
 
     ggml_runtime::TensorBag out;
-    out.add_tensor(ggml_runtime::ggml_bf_tensor(log_sm, x.buft));
+    out.add_tensor(ggml_runtime::ggml_bf_tensor(ggml_log(bf_ctx.ctx, probs.tensor), probs.buft));
     return out;
 }
 
@@ -61,27 +68,25 @@ ggml_runtime::TensorBag
 CtcHeadModule::build_greedy_graph(
     ggml_runtime::Session* session, ggml_runtime::TensorBag input_tensors,
     ggml_runtime::TensorContainer* tc) {
-    auto full = build_graph(session, input_tensors, tc);
-    auto log_probs = full.get_tensor(0);
-    auto bf_ctx = tc->get_ctx_of_buffer_type(log_probs.buft);
+    auto probs = build_probs(session, input_tensors, tc);
+    auto bf_ctx = tc->get_ctx_of_buffer_type(probs.buft);
 
     auto eye = session->model_tensor_container->get_tensor_by_name(argmax_eye_name_);
-    const int64_t C = log_probs.tensor->ne[0];
-    const int64_t T = log_probs.tensor->ne[1];
-    const int64_t B = log_probs.tensor->ne[2];
+    const int64_t C = probs.tensor->ne[0];
+    const int64_t T = probs.tensor->ne[1];
+    const int64_t B = probs.tensor->ne[2];
     // Argmax reduces each column independently, so flatten the outer axes and
     // avoid backend-specific handling of integer concat and strided views.
-    auto flat = ggml_reshape_2d(bf_ctx.ctx, ggml_cont(bf_ctx.ctx, log_probs.tensor), C, T * B);
+    auto flat = ggml_reshape_2d(bf_ctx.ctx, ggml_cont(bf_ctx.ctx, probs.tensor), C, T * B);
     auto ids = ggml_argmax(bf_ctx.ctx, flat);
     auto onehot = ggml_get_rows(bf_ctx.ctx, eye.tensor, ids);
-    auto winning_prob =
-        ggml_exp(bf_ctx.ctx, ggml_sum_rows(bf_ctx.ctx, ggml_mul(bf_ctx.ctx, flat, onehot)));
+    auto winning_prob = ggml_sum_rows(bf_ctx.ctx, ggml_mul(bf_ctx.ctx, flat, onehot));
     ids = ggml_reshape_2d(bf_ctx.ctx, ids, T, B);
     winning_prob = ggml_reshape_2d(bf_ctx.ctx, winning_prob, T, B);
 
     ggml_runtime::TensorBag out;
-    out.add_tensor(ggml_runtime::ggml_bf_tensor(ids, log_probs.buft));
-    out.add_tensor(ggml_runtime::ggml_bf_tensor(winning_prob, log_probs.buft));
+    out.add_tensor(ggml_runtime::ggml_bf_tensor(ids, probs.buft));
+    out.add_tensor(ggml_runtime::ggml_bf_tensor(winning_prob, probs.buft));
     return out;
 }
 
@@ -197,9 +202,10 @@ GreedyCtcDecoder::step_compact(
     return emitted;
 }
 
-std::string
-detokenize_sentencepiece(const std::vector<int>& ids, const std::vector<std::string>& vocab) {
-    std::string out;
+void
+append_sentencepiece_tokens(
+    std::string& out, const std::vector<int>& ids, const std::vector<std::string>& vocab) {
+    const bool trim_leading_space = out.empty();
     for (int id : ids) {
         if (id < 0 || id >= static_cast<int>(vocab.size()))
             continue;
@@ -217,9 +223,20 @@ detokenize_sentencepiece(const std::vector<int>& ids, const std::vector<std::str
             }
         }
     }
-    size_t s = 0;
-    while (s < out.size() && out[s] == ' ') s++;
-    return out.substr(s);
+    if (trim_leading_space) {
+        const size_t s = out.find_first_not_of(' ');
+        if (s == std::string::npos)
+            out.clear();
+        else if (s > 0)
+            out.erase(0, s);
+    }
+}
+
+std::string
+detokenize_sentencepiece(const std::vector<int>& ids, const std::vector<std::string>& vocab) {
+    std::string out;
+    append_sentencepiece_tokens(out, ids, vocab);
+    return out;
 }
 
 }  // namespace nemo_speech::asr

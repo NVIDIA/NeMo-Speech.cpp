@@ -41,7 +41,6 @@ namespace ggml_runtime {
 GGMLF_ATTRIBUTE_FORMAT(5, 6)
 void log_internal(
     ggml_log_level level, const char* file, int line, const char* func, const char* format, ...);
-void log_callback_default(ggml_log_level level, const char* text, void* user_data);
 }  // namespace ggml_runtime
 
 // Kept in the global namespace because llama_file and other global-scope
@@ -104,6 +103,20 @@ struct ggml_bf_tensor {
         : tensor(tensor), buft(buft) {}
 };
 using ggml_bf_tensor_t = ggml_bf_tensor*;
+
+// Non-owning reference to tensor data already resident in a backend buffer.
+// The producer owns both the tensor and its buffer; consumers may bind a
+// contiguous subrange by setting byte_offset.
+struct DeviceTensor {
+    ggml_tensor* tensor = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    size_t byte_offset = 0;
+
+    bool valid() const {
+        return tensor != nullptr && buft != nullptr && tensor->buffer != nullptr &&
+               tensor->data != nullptr;
+    }
+};
 
 struct ggml_bf_context {
     ggml_context* ctx;
@@ -287,6 +300,13 @@ class Session {
         bool persistent = false;
         // False when persistent device contents are already current.
         bool upload = true;
+        // Complete the host-to-device copy before launching the graph. This
+        // permits a device-only graph to return asynchronously even when the
+        // caller's host buffer does not outlive run().
+        bool synchronous_upload = false;
+        // Bind an existing backend tensor instead of allocating and uploading
+        // a host input. The referenced storage must outlive this Session run.
+        const DeviceTensor* device_tensor = nullptr;
     };
 
     // Select by exactly one of TensorBag index or cached name. nbytes is the
@@ -297,6 +317,9 @@ class Session {
         void* host_buffer = nullptr;
         size_t nbytes = 0;
         int64_t out_shape[4] = {0, 0, 0, 0};
+        // When non-null, receives a non-owning backend reference without
+        // synchronizing the graph merely to copy the output to the host.
+        DeviceTensor* device_tensor = nullptr;
     };
 
     // Reuse a SessionState across calls to preserve device-updated stream state;
@@ -355,8 +378,8 @@ class Session {
     void run_impl(
         uint64_t key,
         const std::function<TensorBag(Session*, TensorContainer*)>& define_input_tensors,
-        const std::function<void(Session*, TensorContainer*)>& set_input_data,
-        const std::function<void(Session*, TensorBag, TensorContainer*)>& return_output,
+        const std::function<bool(Session*, TensorContainer*)>& set_input_data,
+        const std::function<bool(Session*, TensorBag, TensorContainer*)>& return_output,
         SessionState* state);
 
     BackendManager* backend_manager_;

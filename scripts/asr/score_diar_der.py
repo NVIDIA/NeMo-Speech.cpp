@@ -3,10 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """DER smoke test for the ggml Sortformer diarizer.
 
-Runs the C++ streaming CLI (test_diar_streaming --rttm) on a set of wavs,
-scores DER against reference RTTMs with pyannote.metrics, and (optionally)
-runs NeMo's streaming Sortformer with the same geometry + binarization for an
-apples-to-apples delta.
+Scores existing batched CLI RTTMs, or runs test_diar_streaming on a set of
+WAVs, against reference RTTMs with pyannote.metrics. It can optionally run
+NeMo's streaming Sortformer with the same geometry and binarization.
 
 Usage:
     python score_diar_der.py --cli <build>/bin/test_diar_streaming \
@@ -15,6 +14,9 @@ Usage:
         --ref /path/to/reference.rttm \
         [--nemo-ckpt diar_streaming_sortformer_4spk-v2.nemo --device cuda] \
         [--gpu] [--max-files N] [--collar 0.25]
+
+    python score_diar_der.py --hyp-dir /path/to/rttms \
+        --wav-dir /path/to/audio --ref /path/to/reference-rttms
 """
 
 from __future__ import annotations
@@ -22,9 +24,10 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import wave
 from pathlib import Path
 
-from pyannote.core import Annotation, Segment
+from pyannote.core import Annotation, Segment, Timeline
 from pyannote.metrics.diarization import DiarizationErrorRate
 
 # Geometry presets + segmentation postprocessing, mirroring the C++ single
@@ -127,10 +130,14 @@ def probs_to_annotation(probs, uri, pp=POSTPROC_CALLHOME) -> Annotation:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cli", required=True, help="test_diar_streaming binary")
-    ap.add_argument("--model", required=True, help="sortformer GGUF")
+    ap.add_argument("--cli", help="test_diar_streaming binary")
+    ap.add_argument("--model", help="sortformer GGUF")
+    ap.add_argument(
+        "--hyp-dir",
+        help="score RTTMs already produced by batched 'nemo-speech diarize'",
+    )
     ap.add_argument("--wav-dir", action="append", required=True)
-    ap.add_argument("--ref", required=True, help="reference RTTM (multi-file)")
+    ap.add_argument("--ref", required=True, help="reference RTTM or directory of RTTMs")
     ap.add_argument("--nemo-ckpt", default=None, help=".nemo for the NeMo baseline")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--gpu", action="store_true", help="run the C++ CLI on GPU")
@@ -138,8 +145,7 @@ def main() -> int:
         "--preset",
         default=DEFAULT_GEOMETRY,
         choices=sorted(GEOMETRY_PRESETS),
-        help="streaming geometry applied to BOTH the C++ CLI and the NeMo "
-        "baseline (single source: diar_presets.py)",
+        help="streaming geometry applied to both the C++ CLI and NeMo baseline",
     )
     ap.add_argument(
         "--cli-arg",
@@ -159,7 +165,12 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    refs = parse_rttm_lines(Path(args.ref).read_text().splitlines())
+    if not args.hyp_dir and (not args.cli or not args.model):
+        ap.error("--cli and --model are required unless --hyp-dir is used")
+
+    ref_path = Path(args.ref)
+    ref_files = sorted(ref_path.glob("*.rttm")) if ref_path.is_dir() else [ref_path]
+    refs = parse_rttm_lines(line for path in ref_files for line in path.read_text().splitlines())
     wavs = []
     for d in args.wav_dir:
         wavs.extend(sorted(Path(d).glob("*.wav")))
@@ -171,16 +182,39 @@ def main() -> int:
         return 1
     print(f"[der] scoring {len(wavs)} files (collar {args.collar})")
 
+    # Preflight validation: check all hypothesis RTTM files exist before scoring
+    if args.hyp_dir:
+        missing_files = []
+        for w in wavs:
+            hyp_file = Path(args.hyp_dir) / f"{w.stem}.rttm"
+            if not hyp_file.exists():
+                missing_files.append(str(hyp_file))
+        if missing_files:
+            print("[der] ERROR: missing hypothesis RTTM files:", file=sys.stderr)
+            for mf in missing_files:
+                print(f"  {mf}", file=sys.stderr)
+            return 1
+
     geom = GEOMETRY_PRESETS[args.preset]
     metric_ours = DiarizationErrorRate(collar=2 * args.collar, skip_overlap=args.skip_overlap)
+    uems = {}
     for w in wavs:
-        cmd = [args.cli, args.model, str(w), "--rttm", w.stem]
-        cmd += geometry_cli_args(geom) + args.cli_arg
-        if args.gpu:
-            cmd.append("--gpu")
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        hyp = parse_rttm_lines(out.stdout.splitlines()).get(w.stem, Annotation(uri=w.stem))
-        d = metric_ours(refs[w.stem], hyp)
+        if args.hyp_dir:
+            hyp_path = Path(args.hyp_dir) / f"{w.stem}.rttm"
+            lines = hyp_path.read_text().splitlines()
+        else:
+            cmd = [args.cli, args.model, str(w), "--rttm", w.stem]
+            cmd += geometry_cli_args(geom) + args.cli_arg
+            if args.gpu:
+                cmd.append("--gpu")
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            lines = out.stdout.splitlines()
+        hyp = parse_rttm_lines(lines).get(w.stem, Annotation(uri=w.stem))
+        with wave.open(str(w), "rb") as wav:
+            duration = wav.getnframes() / wav.getframerate()
+        uem = Timeline([Segment(0.0, duration)], uri=w.stem)
+        uems[w.stem] = uem
+        d = metric_ours(refs[w.stem], hyp, uem=uem)
         if not args.quiet_per_file:
             print(f"[der]   ggml {w.stem[:16]}...: {d:.4f}")
     der_ours = abs(metric_ours)
@@ -212,7 +246,7 @@ def main() -> int:
                 sig_len = torch.tensor([sig.shape[1]], device=device)
                 preds = model.forward(audio_signal=sig, audio_signal_length=sig_len)
                 hyp = probs_to_annotation(preds[0].cpu().numpy(), w.stem)
-                d = metric_nemo(refs[w.stem], hyp)
+                d = metric_nemo(refs[w.stem], hyp, uem=uems[w.stem])
                 print(f"[der]   nemo {w.stem[:16]}...: {d:.4f}")
         der_nemo = abs(metric_nemo)
         print(f"[der] nemo overall DER: {der_nemo:.4f}")

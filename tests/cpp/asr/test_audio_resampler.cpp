@@ -90,6 +90,13 @@ main() {
         rmse_against_sine(fractional, 16000, 1000.0, 32) < 0.01,
         "fractional-ratio conversion preserves an in-band tone");
 
+    const auto source_coprime = sine(47999, 1000.0, 1.0);
+    const auto coprime = resample_audio(source_coprime.data(), source_coprime.size(), 47999, 16000);
+    check(coprime.size() == 16000, "co-prime rate conversion preserves duration");
+    check(
+        rmse_against_sine(coprime, 16000, 1000.0, 32) < 0.01,
+        "co-prime rate conversion preserves an in-band tone");
+
     const auto source_8k = sine(8000, 1000.0, 1.0);
     const auto upsampled = resample_audio(source_8k.data(), source_8k.size(), 8000, 16000);
     check(upsampled.size() == 16000, "8 kHz -> 16 kHz output duration");
@@ -117,6 +124,22 @@ main() {
     streaming.finish(&chunked);
     check(chunked == downsampled, "streaming output is independent of chunk boundaries");
 
+    AudioResampler fractional_streaming(44100, 16000);
+    chunked.clear();
+    offset = 0;
+    chunk_index = 0;
+    while (offset < source_44k.size()) {
+        const size_t count = std::min(
+            kChunks[chunk_index++ % (sizeof(kChunks) / sizeof(kChunks[0]))],
+            source_44k.size() - offset);
+        fractional_streaming.process(source_44k.data() + offset, count, &chunked);
+        offset += count;
+    }
+    fractional_streaming.finish(&chunked);
+    check(
+        chunked == fractional,
+        "fractional-ratio streaming output is independent of chunk boundaries");
+
     const auto source_pcm = pcm16(source_48k);
     Pcm16Resampler pcm_resampler(48000, 11025);
     std::vector<uint8_t> resampled_pcm;
@@ -135,6 +158,14 @@ main() {
     check(
         pcm_resampler.output_samples() == 11025 && resampled_pcm.size() == 11025 * 2,
         "signed-16 PCM streaming supports 11025 Hz output");
+
+    Pcm16Resampler pcm_one_shot(48000, 11025);
+    std::vector<uint8_t> one_shot_pcm;
+    pcm_one_shot.process(source_pcm.data(), source_pcm.size(), &one_shot_pcm);
+    pcm_one_shot.finish(&one_shot_pcm);
+    check(
+        resampled_pcm == one_shot_pcm,
+        "signed-16 PCM output is independent of streaming chunk boundaries");
 
     bool odd_pcm_rejected = false;
     try {

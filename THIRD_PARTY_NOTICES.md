@@ -55,13 +55,18 @@ used by its model-conversion tooling:
   [`COPYING.3`](third_party/kenlm/COPYING.3), and
   [`COPYING.LESSER.3`](third_party/kenlm/COPYING.LESSER.3)
 
-File-level exceptions used by the runtime include MurmurHash (Austin Appleby,
-public domain/MIT), StringPiece (Google and RE2 authors, BSD 3-Clause),
-double-conversion (V8 authors, BSD 3-Clause), and integer conversion code (Milo
-Yip and Wojciech Muła, MIT/BSD). Their upstream notices remain intact.
+The runtime uses these file-level exceptions:
 
-KenLM's AT&T-licensed `util/getopt.*` files are explicitly excluded from this
-project's runtime source allowlist and are not compiled or linked.
+- `util/murmur_hash.cc`: Austin Appleby, MIT option
+- `util/string_piece.cc` and `util/string_piece.hh`: Google and RE2 authors,
+  BSD 3-Clause
+- `util/double-conversion/*`: V8 authors, BSD 3-Clause
+- `util/integer_to_string.cc` and `util/integer_to_string.hh`: Milo Yip and
+  Wojciech Muła, MIT/BSD
+
+All other files in the project's explicit KenLM runtime source allowlist are
+LGPL 2.1 or later. KenLM's AT&T-licensed `util/getopt.c` and `util/getopt.hh`
+are explicitly excluded and are not compiled or linked.
 
 ### Open JTalk
 
@@ -103,11 +108,65 @@ project's runtime source allowlist and are not compiled or linked.
 - Copyright The OpenSSL Project Authors and other contributors
 - License: Apache License 2.0
 
-OpenSSL is dynamically linked for optional HTTP-server TLS. It is not
-incorporated into the source tree; binary and container distributions include
-the applicable OpenSSL attribution and Apache 2.0 terms.
+OpenSSL is linked only when HTTP-server TLS is enabled. Windows packages include
+its license. The default Linux container does not include OpenSSL.
+
+### Windows vcpkg dependencies
+
+Windows builds obtain optional dependencies through vcpkg. Installed packages
+include each selected dependency's license.
+
+### Container system libraries
+
+The Linux container copies the shared libraries required by its executables
+from the CUDA/Ubuntu builder into a `FROM scratch` runtime. This includes the
+GNU C Library, GCC runtime libraries, c-ares, zlib, bzip2, and XZ Utils/liblzma,
+subject to the exact feature set and package revisions in the built image.
+
+The container records the package copyright file for every copied
+Debian/Ubuntu shared library under
+`/opt/nemo-speech/share/licenses/nemo-speech/third_party/system/`. The complete
+project notice set is installed under
+`/opt/nemo-speech/share/licenses/nemo-speech/`.
+
+### NVIDIA CUDA Runtime
+
+- Source: [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
+- Copyright (c) NVIDIA CORPORATION & AFFILIATES
+- License: NVIDIA Software License Agreement and CUDA Supplement
+
+CUDA release archives include the redistributable CUDA runtime library. The
+applicable agreement is installed with the archive under
+`share/licenses/nemo-speech/nvidia/cuda-runtime/`.
 
 ## Other incorporated third-party code and data
+
+### miniaudio
+
+- Source: [`mackron/miniaudio`](https://github.com/mackron/miniaudio), version
+  0.11.25 at commit `9634bedb5b5a2ca38c1ee7108a9358a4e233f14d`, vendored by
+  the pinned llama.cpp checkout
+- Path: `llama.cpp/vendor/miniaudio/miniaudio.h`
+- Copyright 2025 David Reid
+- License: Public Domain (Unlicense) or MIT No Attribution (MIT-0); upstream
+  text is reproduced at
+  [`third_party/miniaudio/LICENSE`](third_party/miniaudio/LICENSE)
+
+The command-line microphone capture layer compiles miniaudio directly into
+`nemo-speech`. Release archives install its license under
+`share/licenses/nemo-speech/third_party/miniaudio/`.
+
+### SentencePiece
+
+- Source: [`google/sentencepiece`](https://github.com/google/sentencepiece),
+  revision `17d7580d6407802f85855d2cc9190634e2c95624`
+- Copyright 2018 Google Inc.
+- License: Apache License 2.0
+
+Default Windows ASR, macOS, and Linux release builds statically link the
+SentencePiece runtime and its bundled Abseil, protobuf-lite, and Darts-clone
+components. Their Apache 2.0 and BSD license texts are installed under
+`share/licenses/nemo-speech/third_party/sentencepiece/`.
 
 ### whisper.cpp sample audio
 

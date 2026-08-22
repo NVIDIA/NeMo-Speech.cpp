@@ -77,15 +77,31 @@ void
 test_sentencepiece_punctuation_detokenization() {
     const std::vector<std::string> vocab = {
         "\xE2\x96\x81"
-        "Hello",
-        "\xE2\x96\x81there", "\xE2\x96\x81?", "\xE2\x96\x81!", "\xE2\x96\x81\xE0\xA5\xA4"};
+        "How",
+        "\xE2\x96\x81old",
+        "\xE2\x96\x81is",
+        "\xE2\x96\x81"
+        "Brooklyn",
+        "\xE2\x96\x81"
+        "Bridge",
+        "\xE2\x96\x81?",
+        "\xE2\x96\x81!",
+        "\xE2\x96\x81\xE0\xA5\xA4"};
     check(
-        detokenize_sentencepiece({0, 1, 2}, vocab) == "Hello there?",
+        detokenize_sentencepiece({0, 1, 2, 3, 4, 5}, vocab) == "How old is Brooklyn Bridge?",
         "sentencepiece: boundary-prefixed terminator attaches to preceding word");
     check(
-        detokenize_sentencepiece({0, 3}, vocab) == "Hello!" &&
-            detokenize_sentencepiece({0, 4}, vocab) == "Hello\xE0\xA5\xA4",
+        detokenize_sentencepiece({0, 6}, vocab) == "How!" &&
+            detokenize_sentencepiece({0, 7}, vocab) == "How\xE0\xA5\xA4",
         "sentencepiece: ASCII and Devanagari terminators attach consistently");
+
+    std::string incremental;
+    append_sentencepiece_tokens(incremental, {0, 1}, vocab);
+    append_sentencepiece_tokens(incremental, {2, 3, 4}, vocab);
+    append_sentencepiece_tokens(incremental, {5}, vocab);
+    check(
+        incremental == detokenize_sentencepiece({0, 1, 2, 3, 4, 5}, vocab),
+        "sentencepiece: incremental detokenization matches full detokenization");
 }
 
 void
@@ -563,6 +579,25 @@ test_tdt_zero_duration_guard() {
     check(ids.empty() && eng.joint_calls == 1, "tdt: blank duration zero advances immediately");
 }
 
+void
+test_tdt_duration_crosses_step_boundary() {
+    MockTdtEngine eng;
+    TdtGreedyDecoder dec(&eng);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> frame(2, 0.0f);
+    eng.rounds = {{blank, 2}};
+    check(dec.step(frame.data(), 2, 1, 0).empty(), "tdt: boundary setup is blank");
+
+    const int calls_before_skip = eng.joint_calls;
+    check(dec.step(frame.data(), 2, 1, 1).empty(), "tdt: carried duration skips a whole block");
+    check(eng.joint_calls == calls_before_skip, "tdt: skipped block performs no joint call");
+
+    eng.rounds = {{0, 1}};
+    const auto ids = dec.step(frame.data(), 2, 1, 2);
+    check(ids == std::vector<int>({0}), "tdt: emits after carried duration");
+    check(dec.last_emit_frame() == 2, "tdt: carries duration across step boundaries");
+}
+
 }  // namespace
 
 int
@@ -586,6 +621,7 @@ main() {
     test_rnnt_open_word_needs_finalize();
     test_tdt_duration_and_state_commit();
     test_tdt_zero_duration_guard();
+    test_tdt_duration_crosses_step_boundary();
     std::fprintf(stdout, g_fail ? "FAILED (%d)\n" : "ALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

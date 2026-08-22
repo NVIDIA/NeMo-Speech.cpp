@@ -8,8 +8,10 @@ Start with:
 
 - [Installation](install.md)
 - [Command-line workflows](cli.md)
+- [Configuration examples](../config/README.md)
 - [Model conversion](model-conversion.md)
 - [HTTP/realtime and optional gRPC server](server.md)
+- [HTTP API reference](api.md)
 - [Client integration](clients.md)
 - [Native SDK integration](sdk.md)
 - [Troubleshooting](troubleshooting.md)
@@ -19,8 +21,8 @@ Start with:
 
 ## ASR
 
-- [Models and conversion](asr/models.md) - download from Hugging Face or convert
-  a local NeMo checkpoint to GGUF; quantization options.
+- [Models](asr/models.md) - ready-to-run GGUF downloads, custom checkpoint
+  conversion, and quantization options.
 - [Configuration](asr/configuration.md) - full `asr.*` key reference plus the
   decoding / word-boosting / VAD / endpointing / diarization / postprocessing knobs.
 - [Feature matrix and customization](asr/customization.md) - which models
@@ -28,7 +30,8 @@ Start with:
 
 ## TTS
 
-- [Models and conversion](tts/models.md) - MagpieTTS + NanoCodec GGUF conversion.
+- [Models](tts/models.md) - ready-to-run MagpieTTS and NanoCodec GGUF downloads,
+  tokenizer setup, and custom conversion.
 - [Configuration](tts/configuration.md) - `tts.*` key reference and serving.
 
 ## NMT
@@ -44,5 +47,5 @@ Start with:
 - [ASR batching](development/asr-batching.md) - neural microbatching and
   streaming-state arenas.
 - [ggml patches](development/ggml-patches.md) - the project-specific ggml changes.
-- [cuBLAS shim](development/cublas-shim.md) - the in-tree drop-in cuBLAS and GPU
-  kernels.
+- [cuBLAS shim](development/cublas-shim.md) - the in-tree drop-in cuBLAS
+  replacement.

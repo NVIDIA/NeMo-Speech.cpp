@@ -45,6 +45,10 @@ class CtcHeadModule : public ggml_runtime::Module {
     void set_data(ggml_runtime::Session* session) override;
 
    private:
+    ggml_runtime::ggml_bf_tensor build_probs(
+        ggml_runtime::Session* session, ggml_runtime::TensorBag input_tensors,
+        ggml_runtime::TensorContainer* tc);
+
     std::string name_;
     CtcConfig cfg_;
     ggml_runtime::Conv1D* proj_;  // decoder.decoder_layers.0

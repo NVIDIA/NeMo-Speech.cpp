@@ -34,9 +34,12 @@ class CacheAwareEncoder {
 
        private:
         friend class CacheAwareEncoder;
-        State(CacheAwareEncoder* owner, int slot) : owner_(owner), slot_(slot) {}
+        State(CacheAwareEncoder* owner, int slot, bool needs_reset)
+            : owner_(owner), slot_(slot), needs_reset_(needs_reset) {}
         CacheAwareEncoder* owner_ = nullptr;
         int slot_ = -1;
+        int ring_head_ = 0;
+        bool needs_reset_ = false;
     };
     // Borrows `bm` + `loader` (owned by AsrModel for this encoder's lifetime).
     // `base_cfg` is the model's non-cache EncoderConfig; `n_mels` sizes the mel
@@ -69,7 +72,7 @@ class CacheAwareEncoder {
     void encode(
         State& state, const float* mel, int n_mel_frames, const float* attn_mask, int attn_mask_len,
         std::vector<float>& enc_out, int& T_enc, const float* tail_input = nullptr,
-        int tail_input_dim = 0);
+        int tail_input_dim = 0, ggml_runtime::DeviceTensor* device_output = nullptr);
 
     // Null before the first use builds the session.
     ggml_runtime::Session* session() const { return session_.get(); }
@@ -98,8 +101,11 @@ class CacheAwareEncoder {
     std::unique_ptr<EncoderBatcher> batcher_;
     std::mutex slots_mu_;
     std::vector<bool> slots_used_;
+    std::vector<bool> slots_need_reset_;
     void release_slot(int slot);
     void zero_slot(int slot);
+    void zero_slots(std::vector<int> slots);
+    bool ring_cache_enabled_ = false;
     int right_ctx_ = -1;  // -1 = use the model's stored train_right_ctx
 };
 

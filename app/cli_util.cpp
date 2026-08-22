@@ -3,6 +3,7 @@
 
 #include "cli_util.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -10,6 +11,10 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+
+#include "audio_file.h"
+#include "ggml.h"
+#include "ggml_log_filter.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -24,6 +29,7 @@ struct CliOutputState {
 };
 
 CliOutputState output_state;
+nemo_speech::GgmlLogFilter dependency_logs;
 
 }  // namespace
 
@@ -157,6 +163,32 @@ read_text_file(const std::filesystem::path& path) {
     return output.str();
 }
 
+std::vector<std::filesystem::path>
+collect_wav_inputs(const std::filesystem::path& input, bool recursive) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(input, error)) {
+        if (!nemo_speech::audio::is_wav_path(input.string()))
+            throw std::invalid_argument("input must be a .wav file");
+        return {std::filesystem::absolute(input)};
+    }
+    if (!std::filesystem::is_directory(input, error))
+        throw std::invalid_argument(input.string() + " is not a file or directory");
+    std::vector<std::filesystem::path> files;
+    auto add = [&](const auto& entry) {
+        if (entry.is_regular_file(error) && nemo_speech::audio::is_wav_path(entry.path().string()))
+            files.push_back(std::filesystem::absolute(entry.path()));
+    };
+    if (recursive) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(input)) add(entry);
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator(input)) add(entry);
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty())
+        throw std::invalid_argument(input.string() + " contains no WAV files");
+    return files;
+}
+
 std::filesystem::path
 relative_output_path(
     const std::filesystem::path& input_root, const std::filesystem::path& input_file) {
@@ -240,6 +272,8 @@ open_url_in_browser(const std::string& url) {
 void
 configure_cli_output(bool json, bool quiet, bool verbose) {
     output_state = {json, quiet, verbose};
+    dependency_logs.set_verbose(verbose);
+    ggml_log_set(nemo_speech::GgmlLogFilter::callback, &dependency_logs);
 }
 
 bool

@@ -9,6 +9,7 @@
 #include "commands.h"
 #include "ggml-backend.h"
 #include "json.h"
+#include "model_store.h"
 
 namespace {
 using nemo_speech::json::Value;
@@ -42,6 +43,7 @@ build_features() {
     result["integrated_vad"] = false;
     result["punctuation"] = false;
 #endif
+    result["model_pull"] = true;
 #if defined(NEMO_SPEECH_CLI_DIAR)
     result["diarization"] = true;
 #else
@@ -177,11 +179,20 @@ command_doctor(int argc, char** argv) {
         result["accelerator_compiled"] = accelerator_compiled;
         result["accelerator_available"] = accelerator_available;
         result["driver_runtime_compatible"] = !accelerator_compiled || accelerator_available;
+        const auto downloader = model_downloader_executable();
+        Value model_download(Value::Object{});
+        model_download["available"] = !downloader.empty();
+        model_download["executable"] = downloader.u8string();
+        result["model_download"] = std::move(model_download);
         Value::Array runtime_warnings;
         if (accelerator_compiled && !accelerator_available)
             runtime_warnings.emplace_back(
                 "this build includes a GPU backend, but no compatible accelerator/driver was "
                 "discovered; use --device cpu or repair the driver/runtime installation");
+        if (downloader.empty())
+            runtime_warnings.emplace_back(
+                "automatic model downloads require curl on PATH; local and cached models still "
+                "work");
         result["runtime_warnings"] = std::move(runtime_warnings);
         if (json) {
             std::printf("%s\n", result.dump(2).c_str());
@@ -201,6 +212,10 @@ command_doctor(int argc, char** argv) {
                     std::printf(" (%.1f GiB)", total / 1073741824.0);
                 std::printf("\n");
             }
+            if (downloader.empty())
+                std::printf("Model downloads: unavailable (curl not found on PATH)\n");
+            else
+                std::printf("Model downloads: %s\n", downloader.u8string().c_str());
             for (const auto& warning : result.at("runtime_warnings").array())
                 std::printf("Runtime warning: %s\n", warning.string().c_str());
         }

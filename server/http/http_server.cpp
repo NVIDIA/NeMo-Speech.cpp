@@ -22,6 +22,7 @@
 #include "audio_resampler.h"
 #include "engine_registry.h"
 #include "json.h"
+#include "subtitles.h"
 
 namespace nemo_speech::http {
 namespace {
@@ -132,6 +133,41 @@ form_value(
     return fallback;
 }
 
+// `speech_contexts` - [{"phrases": ["..."], "boost": N}] - parsed into
+// recognition options. Same field name and shape as the gRPC RecognitionConfig
+// so word boosting reads identically across surfaces.
+void
+apply_speech_contexts(const Value& parsed, std::vector<asr::AsrRequestOptions::Boost>& out) {
+    if (!parsed.is_array())
+        throw std::invalid_argument("speech_contexts must be a JSON array");
+    for (const Value& context : parsed.array()) {
+        asr::AsrRequestOptions::Boost boost;
+        boost.boost = static_cast<float>(context.number_or("boost", 10.0));
+        if (const Value* phrases = context.find("phrases")) {
+            if (!phrases->is_array())
+                throw std::invalid_argument("speech_contexts[].phrases must be an array");
+            for (const Value& phrase : phrases->array()) boost.phrases.push_back(phrase.string());
+        }
+        if (!boost.phrases.empty())
+            out.push_back(std::move(boost));
+    }
+}
+
+void
+apply_speech_contexts(const std::string& json, std::vector<asr::AsrRequestOptions::Boost>& out) {
+    if (json.empty())
+        return;
+    try {
+        apply_speech_contexts(Value::parse(json), out);
+    }
+    catch (const std::invalid_argument&) {
+        throw;
+    }
+    catch (const std::exception&) {
+        throw std::invalid_argument("speech_contexts must be valid JSON");
+    }
+}
+
 bool
 form_bool(const httplib::Request& request, const std::string& name, bool fallback = false) {
     std::string value = form_value(request, name);
@@ -238,12 +274,21 @@ transcript_response(
         return alternative.transcript + "\n";
     if (format == "srt" || format == "vtt") {
         const bool vtt = format == "vtt";
-        int end = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
-        if (!alternative.words.empty())
-            end = std::max(end, alternative.words.back().end_time);
-        std::string output = vtt ? "WEBVTT\n\n" : "1\n";
-        output += timecode(0, vtt) + " --> " + timecode(end, vtt) + "\n";
-        output += alternative.transcript + "\n";
+        int audio_ms = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
+        std::vector<subtitle::Word> words;
+        words.reserve(alternative.words.size());
+        for (const auto& word : alternative.words)
+            words.push_back(
+                {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag});
+        const auto cues = subtitle::make_cues(words, alternative.transcript, audio_ms);
+        std::string output = vtt ? "WEBVTT\n\n" : "";
+        for (size_t i = 0; i < cues.size(); ++i) {
+            if (!vtt)
+                output += std::to_string(i + 1) + "\n";
+            output += timecode(cues[i].start_ms, vtt) + " --> " +
+                      timecode(std::max(cues[i].start_ms + 1, cues[i].end_ms), vtt) + "\n";
+            output += cues[i].text + "\n\n";
+        }
         return output;
     }
     Value root(Value::Object{});
@@ -514,15 +559,40 @@ struct Server::Impl {
                         "response_format must be json, verbose_json, text, srt, or vtt");
                 asr::AsrRequestOptions options;
                 options.language_code = language;
-                options.enable_automatic_punctuation = true;
-                options.enable_word_time_offsets = format == "verbose_json";
+                options.enable_automatic_punctuation =
+                    form_bool(request, "automatic_punctuation", true);
+                options.verbatim_transcripts = form_bool(request, "verbatim");
+                options.profanity_filter = form_bool(request, "profanity_filter");
+                options.enable_word_time_offsets =
+                    format == "verbose_json" || format == "srt" || format == "vtt";
                 options.enable_speaker_diarization = form_bool(request, "diarization");
+                if (options.enable_speaker_diarization) {
+                    const std::string speakers = form_value(request, "max_speaker_count");
+                    if (!speakers.empty()) {
+                        size_t consumed = 0;
+                        int parsed = 0;
+                        try {
+                            parsed = std::stoi(speakers, &consumed);
+                        }
+                        catch (const std::exception&) {
+                            consumed = 0;
+                        }
+                        if (consumed != speakers.size() || parsed <= 0)
+                            throw std::invalid_argument(
+                                "max_speaker_count must be a positive integer");
+                        options.max_speaker_count = parsed;
+                    }
+                }
                 if (options.enable_speaker_diarization && format != "verbose_json")
                     throw std::invalid_argument(
                         "diarization requires response_format=verbose_json");
+                // OpenAI-compat shim: `prompt` = one boosted phrase at the default
+                // score. The native field is `speech_contexts` (same shape as gRPC).
                 const std::string prompt = form_value(request, "prompt");
                 if (!prompt.empty())
                     options.speech_contexts.push_back({{prompt}, 10.0f});
+                apply_speech_contexts(
+                    form_value(request, "speech_contexts"), options.speech_contexts);
                 auto recognizer = this->models.asr();
                 const auto result = recognizer->recognize(
                     audio.samples.data(), audio.samples.size(), options, language,
@@ -602,10 +672,15 @@ struct Server::Impl {
                 options.source_language = requested_source;
                 options.target_language = target;
                 options.recognition.language_code = requested_source;
-                options.recognition.enable_automatic_punctuation = true;
+                options.recognition.enable_automatic_punctuation =
+                    form_bool(request, "automatic_punctuation", true);
+                options.recognition.verbatim_transcripts = form_bool(request, "verbatim");
+                options.recognition.profanity_filter = form_bool(request, "profanity_filter");
                 const std::string prompt = form_value(request, "prompt");
                 if (!prompt.empty())
                     options.recognition.speech_contexts.push_back({{prompt}, 10.0f});
+                apply_speech_contexts(
+                    form_value(request, "speech_contexts"), options.recognition.speech_contexts);
                 std::vector<speech::SpeechTranslationResult> translated;
                 speech::SpeechTranslationCallbacks callbacks;
                 callbacks.translation = [&](const auto& result) {
@@ -657,7 +732,10 @@ struct Server::Impl {
                 options.target_language = form_value(request, "target_language");
                 options.synthesize_speech = true;
                 options.recognition.language_code = options.source_language;
-                options.recognition.enable_automatic_punctuation = true;
+                options.recognition.enable_automatic_punctuation =
+                    form_bool(request, "automatic_punctuation", true);
+                options.recognition.verbatim_transcripts = form_bool(request, "verbatim");
+                options.recognition.profanity_filter = form_bool(request, "profanity_filter");
                 options.synthesis.language_code = options.target_language;
                 options.synthesis.voice_name =
                     openai_voice(*this->models.tts(), form_value(request, "voice"));
@@ -683,6 +761,8 @@ struct Server::Impl {
                 const std::string prompt = form_value(request, "prompt");
                 if (!prompt.empty())
                     options.recognition.speech_contexts.push_back({{prompt}, 10.0f});
+                apply_speech_contexts(
+                    form_value(request, "speech_contexts"), options.recognition.speech_contexts);
                 std::string pcm;
                 int output_sample_rate = 0;
                 speech::SpeechTranslationCallbacks callbacks;
@@ -802,7 +882,8 @@ struct Server::Impl {
             size_t audio_bytes = 0;
             auto ensure_stream = [&] {
                 if (!stream)
-                    stream = recognizer->streaming_recognize(options, options.language_code);
+                    stream = recognizer->streaming_recognize(
+                        options, options.language_code, /*coordinate_ingress=*/true);
             };
             auto send = [&](Value event) {
                 if (!event.find("event_id"))
@@ -908,6 +989,21 @@ struct Server::Impl {
                             updated->bool_or("word_timestamps", false);
                         options.enable_speaker_diarization =
                             updated->bool_or("speaker_diarization", false);
+                        const double speakers =
+                            updated->number_or("max_speaker_count", options.max_speaker_count);
+                        if (speakers <= 0.0 || speakers != std::floor(speakers))
+                            throw std::invalid_argument(
+                                "max_speaker_count must be a positive integer");
+                        options.max_speaker_count = static_cast<int>(speakers);
+                        options.profanity_filter = updated->bool_or("profanity_filter", false);
+                        options.stop_history_eou_ms = static_cast<float>(
+                            updated->number_or("endpointing_ms", options.stop_history_eou_ms));
+                        options.speech_contexts.clear();
+                        const std::string prompt = updated->string_or("prompt", "");
+                        if (!prompt.empty())
+                            options.speech_contexts.push_back({{prompt}, 10.0f});
+                        if (const Value* contexts = updated->find("speech_contexts"))
+                            apply_speech_contexts(*contexts, options.speech_contexts);
                         Value response(Value::Object{});
                         response["type"] = "session.updated";
                         response["session"] = *updated;

@@ -3,6 +3,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#if defined(NEMO_SPEECH_CLI_LIVE)
+#include <chrono>
+#include <csignal>
+#endif
 #include <cstdio>
 #include <filesystem>
 #include <iomanip>
@@ -17,9 +22,13 @@
 #include "cli_util.h"
 #include "commands.h"
 #include "engine_registry.h"
+#if defined(NEMO_SPEECH_CLI_LIVE)
+#include "microphone_capture.h"
+#endif
 #include "model_utils.h"
 #include "parameter_parser.h"
 #include "recognizer.h"
+#include "subtitles.h"
 #if defined(NEMO_SPEECH_CLI_NMT)
 #include "speech_translator.h"
 #endif
@@ -28,14 +37,6 @@ namespace {
 namespace fs = std::filesystem;
 namespace asr = nemo_speech::asr;
 
-struct Word {
-    std::string text;
-    int start_ms = 0;
-    int end_ms = 0;
-    float confidence = 0.0f;
-    int speaker = 0;
-};
-
 struct Transcript {
     std::string text;
     std::string source_text;
@@ -43,7 +44,7 @@ struct Transcript {
     float confidence = 0.0f;
     float audio_seconds = 0.0f;
     std::vector<std::string> languages;
-    std::vector<Word> words;
+    std::vector<nemo_speech::subtitle::Word> words;
 };
 
 enum class OutputFormat { Text, Json, Srt, Vtt };
@@ -72,6 +73,7 @@ struct Options {
     bool punctuation = true;
     bool verbatim = false;
     bool diarize = false;
+    bool live = false;
     bool stream = false;
     bool warmup = true;
     bool batching = true;
@@ -169,6 +171,10 @@ parse_options(int argc, char** argv) {
             o.force = true;
         else if (arg == "--word-times")
             o.word_times = true;
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        else if (arg == "--live")
+            o.live = true;
+#endif
         else if (arg == "--stream")
             o.stream = true;
         else if (arg == "--no-warmup")
@@ -177,6 +183,8 @@ parse_options(int argc, char** argv) {
             o.batching = false;
         else if (arg == "--max-alternatives")
             o.request.max_alternatives = parse_int(required_value(i, argc, argv, arg), arg, 1, 100);
+        else if (arg == "--max-speaker-count")
+            o.request.max_speaker_count = parse_int(required_value(i, argc, argv, arg), arg, 1, 32);
         else if (arg == "--profanity-filter")
             o.request.profanity_filter = true;
         else if (arg == "--endpointing-ms")
@@ -203,10 +211,18 @@ parse_options(int argc, char** argv) {
         else
             throw std::invalid_argument("unexpected argument: " + arg);
     }
-    if (o.input.empty())
+    if (o.live && !o.input.empty())
+        throw std::invalid_argument("--live does not accept an input file or directory");
+    if (!o.live && o.input.empty())
         throw std::invalid_argument("an input WAV file or directory is required");
     if (!o.output.empty() && !o.output_dir.empty())
         throw std::invalid_argument("use only one of --output and --output-dir");
+    if (o.live && !o.output_dir.empty())
+        throw std::invalid_argument("--output-dir is not valid with --live; use --output");
+    if (o.live && o.recursive)
+        throw std::invalid_argument("--recursive is not valid with --live");
+    if (o.live && o.concurrency > 0)
+        throw std::invalid_argument("--concurrency is not valid with --live");
 #if defined(NEMO_SPEECH_CLI_NMT)
     if (!o.translate_to.empty() && (o.format == OutputFormat::Srt || o.format == OutputFormat::Vtt))
         throw std::invalid_argument("--translate-to currently supports text and json output");
@@ -216,35 +232,8 @@ parse_options(int argc, char** argv) {
     return o;
 }
 
-std::vector<fs::path>
-collect_inputs(const Options& options) {
-    std::error_code error;
-    if (fs::is_regular_file(options.input, error)) {
-        if (!nemo_speech::audio::is_wav_path(options.input.string()))
-            throw std::invalid_argument("input must be a .wav file");
-        return {fs::absolute(options.input)};
-    }
-    if (!fs::is_directory(options.input, error))
-        throw std::invalid_argument(options.input.string() + " is not a file or directory");
-    std::vector<fs::path> files;
-    auto add = [&](const auto& entry) {
-        if (entry.is_regular_file(error) && nemo_speech::audio::is_wav_path(entry.path().string()))
-            files.push_back(fs::absolute(entry.path()));
-    };
-    if (options.recursive) {
-        for (const auto& entry : fs::recursive_directory_iterator(options.input)) add(entry);
-    } else {
-        for (const auto& entry : fs::directory_iterator(options.input)) add(entry);
-    }
-    std::sort(files.begin(), files.end());
-    if (files.empty())
-        throw std::invalid_argument(options.input.string() + " contains no WAV files");
-    return files;
-}
-
-Transcript
-transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::path& path) {
-    const auto audio = nemo_speech::audio::load_wav_file(path.string());
+asr::AsrRequestOptions
+make_request_options(const Options& options) {
     asr::AsrRequestOptions request = options.request;
     request.language_code = options.language;
     request.enable_word_time_offsets = options.word_times || options.format == OutputFormat::Json ||
@@ -255,33 +244,43 @@ transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::pa
     request.enable_speaker_diarization = options.diarize;
     if (!options.speech_contexts.empty())
         request.speech_contexts.push_back({options.speech_contexts, options.speech_context_boost});
+    return request;
+}
+
+void
+append_result(Transcript& transcript, const asr::Result& result) {
+    if (result.alternatives.empty())
+        return;
+    const auto& alternative = result.alternatives.front();
+    if (!alternative.transcript.empty()) {
+        if (!transcript.text.empty() && alternative.transcript.front() != '.' &&
+            alternative.transcript.front() != ',' && alternative.transcript.front() != '!' &&
+            alternative.transcript.front() != '?')
+            transcript.text += ' ';
+        transcript.text += alternative.transcript;
+    }
+    transcript.confidence = alternative.confidence;
+    transcript.audio_seconds = std::max(transcript.audio_seconds, result.audio_processed);
+    for (const auto& language : alternative.language_codes)
+        if (std::find(transcript.languages.begin(), transcript.languages.end(), language) ==
+            transcript.languages.end())
+            transcript.languages.push_back(language);
+    for (const auto& word : alternative.words)
+        transcript.words.push_back(
+            {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag});
+}
+
+Transcript
+transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::path& path) {
+    const auto audio = nemo_speech::audio::load_wav_file(path.string());
+    const asr::AsrRequestOptions request = make_request_options(options);
 
     Transcript transcript;
-    auto append = [&](const asr::Result& result) {
-        if (result.alternatives.empty())
-            return;
-        const auto& alternative = result.alternatives.front();
-        if (!alternative.transcript.empty()) {
-            if (!transcript.text.empty() && alternative.transcript.front() != '.' &&
-                alternative.transcript.front() != ',' && alternative.transcript.front() != '!' &&
-                alternative.transcript.front() != '?')
-                transcript.text += ' ';
-            transcript.text += alternative.transcript;
-        }
-        transcript.confidence = alternative.confidence;
-        transcript.audio_seconds = std::max(transcript.audio_seconds, result.audio_processed);
-        for (const auto& language : alternative.language_codes)
-            if (std::find(transcript.languages.begin(), transcript.languages.end(), language) ==
-                transcript.languages.end())
-                transcript.languages.push_back(language);
-        for (const auto& word : alternative.words)
-            transcript.words.push_back(
-                {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag});
-    };
     if (!options.stream) {
-        append(recognizer.recognize(
-            audio.samples.data(), audio.samples.size(), request, options.language,
-            audio.sample_rate));
+        append_result(
+            transcript, recognizer.recognize(
+                            audio.samples.data(), audio.samples.size(), request, options.language,
+                            audio.sample_rate));
     } else {
         auto stream = recognizer.streaming_recognize(request, options.language);
         const size_t chunk = std::max<size_t>(1, audio.sample_rate * 160 / 1000);
@@ -290,68 +289,110 @@ transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::pa
             stream->push(audio.samples.data() + offset, count, audio.sample_rate);
             while (auto result = stream->next()) {
                 if (result->is_final)
-                    append(*result);
+                    append_result(transcript, *result);
                 else
                     break;
             }
         }
-        append(stream->finish());
+        append_result(transcript, stream->finish());
     }
     if (transcript.text.empty() && transcript.words.empty())
         transcript.audio_seconds = audio.samples.size() / static_cast<float>(audio.sample_rate);
     return transcript;
 }
 
-bool
-attaches_to_previous(const std::string& word) {
-    static const std::string punctuation = ".,!?;:%)]}\xE2\x80\x9D\xE2\x80\x99";
-    return !word.empty() && punctuation.find(word) != std::string::npos;
+#if defined(NEMO_SPEECH_CLI_LIVE)
+volatile std::sig_atomic_t live_running = 1;
+
+void
+stop_live_capture(int /*signal*/) {
+    live_running = 0;
 }
 
-std::string
-join_words(const std::vector<Word>& words, size_t begin, size_t end) {
-    std::string output;
-    for (size_t i = begin; i < end; ++i) {
-        if (!output.empty() && !attaches_to_previous(words[i].text))
-            output += ' ';
-        output += words[i].text;
-    }
-    return output;
-}
+class SignalHandlerGuard {
+   public:
+    SignalHandlerGuard() : previous_(std::signal(SIGINT, stop_live_capture)) {}
+    ~SignalHandlerGuard() { std::signal(SIGINT, previous_); }
 
-struct Cue {
-    int start_ms;
-    int end_ms;
-    std::string text;
+    SignalHandlerGuard(const SignalHandlerGuard&) = delete;
+    SignalHandlerGuard& operator=(const SignalHandlerGuard&) = delete;
+
+   private:
+    using Handler = void (*)(int);
+    Handler previous_;
 };
 
-std::vector<Cue>
-make_cues(const Transcript& transcript) {
-    std::vector<Cue> cues;
-    if (transcript.words.empty()) {
-        if (!transcript.text.empty())
-            cues.push_back(
-                {0, std::max(1, static_cast<int>(transcript.audio_seconds * 1000)),
-                 transcript.text});
-        return cues;
-    }
-    size_t begin = 0;
-    for (size_t i = 1; i <= transcript.words.size(); ++i) {
-        const bool end = i == transcript.words.size();
-        const int duration =
-            end ? 0 : transcript.words[i].end_ms - transcript.words[begin].start_ms;
-        const int pause = end ? 0 : transcript.words[i].start_ms - transcript.words[i - 1].end_ms;
-        const std::string candidate =
-            end ? std::string() : join_words(transcript.words, begin, i + 1);
-        if (end || duration > 5000 || pause > 800 || candidate.size() > 84) {
-            cues.push_back(
-                {transcript.words[begin].start_ms, transcript.words[i - 1].end_ms,
-                 join_words(transcript.words, begin, i)});
-            begin = i;
+Transcript
+transcribe_live(asr::Recognizer& recognizer, const Options& options) {
+    auto stream = recognizer.streaming_recognize(make_request_options(options), options.language);
+    nemo_speech::cli::MicrophoneCapture microphone;
+    microphone.start();
+
+    if (!cli_quiet() && !cli_json())
+        std::fprintf(
+            stderr, "[live] listening on \"%s\" at %d Hz; press Ctrl-C to stop\n",
+            microphone.device_name().c_str(), microphone.sample_rate());
+
+    live_running = 1;
+    SignalHandlerGuard signal_guard;
+    Transcript transcript;
+    std::string last_interim;
+    size_t captured_samples = 0;
+
+    auto drain_results = [&] {
+        while (auto result = stream->next()) {
+            if (result->is_final) {
+                append_result(transcript, *result);
+                last_interim.clear();
+                if (!cli_quiet() && !cli_json() && !result->alternatives.empty() &&
+                    !result->alternatives.front().transcript.empty())
+                    std::fprintf(
+                        stderr, "[live final @ %.2fs] %s\n", result->audio_processed,
+                        result->alternatives.front().transcript.c_str());
+                continue;
+            }
+            if (!result->alternatives.empty()) {
+                const std::string& text = result->alternatives.front().transcript;
+                if (!text.empty() && text != last_interim) {
+                    if (!cli_quiet() && !cli_json())
+                        std::fprintf(
+                            stderr, "[live partial @ %.2fs] %s\n", result->audio_processed,
+                            text.c_str());
+                    last_interim = text;
+                }
+            }
+            // By contract, an interim is the last result until more audio is pushed.
+            break;
         }
+    };
+
+    while (live_running) {
+        auto samples = microphone.drain();
+        if (samples.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+        captured_samples += samples.size();
+        stream->push(samples.data(), samples.size(), microphone.sample_rate());
+        drain_results();
     }
-    return cues;
+
+    microphone.stop();
+    auto tail = microphone.drain();
+    if (!tail.empty()) {
+        captured_samples += tail.size();
+        stream->push(tail.data(), tail.size(), microphone.sample_rate());
+        drain_results();
+    }
+    append_result(transcript, stream->finish());
+    transcript.audio_seconds = std::max(
+        transcript.audio_seconds, captured_samples / static_cast<float>(microphone.sample_rate()));
+    if (!cli_quiet() && !cli_json())
+        std::fprintf(
+            stderr, "[live] stopped after %.2fs of captured audio\n", transcript.audio_seconds);
+    return transcript;
 }
+#endif
 
 std::string
 timestamp(int milliseconds, bool vtt) {
@@ -368,6 +409,11 @@ timestamp(int milliseconds, bool vtt) {
     return output.str();
 }
 
+float
+json_number(float value) {
+    return std::isfinite(value) ? value : 0.0f;
+}
+
 std::string
 render(const Transcript& t, OutputFormat format, const fs::path& source) {
     std::ostringstream output;
@@ -376,8 +422,8 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
     } else if (format == OutputFormat::Json) {
         output << "{\n  \"file\": \"" << json_escape(source.string()) << "\",\n"
                << "  \"text\": \"" << json_escape(t.text) << "\",\n"
-               << "  \"confidence\": " << t.confidence << ",\n"
-               << "  \"duration\": " << t.audio_seconds << ",\n  \"languages\": [";
+               << "  \"confidence\": " << json_number(t.confidence) << ",\n"
+               << "  \"duration\": " << json_number(t.audio_seconds) << ",\n  \"languages\": [";
         for (size_t i = 0; i < t.languages.size(); ++i)
             output << (i ? ", " : "") << '"' << json_escape(t.languages[i]) << '"';
         output << "],";
@@ -389,7 +435,7 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
             const auto& w = t.words[i];
             output << (i ? "," : "") << "\n    {\"word\": \"" << json_escape(w.text)
                    << "\", \"start\": " << w.start_ms / 1000.0 << ", \"end\": " << w.end_ms / 1000.0
-                   << ", \"confidence\": " << w.confidence;
+                   << ", \"confidence\": " << json_number(w.confidence);
             if (w.speaker > 0)
                 output << ", \"speaker\": " << w.speaker;
             output << '}';
@@ -399,7 +445,8 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
         const bool vtt = format == OutputFormat::Vtt;
         if (vtt)
             output << "WEBVTT\n\n";
-        const auto cues = make_cues(t);
+        const auto cues = nemo_speech::subtitle::make_cues(
+            t.words, t.text, static_cast<int>(t.audio_seconds * 1000));
         for (size_t i = 0; i < cues.size(); ++i) {
             if (!vtt)
                 output << i + 1 << '\n';
@@ -431,12 +478,22 @@ extension(OutputFormat format) {
 void
 print_transcribe_help(const char* program) {
     std::printf(
-        "Usage: %s transcribe INPUT [--model MODEL] [options]\n\n"
-        "Transcribe one WAV file or every WAV file in a directory. Directory\n"
+        "Usage: %s transcribe INPUT [--model MODEL] [options]\n"
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        "       %s transcribe --live [--model MODEL] [options]\n\n"
+        "Transcribe a WAV file, directory, or the default microphone. Directory\n"
+#else
+        "\n"
+        "Transcribe a WAV file or directory. Directory\n"
+#endif
         "work shares one recognizer; --concurrency feeds multiple utterances to\n"
         "that recognizer so compatible inference is batched on the GPU.\n\n"
         "Options:\n"
-        "  -m, --model MODEL         Local ASR GGUF path\n"
+        "  -m, --model MODEL         ASR GGUF path or indexed HF repo\n"
+        "                            (default: nvidia/nemotron-3.5-asr-streaming-0.6b)\n"
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        "  --live                    Transcribe the default microphone until Ctrl-C\n"
+#endif
         "  -l, --language CODE       Language code or prompt\n"
         "  --device, --backend DEVICE\n"
         "                            auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
@@ -448,9 +505,11 @@ print_transcribe_help(const char* program) {
         "  -o, --output PATH         Output path for one input\n"
         "  --output-dir DIR          Preserve directory layout under DIR\n"
         "  -r, --recursive           Recurse into input directories\n"
-        "  --word-times              Include word timestamps in diagnostics\n"
+        "  --word-times              Compatibility flag; JSON/subtitles imply it\n"
         "  --vad-model PATH          Optional Silero VAD GGUF\n"
-        "  --diar-model PATH         Tag words with a Sortformer diarizer\n"
+        "  --vad-masking             Mask silence features (requires --vad-model)\n"
+        "  --diarize                 Tag words with the default Sortformer diarizer\n"
+        "  --diar-model MODEL        Tag words with a selected Sortformer diarizer\n"
         "  --itn-model-dir DIR       Inverse text normalization grammars\n"
         "  --pnc-model PATH          Punctuation/capitalization GGUF\n"
 #if defined(NEMO_SPEECH_CLI_NMT)
@@ -459,8 +518,10 @@ print_transcribe_help(const char* program) {
 #endif
         "  --no-punctuation          Disable automatic punctuation\n"
         "  --verbatim                Disable ordinary ITN\n"
-        "  --stream                  Exercise cache-aware streaming inference\n"
-        "  --max-alternatives N      Request N-best hypotheses\n"
+        "  --stream                  Stream chunks from a recorded WAV input\n"
+        "  --endpointing             Finalize streaming utterances on silence\n"
+        "  --stop-history-eou-ms N   Endpoint silence threshold (default 800)\n"
+        "  --max-alternatives N      Request N-best; current decoders return one\n"
         "  --speech-context PHRASE   Add a decoder boost phrase (repeatable)\n"
         "  --speech-context-boost N  Boost applied to speech context phrases\n"
         "  --profanity-filter        Mask words from the configured list\n"
@@ -472,7 +533,12 @@ print_transcribe_help(const char* program) {
         "  --no-warmup               Skip model warmup\n"
         "  --no-batching             Disable dynamic batching\n"
         "  --force                   Replace existing output files\n",
-        program);
+        program
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        ,
+        program
+#endif
+    );
 }
 
 int
@@ -483,24 +549,31 @@ command_transcribe(int argc, char** argv) {
             return 0;
         }
         Options options = parse_options(argc, argv);
-        const auto inputs = collect_inputs(options);
-        const bool directory = fs::is_directory(options.input);
+        std::vector<fs::path> inputs;
+        bool directory = false;
+        if (!options.live) {
+            inputs = collect_wav_inputs(options.input, options.recursive);
+            directory = fs::is_directory(options.input);
+        }
         if (directory && !options.output.empty())
             throw std::invalid_argument("--output is only valid for one input; use --output-dir");
         if (!directory && !options.output_dir.empty())
             throw std::invalid_argument("--output-dir is only valid for a directory input");
         const int configured_gpu = options.device_set ? options.gpu : options.engine.backend.gpu;
-        const int concurrency = std::min<int>(
-            options.concurrency > 0 ? options.concurrency
-                                    : (directory && configured_gpu >= 0 ? 4 : 1),
-            inputs.size());
+        const int concurrency =
+            options.live ? 1
+                         : std::min<int>(
+                               options.concurrency > 0 ? options.concurrency
+                                                       : (directory && configured_gpu >= 0 ? 4 : 1),
+                               inputs.size());
 
         asr::RecognizerConfig config = options.engine;
+        config.log_status = !cli_quiet() && !cli_json();
         if (options.device_set)
             config.backend.gpu = options.gpu;
         config.model.path =
-            require_model_file(
-                options.model.empty() ? config.model.path : options.model, "ASR model")
+            resolve_model_file(
+                options.model.empty() ? config.model.path : options.model, "asr", "ASR model")
                 .string();
         if (!options.vad_model.empty() || !config.vad.model_path.empty())
             config.vad.model_path =
@@ -508,11 +581,11 @@ command_transcribe(int argc, char** argv) {
                     options.vad_model.empty() ? config.vad.model_path : options.vad_model,
                     "VAD model")
                     .string();
-        if (!options.diar_model.empty() || !config.diar.model_path.empty())
+        if (options.diarize || !options.diar_model.empty() || !config.diar.model_path.empty())
             config.diar.model_path =
-                require_model_file(
+                resolve_model_file(
                     options.diar_model.empty() ? config.diar.model_path : options.diar_model,
-                    "diarization model")
+                    "diarization", "diarization model")
                     .string();
         if (!options.itn_model_dir.empty() || !config.postproc.itn_model_dir.empty())
             config.postproc.itn_model_dir =
@@ -533,10 +606,16 @@ command_transcribe(int argc, char** argv) {
             std::max(config.batching.max_queue_depth, concurrency * 4);
         config.batching.state_arena_slots =
             std::max(config.batching.state_arena_slots, concurrency);
-        if (cli_verbose())
-            std::fprintf(
-                stderr, "transcribe: model=%s inputs=%zu concurrency=%d device=%d\n",
-                config.model.path.c_str(), inputs.size(), concurrency, config.backend.gpu);
+        if (cli_verbose()) {
+            if (options.live)
+                std::fprintf(
+                    stderr, "transcribe: model=%s input=microphone device=%d\n",
+                    config.model.path.c_str(), config.backend.gpu);
+            else
+                std::fprintf(
+                    stderr, "transcribe: model=%s inputs=%zu concurrency=%d device=%d\n",
+                    config.model.path.c_str(), inputs.size(), concurrency, config.backend.gpu);
+        }
         nemo_speech::EngineRegistryConfig registry_config;
         registry_config.asr = true;
 #if defined(NEMO_SPEECH_CLI_NMT)
@@ -562,6 +641,31 @@ command_transcribe(int argc, char** argv) {
 #endif
         if (options.warmup)
             engines.warmup();
+
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        if (options.live) {
+            Transcript transcript = transcribe_live(*recognizer, options);
+#if defined(NEMO_SPEECH_CLI_NMT)
+            if (speech_translator && !transcript.text.empty()) {
+                const auto translated = speech_translator->translate_text(
+                    transcript.text, options.language, options.translate_to, transcript.languages);
+                transcript.source_text = translated.transcript;
+                transcript.text = translated.text;
+                transcript.target_language = translated.language_code;
+            }
+#endif
+            const std::string contents =
+                render(transcript, options.format, fs::path("<microphone>"));
+            if (options.output.empty())
+                std::fwrite(contents.data(), 1, contents.size(), stdout);
+            else {
+                write_text_file(options.output, contents, options.force);
+                if (!cli_quiet())
+                    std::fprintf(stderr, "microphone -> %s\n", options.output.string().c_str());
+            }
+            return 0;
+        }
+#endif
 
         std::vector<Transcript> transcripts(inputs.size());
         std::vector<std::string> errors(inputs.size());

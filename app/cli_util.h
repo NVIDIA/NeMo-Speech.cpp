@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 inline constexpr int kCliExitSuccess = 0;
 inline constexpr int kCliExitRuntime = 1;
@@ -28,6 +29,8 @@ int default_gpu_index();
 int parse_device(const std::string& value, const std::string& option = "--device");
 std::string json_escape(const std::string& value);
 std::string read_text_file(const std::filesystem::path& path);
+std::vector<std::filesystem::path> collect_wav_inputs(
+    const std::filesystem::path& input, bool recursive);
 std::filesystem::path relative_output_path(
     const std::filesystem::path& input_root, const std::filesystem::path& input_file);
 void write_text_file(const std::filesystem::path& path, const std::string& contents, bool force);

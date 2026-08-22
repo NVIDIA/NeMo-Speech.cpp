@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Stateful mono float32 sample-rate conversion shared by speech pipelines. The
-// windowed-sinc low-pass filter prevents high-frequency aliases when downsampling,
-// while retained filter history makes output independent of streaming chunk sizes.
+// precomputed windowed-sinc filter prevents aliases while retained history makes
+// output independent of streaming chunk sizes.
 #pragma once
 
 #include <cstddef>
@@ -29,16 +29,24 @@ class AudioResampler {
 
    private:
     void emit_available(bool final, std::vector<float>* output);
-    float filtered_sample(long double source_position) const;
+    float filtered_sample(uint64_t center, size_t phase) const;
     float input_sample(int64_t index) const;
     void compact_history();
+    void advance_source_position();
+    size_t phase_index() const;
 
     int input_rate_;
     int output_rate_;
+    uint64_t rate_gcd_ = 1;
+    size_t phase_count_ = 1;
+    bool exact_phase_table_ = true;
+    std::vector<float> coefficients_;
     std::vector<float> input_;
     uint64_t input_start_ = 0;
     uint64_t total_input_ = 0;
     uint64_t next_output_ = 0;
+    uint64_t source_index_ = 0;
+    uint64_t source_remainder_ = 0;
     bool finished_ = false;
 };
 
@@ -58,6 +66,8 @@ class Pcm16Resampler {
     void append_pcm(const std::vector<float>& samples, std::vector<uint8_t>* output);
 
     AudioResampler resampler_;
+    std::vector<float> decoded_;
+    std::vector<float> converted_;
     uint64_t output_samples_ = 0;
 };
 

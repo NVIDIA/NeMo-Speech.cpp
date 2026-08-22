@@ -1,20 +1,20 @@
 # nemo-speech ASR config. Load with: nemo-speech serve --config this.yaml
 #
-# The nested maps mirror the dotted keys exactly: `asr.vad.masker.onset` below
-# is the same setting as `--asr.vad.masker.onset` on the command line. The tree
-# is generated from the config structs (RecognizerConfig::Register), so it stays
-# in sync automatically; `nemo-speech serve --help` lists common options.
+# Nested maps mirror dotted command-line keys: `asr.vad.masker.onset` is the
+# same setting as `--asr.vad.masker.onset`. See docs/asr/configuration.md for
+# the complete key reference.
 #
 # Precedence is: this file < NEMO_SPEECH_* env vars < CLI flags.
 # Every key is optional - omitted keys keep their built-in defaults. An UNKNOWN
 # key is a hard error (so typos are caught, not silently ignored). The values
-# shown here are the defaults unless noted; paths are placeholders to fill in.
+# shown here are the defaults unless noted; the model reference and commented
+# paths are examples.
 asr:
   backend:
     gpu: 0                       # GPU device index, -1 = CPU
 
   model:
-    path: /models/nemotron-speech-streaming-en-0.6b.q8_0.gguf
+    path: nemotron-3.5            # indexed name, HF repo ID, or local GGUF
     # name:                      # display name; default is derived from the model
 
   streaming:
@@ -22,6 +22,13 @@ asr:
     ctc_left_padding: 1.92       # CTC left context (seconds)
     ctc_right_padding: 1.92      # CTC right context (seconds)
     rnnt_right_context: 1        # cache-aware R: 1 = low-latency preset, -1 = model max
+
+  batching:
+    enabled: true                # nemo-speech serve default; disable to minimize single-request latency
+    max_batch_size: 1024
+    max_queue_delay_us: 5000
+    state_arena_slots: 16
+    offline_bucket_ms: 0         # 0 = do not silence-pad offline inputs into shared buckets
 
   decoder:
     kind: greedy                 # greedy | flashlight
@@ -36,9 +43,9 @@ asr:
     # word_insertion_score: 1.0
 
   vad:
-    model_path: /models/silero-v6.2.0.gguf      # empty = no VAD loaded
+    # model_path: /models/silero-v6.2.0.gguf    # empty = no VAD loaded
     masker:
-      mask_enable: false         # zero silent mel frames before the encoder
+      mask_enable: false         # mask silence features before the encoder
       onset: 0.5                 # prob > onset  -> enter speech
       offset: 0.3                # prob < offset -> leave speech
       # pad_onset_ms: 200
@@ -46,9 +53,13 @@ asr:
       # min_duration_off_ms: 500
 
   endpointing:
-    enable: true                 # mid-stream end-of-utterance
-    vad_based: true              # ride the VAD timeline (needs vad.model_path); else token-silence
+    enable: false                # mid-stream end-of-utterance
+    vad_based: false             # ride the VAD timeline (needs vad.model_path); else token-silence
     stop_history_eou_ms: 800     # trailing silence before EOU (ms)
+
+  diar:
+    # model_path: sortformer     # enables word-level speaker tags when requested
+    preset: streaming            # streaming | offline (larger chunks and caches)
 
   postproc:
     # pnc_model_path: /models/pnc.gguf           # punctuation + capitalization

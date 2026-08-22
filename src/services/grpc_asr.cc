@@ -4,6 +4,7 @@
 #include "grpc_asr.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -11,11 +12,48 @@
 
 #include "audio_decoder.h"
 #include "audio_resampler.h"
+#include "model.h"
 #include "types.h"  // AsrRequestOptions, Result
 
 namespace nemo_speech {
 
 namespace {
+
+void
+dump_batch_metrics(const asr::Recognizer& recognizer, const char* label) {
+    if (std::getenv("NEMO_SPEECH_BATCH_METRICS") == nullptr)
+        return;
+    const auto print = [label](const char* stage, const asr::BatchMetrics& m) {
+        const double mean = m.batches > 0 ? static_cast<double>(m.items) / m.batches : 0.0;
+        const double requested =
+            m.batches > 0 ? static_cast<double>(m.requested_items) / m.batches : 0.0;
+        const double wait_us =
+            m.batches > 0 ? static_cast<double>(m.queue_wait_ns) / m.batches / 1000.0 : 0.0;
+        const double ready = m.batches > 0 ? static_cast<double>(m.ready_items) / m.batches : 0.0;
+        const double compatible =
+            m.batches > 0 ? static_cast<double>(m.compatible_items) / m.batches : 0.0;
+        const double execution_us =
+            m.batches > 0 ? static_cast<double>(m.execution_ns) / m.batches / 1000.0 : 0.0;
+        std::cerr << "[grpc batch metrics] " << label << " stage=" << stage
+                  << " batches=" << m.batches << " items=" << m.items << " mean=" << mean
+                  << " singleton=" << m.singleton_batches << " max=" << m.max_observed_batch
+                  << " target_mean=" << requested << " target_hit=" << m.target_reached_batches
+                  << " full=" << m.capacity_batches << " ready_set=" << m.ready_set_batches
+                  << " deadline=" << m.deadline_batches << " ready_mean=" << ready
+                  << " compatible_mean=" << compatible << " wait_us=" << wait_us
+                  << " execution_us=" << execution_us << "\n";
+    };
+    const auto* model = recognizer.model();
+    print("frontend", model->fe().batch_metrics());
+    if (model->head_kind() == asr::HeadKind::Ctc) {
+        print("encoder", static_cast<const asr::CtcModel*>(model)->batch_metrics());
+    } else {
+        const auto* rnnt = static_cast<const asr::RnntModel*>(model);
+        print("encoder", rnnt->encoder_batch_metrics());
+        print("predictor", rnnt->predictor_batch_metrics());
+        print("joint", rnnt->joint_batch_metrics());
+    }
+}
 
 // Validate a RecognitionConfig against engine capabilities. Returns an empty
 // Status on success, or an INVALID_ARGUMENT with a helpful message.
@@ -141,6 +179,191 @@ fill_proto_alternative(
     }
 }
 
+template <class Fn>
+grpc::Status
+guard_streaming_call(const char* operation, Fn&& fn) {
+    try {
+        return fn();
+    }
+    catch (const std::invalid_argument& e) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, e.what());
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[grpc_asr] StreamingRecognize " << operation << " EXCEPTION: " << e.what()
+                  << "\n";
+        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+    }
+    catch (...) {
+        std::cerr << "[grpc_asr] StreamingRecognize " << operation
+                  << " EXCEPTION: unknown (non-std)\n";
+        return grpc::Status(grpc::StatusCode::INTERNAL, "unknown internal error");
+    }
+}
+
+// Own one RPC's decoder, recognition stream, response state, and temporary
+// buffers. Model work completes before the outer service loop performs network
+// writes, and cancellation releases state without flushing an unusable tail.
+class StreamingAsrSession {
+   public:
+    explicit StreamingAsrSession(asr::Recognizer* recognizer) : recognizer_(recognizer) {}
+
+    grpc::Status start(const nr_asr::StreamingRecognizeRequest& first) {
+        return guard_streaming_call("start", [&]() -> grpc::Status {
+            if (started_) {
+                return grpc::Status(
+                    grpc::StatusCode::INVALID_ARGUMENT, "streaming_config was already received");
+            }
+            if (!first.has_streaming_config()) {
+                return grpc::Status(
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "first message must contain streaming_config");
+            }
+            const auto& config = first.streaming_config();
+            const auto& recognition = config.config();
+            auto status = validate_config(recognition);
+            if (!status.ok())
+                return status;
+
+            interim_results_ = config.interim_results();
+            options_ = extract_options(recognition);
+            request_id_ = first.has_id() ? first.id().value() : std::string();
+            decoder_ = std::make_unique<audio::Pcm16StreamDecoder>(recognition.sample_rate_hertz());
+            stream_ = recognizer_->streaming_recognize(
+                options_, recognition.language_code(), /*coordinate_ingress=*/true);
+            started_ = true;
+            return grpc::Status::OK;
+        });
+    }
+
+    grpc::Status process(
+        const nr_asr::StreamingRecognizeRequest& request,
+        std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
+        return guard_streaming_call("process", [&]() -> grpc::Status {
+            responses.clear();
+            if (!started_ || !stream_) {
+                return grpc::Status(
+                    grpc::StatusCode::FAILED_PRECONDITION, "streaming_config was not received");
+            }
+
+            const auto& runtime = request.runtime_config();
+            const auto force_it = runtime.find("force_eou");
+            const bool forced = force_it != runtime.end() && force_it->second == "true";
+            if (forced)
+                stream_->force_endpoint();
+            if (!request.has_audio_content() || request.audio_content().empty()) {
+                if (forced)
+                    (void)drain_finals(responses);
+                return grpc::Status::OK;
+            }
+
+            audio_chunk_.clear();
+            decoder_->process(request.audio_content(), &audio_chunk_);
+            if (audio_chunk_.empty())
+                return grpc::Status::OK;
+            const int sample_rate =
+                decoder_->sample_rate() > 0 ? decoder_->sample_rate() : recognizer_->sample_rate();
+            stream_->push(audio_chunk_.data(), audio_chunk_.size(), sample_rate);
+            append_partial(drain_finals(responses), responses);
+            return grpc::Status::OK;
+        });
+    }
+
+    grpc::Status finish(std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
+        return guard_streaming_call("finish", [&]() -> grpc::Status {
+            responses.clear();
+            if (!started_ || !stream_) {
+                return grpc::Status(
+                    grpc::StatusCode::FAILED_PRECONDITION, "streaming_config was not received");
+            }
+
+            audio_chunk_.clear();
+            decoder_->finish(&audio_chunk_);
+            if (!audio_chunk_.empty()) {
+                const int sample_rate = decoder_->sample_rate() > 0 ? decoder_->sample_rate()
+                                                                    : recognizer_->sample_rate();
+                stream_->push(audio_chunk_.data(), audio_chunk_.size(), sample_rate);
+                (void)drain_finals(responses);
+            }
+            const asr::Result result = stream_->finish();
+            stream_.reset();
+            if (!result.alternatives.front().transcript.empty() || !any_final_)
+                append_final(result, responses);
+            return grpc::Status::OK;
+        });
+    }
+
+    void cancel() { stream_.reset(); }
+
+   private:
+    void add_request_id(nr_asr::StreamingRecognizeResponse& response) const {
+        if (!request_id_.empty())
+            response.mutable_id()->set_value(request_id_);
+    }
+
+    void append_partial(
+        const std::optional<asr::Result>& result,
+        std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
+        nr_asr::StreamingRecognizeResponse response;
+        if (result && interim_results_) {
+            const std::string& transcript = result->alternatives.front().transcript;
+            if (!transcript.empty() && transcript != last_emitted_transcript_) {
+                auto* proto_result = response.add_results();
+                proto_result->set_is_final(false);
+                proto_result->set_stability(0.0f);
+                proto_result->set_audio_processed(result->audio_processed);
+                proto_result->set_channel_tag(result->channel_tag);
+                auto* alternative = proto_result->add_alternatives();
+                alternative->set_transcript(join_continuation(any_final_, transcript));
+                alternative->set_confidence(0.0f);
+                last_emitted_transcript_ = transcript;
+            }
+        }
+        add_request_id(response);
+        responses.push_back(std::move(response));
+    }
+
+    void append_final(
+        const asr::Result& result, std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
+        nr_asr::StreamingRecognizeResponse response;
+        auto* proto_result = response.add_results();
+        proto_result->set_is_final(true);
+        proto_result->set_stability(result.stability);
+        proto_result->set_audio_processed(result.audio_processed);
+        proto_result->set_channel_tag(result.channel_tag);
+        for (const auto& alternative : result.alternatives) {
+            fill_proto_alternative(
+                proto_result->add_alternatives(), alternative, options_.needs_word_timings(),
+                any_final_);
+        }
+        add_request_id(response);
+        responses.push_back(std::move(response));
+        last_emitted_transcript_.clear();
+        any_final_ = true;
+    }
+
+    std::optional<asr::Result> drain_finals(
+        std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
+        auto result = stream_->next();
+        while (result && result->is_final) {
+            if (!result->alternatives.front().transcript.empty())
+                append_final(*result, responses);
+            result = stream_->next();
+        }
+        return result;
+    }
+
+    asr::Recognizer* recognizer_ = nullptr;
+    std::unique_ptr<asr::RecognitionStream> stream_;
+    std::unique_ptr<audio::Pcm16StreamDecoder> decoder_;
+    asr::AsrRequestOptions options_;
+    std::string request_id_;
+    std::string last_emitted_transcript_;
+    std::vector<float> audio_chunk_;
+    bool started_ = false;
+    bool interim_results_ = false;
+    bool any_final_ = false;
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -152,7 +375,9 @@ GrpcAsrService::GrpcAsrService(std::shared_ptr<asr::Recognizer> recognizer)
         throw std::invalid_argument("GrpcAsrService requires an ASR recognizer");
 }
 
-GrpcAsrService::~GrpcAsrService() = default;
+GrpcAsrService::~GrpcAsrService() {
+    dump_batch_metrics(*recognizer_, "shutdown");
+}
 
 grpc::Status
 GrpcAsrService::Recognize(
@@ -221,191 +446,46 @@ GrpcAsrService::StreamingRecognize(
     grpc::ServerContext* ctx,
     grpc::ServerReaderWriter<nr_asr::StreamingRecognizeResponse, nr_asr::StreamingRecognizeRequest>*
         stream) {
-    // ----- 1. Read first message; must be streaming_config. -----
-    nr_asr::StreamingRecognizeRequest first;
-    if (!stream->Read(&first)) {
+    nr_asr::StreamingRecognizeRequest request;
+    if (!stream->Read(&request)) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "no messages received");
     }
-    if (!first.has_streaming_config()) {
-        return grpc::Status(
-            grpc::StatusCode::INVALID_ARGUMENT, "first message must contain streaming_config");
-    }
-    const auto& scfg = first.streaming_config();
-    const auto& rcfg = scfg.config();
-    auto v = validate_config(rcfg);
-    if (!v.ok())
-        return v;
-    const bool interim_results = scfg.interim_results();
-    const asr::AsrRequestOptions opts = extract_options(rcfg);
-    // Echoed on every response when the client supplied one (riva contract).
-    const std::string request_id = first.has_id() ? first.id().value() : std::string();
 
-    // We emit exactly one StreamingRecognizeResponse per input audio chunk so
-    // `riva_streaming_asr_client --simulate_realtime` can match request/
-    // response 1:1 for per-chunk latency stats.
-    //
-    // During warm-up (before chunk_sec + right_pad_sec of audio is buffered)
-    // and on chunks that produce no new tokens, we send an EMPTY response
-    // (no `results` entries). The Riva clients gate printing on
-    // `response.results_size() > 0`, so empty responses are silent on the
-    // wire but still count for recv-side latency bookkeeping.
+    StreamingAsrSession session(recognizer_.get());
+    auto status = session.start(request);
+    if (!status.ok())
+        return status;
 
-    std::string last_emitted_transcript;
-    // True once a final has been emitted on this stream. Subsequent streaming
-    // results (interims + finals) get a leading space so the riva client's
-    // cumulative display joins utterance segments with a separator (matches
-    // riva; our detokenizer trims each segment's own leading space).
-    bool any_final = false;
-    // Flipped when the client vanishes (failed Write); stops decode work.
-    bool write_failed = false;
-    auto send = [&](nr_asr::StreamingRecognizeResponse& resp) {
-        // Once a write fails the client is gone: stop attempting writes so a
-        // trailing final left in drain_finals isn't re-emitted as an interim,
-        // and no further work writes to a dead stream.
-        if (write_failed)
-            return;
-        if (!request_id.empty())
-            resp.mutable_id()->set_value(request_id);
-        if (!stream->Write(resp))
-            write_failed = true;
-    };
-
-    try {
-        // ----- 2. Per-stream recognition (CTC: buffered, RNNT: cache-aware). -----
-        auto strm = recognizer_->streaming_recognize(opts, rcfg.language_code());
-
-        // Emit an interim (non-final) result for the trailing partial. Dedups on
-        // unchanged text and respects interim_results; always sends a response
-        // (empty if nothing to report) to keep the 1:1 chunk/response contract.
-        auto write_partial = [&](const std::optional<asr::Result>& r) {
-            nr_asr::StreamingRecognizeResponse resp;
-            if (r && interim_results) {
-                const std::string& t = r->alternatives.front().transcript;
-                if (!t.empty() && t != last_emitted_transcript) {
-                    auto* result = resp.add_results();
-                    result->set_is_final(false);
-                    result->set_stability(0.0f);
-                    result->set_audio_processed(r->audio_processed);
-                    result->set_channel_tag(r->channel_tag);
-                    auto* alt = result->add_alternatives();
-                    alt->set_transcript(join_continuation(any_final, t));
-                    alt->set_confidence(0.0f);  // WordInfo is final-only (riva)
-                    last_emitted_transcript = t;
-                }
-            }
-            send(resp);
-        };
-
-        // Send a FINAL result (mid-stream EOU or end-of-stream). The library
-        // already post-processed it; this just maps to proto. One stream can
-        // carry multiple finals (riva's multi-utterance behaviour).
-        auto emit_final = [&](const asr::Result& r) {
-            nr_asr::StreamingRecognizeResponse resp;
-            auto* result = resp.add_results();
-            result->set_is_final(true);
-            result->set_stability(r.stability);
-            result->set_audio_processed(r.audio_processed);
-            result->set_channel_tag(r.channel_tag);
-            // All alternatives (N-best); the library already capped at max_alternatives.
-            for (const auto& alt : r.alternatives) {
-                fill_proto_alternative(
-                    result->add_alternatives(), alt, opts.needs_word_timings(),
-                    /*continuation=*/any_final);
-            }
-            send(resp);
-            last_emitted_transcript.clear();  // next utterance's partials start fresh
-            any_final = true;
-        };
-
-        // Drive decoding for the audio buffered so far: emit each final, then
-        // return the trailing interim for the caller to emit. Empty-transcript
-        // finals (a VAD blip that decoded to nothing) are swallowed, matching the
-        // end-of-stream guard below. Stops the moment a write fails: each step
-        // holds the global GGML compute mutex, so decoding for a vanished client
-        // delays active streams.
-        auto drain_finals = [&]() -> std::optional<asr::Result> {
-            auto r = strm->next();
-            while (r && r->is_final && !write_failed) {
-                if (!r->alternatives.front().transcript.empty())
-                    emit_final(*r);
-                r = strm->next();
-            }
-            return r;
-        };
-
-        // ----- 3. Loop: read audio_content, advance runner, write partials. -----
-        nr_asr::StreamingRecognizeRequest in;
-        std::vector<float> audio_chunk;
-        audio::Pcm16StreamDecoder decoder(rcfg.sample_rate_hertz());
-        while (!write_failed && stream->Read(&in)) {
-            // riva force_eou: per-message runtime_config latches an immediate
-            // EOU, honored on the next runner poll.
-            const auto& rtc = in.runtime_config();
-            const auto rc_it = rtc.find("force_eou");
-            const bool forced = (rc_it != rtc.end() && rc_it->second == "true");
-            if (forced)
-                strm->force_endpoint();
-
-            // Messages with no (or empty) audio still honor a latched force_eou.
-            if (!in.has_audio_content() || in.audio_content().empty()) {
-                if (forced)
-                    drain_finals();  // fire the forced EOU without new audio
-                continue;
-            }
-            audio_chunk.clear();
-            decoder.process(in.audio_content(), &audio_chunk);
-            if (audio_chunk.empty())
-                continue;
-            const int input_sample_rate =
-                decoder.sample_rate() > 0 ? decoder.sample_rate() : recognizer_->sample_rate();
-            strm->push(audio_chunk.data(), audio_chunk.size(), input_sample_rate);
-
-            write_partial(drain_finals());
-        }
-
-        // Skip the tail decode for a vanished client: finalize() flushes the
-        // whole buffered window through the encoder (+ PnC) under the compute
-        // mutex.
-        if (write_failed || ctx->IsCancelled()) {
+    std::vector<nr_asr::StreamingRecognizeResponse> responses;
+    while (stream->Read(&request)) {
+        if (ctx->IsCancelled()) {
+            session.cancel();
             return grpc::Status::CANCELLED;
         }
-
-        // Complete raw-header detection and reject a trailing half sample.
-        audio_chunk.clear();
-        decoder.finish(&audio_chunk);
-        if (!audio_chunk.empty()) {
-            const int input_sample_rate =
-                decoder.sample_rate() > 0 ? decoder.sample_rate() : recognizer_->sample_rate();
-            strm->push(audio_chunk.data(), audio_chunk.size(), input_sample_rate);
-            drain_finals();
+        status = session.process(request, responses);
+        if (!status.ok())
+            return status;
+        for (auto& response : responses) {
+            if (!stream->Write(response)) {
+                session.cancel();
+                return grpc::Status::CANCELLED;
+            }
         }
+    }
 
-        // ----- 4. End of audio: finalize, then emit the end-of-stream final.
-        // Skip it only when endpointing already finalized every utterance and
-        // the tail is empty, to avoid a trailing empty final.
-        const asr::Result final_r = strm->finish();
-        if (!final_r.alternatives.front().transcript.empty() || !any_final) {
-            emit_final(final_r);
-        }
-        // A failed final write means the client is gone: report cancellation
-        // rather than OK so the RPC status reflects reality.
-        if (write_failed) {
+    if (ctx->IsCancelled()) {
+        session.cancel();
+        return grpc::Status::CANCELLED;
+    }
+    status = session.finish(responses);
+    if (!status.ok())
+        return status;
+    for (auto& response : responses) {
+        if (!stream->Write(response)) {
+            session.cancel();
             return grpc::Status::CANCELLED;
         }
     }
-    catch (const std::invalid_argument& e) {
-        // Client error (e.g. diarization requested without a loaded diarizer).
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, e.what());
-    }
-    catch (const std::exception& e) {
-        std::cerr << "[grpc_asr] EXCEPTION: " << e.what() << "\n";
-        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
-    }
-    catch (...) {
-        std::cerr << "[grpc_asr] EXCEPTION: unknown (non-std)\n";
-        return grpc::Status(grpc::StatusCode::INTERNAL, "unknown internal error");
-    }
-
     return grpc::Status::OK;
 }
 

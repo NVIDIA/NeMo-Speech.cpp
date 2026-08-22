@@ -38,7 +38,7 @@ clone() {  # clone <url> <dir> <commit>
 
 mkdir -p "$WORK"
 cd "$WORK"
-# Compatible OpenFST and Sparrowhawk revisions.
+# Pinned OpenFST and Sparrowhawk compatibility revisions.
 clone https://github.com/sarane22/openfst.git     openfst     fc23b4cf529429284b874a26f28b15c6cc94f404
 clone https://github.com/sarane22/sparrowhawk.git sparrowhawk 8b082acc507312077a096be8398584a13832c490
 

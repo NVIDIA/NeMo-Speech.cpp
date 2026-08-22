@@ -4,14 +4,14 @@
 #   nemo-speech serve --config config/nmt.example.yaml
 #
 # Requires a build with -DNEMO_SPEECH_BUILD_NMT=ON. The translation model is a
-# Riva-Translate GGUF; the language pair is selected per request via the
-# source_language / target_language fields of TranslateText.
+# Riva-Translate GGUF; the language pair is selected per request with the
+# source_language and target_language fields.
 nmt:
   enabled: true                 # true | false | auto
   backend:
     gpu: 0                      # GPU device index, -1 = CPU
   model:
-    path: /models/riva-translate-4b-instruct-v1.1.q8_0.gguf   # f16 also works
+    path: /models/riva-translate-4b-instruct-v2.q8_0.gguf   # f16 also works
     n_ctx: 1024                 # decode context length; sized for sentence-level
                                 # translation. Raise for document-length inputs
                                 # (KV cache grows ~0.13 MiB/token per context).
@@ -20,4 +20,3 @@ nmt:
   pool:
     contexts: 1                 # concurrent decode contexts; each adds one
                                 # n_ctx-sized KV cache. Raise for concurrency.
-  verbose: false                # enable verbose llama.cpp loader/runtime logs

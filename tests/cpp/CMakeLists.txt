@@ -12,8 +12,13 @@ add_executable(test_shared_utilities
     ${CMAKE_SOURCE_DIR}/app/cli_util.cpp)
 target_include_directories(test_shared_utilities PRIVATE ${CMAKE_SOURCE_DIR}/app)
 target_link_libraries(test_shared_utilities PRIVATE
-    nemo_speech_common nemo_speech_engine_registry)
+    nemo_speech_common nemo_speech_engine_registry ggml)
 add_test(NAME shared_utilities COMMAND test_shared_utilities)
+
+add_executable(test_subtitles
+    ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_subtitles.cpp)
+target_link_libraries(test_subtitles PRIVATE nemo_speech_common)
+add_test(NAME subtitles COMMAND test_subtitles)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND AND
@@ -28,10 +33,24 @@ endif()
 
 if(TARGET nemo_speech_cli)
     if(Python3_Interpreter_FOUND)
+        set(cli_contract_args
+            ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cli/cli_contract_test.py
+            $<TARGET_FILE:nemo_speech_cli>)
+        if(NEMO_SPEECH_BUILD_ASR AND NEMO_SPEECH_BUILD_MIC_CAPTURE)
+            list(APPEND cli_contract_args --expect-live)
+        endif()
         add_test(
             NAME cli_contract
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cli/cli_contract_test.py
-                    $<TARGET_FILE:nemo_speech_cli>)
+            COMMAND ${cli_contract_args})
+        find_program(NEMO_SPEECH_CURL_EXECUTABLE NAMES curl curl.exe)
+        if(NEMO_SPEECH_CURL_EXECUTABLE)
+            add_test(
+                NAME cli_model_store
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cli/model_store_test.py
+                        $<TARGET_FILE:nemo_speech_cli>)
+        else()
+            message(WARNING "curl not found; skipping cli_model_store")
+        endif()
         if(UNIX AND NOT APPLE)
             add_test(
                 NAME cli_install_linux

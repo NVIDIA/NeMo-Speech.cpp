@@ -12,6 +12,7 @@
 #include <ggml.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 namespace ggml_runtime {
@@ -78,6 +79,11 @@ RelPositionalEncoding::build_graph(
     Session* session, TensorBag input_tensors, TensorContainer* session_tensor_container) {
     auto input_tensor = input_tensors.get_tensor(0);
     int feature_len = input_tensor.tensor->ne[1];
+    if (feature_len > max_len)
+        throw std::runtime_error(
+            name + ": input has " + std::to_string(feature_len) +
+            " encoder frames, exceeding the offline positional-encoding limit of " +
+            std::to_string(max_len));
 
     auto pe_tensor = session->model_tensor_container->get_tensor_by_name(name + ".pe");
     // Build the per-call view of the PE weight in the per-run container, not
@@ -225,12 +231,11 @@ RelPositionMultiHeadAttention::build_graph_masked(
     ggml_tensor* attn = nullptr;
     bool attn_heads_merged = false;
 #ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
-    // The fused CUDA op handles a per-key mask only (broadcast over queries); a
-    // banded / per-(key,query) offline mask (ne[1] > 1) can't be expressed and
-    // falls back to the unfused graph below. This entire branch is compiled
-    // ONLY with a patched ggml: ggml_fused_relpos_attn is a patch-only symbol,
-    // so a stock-ggml build (NEMO_SPEECH_GGML_PATCHED=OFF) must not reference
-    // it — it takes the unfused path unconditionally.
+    // The fused CUDA op accepts both the streaming per-key mask and the
+    // offline per-(key,query) band mask. This entire branch is compiled ONLY
+    // with a patched ggml: ggml_fused_relpos_attn is a patch-only symbol, so a
+    // stock-ggml build (NEMO_SPEECH_GGML_PATCHED=OFF) must not reference it
+    // — it takes the unfused path unconditionally.
     //
     // Runtime gate too, not just compile-time: the op is CUDA-only (the CPU
     // backend reports it unsupported), so a CPU-only session (use_gpu=false ->
@@ -238,10 +243,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // ggml_backend_sched_split_graph aborts with no backend able to take the
     // node. use_gpu=true guarantees the GPU backend exists (BackendManager
     // throws otherwise), and the scheduler places the op there.
-    const bool mask_fusable =
-        attn_mask == nullptr ||
-        (attn_mask->ne[1] == 1 && attn_mask->ne[2] == 1 && attn_mask->ne[3] == 1);
-    const bool use_fused = session->params.use_gpu && mask_fusable;
+    const bool use_fused = session->params.use_gpu;
     if (use_fused) {
         // Canonical contiguous [d_k, len, n_head, batch] operands. Bias add and
         // rel-shift happen inside the kernel, so q_can is passed pre-bias.

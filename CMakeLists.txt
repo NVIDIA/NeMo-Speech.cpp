@@ -8,19 +8,25 @@ cmake_minimum_required(VERSION 3.26)
 # nemo_speech_tts_version) stay in sync without a hardcoded literal.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _nemo_speech_version_lines)
 foreach(_line ${_nemo_speech_version_lines})
-    if(_line MATCHES "^NEMO_SPEECH_VERSION:[ \t]*([0-9]+\\.[0-9]+\\.[0-9]+)")
-        set(NEMO_SPEECH_VERSION "${CMAKE_MATCH_1}")
+    if(_line MATCHES
+       "^NEMO_SPEECH_VERSION:[ \t]*([0-9]+\\.[0-9]+\\.[0-9]+)([-+][0-9A-Za-z.-]+)?[ \t]*$")
+        set(NEMO_SPEECH_VERSION "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+        set(NEMO_SPEECH_PROJECT_VERSION "${CMAKE_MATCH_1}")
     endif()
 endforeach()
-if(NOT NEMO_SPEECH_VERSION)
+if(NOT NEMO_SPEECH_VERSION OR NOT NEMO_SPEECH_PROJECT_VERSION)
     message(FATAL_ERROR "could not parse NEMO_SPEECH_VERSION from ${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 endif()
 
-project(nemo_speech VERSION ${NEMO_SPEECH_VERSION} LANGUAGES C CXX)
+project(nemo_speech VERSION ${NEMO_SPEECH_PROJECT_VERSION} LANGUAGES C CXX)
 add_compile_definitions(NEMO_SPEECH_VERSION_STR="${NEMO_SPEECH_VERSION}")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+if(WIN32)
+    # Install the Visual C++ runtime required by Windows packages.
+    include(InstallRequiredSystemLibraries)
+endif()
 set(NEMO_SPEECH_LICENSE_INSTALL_DIR
     "${CMAKE_INSTALL_DATADIR}/licenses/nemo-speech")
 install(FILES LICENSE NOTICE THIRD_PARTY_NOTICES.md
@@ -31,6 +37,14 @@ install(DIRECTORY docs/
     DESTINATION "${CMAKE_INSTALL_DATADIR}/doc/nemo-speech/docs")
 install(DIRECTORY config/
     DESTINATION "${CMAKE_INSTALL_DATADIR}/nemo-speech/config")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/share/nemo-speech")
+configure_file(
+    models/index.json
+    "${CMAKE_BINARY_DIR}/share/nemo-speech/model-index.json"
+    COPYONLY)
+install(FILES models/index.json
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/nemo-speech"
+    RENAME model-index.json)
 
 # Windows: stop <windows.h> - pulled in transitively by the CUDA headers when
 # GGML_CUDA=ON - from defining the min()/max() macros, which otherwise clobber
@@ -89,9 +103,11 @@ option(NEMO_SPEECH_BUILD_DIAR      "Build standalone and ASR-integrated diarizat
 option(NEMO_SPEECH_BUILD_TTS       "Build text-to-speech" ON)
 option(NEMO_SPEECH_BUILD_NMT       "Build text translation (links llama.cpp)" ${NEMO_SPEECH_WITH_NMT})
 option(NEMO_SPEECH_BUILD_CLI       "Build the unified nemo-speech CLI" ON)
+option(NEMO_SPEECH_BUILD_MIC_CAPTURE "Build microphone capture in the CLI and examples" ON)
 option(NEMO_SPEECH_BUILD_HTTP      "Build the HTTP server and local playground" OFF)
 option(NEMO_SPEECH_HTTP_TLS        "Enable TLS support in the HTTP server (requires OpenSSL)" OFF)
 option(NEMO_SPEECH_BUILD_GRPC      "Build Riva-compatible gRPC adapters" ${NEMO_SPEECH_WITH_GRPC})
+option(NEMO_SPEECH_GRPC_USE_CONFIG "Resolve protobuf and gRPC from CMake config packages" OFF)
 option(NEMO_SPEECH_BUILD_TESTS     "Build first-party test executables" OFF)
 option(BUILD_TESTING                 "Build first-party test executables" ${NEMO_SPEECH_BUILD_TESTS})
 option(NEMO_SPEECH_BUILD_EXAMPLES  "Build public in-process API examples" OFF)
@@ -115,6 +131,27 @@ endif()
 if(NEMO_SPEECH_BUILD_GRPC)
     set(NEMO_SPEECH_WITH_GRPC ON)
 endif()
+
+# Reject invalid component combinations early.
+if(WIN32 AND NEMO_SPEECH_WITH_NORM)
+    message(FATAL_ERROR
+        "NEMO_SPEECH_WITH_NORM is not supported on Windows; disable normalization")
+endif()
+if(NEMO_SPEECH_BUILD_GRPC AND
+   (NOT NEMO_SPEECH_BUILD_ASR OR NOT NEMO_SPEECH_BUILD_TTS))
+    message(FATAL_ERROR
+        "NEMO_SPEECH_BUILD_GRPC currently requires both ASR and TTS")
+endif()
+if(NEMO_SPEECH_WITH_FLASHLIGHT AND NOT NEMO_SPEECH_BUILD_ASR)
+    message(FATAL_ERROR "NEMO_SPEECH_WITH_FLASHLIGHT requires ASR")
+endif()
+if((NEMO_SPEECH_TTS_WITH_JA OR NEMO_SPEECH_TTS_WITH_ZH) AND
+   NOT NEMO_SPEECH_BUILD_TTS)
+    message(FATAL_ERROR "Optional TTS tokenizers require NEMO_SPEECH_BUILD_TTS=ON")
+endif()
+if(NEMO_SPEECH_HTTP_TLS AND NOT NEMO_SPEECH_BUILD_HTTP)
+    message(FATAL_ERROR "NEMO_SPEECH_HTTP_TLS requires NEMO_SPEECH_BUILD_HTTP=ON")
+endif()
 if(NEMO_SPEECH_BUILD_TESTS)
     set(BUILD_TESTING ON CACHE BOOL "Build first-party test executables" FORCE)
 elseif(BUILD_TESTING)
@@ -127,15 +164,13 @@ if(NEMO_SPEECH_BUILD_DIAR AND NOT NEMO_SPEECH_BUILD_ASR)
         "without the transcribe CLI/API surface")
 endif()
 
-# Drop-in cuBLAS shim (native GEMM, no cuBLASLt). When ON, builds
-# libcublas.so.13 from kernels/cublas_shim.cu. The shipping container image
-# substitutes it for real cuBLAS to drop ~564 MB; put it on LD_LIBRARY_PATH
-# ahead of the system cuBLAS to reproduce that GEMM path natively. See README.
-# On by default: the shim is the intended production GEMM path (it's what the
-# container images ship in place of real cuBLAS). Only built when GGML_CUDA is
-# also ON (see the target below); a no-op for Metal/Vulkan/CPU builds. Set OFF
-# to link real cuBLAS instead.
-option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (libcublas.so.13, native GEMM, no cuBLASLt)" ON)
+# Drop-in cuBLAS shim (native GEMM, no cuBLASLt). Release builds can substitute
+# it for real cuBLAS to reduce their runtime closure.
+# Disabled by default for source builds, which link the CUDA toolkit's cuBLAS.
+# Portable builds enable the shim explicitly.
+# It is only built when GGML_CUDA is also ON (see the target below), and is a
+# no-op for Metal, Vulkan, and CPU builds.
+option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (native GEMM, no cuBLASLt)" OFF)
 
 # Whether the linked ggml has the project ASR patches applied (ggml-patches/:
 # the fused rel-pos attention op and the F16 depthwise-conv kernel). The ASR
@@ -253,18 +288,16 @@ if(GGML_METAL)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
-# In-tree cuBLAS shim: a drop-in libcublas.so.13 backed by native GEMM kernels
-# (no cuBLASLt). ggml-cuda links real cuBLAS at build time, but the shim shares
-# its SONAME, so binaries resolve it instead when it is first on LD_LIBRARY_PATH.
-# The container images ship it in place of real cuBLAS (~564 MB saved); this
-# target reproduces that for native builds.
-# The cuBLAS shim is a Linux-only container size optimization. It relies on ELF
-# SONAME versioning (SOVERSION 13 -> libcublas.so.13) plus a GNU-ld
-# --version-script, neither of which exists with MSVC/link.exe. On Windows,
-# ggml-cuda links the real cuBLAS DLL from the CUDA toolkit, so the shim is
-# neither needed nor buildable - skip it.
-if(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM AND NOT WIN32)
+# In-tree cuBLAS shim backed by native GEMM kernels (no cuBLASLt). ggml-cuda
+# links real cuBLAS at build time. At runtime the loader resolves its cuBLAS
+# dependency to this target's matching major-version library name.
+if(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM)
     enable_language(CUDA)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+        set(NEMO_SPEECH_CUBLAS_SOVERSION 12)
+    else()
+        set(NEMO_SPEECH_CUBLAS_SOVERSION 13)
+    endif()
     add_library(nemo_speech_cublas_shim SHARED kernels/cublas_shim.cu)
     if(CMAKE_CUDA_ARCHITECTURES)
         set(NEMO_SPEECH_CUBLAS_SHIM_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
@@ -274,16 +307,25 @@ if(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM AND NOT WIN32)
         set(NEMO_SPEECH_CUBLAS_SHIM_ARCHITECTURES "80-virtual")
     endif()
     set_target_properties(nemo_speech_cublas_shim PROPERTIES
-        OUTPUT_NAME cublas
-        SOVERSION 13
         CUDA_ARCHITECTURES "${NEMO_SPEECH_CUBLAS_SHIM_ARCHITECTURES}"
+        CUDA_RUNTIME_LIBRARY Static
         CUDA_SEPARABLE_COMPILATION ON)
-    target_link_options(nemo_speech_cublas_shim PRIVATE
-        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/kernels/ver_cublas.map")
-elseif(GGML_CUDA AND NEMO_SPEECH_CUBLAS_SHIM AND WIN32)
-    message(STATUS
-        "NEMO_SPEECH_CUBLAS_SHIM: skipped on Windows; linking the CUDA "
-        "toolkit's real cuBLAS instead.")
+    if(WIN32)
+        # The toolkit import library records this exact DLL name. App-local
+        # deployment therefore substitutes the shim without changing ggml.
+        set_target_properties(nemo_speech_cublas_shim PROPERTIES
+            OUTPUT_NAME "cublas64_${NEMO_SPEECH_CUBLAS_SOVERSION}")
+    else()
+        set_target_properties(nemo_speech_cublas_shim PROPERTIES
+            OUTPUT_NAME cublas
+            SOVERSION "${NEMO_SPEECH_CUBLAS_SOVERSION}")
+        configure_file(
+            kernels/ver_cublas.map
+            "${CMAKE_CURRENT_BINARY_DIR}/ver_cublas.map"
+            @ONLY)
+        target_link_options(nemo_speech_cublas_shim PRIVATE
+            "LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/ver_cublas.map")
+    endif()
 endif()
 
 if(NEMO_SPEECH_WITH_FLASHLIGHT)
@@ -409,8 +451,23 @@ endif()
 
 set(NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR
     "${NEMO_SPEECH_LICENSE_INSTALL_DIR}/third_party")
+if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+    file(GLOB _NEMO_SPEECH_VCPKG_COPYRIGHTS LIST_DIRECTORIES false
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/*/copyright")
+    foreach(_copyright IN LISTS _NEMO_SPEECH_VCPKG_COPYRIGHTS)
+        get_filename_component(_share_dir "${_copyright}" DIRECTORY)
+        get_filename_component(_package "${_share_dir}" NAME)
+        install(FILES "${_copyright}"
+            DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/vcpkg/${_package}"
+            RENAME LICENSE)
+    endforeach()
+endif()
 install(FILES ggml/LICENSE
     DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/ggml")
+if(NEMO_SPEECH_BUILD_ASR AND NEMO_SPEECH_BUILD_CLI AND NEMO_SPEECH_BUILD_MIC_CAPTURE)
+    install(FILES third_party/miniaudio/LICENSE
+        DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/miniaudio")
+endif()
 if(TARGET nemo_speech_cublas_shim)
     install(TARGETS nemo_speech_cublas_shim
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -463,7 +520,7 @@ configure_package_config_file(
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/NeMoSpeechConfigVersion.cmake
     VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion)
+    COMPATIBILITY SameMinorVersion)
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/NeMoSpeechConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/NeMoSpeechConfigVersion.cmake

@@ -123,6 +123,7 @@ A lightweight native C++ runtime for NVIDIA Nemotron Speech models built on ggml
 
 ## Contents
 
+- [Models and applications](#models-and-applications)
 - [Installation](#installation)
 - [About this fork](#about-this-fork)
 - [Quick start](#quick-start)
@@ -136,39 +137,57 @@ A lightweight native C++ runtime for NVIDIA Nemotron Speech models built on ggml
 
 ## Installation
 
-From a source checkout, install the CLI, HTTP API, and browser playground for
-the detected platform and backend:
+Install the `nemo-speech` CLI for the detected platform and backend:
+
+On Linux or macOS, run:
 
 ```bash
-scripts/install.sh --source
+curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
 ```
 
-The source build requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
-and the toolkit for the selected GPU backend. See
+On Windows, run from PowerShell:
+
+```powershell
+irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
+```
+
+Open a new PowerShell window after installation so the updated user `PATH`
+takes effect.
+
+The installer prefers a verified native release and falls back to a source
+build when an artifact is unavailable. A source build requires Git, CMake 3.26
+or newer, Ninja, a C++17 compiler, SentencePiece development files, and the
+toolchain required by the selected backend, if any. See
 [Installation](docs/install.md) for platform-specific prerequisites and
-options. The same installer will support native release archives once their
-public URL is configured.
+options.
 
 ## Quick start
 
-The runtime consumes GGUF models. Until the preconverted GGUF is published,
-use the included converter to download the public `.nemo` checkpoint and
-produce a portable Q8 model. Complete the one-time
-[conversion setup](docs/model-conversion.md) first; it does not install NeMo.
+Transcribe a local WAV file. On first use, the CLI downloads the pinned default
+Nemotron 3.5 GGUF from Hugging Face and verifies its size and SHA-256:
 
 ```bash
-python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
-  --outfile nemotron-speech-streaming-en-0.6b.q8_0.gguf
-
-nemo-speech transcribe test_files/asr/wav/test/jfk.wav \
-  --model nemotron-speech-streaming-en-0.6b.q8_0.gguf
+nemo-speech transcribe /path/to/audio.wav
 ```
 
-The converter downloads only the `.nemo` checkpoint through the standard
-Hugging Face cache. The CLI selects an available backend and handles common
-mono or stereo PCM WAV sample rates automatically. Substitute your own WAV
-file after verifying the bundled sample.
+Source checkouts can use `test_files/asr/wav/test/jfk.wav` as a smoke-test
+input.
+
+The same command can transcribe the default microphone on builds that include
+live capture:
+
+```bash
+nemo-speech transcribe --live
+```
+
+Run `nemo-speech model list` to see defaults, short names, and which command
+uses each model. For example, `nemo-speech pull nemotron-en` downloads the
+English-only model ahead of time, and `--model nemotron-en` selects it. Local
+GGUF paths continue to work without downloading anything. The CLI selects an
+available backend and handles common mono or stereo PCM WAV sample rates
+automatically. See the [CLI model guide](docs/cli.md#models-and-cache) and
+[model conversion](docs/model-conversion.md) for custom checkpoints.
 
 ## Command line
 
@@ -183,13 +202,13 @@ Start the same runtime as a local HTTP service and open the playground:
 
 ```bash
 nemo-speech serve \
-  --asr-model nemotron-speech-streaming-en-0.6b.q8_0.gguf \
+  --asr-model nemotron-3.5 \
   --open
 ```
 
-The server binds to <http://127.0.0.1:8080> by default and also provides a
-documented OpenAI-compatible audio API subset and realtime WebSocket
-transcription. A separately built `riva_server` binary provides the
+The server binds to <http://127.0.0.1:8080> by default. Its transcription and
+speech routes expose documented OpenAI-compatible subsets, alongside realtime
+WebSocket transcription. A separately built `riva_server` binary provides the
 Riva-compatible gRPC interface. See the [server guide](docs/server.md) when you
 are ready to integrate either interface.
 
@@ -209,13 +228,12 @@ gRPC usage.
 
 ## Build from source
 
-For a CUDA ASR and TTS server with the playground from an initialized checkout:
-
-Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, and a supported CUDA
-toolkit.
+Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, SentencePiece
+development files, and the toolchain required by the selected backend, if any.
+For a CUDA ASR and TTS server with the playground:
 
 ```bash
-git submodule update --init ggml third_party/cpp-httplib
+git submodule update --init ggml llama.cpp third_party/cpp-httplib
 scripts/configure.sh cuda-server
 cmake --build --preset cuda-server
 ```
@@ -233,6 +251,7 @@ Windows, and container instructions are in
 | [CLI guide](docs/cli.md) | Transcription, subtitles, directories, diarization, NMT, TTS, and tooling |
 | [Model conversion](docs/model-conversion.md) | Convert NeMo and Hugging Face checkpoints to runtime GGUF files |
 | [Servers](docs/server.md) | HTTP playground/realtime serving and the separate Riva-compatible gRPC server |
+| [HTTP API reference](docs/api.md) | Every endpoint's request fields, responses, and the realtime protocol |
 | [Native SDK](docs/sdk.md) | CMake components, C ABI lifetimes, threading, and examples |
 | [Client integration](docs/clients.md) | OpenAI SDKs, curl, and Riva gRPC clients |
 | [Troubleshooting](docs/troubleshooting.md) | `doctor` output and common runtime failures |
@@ -242,9 +261,13 @@ Windows, and container instructions are in
 
 ## License
 
-NVIDIA-authored code is released under the [Apache License 2.0](LICENSE), with
-the project copyright notice in [NOTICE](NOTICE). Third-party components retain
-their respective terms; see [Third-Party Notices](THIRD_PARTY_NOTICES.md).
+NVIDIA-authored code is released under the
+[Apache License 2.0](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/LICENSE),
+with the project copyright notice in
+[NOTICE](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/NOTICE). Third-party
+components retain their respective terms; see
+[Third-Party Notices](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/THIRD_PARTY_NOTICES.md).
+Release archives also include these files under `share/licenses/nemo-speech/`.
 
 ## Contributing
 

@@ -21,10 +21,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "decoder.h"  // Decoder, WordTiming (and runtime.h transitively)
+#include "context_biasing.h"  // ContextBiasingTree (RNNT word boosting)
+#include "decoder.h"          // Decoder, WordTiming, DecoderConfig (and runtime.h transitively)
 
 namespace nemo_speech::asr {
 
@@ -78,8 +80,9 @@ class RnntEngine {
 
     virtual std::unique_ptr<RnntStreamState> make_rnnt_stream_state() = 0;
 
-    // Bracket one host greedy step so implementations can derive a live
-    // microbatch target.
+    // Bracket one host greedy step. Production uses this scope to align an
+    // admission wave and account for decoder work that can become ready; test
+    // engines can keep the no-op defaults.
     virtual void begin_decode_step() {}
     virtual void end_decode_step() {}
 
@@ -97,6 +100,20 @@ class RnntEngine {
         RnntStreamState& state, const float* enc_proj, int joint_dim, int T, int32_t* token_ids,
         const float* logit_bias = nullptr) = 0;
 
+    virtual void joint_argmax_device(
+        RnntStreamState&, const ggml_runtime::DeviceTensor&, int, int, int, int32_t*,
+        const float* = nullptr) {
+        throw std::runtime_error("device RNNT joint is not supported by this engine");
+    }
+
+    virtual void predict_and_joint_rnnt_argmax_device(
+        RnntStreamState& state, int prev_token, int active_bank,
+        const ggml_runtime::DeviceTensor& enc_proj, int frame_offset, int joint_dim, int T,
+        int32_t* token_ids, const float* logit_bias = nullptr) {
+        predict_rnnt(state, prev_token, active_bank);
+        joint_argmax_device(state, enc_proj, frame_offset, joint_dim, T, token_ids, logit_bias);
+    }
+
     // TDT splits the joint output into independent token and duration slices.
     virtual void joint_tdt_argmax(
         RnntStreamState& state, const float* enc_proj, int joint_dim, int T, int32_t* token_ids,
@@ -110,24 +127,37 @@ class RnntEngine {
         predict_rnnt(state, prev_token, active_bank);
         joint_tdt_argmax(state, enc_proj, joint_dim, 1, token_id, duration_id);
     }
+
+    // Encode a word-boosting phrase into subword token ids using the model's
+    // tokenizer (for RNNT context biasing). Returns empty when no tokenizer is
+    // available, in which case boosting is silently skipped.
+    virtual std::vector<int> encode_phrase(const std::string& /*text*/) const { return {}; }
 };
 
 // Head impl for RNNT models.
 class RnntGreedyDecoder : public Decoder {
    public:
-    explicit RnntGreedyDecoder(RnntEngine* engine);
+    RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cfg = DecoderConfig{});
 
     void reset() override;
     // Soft utterance reset for callers that intentionally preserve predictor
     // context. CacheStreamRunner uses reset() at an endpoint boundary.
+    // Also resets the context-biasing match position so phrase
+    // matching restarts cleanly.
     void reset_utterance() override {
         words_.clear();
         cur_ = WordTiming{};
         cur_open_ = false;
+        bias_node_ = ContextBiasingTree::kRoot;
     }
+    // Build the per-request context-biasing tree from speech_contexts.
+    void set_request_options(const AsrRequestOptions& opts) override;
     // enc_out: joint encoder projection (joint_dim, T) flat-packed. The model
     // computes it once per chunk, after optional language-prompt fusion.
     std::vector<int> step(const float* enc_out, int d_model, int T, int64_t frame_offset) override;
+    std::vector<int> step_device(
+        const ggml_runtime::DeviceTensor& enc_out, int d_model, int T,
+        int64_t frame_offset) override;
     int blank_id() const override { return engine_->rnnt_config().blank_id; }
     const std::vector<std::string>& vocab() const override { return engine_->vocab(); }
 
@@ -142,6 +172,9 @@ class RnntGreedyDecoder : public Decoder {
     const RnntDecodeStats& stats() const { return stats_; }
 
    private:
+    std::vector<int> step_impl(
+        const float* enc_out, const ggml_runtime::DeviceTensor* device_enc_out, int d_model, int T,
+        int64_t frame_offset);
     void flush_word();
     void build_punct_bias();
 
@@ -178,6 +211,21 @@ class RnntGreedyDecoder : public Decoder {
     std::vector<WordTiming> words_;
     bool cur_open_ = false;
     WordTiming cur_;
+
+    // RNNT context biasing (word boosting), built per request from
+    // speech_contexts. bias_node_ is the per-stream Aho-Corasick match state.
+    ContextBiasingTree bias_tree_;
+    int bias_node_ = ContextBiasingTree::kRoot;
+    bool bias_on_ = false;
+    // --boosting-tree-alpha: an extra global multiplier (default 1.0, i.e. no
+    // change). The effective alpha is this times the per-request weight derived
+    // from the speech_contexts boost (see set_request_options).
+    float bias_alpha_cfg_ = 1.0f;
+    float bias_eff_alpha_ = 1.0f;  // effective alpha for the current request
+    float bias_depth_scaling_ = 2.0f;
+    double bias_max_boost_ = 5.0;           // greedy-safe upper clamp on the request boost
+    std::vector<float> bias_scratch_;       // dense per-round joint-logit bias
+    std::vector<int32_t> boost_token_ids_;  // blank-excluded re-rank pass output
 };
 
 // Token-and-Duration Transducer greedy decoder. Predictor state commits only
@@ -206,6 +254,10 @@ class TdtGreedyDecoder : public Decoder {
     int prev_token_ = -1;
     int active_bank_ = 0;
     bool predictor_valid_ = false;
+    // A duration may advance past the end of one encoder block. Carry that
+    // remainder into the next step() so segmented and contiguous decoding
+    // present the same encoder clock to TDT.
+    int pending_skip_ = 0;
     RnntDecodeStats stats_;
     int64_t last_emit_frame_ = -1;
     bool compute_ts_ = false;

@@ -97,9 +97,10 @@ check_shared_states(
     ggml_runtime::BackendManager& bm, const std::string& gguf, const std::vector<float>& audio) {
     BatchingConfig batching;
     batching.enabled = true;
-    batching.max_batch_size = 4;
-    batching.max_queue_delay_us = 20000;
+    batching.max_batch_size = 8;
+    batching.max_queue_delay_us = 500000;
     auto model = std::make_shared<SileroVadModel>(bm, gguf, batching);
+    const ScopedBatchCohort scalar_cohort(1);
     SileroVad a(model), b(model);
     std::vector<float> pa, pb;
     constexpr size_t kFeed = 733;  // deliberately not a 512-sample boundary
@@ -137,14 +138,54 @@ check_shared_states(
     }
     std::fprintf(stdout, "[shared-state] PASS: one Session, isolated recurrent state\n");
 
+    auto grouped_state = model->make_state();
+    auto sequential_state = model->make_state();
+    const int window = model->config().window_size;
+    const int n_windows =
+        std::min(16, static_cast<int>(audio.size() / static_cast<size_t>(window)));
+    std::vector<float> grouped_probs;
+    std::vector<float> sequential_probs;
+    for (int first = 0; first < n_windows;) {
+        const int count = std::min(5, n_windows - first);
+        std::vector<float> result;
+        model->infer(
+            grouped_state, audio.data() + static_cast<size_t>(first) * window, count, result);
+        grouped_probs.insert(grouped_probs.end(), result.begin(), result.end());
+        first += count;
+    }
+    for (int i = 0; i < n_windows; ++i) {
+        std::vector<float> result;
+        model->infer(sequential_state, audio.data() + static_cast<size_t>(i) * window, 1, result);
+        sequential_probs.push_back(result.front());
+    }
+    double multistep_max_abs = 0.0;
+    if (grouped_probs.size() == sequential_probs.size()) {
+        for (size_t i = 0; i < grouped_probs.size(); ++i) {
+            multistep_max_abs = std::max(
+                multistep_max_abs,
+                std::abs(static_cast<double>(grouped_probs[i]) - sequential_probs[i]));
+        }
+    }
+    std::fprintf(
+        stdout, "[multi-step] windows=%d, max abs diff vs sequential %.3e\n", n_windows,
+        multistep_max_abs);
+    if (grouped_probs.size() != sequential_probs.size() || multistep_max_abs > 1e-5) {
+        std::fprintf(
+            stderr, "FAIL: grouped VAD windows changed probabilities or recurrent state\n");
+        return false;
+    }
+    std::fprintf(stdout, "[multi-step] PASS: grouped graph matches sequential recurrence\n");
+
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
     std::vector<std::future<std::vector<float>>> calls;
+    const auto metrics_before = model->batch_metrics();
     const size_t batch_prefix =
         std::min(audio.size(), static_cast<size_t>(model->config().window_size * 8));
     for (int i = 0; i < 4; ++i) {
         calls.push_back(std::async(std::launch::async, [&, i] {
             (void)i;
+            const ScopedBatchCohort cohort(4);
             SileroVad vad(model);
             ready.fetch_add(1);
             while (!go.load()) std::this_thread::yield();
@@ -165,7 +206,13 @@ check_shared_states(
             return false;
         }
     }
-    if (model->batch_metrics().max_observed_batch < 4) {
+    const auto metrics_after = model->batch_metrics();
+    if (metrics_after.deadline_batches != metrics_before.deadline_batches ||
+        metrics_after.target_reached_batches <= metrics_before.target_reached_batches) {
+        std::fprintf(stderr, "FAIL: VAD cohort waited for the queue deadline\n");
+        return false;
+    }
+    if (metrics_after.max_observed_batch < 4) {
         std::fprintf(stderr, "FAIL: VAD requests did not coalesce\n");
         return false;
     }

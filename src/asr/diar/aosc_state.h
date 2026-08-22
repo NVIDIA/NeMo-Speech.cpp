@@ -11,6 +11,7 @@
 // the first compression - NeMo's `spkcache_preds is None` sentinel).
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,31 @@ struct DiarGeometry {
     // Validates positive chunk/update sizes, non-negative contexts and FIFO,
     // the minimum speaker-cache budget, and the positional-encoding limit.
     void validate(int n_spk, int sil_frames_per_spk, int pos_emb_max_len) const;
+};
+
+// Keeps transient channel redraws from becoming new speaker identities. A
+// channel is established only after a short clean or fading handoff; until
+// then its probability is folded into the strongest established channel.
+class ChannelBirthGate {
+   public:
+    explicit ChannelBirthGate(int n_spk);
+
+    void reset();
+    void append(const std::vector<float>& raw, std::vector<float>& timeline);
+    bool is_established(int speaker) const;
+
+   private:
+    bool observe(const float* probs);
+    void relabel(float* probs) const;
+    void push_raw(const float* probs);
+
+    int n_spk_;
+    int64_t frame_ = 0;
+    std::vector<uint8_t> established_;
+    std::vector<int> clean_frames_;
+    std::vector<int> fading_frames_;
+    std::vector<int64_t> last_win_;
+    std::vector<float> raw_ring_;
 };
 
 class AoscState {

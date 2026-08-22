@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "model.h"
@@ -20,6 +22,19 @@
 namespace nemo_speech::asr {
 
 namespace {
+
+const char*
+head_name(HeadKind head) {
+    switch (head) {
+        case HeadKind::Ctc:
+            return "ctc";
+        case HeadKind::Rnnt:
+            return "rnnt";
+        case HeadKind::Tdt:
+            return "tdt";
+    }
+    return "unknown";
+}
 
 std::unique_ptr<ggml_runtime::BackendManager>
 make_backend(int gpu_idx) {
@@ -50,8 +65,31 @@ vocab_self_punctuates(const std::vector<std::string>& vocab) {
 
 }  // namespace
 
+bool
+exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int input_sample_rate) {
+    if (n_samples == 0)
+        return false;
+    const int rate = input_sample_rate > 0 ? input_sample_rate : model.sample_rate();
+    if (rate <= 0)
+        return false;
+
+    const auto& enc = model.encoder_config();
+    const long double model_samples = std::ceil(
+        static_cast<long double>(n_samples) * model.sample_rate() / static_cast<long double>(rate));
+    long double frames =
+        std::floor((model_samples + 1.0L) / static_cast<long double>(model.fe().hop_length())) +
+        1.0L;
+    const int stages = static_cast<int>(std::log2(enc.subsampling_factor));
+    for (int i = 0; i < stages; ++i) {
+        frames = enc.conv_context == ConvContext::Causal ? std::floor(frames / 2.0L) + 1.0L
+                                                         : std::floor((frames + 1.0L) / 2.0L);
+    }
+    return frames > enc.pos_emb_max_len;
+}
+
 Recognizer::Recognizer(RecognizerConfig cfg)
-    : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)), ingress_batches_(cfg_.batching) {
+    : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)),
+      streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
     if (cfg_.streaming.chunk_size <= 0.0f || cfg_.streaming.ctc_left_padding < 0.0f ||
         cfg_.streaming.ctc_right_padding < 0.0f)
         throw std::invalid_argument(
@@ -66,7 +104,7 @@ Recognizer::Recognizer(RecognizerConfig cfg)
         (cfg_.vad.masker.mask_enable || (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
     if (need_vad) {
         vad_model_ = std::make_shared<SileroVadModel>(*bm_, cfg_.vad.model_path, cfg_.batching);
-        std::cerr << "[recognizer] VAD weights/session loaded once and shared across streams\n";
+        GGMLF_LOG_INFO("[recognizer] VAD weights/session loaded once and shared across streams\n");
     }
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
     // Share the loaded language model and lexicon trie across streams.
@@ -78,25 +116,92 @@ Recognizer::Recognizer(RecognizerConfig cfg)
         fcfg.lm_path = cfg_.decoder.lm_path;
         fcfg.lexicon_path = cfg_.decoder.lexicon_path;
         fcfg.tokenizer_path = cfg_.decoder.tokenizer_path;
+        fcfg.embedded_spm = ctc->embedded_tokenizer();
         flashlight_resources_ =
             std::make_shared<const FlashlightResources>(ctc->ctc_config(), ctc->vocab(), fcfg);
-        std::cerr << "[recognizer] flashlight resources loaded (lm + lexicon trie, shared)\n";
+        GGMLF_LOG_INFO("[recognizer] flashlight resources loaded (lm + lexicon trie, shared)\n");
     }
 #endif
-    std::cerr << "[recognizer] streaming cfg: chunk=" << cfg_.streaming.chunk_size
-              << "s left=" << cfg_.streaming.ctc_left_padding
-              << "s right=" << cfg_.streaming.ctc_right_padding << "s\n";
 
     if (!cfg_.diar.model_path.empty()) {
-        diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path);
+        diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path, cfg_.batching);
         const DiarGeometry geo = cfg_.diar.resolved_geometry();
-        std::cerr << "[recognizer] diarizer loaded: " << cfg_.diar.model_path
-                  << " (spkcache=" << geo.spkcache_len << " fifo=" << geo.fifo_len
-                  << " chunk=" << geo.chunk_len << " rc=" << geo.chunk_right_context << ")\n";
+        GGMLF_LOG_INFO(
+            "[recognizer] diarizer loaded: %s (spkcache=%d fifo=%d chunk=%d rc=%d)\n",
+            cfg_.diar.model_path.c_str(), geo.spkcache_len, geo.fifo_len, geo.chunk_len,
+            geo.chunk_right_context);
     }
+    log_model_status();
 }
 
 Recognizer::~Recognizer() = default;
+
+void
+Recognizer::log_model_status() const {
+    if (!cfg_.log_status)
+        return;
+    const ggml_backend_t gpu = bm_->gpu_backend_handle();
+    std::string summary = "[asr] model=" + model_name_ + " head=" + head_name(model_->head_kind()) +
+                          " backend=" + (gpu != nullptr ? ggml_backend_name(gpu) : "CPU");
+    if (vad_model_)
+        summary += " vad=on";
+    if (diar_model_)
+        summary += " diarization=on";
+#ifdef NEMO_SPEECH_WITH_FLASHLIGHT
+    if (flashlight_resources_)
+        summary += " decoder=flashlight";
+#endif
+    std::fprintf(stderr, "%s\n", summary.c_str());
+}
+
+void
+Recognizer::log_execution_status(bool streaming) const {
+    if (!cfg_.log_status)
+        return;
+    auto emit = [this, streaming] {
+        const HeadKind head = model_->head_kind();
+        if (!streaming) {
+            const auto& enc = model_->encoder_config();
+            if (enc.offline_left_ctx < 0 && enc.offline_right_ctx < 0) {
+                std::fprintf(
+                    stderr, "[asr] mode=offline head=%s attention=full-context\n", head_name(head));
+            } else {
+                std::fprintf(
+                    stderr,
+                    "[asr] mode=offline head=%s attention-left=%d "
+                    "attention-right=%d encoder-frames\n",
+                    head_name(head), enc.offline_left_ctx, enc.offline_right_ctx);
+            }
+            return;
+        }
+        if (head == HeadKind::Ctc) {
+            const float window = cfg_.streaming.ctc_left_padding + cfg_.streaming.chunk_size +
+                                 cfg_.streaming.ctc_right_padding;
+            std::fprintf(
+                stderr,
+                "[asr] mode=streaming head=ctc chunk=%.2fs left=%.2fs right=%.2fs window=%.2fs\n",
+                cfg_.streaming.chunk_size, cfg_.streaming.ctc_left_padding,
+                cfg_.streaming.ctc_right_padding, window);
+            return;
+        }
+        const EncoderConfig enc =
+            make_cache_aware_config(model_->encoder_config(), cfg_.streaming.rnnt_right_context);
+        const int center = enc.cache_chunk_frames - enc.cache_right_ctx;
+        const double step_ms = enc.cache_chunk_frames * model_->ms_per_enc_frame();
+        std::fprintf(
+            stderr,
+            "[asr] mode=streaming head=%s left=%d center=%d right=%d attention=%d "
+            "encoder-frames step=%.0fms\n",
+            head_name(head), enc.cache_left_ctx, center, enc.cache_right_ctx,
+            enc.cache_left_ctx + enc.cache_chunk_frames, step_ms);
+    };
+    std::call_once(streaming ? streaming_status_once_ : offline_status_once_, std::move(emit));
+}
+
+BatchMetrics
+Recognizer::vad_batch_metrics() const {
+    return vad_model_ ? vad_model_->batch_metrics() : BatchMetrics{};
+}
 
 std::unique_ptr<AsrRunner>
 Recognizer::make_runner() const {
@@ -118,9 +223,11 @@ Recognizer::warmup() {
     // build (and, for RNNT, the cache-aware Session setup) happens now. 0.1 s
     // chunks: enough for the buffered runner to emit one full window and the
     // cache-aware runner to advance several chunks; finalize() flushes the tail.
+    const bool supports_streaming =
+        model_->head_kind() == HeadKind::Ctc ||
+        static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
     std::unique_ptr<AsrRunner> runner;
-    if (model_->head_kind() != HeadKind::Ctc &&
-        !static_cast<RnntModel*>(model_.get())->supports_cache_streaming())
+    if (!supports_streaming)
         runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     else
         runner = make_runner();
@@ -139,6 +246,63 @@ Recognizer::warmup() {
         runner->step();
     }
     runner->finalize();
+    runner.reset();
+
+    // The scalar pass cannot populate CUDA graphs for production microbatch
+    // shapes. Without this pass, the first wide-concurrency request wave pays
+    // graph construction/capture and grows shared scheduler pools while its
+    // latency is already being measured. Warm the configured physical maximum
+    // twice: pass one grows all shared pools, pass two rebuilds stable graph
+    // placements after that growth. CPU deployments retain the lightweight
+    // scalar warmup.
+    const int warmup_batch =
+        std::min(cfg_.batching.max_batch_size, cfg_.batching.state_arena_slots);
+    if (supports_streaming && model_->backend_manager().get_params().use_gpu &&
+        cfg_.batching.enabled && warmup_batch > 1) {
+        auto run_batch_warmup = [&] {
+            std::vector<std::unique_ptr<AsrRunner>> runners;
+            runners.reserve(static_cast<size_t>(warmup_batch));
+            for (int b = 0; b < warmup_batch; ++b) {
+                auto batched_runner = make_runner();
+                if (model_->has_prompt())
+                    batched_runner->set_prompt_index(model_->prompt_index_for_lang("auto"));
+                runners.push_back(std::move(batched_runner));
+            }
+
+            std::atomic<int> ready{0};
+            std::atomic<bool> start{false};
+            std::vector<std::exception_ptr> errors(static_cast<size_t>(warmup_batch));
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<size_t>(warmup_batch));
+            for (int b = 0; b < warmup_batch; ++b) {
+                threads.emplace_back([&, b, batched_runner = std::move(runners[b])]() mutable {
+                    try {
+                        const ScopedBatchCohort cohort(warmup_batch);
+                        ready.fetch_add(1, std::memory_order_release);
+                        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+                        for (int i = 0; i < iters; ++i) {
+                            batched_runner->feed_audio(chunk.data(), chunk.size());
+                            batched_runner->step();
+                        }
+                        batched_runner->finalize();
+                    }
+                    catch (...) {
+                        errors[static_cast<size_t>(b)] = std::current_exception();
+                    }
+                });
+            }
+            while (ready.load(std::memory_order_acquire) != warmup_batch) std::this_thread::yield();
+            start.store(true, std::memory_order_release);
+            for (auto& thread : threads) thread.join();
+            for (const auto& error : errors)
+                if (error)
+                    std::rethrow_exception(error);
+        };
+
+        run_batch_warmup();
+        run_batch_warmup();
+        GGMLF_LOG_INFO("[recognizer] warmed streaming batch shape B=%d\n", warmup_batch);
+    }
 
     // Warm the diarizer Session's graph shapes too: the streaming warmup
     // ladder (growing fifo), the first spkcache compression (~19 s in), and
@@ -166,6 +330,13 @@ RecognitionStream::RecognitionStream(
         diar_ = std::make_unique<DiarStream>(
             *recognizer_->diar_model(), recognizer_->config().diar.resolved_geometry());
     }
+    if (coordinate_ingress_)
+        recognizer_->register_streaming_ingress();
+}
+
+RecognitionStream::~RecognitionStream() {
+    if (coordinate_ingress_)
+        recognizer_->unregister_streaming_ingress();
 }
 
 void
@@ -251,9 +422,8 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
 
     // Build one Alternative from a decoder hypothesis. Postproc (PnC/ITN/
     // profanity) may remap word spans, so it runs before frame->ms conversion;
-    // word offsets are produced only when requested. Speaker tags: riva
-    // semantics - mean diarizer frame probability over the word's span,
-    // argmax, 1-based; only the top alternative is tagged.
+    // word offsets are produced only when requested. Speaker tags are 1-based;
+    // only the top alternative is tagged.
     auto make_alt = [&](const std::string& transcript, float confidence,
                         const std::vector<WordTiming>& words_in, bool tag_speakers) {
         Alternative alt;
@@ -275,8 +445,11 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
                 ww.confidence = w.confidence;
                 ww.language_code = lang0;
                 if (tag_speakers && diar_) {
+                    // Transducer punctuation can extend a word timestamp into
+                    // the next turn. Anchor attribution to the word onset and
+                    // average two diar frames to reject single-frame noise.
                     const int spk =
-                        diar_->speaker_for_time(ww.start_time / 1000.0, ww.end_time / 1000.0);
+                        diar_->speaker_for_word_time(ww.start_time / 1000.0, ww.end_time / 1000.0);
                     ww.speaker_tag = spk >= 0 ? spk + 1 : 0;
                 }
                 alt.words.push_back(std::move(ww));
@@ -315,7 +488,10 @@ RecognitionStream::flush_diar_deficit_(const StreamingUpdate& u) {
 
 std::optional<Result>
 RecognitionStream::next() {
-    const ScopedBatchCohort cohort_scope(pending_cohort_target_);
+    // Inherit an enclosing cohort (e.g. Recognizer::recognize's ingress
+    // result) when this stream has none of its own.
+    const ScopedBatchCohort cohort_scope(
+        pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     auto u = runner_->step();
     if (u.is_final) {
         flush_diar_deficit_(u);
@@ -339,7 +515,8 @@ RecognitionStream::next() {
 
 Result
 RecognitionStream::finish() {
-    const ScopedBatchCohort cohort_scope(pending_cohort_target_);
+    const ScopedBatchCohort cohort_scope(
+        pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     pending_cohort_target_ = 0;
     if (resampler_ && !resampler_flushed_) {
         resampled_audio_.clear();
@@ -358,28 +535,46 @@ RecognitionStream::finish() {
 }
 
 std::unique_ptr<RecognitionStream>
-Recognizer::streaming_recognize(AsrRequestOptions opts, const std::string& language_code) {
+Recognizer::streaming_recognize(
+    AsrRequestOptions opts, const std::string& language_code, bool coordinate_ingress) {
     opts.language_code = language_code;
     auto runner = make_runner();
+    log_execution_status(/*streaming=*/true);
     if (model_->has_prompt())
         runner->set_prompt_index(model_->prompt_index_for_lang(language_code));
-    return std::make_unique<RecognitionStream>(this, std::move(runner), std::move(opts));
+    return std::make_unique<RecognitionStream>(
+        this, std::move(runner), std::move(opts), coordinate_ingress);
 }
 
 Result
 Recognizer::recognize(
     const float* samples, size_t n, AsrRequestOptions opts, const std::string& language_code,
     int sample_rate) {
+    // A lone in-flight request skips the ingress gather wait entirely.
+    const ScopedActiveCount active(active_offline_requests_);
+    const ScopedBatchCohort cohort_scope(offline_ingress_batches_.arrive(active.count()));
     const ggml_backend_t gpu = bm_->gpu_backend_handle();
     const bool vulkan =
         gpu != nullptr && std::string(ggml_backend_name(gpu)).rfind("Vulkan", 0) == 0;
+    const bool exceeds_offline_limit = exceeds_offline_position_limit(*model_, n, sample_rate);
+    const bool supports_streaming =
+        model_->head_kind() == HeadKind::Ctc ||
+        static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
+    // Vulkan RNNT support was originally validated on the cache-aware graph.
+    // Keep that compatibility route until the offline graph has Vulkan parity
+    // coverage; CTC and offline-only TDT remain offline.
+    const bool use_streaming =
+        (exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
+        supports_streaming;
     std::unique_ptr<AsrRunner> runner;
-    if (vulkan && model_->head_kind() != HeadKind::Ctc &&
-        static_cast<RnntModel*>(model_.get())->supports_cache_streaming()) {
+    if (use_streaming) {
         runner = make_runner();
     } else {
+        // Past the positional-encoding limit OfflineRunner splits the audio at
+        // quiet points and decodes segment by segment.
         runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     }
+    log_execution_status(use_streaming);
     if (model_->has_prompt())
         runner->set_prompt_index(model_->prompt_index_for_lang(language_code));
     opts.language_code = language_code;

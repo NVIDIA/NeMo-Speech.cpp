@@ -6,15 +6,16 @@ helps choose the right mechanism; the exact keys and defaults are in
 
 ## Feature matrix
 
-Support depends mainly on the model head. Decoder biasing requires the
-Flashlight LM decoder and is CTC-only; postprocessing and diarization are
-head-independent.
+Support depends mostly on the head type. Word boosting works on CTC with the
+Flashlight LM decoder and on cache-aware RNNT; postprocessing and diarization
+are head-independent.
 
-| Model | Word boosting | VAD masking | Endpointing | Profanity | ITN | Auto punctuation | Language ID | Diarization |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| [Parakeet CTC 1.1B](models.md#parakeet-ctc-11b-offline--buffered-streaming) | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| [Nemotron-Speech 0.6B](models.md#nemotron-speech-streaming-06b-cache-aware-rnnt) | No | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| [Nemotron 3.5 0.6B](models.md#nemotron-35-06b-multilingual-prompt-conditioned-rnnt) | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Model | Languages | Word boosting | VAD masking | Endpointing | Profanity | ITN | Auto punctuation | Language metadata | Diarization |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| [Nemotron 3.5 0.6B](models.md#nemotron-35-06b-multilingual-prompt-conditioned-rnnt) | 40+ | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| [Nemotron-Speech 0.6B](models.md#nemotron-speech-streaming-06b-cache-aware-rnnt) | en | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| [Parakeet TDT 0.6B v3](models.md#parakeet-tdt-06b-v3-multilingual-offline-transducer) | 25 | No | No | No | Yes | Yes | Yes | No | Yes |
+| [Parakeet CTC 1.1B](models.md#parakeet-ctc-11b-offline--buffered-streaming) | en | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
 
 ## Request-time options
 
@@ -22,11 +23,15 @@ These options can vary between requests without restarting the server.
 
 ### Word boosting
 
-`RecognitionConfig.speech_contexts` biases the Flashlight decoder toward names,
-jargon, and other caller-supplied phrases. Stock Riva clients expose it through
-`--boosted_words` and `--boosted_words_score`. The server must start with a
-KenLM model and lexicon; a SentencePiece model also enables out-of-vocabulary
-and multi-word phrases. See [Word boosting](configuration.md#word-boosting).
+`RecognitionConfig.speech_contexts` biases recognition toward caller-supplied
+phrases (names, jargon); stock Riva clients expose `--boosted_words` +
+`--boosted_words_score`. Phrases are tokenized with the GGUF-embedded
+tokenizer - re-convert pre-embed GGUFs with `convert_model.py` (CTC also
+accepts an `asr.decoder.tokenizer_path` override).
+
+CTC needs the Flashlight LM decoder and typically uses scores of 8-10.
+Cache-aware RNNT requires no extra artifacts and typically uses 2-3. See
+[word boosting](configuration.md#word-boosting) for fields and limits.
 
 ### Transcript postprocessing
 
@@ -47,14 +52,17 @@ is requested without one. Word timestamps are enabled automatically. See
 [ASR configuration](configuration.md#key-reference) and
 [Sortformer models](models.md#sortformer-speaker-diarization).
 
+Sortformer v2 supports up to four speakers.
+
 For diarization without ASR, use `nemo-speech diarize` or the standalone
 `nemo_speech_diar_*` C API.
 
 ### Language selection
 
 Nemotron 3.5 accepts a request language such as `en-US` or `es-ES`, or `auto`
-for model-based detection. The selected language is returned on the transcript
-and words. Other listed ASR models do not perform language identification.
+for model-based detection. Structured results return the selected or detected
+language on the transcript and words. Other listed ASR models do not return
+language-identification metadata.
 
 ### Force an endpoint
 
@@ -80,8 +88,8 @@ These settings affect the loaded engine and therefore require a restart.
   for accuracy. Parakeet CTC instead uses its chunk and left/right padding
   settings.
 
-## Compatibility notes
+## gRPC compatibility
 
 The Riva-compatible gRPC adapter intentionally does not implement every Riva
 codec and recognition option. See
-[Riva parity: known exclusions](configuration.md#riva-parity-known-exclusions).
+[gRPC compatibility](configuration.md#grpc-compatibility).

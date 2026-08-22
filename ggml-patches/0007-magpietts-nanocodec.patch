@@ -358,12 +358,11 @@ index e25be359..ebdd1451 100644
  static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
      bool res = false;
 
-@@ -3292,7 +3309,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -3292,7 +3309,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
      if (cgraph->uid != 0 &&
          cgraph->uid == graph->uid) {
 -        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
-+        ggml_cuda_graph_log_event(__func__, "uid reused", cgraph, graph_key);
          GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
          return false;
      }

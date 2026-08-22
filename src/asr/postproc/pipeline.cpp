@@ -22,6 +22,7 @@
 #include "itn_align.h"
 #include "pnc_model.h"
 #include "pnc_runner.h"
+#include "runtime.h"
 
 namespace nemo_speech::asr::postproc {
 namespace {
@@ -126,8 +127,9 @@ struct Postprocessor::ItnRegistry {
             throw std::runtime_error(
                 "ITN: no two-FAR grammar directories found under " + root.string());
         }
-        std::cerr << "[itn] discovered " << grammar_dirs.size()
-                  << " language grammar directories under " << root.string() << "\n";
+        GGMLF_LOG_INFO(
+            "[itn] discovered %zu language grammar directories under %s\n", grammar_dirs.size(),
+            root.string().c_str());
 #else
         // Preserve the existing warning for a configured grammar in a build
         // without text-normalization support.
@@ -277,6 +279,11 @@ Postprocessor::Postprocessor(
 
 Postprocessor::~Postprocessor() = default;
 
+BatchMetrics
+Postprocessor::pnc_batch_metrics() const {
+    return pnc_model_ ? pnc_model_->batch_metrics() : BatchMetrics{};
+}
+
 std::string
 Postprocessor::apply(
     const std::string& transcript, const AsrRequestOptions& opts, std::vector<WordTiming>* words,
@@ -284,23 +291,37 @@ Postprocessor::apply(
     static const bool t_log = std::getenv("NEMO_SPEECH_TIMING") != nullptr;
     const auto begin = std::chrono::steady_clock::now();
     double queue_ms = 0.0;
-    auto result = executor_->run(
+    auto text = executor_->run(
         [this, &transcript, &opts, words, &language_code] {
-            return apply_impl(transcript, opts, words, language_code);
+            return apply_cpu(transcript, opts, words, language_code);
         },
         &queue_ms);
+
+    const auto pnc_begin = std::chrono::steady_clock::now();
+    if (pnc_runner_ && opts.enable_automatic_punctuation)
+        text = pnc_runner_->postprocess(text);
+    const auto pnc_end = std::chrono::steady_clock::now();
+
+    if (opts.enable_automatic_punctuation)
+        text = sanitize_punctuation_spacing(text);
+    else
+        text = strip_formatting(text);
+
     if (t_log) {
         const double total_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
                 .count();
+        const double pnc_ms =
+            std::chrono::duration<double, std::milli>(pnc_end - pnc_begin).count();
         std::fprintf(
-            stderr, "[timing] postproc-dispatch queue=%.2f total=%.2f ms\n", queue_ms, total_ms);
+            stderr, "[timing] postproc-dispatch queue=%.2f pnc=%.2f total=%.2f ms\n", queue_ms,
+            pnc_ms, total_ms);
     }
-    return result;
+    return text;
 }
 
 std::string
-Postprocessor::apply_impl(
+Postprocessor::apply_cpu(
     const std::string& transcript, const AsrRequestOptions& opts, std::vector<WordTiming>* words,
     const std::string& language_code) const {
     std::string text = transcript;
@@ -327,27 +348,13 @@ Postprocessor::apply_impl(
         text = normalized;
     }
     const auto _t2 = _clk::now();
-    // Automatic punctuation is independent of verbatim_transcripts, which gates ITN.
-    if (pnc_runner_ && opts.enable_automatic_punctuation)
-        text = pnc_runner_->postprocess(text);
-    // Riva's unified output pass removes token separators before closing
-    // punctuation, including separators introduced by ITN ("€500 .").
-    if (opts.enable_automatic_punctuation)
-        text = sanitize_punctuation_spacing(text);
-    // enable_automatic_punctuation=false means verbatim, no-punctuation output.
-    // The PnC BERT above is gated off; here we also strip the casing +
-    // punctuation a self-punctuating acoustic model bakes in (a no-op on plain
-    // CTC output). Last so it also clears any ITN-introduced punctuation.
-    if (!opts.enable_automatic_punctuation)
-        text = strip_formatting(text);
     if (t_log) {
-        const auto _t3 = _clk::now();
         auto ms = [](auto a, auto b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         std::fprintf(
-            stderr, "[timing] postproc chars=%zu profanity=%.2f itn=%.2f pnc=%.2f ms\n",
-            text.size(), ms(_t0, _t1), ms(_t1, _t2), ms(_t2, _t3));
+            stderr, "[timing] postproc-cpu chars=%zu profanity=%.2f itn=%.2f ms\n", text.size(),
+            ms(_t0, _t1), ms(_t1, _t2));
     }
     return text;
 }

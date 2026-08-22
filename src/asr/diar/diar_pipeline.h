@@ -64,11 +64,14 @@ struct DiarConfig {
 // Shared, stream-independent resources: the model Session + its FE config.
 class DiarModel {
    public:
-    DiarModel(ggml_runtime::BackendManager& bm, const std::string& gguf_path);
+    DiarModel(
+        ggml_runtime::BackendManager& bm, const std::string& gguf_path,
+        const BatchingConfig& batching = {});
 
     SortformerModel& model() { return model_; }
     MelSpectrogramExtractor& fe() { return fe_; }
     const SortformerModelConfig& cfg() const { return model_.cfg(); }
+    BatchMetrics batch_metrics() const { return model_.batch_metrics(); }
 
     // Full offline diarization: one forward pass over the whole file with
     // full self-attention and NO streaming state (NeMo streaming_mode=False;
@@ -159,8 +162,11 @@ class DiarStream {
     // emitted frame (riva's extrapolation for words past the diarized
     // frontier). Returns -1 when nothing has been emitted yet.
     int speaker_for_frames(int64_t start_frame, int64_t end_frame) const;
-    // Same, for a time range in seconds (used for word timestamps).
+    // Same, for a time range in seconds.
     int speaker_for_time(double t0, double t1) const;
+    // Word attribution is onset-anchored because late punctuation emissions
+    // can extend transducer word spans into the next speaker's turn.
+    int speaker_for_word_time(double t0, double t1) const;
 
     using Segment = DiarSegment;
     std::vector<Segment> segments(const DiarSegmentationCfg& cfg = DiarSegmentationCfg()) const;
@@ -181,6 +187,7 @@ class DiarStream {
     double sec_per_frame_;
 
     AoscState state_;
+    ChannelBirthGate birth_gate_;
     std::vector<float> audio_buf_;
     size_t audio_base_ = 0;  // global sample index of audio_buf_[0]
     std::vector<float> mel_buf_;

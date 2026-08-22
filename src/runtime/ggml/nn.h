@@ -11,6 +11,11 @@
 #include "runtime.h"
 
 namespace ggml_runtime {
+
+ggml_tensor* cached_q8_input(
+    Session* session, TensorContainer* session_tensor_container, const ggml_bf_tensor& weight,
+    ggml_tensor* input);
+
 class Conv1D : public Module {
    public:
     Conv1D(

@@ -3,8 +3,8 @@
 # Load with:
 #   nemo-speech serve --config config/server.example.yaml
 #
-# ASR, NMT, and TTS are enabled automatically when their required model paths
-# are present. Set `enabled: false` under a section to force that service off.
+# ASR, diarization, NMT, and TTS are enabled when their required model paths
+# are present. Set `enabled: false` under ASR, NMT, or TTS to force it off.
 http:
   enabled: true
   host: 127.0.0.1
@@ -49,11 +49,16 @@ asr:
     # itn_model_dir: /models/sparrowhawk_en
     # profanity_list_path: /models/profanity.txt
 
+# This model also enables word-level speaker tags on ASR responses.
+diar:
+  model_path: nvidia/diar_streaming_sortformer_4spk-v2
+  preset: streaming             # streaming | offline (larger chunks and caches)
+
 tts:
   enabled: true                 # true | false | auto
-  magpie-model: /models/magpie-tts.gguf
-  codec-model: /models/nano-codec.gguf
-  tokenizer-model-dir: /models/magpie-tts-nemo
+  magpie-model: /models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf
+  codec-model: /models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf
+  tokenizer-model-dir: /models/magpie-tts/extracted
   # tn-model-dir: /models/en_tn_grammars_cased   # written-form -> spoken-form TN
 
   language-code: en-US
@@ -83,8 +88,6 @@ tts:
   uma-mode: auto                # auto | off | on
   longform: auto                # auto | off | on
 
-  benchmark: false
-  verbose: false
   voice-name:
   warmup-enabled: true
   warmup-text: "Hello from Magpie T T S."
@@ -97,10 +100,9 @@ nmt:
   backend:
     gpu: 0                      # GPU device index, -1 = CPU
   model:
-    path: /models/riva-translate-4b-instruct-v1.1.q8_0.gguf   # f16 also works
-    n_ctx: 8192
+    path: /models/riva-translate-4b-instruct-v2.q8_0.gguf   # f16 also works
+    n_ctx: 1024                 # raise for longer inputs; KV cache grows with n_ctx
   generation:
     max_new_tokens: 256
   pool:
     contexts: 1                 # concurrent decode contexts
-  verbose: false

@@ -130,9 +130,43 @@ verify_decoder_batch(RnntModel& model) {
 }
 
 bool
+verify_fresh_encoder_slots(RnntModel& model, int right_context) {
+    constexpr int B = 4;
+    const auto cfg = make_cache_aware_config(model.encoder_config(), right_context);
+    const int M = model.fe_config().n_mels;
+    const int mel_frames = 9 + cfg.subsampling_factor * cfg.cache_chunk_frames;
+    const int mask_len = cfg.cache_left_ctx + cfg.cache_chunk_frames;
+    std::vector<float> mel(static_cast<size_t>(M) * mel_frames);
+    std::vector<float> mask(static_cast<size_t>(mask_len));
+    for (size_t i = 0; i < mel.size(); ++i)
+        mel[i] = 0.2f * std::sin(0.017f * static_cast<float>(i));
+    for (int i = 0; i < cfg.cache_left_ctx; ++i) mask[static_cast<size_t>(i)] = -1e9f;
+
+    std::vector<CacheAwareEncoder::State> states;
+    for (int b = 0; b < B; ++b) states.push_back(model.make_cache_state());
+    std::vector<std::vector<float>> output(B);
+    std::vector<int> frames(B);
+    for (int b = 0; b < B; ++b) {
+        model.encode_cache_aware(
+            states[b], mel.data(), mel_frames, mask.data(), mask_len, output[b], frames[b]);
+    }
+
+    float max_error = 0.0f;
+    for (int b = 1; b < B; ++b) {
+        if (frames[b] != frames[0] || output[b].size() != output[0].size())
+            return false;
+        for (size_t i = 0; i < output[0].size(); ++i)
+            max_error = std::max(max_error, std::abs(output[b][i] - output[0][i]));
+    }
+    std::fprintf(stderr, "[encoder slots] first-use max abs error=%.6g\n", max_error);
+    return max_error == 0.0f;
+}
+
+bool
 verify_encoder_batch(RnntModel& model, int right_context) {
     constexpr int B = 4;
-    constexpr float kBatchShapeMaxAbsError = 5e-2f;
+    constexpr float kMaxAbsError = 7.5e-2f;
+    constexpr double kMaxRelativeRmse = 2.5e-2;
     const auto cfg = make_cache_aware_config(model.encoder_config(), right_context);
     const int M = model.fe_config().n_mels;
     const int mel_frames = 9 + cfg.subsampling_factor * cfg.cache_chunk_frames;
@@ -159,11 +193,13 @@ verify_encoder_batch(RnntModel& model, int right_context) {
     }
 
     struct BatchResult {
-        std::vector<std::vector<float>> values = std::vector<std::vector<float>>(B);
-        std::vector<int> frames = std::vector<int>(B);
+        explicit BatchResult(int batch_size) : values(batch_size), frames(batch_size) {}
+
+        std::vector<std::vector<float>> values;
+        std::vector<int> frames;
     };
     auto run_batch = [&]() {
-        BatchResult result;
+        BatchResult result(B);
         std::vector<CacheAwareEncoder::State> states;
         for (int b = 0; b < B; ++b) states.push_back(model.make_cache_state());
         std::atomic<int> ready{0};
@@ -190,6 +226,11 @@ verify_encoder_batch(RnntModel& model, int right_context) {
 
     float batch_shape_max_error = 0.0f;
     float repeat_max_error = 0.0f;
+    long double batch_shape_squared_error = 0.0L;
+    long double repeat_squared_error = 0.0L;
+    long double reference_squared = 0.0L;
+    float reference_max = 0.0f;
+    size_t compared_values = 0;
     for (int b = 0; b < B; ++b) {
         if (got.frames[b] != expected_T[b] || repeated.frames[b] != got.frames[b] ||
             got.values[b].size() != expected[b].size() ||
@@ -203,19 +244,39 @@ verify_encoder_batch(RnntModel& model, int right_context) {
                 std::max(batch_shape_max_error, std::abs(got.values[b][i] - expected[b][i]));
             repeat_max_error =
                 std::max(repeat_max_error, std::abs(repeated.values[b][i] - got.values[b][i]));
+            const long double batch_error =
+                static_cast<long double>(got.values[b][i]) - expected[b][i];
+            const long double repeat_error =
+                static_cast<long double>(repeated.values[b][i]) - got.values[b][i];
+            batch_shape_squared_error += batch_error * batch_error;
+            repeat_squared_error += repeat_error * repeat_error;
+            reference_squared += static_cast<long double>(expected[b][i]) * expected[b][i];
+            reference_max = std::max(reference_max, std::abs(expected[b][i]));
+            ++compared_values;
         }
     }
+    const double batch_shape_rmse =
+        std::sqrt(static_cast<double>(batch_shape_squared_error / compared_values));
+    const double repeat_rmse =
+        std::sqrt(static_cast<double>(repeat_squared_error / compared_values));
+    const double reference_rms =
+        std::sqrt(static_cast<double>(reference_squared / compared_values));
+    const double batch_shape_relative_rmse = batch_shape_rmse / reference_rms;
+    const double repeat_relative_rmse = repeat_rmse / reference_rms;
     const auto metrics = model.encoder_batch_metrics();
     std::fprintf(
         stderr,
-        "[encoder batch] max B=%llu B=1/B=4 max abs error=%.6g repeat B=4 max abs error=%.6g\n",
-        (unsigned long long)metrics.max_observed_batch, batch_shape_max_error, repeat_max_error);
-    // BF16 and quantized encoder graphs can legitimately change accumulation
-    // order when the batch dimension changes. Bound that cross-shape drift,
-    // but require identical results when the B=4 graph is repeated. The full
-    // streaming phase below separately requires exact transcript parity.
-    return metrics.max_observed_batch >= B && batch_shape_max_error <= kBatchShapeMaxAbsError &&
-           repeat_max_error == 0.0f;
+        "[encoder batch] max B=%llu reference max=%.6g RMS=%.6g "
+        "B=1/B=4 max abs error=%.6g relative RMSE=%.6g "
+        "repeat B=4 max abs error=%.6g relative RMSE=%.6g\n",
+        (unsigned long long)metrics.max_observed_batch, reference_max, reference_rms,
+        batch_shape_max_error, batch_shape_relative_rmse, repeat_max_error, repeat_relative_rmse);
+    // BF16 and quantized encoder graphs can change accumulation order with the
+    // batch shape and with an item's row in that batch. Bound both effects; the
+    // full streaming phase below separately requires exact transcript parity.
+    return metrics.max_observed_batch >= B && batch_shape_max_error <= kMaxAbsError &&
+           repeat_max_error <= kMaxAbsError && batch_shape_relative_rmse <= kMaxRelativeRmse &&
+           repeat_relative_rmse <= kMaxRelativeRmse;
 }
 
 // Run one full streaming utterance on a fresh runner and return the final
@@ -315,6 +376,8 @@ main(int argc, char** argv) {
     RecognizerConfig cfg;
     cfg.streaming.rnnt_right_context = right_context;
     rnnt->set_cache_right_ctx(cfg.streaming.rnnt_right_context);
+    if (!verify_fresh_encoder_slots(*rnnt, right_context))
+        return 5;
     if (!verify_encoder_batch(*rnnt, right_context))
         return 5;
     const int prompt_index = rnnt->prompt_index_for_lang(language);

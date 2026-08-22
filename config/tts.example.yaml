@@ -10,9 +10,9 @@
 # Every key is optional, and omitted keys keep their built-in defaults. Unknown
 # keys are a hard error so typos are not silently ignored.
 tts:
-  magpie-model: /models/magpie-tts.gguf
-  codec-model: /models/nano-codec.gguf
-  tokenizer-model-dir: /models/magpie-tts-nemo
+  magpie-model: /models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf
+  codec-model: /models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf
+  tokenizer-model-dir: /models/magpie-tts/extracted
   # tn-model-dir: /models/en_tn_grammars_cased   # written-form -> spoken-form TN
 
   language-code: en-US
@@ -43,9 +43,6 @@ tts:
   sampling-backend: auto        # auto | cpu | cuda
   uma-mode: auto                # auto | off | on
   longform: auto                # auto | off | on
-
-  benchmark: false
-  verbose: false
 
   # Server defaults and startup warmup:
   # voice-name: John

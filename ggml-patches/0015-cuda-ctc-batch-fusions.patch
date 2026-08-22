@@ -1,0 +1,733 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 873ac0e..b92b14f 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4183,6 +4183,111 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return n_fused;
+     }
+
++    const std::initializer_list<ggml_op> batch_norm_ops = {
++        GGML_OP_SUB, GGML_OP_ADD, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_MUL, GGML_OP_ADD
++    };
++    const bool batch_norm_ops_match =
++        i + (int) batch_norm_ops.size() <= cgraph->n_nodes &&
++        std::equal(
++            batch_norm_ops.begin(), batch_norm_ops.end(), cgraph->nodes + i,
++            [](ggml_op op, const ggml_tensor * tensor) { return op == tensor->op; });
++    const bool batch_norm_subgraph =
++        batch_norm_ops_match &&
++        ggml_can_fuse_subgraph(cgraph, i, batch_norm_ops, { i + 5 });
++    if (batch_norm_subgraph) {
++        ggml_tensor * sub      = cgraph->nodes[i];
++        ggml_tensor * var_add  = cgraph->nodes[i + 1];
++        ggml_tensor * sqrt     = cgraph->nodes[i + 2];
++        ggml_tensor * div      = cgraph->nodes[i + 3];
++        ggml_tensor * mul      = cgraph->nodes[i + 4];
++        ggml_tensor * out      = cgraph->nodes[i + 5];
++
++        const ggml_tensor * input = sub->src[0];
++        const ggml_tensor * mean  = sub->src[1];
++        const ggml_tensor * variance = nullptr;
++        const ggml_tensor * epsilon  = nullptr;
++        if (ggml_nelements(var_add->src[0]) == 1) {
++            epsilon = var_add->src[0];
++            variance = var_add->src[1];
++        } else if (ggml_nelements(var_add->src[1]) == 1) {
++            variance = var_add->src[0];
++            epsilon = var_add->src[1];
++        }
++
++        const ggml_tensor * weight =
++            mul->src[0] == div ? mul->src[1] :
++            mul->src[1] == div ? mul->src[0] : nullptr;
++        const ggml_tensor * bias =
++            out->src[0] == mul ? out->src[1] :
++            out->src[1] == mul ? out->src[0] : nullptr;
++
++        const int64_t channels = input->ne[1];
++        const bool graph_ok =
++            sqrt->src[0] == var_add &&
++            div->src[0] == sub && div->src[1] == sqrt;
++        const bool params_ok =
++            variance != nullptr && epsilon != nullptr && weight != nullptr && bias != nullptr &&
++            ggml_nelements(mean) == channels &&
++            ggml_nelements(variance) == channels &&
++            ggml_nelements(weight) == channels &&
++            ggml_nelements(bias) == channels;
++        const bool types_ok =
++            input->type == GGML_TYPE_F32 && mean->type == GGML_TYPE_F32 &&
++            variance != nullptr && variance->type == GGML_TYPE_F32 &&
++            epsilon != nullptr && epsilon->type == GGML_TYPE_F32 &&
++            weight != nullptr && weight->type == GGML_TYPE_F32 &&
++            bias != nullptr && bias->type == GGML_TYPE_F32 &&
++            sub->type == GGML_TYPE_F32 && var_add->type == GGML_TYPE_F32 &&
++            sqrt->type == GGML_TYPE_F32 && div->type == GGML_TYPE_F32 &&
++            mul->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32;
++        const bool layout_ok =
++            ggml_is_contiguous(input) && ggml_is_contiguous(mean) &&
++            variance != nullptr && ggml_is_contiguous(variance) &&
++            epsilon != nullptr && ggml_is_contiguous(epsilon) &&
++            weight != nullptr && ggml_is_contiguous(weight) &&
++            bias != nullptr && ggml_is_contiguous(bias) &&
++            ggml_is_contiguous(out) && ggml_are_same_shape(input, out);
++        const int out_node = i + 5;
++
++        const bool common_eligible =
++            graph_ok && params_ok && types_ok && layout_ok;
++        if (common_eligible &&
++            ggml_can_fuse_subgraph(
++                cgraph, i,
++                { GGML_OP_SUB, GGML_OP_ADD, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_MUL,
++                  GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_UNARY },
++                { i + 8 })) {
++            ggml_tensor * permute = cgraph->nodes[i + 6];
++            ggml_tensor * cont = cgraph->nodes[i + 7];
++            ggml_tensor * silu = cgraph->nodes[i + 8];
++            const bool transpose_ok =
++                permute->src[0] == out && cont->src[0] == permute && silu->src[0] == cont &&
++                ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
++                permute->type == GGML_TYPE_F32 && cont->type == GGML_TYPE_F32 &&
++                silu->type == GGML_TYPE_F32 &&
++                permute->ne[0] == input->ne[1] && permute->ne[1] == input->ne[0] &&
++                permute->ne[2] == input->ne[2] && permute->ne[3] == input->ne[3] &&
++                permute->nb[0] == out->nb[1] && permute->nb[1] == out->nb[0] &&
++                permute->nb[2] == out->nb[2] && permute->nb[3] == out->nb[3] &&
++                ggml_is_contiguous(cont) && ggml_is_contiguous(silu) &&
++                ggml_are_same_shape(cont, silu);
++            const int transpose_out_node = i + 8;
++            if (transpose_ok &&
++                ggml_cuda_check_fusion_memory_ranges(
++                    cgraph, i, 9, &transpose_out_node, 1)) {
++                ggml_cuda_op_batch_norm_silu_transpose_fused(
++                    *cuda_ctx, input, mean, variance, epsilon, weight, bias, silu);
++                return 8;
++            }
++        }
++        if (common_eligible &&
++            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, &out_node, 1)) {
++            ggml_cuda_op_batch_norm_fused(
++                *cuda_ctx, input, mean, variance, epsilon, weight, bias, out);
++            return 5;
++        }
++    }
++
+     //topk-moe
+     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+@@ -4566,21 +4671,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     fused_mul_mat_vec = false;
+     fused_node_count  = 0;
+
+-    // A BF16 projection immediately following SiLU would otherwise launch an
+-    // F32 SiLU kernel and then a separate F32-to-BF16 input conversion. Emit
+-    // the same rounded BF16 activation directly in one pass.
++    // A 16-bit projection immediately following SiLU would otherwise launch an
++    // F32 SiLU kernel and then a separate input conversion.
+     if (ggml_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_CPY })) {
+         const ggml_tensor * silu_node = cgraph->nodes[i];
+         ggml_tensor * cast_node = cgraph->nodes[i + 1];
++        const bool cast_supported =
++            cast_node->type == GGML_TYPE_F16 ||
++            (cast_node->type == GGML_TYPE_BF16 && native_bf16);
+         const bool eligible =
+-            native_bf16 && ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
++            cast_supported && ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
+             cast_node->src[0] == silu_node &&
+             silu_node->src[0]->type == GGML_TYPE_F32 &&
+-            silu_node->type == GGML_TYPE_F32 && cast_node->type == GGML_TYPE_BF16 &&
++            silu_node->type == GGML_TYPE_F32 &&
+             ggml_are_same_shape(silu_node->src[0], cast_node) &&
+             ggml_is_contiguous(silu_node->src[0]) && ggml_is_contiguous(cast_node);
+         if (eligible) {
+-            ggml_cuda_op_silu_f32_to_bf16(*cuda_ctx, silu_node, cast_node);
++            ggml_cuda_op_silu_f32_to_16(*cuda_ctx, silu_node, cast_node);
+             return 1;
+         }
+     }
+@@ -4626,6 +4733,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+
++    // Fold a following residual into the same cuBLASLt projection epilogue.
++    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
++        ggml_tensor *       mm_node      = cgraph->nodes[i];
++        ggml_tensor *       bias_node    = cgraph->nodes[i + 1];
++        ggml_tensor *       residual_add = cgraph->nodes[i + 2];
++        const ggml_tensor * bias =
++            bias_node->src[0] == mm_node ? bias_node->src[1] :
++            bias_node->src[1] == mm_node ? bias_node->src[0] : nullptr;
++        const ggml_tensor * residual =
++            residual_add->src[0] == bias_node ? residual_add->src[1] :
++            residual_add->src[1] == bias_node ? residual_add->src[0] : nullptr;
++        if (bias != nullptr && residual != nullptr &&
++            bias->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(bias) && ggml_is_contiguous(residual) &&
++            ggml_nelements(bias) == mm_node->ne[0] &&
++            ggml_are_same_shape(mm_node, residual) &&
++            ggml_is_contiguous(residual_add) &&
++            ggml_cuda_skinny_q8_residual_supported(
++                mm_node->src[0], mm_node->src[1], mm_node)) {
++            ggml_cuda_mul_mat_skinny_q8_bias_residual(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], bias, residual, residual_add);
++            return 2;
++        }
++    }
++
+     // skinny-q8 GEMM + row-vector bias: the upstream MUL_MAT+ADD fusion below
+     // requires a same-shape add, so the classic broadcast Linear bias
+     // ([M] over [M,N]) never qualifies — fold it into the skinny GEMM's
+@@ -4713,7 +4845,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+
+-    // LayerNorm affine followed by a BF16 projection. Store the affine result
++    // LayerNorm affine followed by a 16-bit projection. Store the affine result
+     // directly in the projection's input precision instead of writing F32 and
+     // launching a second full-tensor conversion.
+     if (ggml_can_fuse(cgraph, i,
+@@ -4726,10 +4858,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             mul->src[0] == norm ? mul->src[1] : mul->src[0];
+         const ggml_tensor * beta =
+             add->src[0] == mul ? add->src[1] : add->src[0];
++        const bool cast_supported =
++            cast->type == GGML_TYPE_F16 ||
++            (cast->type == GGML_TYPE_BF16 && native_bf16);
+         const bool eligible =
+-            native_bf16 && cast->src[0] == add && norm->src[0]->type == GGML_TYPE_F32 &&
++            cast_supported && cast->src[0] == add && norm->src[0]->type == GGML_TYPE_F32 &&
+             norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+-            add->type == GGML_TYPE_F32 && cast->type == GGML_TYPE_BF16 &&
++            add->type == GGML_TYPE_F32 &&
+             gamma->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 &&
+             ggml_nelements(gamma) == norm->ne[0] &&
+             ggml_nelements(beta) == norm->ne[0] &&
+@@ -5690,7 +5825,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                         return false;
+                     }
+                 }
+-                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
++                if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 &&
++                    !(op->op == GGML_OP_MUL_MAT &&
++                      ggml_cuda_skinny_q8_supported(a, b, op))) {
+                     return false;
+                 }
+ #ifdef GGML_USE_MUSA
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index 555c951..e30c025 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+
+ template <int block_size>
+@@ -81,6 +82,61 @@ static __global__ void norm_mul_add_f32(
+     }
+ }
+
++static __global__ void batch_norm_f32(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels) {
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= nelements) {
++        return;
++    }
++
++    const int64_t channel = (i / ntime) % nchannels;
++    const float centered = __fsub_rn(x[i], mean[channel]);
++    const float denominator = sqrtf(__fadd_rn(variance[channel], epsilon[0]));
++    const float normalized = __fdiv_rn(centered, denominator);
++    dst[i] = __fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]);
++}
++
++static __global__ void batch_norm_silu_transpose_f32(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels) {
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= nelements) {
++        return;
++    }
++
++    const int64_t channel = (i / ntime) % nchannels;
++    const int64_t time = i % ntime;
++    const int64_t sample = i / (ntime * nchannels);
++    const float centered = __fsub_rn(x[i], mean[channel]);
++    const float denominator = sqrtf(__fadd_rn(variance[channel], epsilon[0]));
++    const float normalized = __fdiv_rn(centered, denominator);
++    const float affine = __fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]);
++    dst[channel + nchannels * (time + ntime * sample)] = ggml_cuda_op_silu_single(affine);
++}
++
++static void batch_norm_f32_cuda(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels, cudaStream_t stream) {
++    constexpr int block_size = 256;
++    const int64_t block_count = (nelements + block_size - 1) / block_size;
++    batch_norm_f32<<<block_count, block_size, 0, stream>>>(
++        x, mean, variance, epsilon, weight, bias, dst, nelements, ntime, nchannels);
++}
++
++static void batch_norm_silu_transpose_f32_cuda(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels, cudaStream_t stream) {
++    constexpr int block_size = 256;
++    const int64_t block_count = (nelements + block_size - 1) / block_size;
++    batch_norm_silu_transpose_f32<<<block_count, block_size, 0, stream>>>(
++        x, mean, variance, epsilon, weight, bias, dst, nelements, ntime, nchannels);
++}
++
+ template <int block_size>
+ static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
+     // blockIdx.x: num_groups idx
+@@ -343,10 +399,9 @@ static void norm_mul_add_cuda(
+             norm_mul_add_f32<WARP_SIZE, false, T><<<blocks_num, block_dims, 0, stream>>>(
+                 x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         }
+-    } else if (ncols == 1024 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER) {
+-        // Hopper and newer: four elements per thread keeps high occupancy
+-        // while reducing the affine LayerNorm reduction from 32 warps/block
+-        // to 8. Retain the established 1024-thread path on older devices.
++    } else if (ncols == 1024 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
++        // Four elements per thread keeps high occupancy while reducing the
++        // affine LayerNorm reduction from 32 warps/block to 8.
+         const dim3 block_dims(256, 1, 1);
+         if (add) {
+             norm_mul_add_f32<256, true, T><<<blocks_num, block_dims, 8 * sizeof(float2), stream>>>(
+@@ -519,7 +574,7 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ // or add_tensor), mirroring ggml_cuda_op_rms_norm_fused(_add). Eligibility
+ // (row-vector operands, F32, contiguity) is enforced in ggml_cuda_can_fuse.
+ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+-                             ggml_tensor * add_tensor, ggml_tensor * bf16_dst) {
++                             ggml_tensor * add_tensor, ggml_tensor * cast_dst) {
+     const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
+     float eps = 0.0f;
+     memcpy(&eps, dst->op_params, sizeof(float));
+@@ -563,13 +618,19 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     const int64_t s02 = norm_src->nb[2] / ts0;
+     const int64_t s03 = norm_src->nb[3] / ts0;
+
+-    if (bf16_dst != nullptr) {
+-        GGML_ASSERT(bf16_dst->type == GGML_TYPE_BF16);
+-        GGML_ASSERT(ggml_is_contiguous(bf16_dst));
+-        GGML_ASSERT(ggml_are_same_shape(dst, bf16_dst));
+-        norm_mul_add_cuda(
+-            src0_d, mul_d, add_d, (nv_bfloat16 *) bf16_dst->data,
+-            ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++    if (cast_dst != nullptr) {
++        GGML_ASSERT(cast_dst->type == GGML_TYPE_BF16 || cast_dst->type == GGML_TYPE_F16);
++        GGML_ASSERT(ggml_is_contiguous(cast_dst));
++        GGML_ASSERT(ggml_are_same_shape(dst, cast_dst));
++        if (cast_dst->type == GGML_TYPE_BF16) {
++            norm_mul_add_cuda(
++                src0_d, mul_d, add_d, (nv_bfloat16 *) cast_dst->data,
++                ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++        } else {
++            norm_mul_add_cuda(
++                src0_d, mul_d, add_d, (half *) cast_dst->data,
++                ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++        }
+     } else {
+         norm_mul_add_cuda(
+             src0_d, mul_d, add_d, dst_d,
+@@ -577,6 +638,50 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     }
+ }
+
++void ggml_cuda_op_batch_norm_fused(ggml_backend_cuda_context & ctx,
++                                   const ggml_tensor *         input,
++                                   const ggml_tensor *         mean,
++                                   const ggml_tensor *         variance,
++                                   const ggml_tensor *         epsilon,
++                                   const ggml_tensor *         weight,
++                                   const ggml_tensor *         bias,
++                                   ggml_tensor *               dst) {
++    batch_norm_f32_cuda(
++        (const float *) input->data,
++        (const float *) mean->data,
++        (const float *) variance->data,
++        (const float *) epsilon->data,
++        (const float *) weight->data,
++        (const float *) bias->data,
++        (float *) dst->data,
++        ggml_nelements(input),
++        input->ne[0],
++        input->ne[1],
++        ctx.stream());
++}
++
++void ggml_cuda_op_batch_norm_silu_transpose_fused(ggml_backend_cuda_context & ctx,
++                                                  const ggml_tensor *         input,
++                                                  const ggml_tensor *         mean,
++                                                  const ggml_tensor *         variance,
++                                                  const ggml_tensor *         epsilon,
++                                                  const ggml_tensor *         weight,
++                                                  const ggml_tensor *         bias,
++                                                  ggml_tensor *               dst) {
++    batch_norm_silu_transpose_f32_cuda(
++        (const float *) input->data,
++        (const float *) mean->data,
++        (const float *) variance->data,
++        (const float *) epsilon->data,
++        (const float *) weight->data,
++        (const float *) bias->data,
++        (float *) dst->data,
++        ggml_nelements(input),
++        input->ne[0],
++        input->ne[1],
++        ctx.stream());
++}
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const float * src0_d = (const float *)src0->data;
+diff --git a/src/ggml-cuda/norm.cuh b/src/ggml-cuda/norm.cuh
+index 8f4287c..f580ae9 100644
+--- a/src/ggml-cuda/norm.cuh
++++ b/src/ggml-cuda/norm.cuh
+@@ -5,7 +5,25 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ // Fused LayerNorm + row-vector mul (gamma) + optional row-vector add (beta).
+ // add_tensor may be nullptr (norm+mul only).
+ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+-                             ggml_tensor * add_tensor, ggml_tensor * bf16_dst = nullptr);
++                             ggml_tensor * add_tensor, ggml_tensor * cast_dst = nullptr);
++
++void ggml_cuda_op_batch_norm_fused(ggml_backend_cuda_context & ctx,
++                                   const ggml_tensor *         input,
++                                   const ggml_tensor *         mean,
++                                   const ggml_tensor *         variance,
++                                   const ggml_tensor *         epsilon,
++                                   const ggml_tensor *         weight,
++                                   const ggml_tensor *         bias,
++                                   ggml_tensor *               dst);
++
++void ggml_cuda_op_batch_norm_silu_transpose_fused(ggml_backend_cuda_context & ctx,
++                                                  const ggml_tensor *         input,
++                                                  const ggml_tensor *         mean,
++                                                  const ggml_tensor *         variance,
++                                                  const ggml_tensor *         epsilon,
++                                                  const ggml_tensor *         weight,
++                                                  const ggml_tensor *         bias,
++                                                  ggml_tensor *               dst);
+
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+diff --git a/src/ggml-cuda/skinny-q8.cu b/src/ggml-cuda/skinny-q8.cu
+index fe329bb..1122e05 100644
+--- a/src/ggml-cuda/skinny-q8.cu
++++ b/src/ggml-cuda/skinny-q8.cu
+@@ -94,14 +94,19 @@ static __global__ void skq8_dequantize_weight_f16(
+     *(half2 *) (out + i) = __floats2half2_rn((float) q.x * scale, (float) q.y * scale);
+ }
+
+-static __global__ void skq8_add_bias_f32(
+-    float * __restrict__ dst, const float * __restrict__ bias,
+-    const int M, const int64_t count) {
+-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+-    if (i < count) {
+-        dst[i] += bias[i % M];
+-    }
++static bool skq8_cublas_f16_enabled_for_n(int64_t n) {
++    static const bool enabled = []() {
++        const char * e = getenv("GGML_SKINNY_Q8_CUBLAS_F16");
++        return e != nullptr && e[0] != '0';
++    }();
++    static const int min_n = []() {
++        const char * e = getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
++        const int value = e != nullptr ? atoi(e) : 128;
++        return value > 0 ? value : 1;
++    }();
++    return enabled && n >= min_n;
+ }
++
+ #endif
+
+ // ---------------------------------------------------------------------------
+@@ -388,6 +393,25 @@ static __global__ void skq8_reduce_splitk(
+     dst[i] = sum;
+ }
+
++#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
++static __global__ void skq8_add_epilogue_f32(
++    float * __restrict__ dst, const float * __restrict__ bias,
++    const float * __restrict__ residual, const int m, const int64_t count) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= count) {
++        return;
++    }
++    float value = dst[i];
++    if (residual != nullptr) {
++        value += residual[i];
++    }
++    if (bias != nullptr) {
++        value += bias[i % m];
++    }
++    dst[i] = value;
++}
++#endif
++
+ // Repacked-weight cache. Keyed by the weight tensor's device pointer; entries
+ // live for the process lifetime (model weights are loaded once). Repacking
+ // happens on first (eager/warmup) use, before any CUDA-graph capture.
+@@ -453,10 +477,18 @@ bool ggml_cuda_skinny_q8_supported(
+     // all outer columns as one logical N so a weight repacked by a scalar
+     // graph remains usable by a later true-batch graph.
+     const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
+-    const bool call_ok = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+-                         ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+-                         src1->ne[0] == src0->ne[0] &&
+-                         ggml_nelements(dst) == src0->ne[1] * total_n;
++    const bool f16_input_ok =
++#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
++        src1->type == GGML_TYPE_F16 && skq8_cublas_f16_enabled_for_n(total_n);
++#else
++        false;
++#endif
++    const bool call_ok =
++        (src1->type == GGML_TYPE_F32 || f16_input_ok) &&
++        dst->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++        src1->ne[0] == src0->ne[0] &&
++        ggml_nelements(dst) == src0->ne[1] * total_n;
+
+     if (planar_q8) {
+         // N<=8 is handled by planar MMVQ. Wider calls must stay on this path
+@@ -479,13 +511,9 @@ bool ggml_cuda_skinny_q8_supported(
+         GGML_ASSERT(call_ok && "skinny-q8: repacked weight used in an unsupported mul_mat shape");
+         return true;
+     }
+-    // By default, select only on logical width so outer batch size cannot
+-    // change the accumulation path. The opt-in mode is an end-to-end ASR
+-    // experiment for streaming shapes such as [K,2,B]: it flattens the dense
+-    // outer batch and lets the tensor-core kernel tile N beyond 64. It is not
+-    // the default because skinny-Q8 has a different accumulation order from
+-    // MMVQ; callers must validate transcript/accuracy parity. Use a separate
+-    // repack allocation (GGML_SKINNY_Q8_INPLACE=0) with multi-stream schedulers.
++    // Keep the accumulation path independent of outer batch size by default.
++    // The opt-in mode flattens [K,N,B...] for the tensor-core kernel; use a
++    // separate repack allocation with multi-stream schedulers.
+     static const bool outer_batch_dispatch = []() {
+         const char * e = getenv("GGML_SKINNY_Q8_OUTER_BATCH");
+         return e != nullptr && e[0] != '0';
+@@ -498,9 +526,21 @@ bool ggml_cuda_skinny_q8_supported(
+     return eligible;
+ }
+
++bool ggml_cuda_skinny_q8_residual_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
++    const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
++    return ggml_cuda_skinny_q8_supported(src0, src1, dst) &&
++           skq8_cublas_f16_enabled_for_n(total_n);
++#else
++    GGML_UNUSED_VARS(src0, src1, dst);
++    return false;
++#endif
++}
++
+ static void skq8_run(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+-    const ggml_tensor * bias, ggml_tensor * dst) {
++    const ggml_tensor * bias, const ggml_tensor * residual, ggml_tensor * dst) {
+     const int64_t M  = src0->ne[1];
+     const int64_t K  = src0->ne[0];
+     const int64_t N  = ggml_nelements(src1) / src1->ne[0];
+@@ -508,16 +548,7 @@ static void skq8_run(
+
+     cudaStream_t stream = ctx.stream();
+ #if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+-    static const bool cublas_f16_enabled = []() {
+-        const char * e = getenv("GGML_SKINNY_Q8_CUBLAS_F16");
+-        return e != nullptr && e[0] != '0';
+-    }();
+-    static const int cublas_f16_min_n = []() {
+-        const char * e = getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
+-        const int value = e != nullptr ? atoi(e) : 128;
+-        return value > 0 ? value : 1;
+-    }();
+-    const bool use_cublas_f16 = cublas_f16_enabled && N >= cublas_f16_min_n;
++    const bool use_cublas_f16 = skq8_cublas_f16_enabled_for_n(N);
+ #endif
+
+     // Repacked weight planes (create on first use). Default: IN PLACE. The plane
+@@ -612,29 +643,44 @@ static void skq8_run(
+     // the live activation, and retain FP32 accumulation/output.
+     if (use_cublas_f16) {
+         GGML_ASSERT(planes.f16 != nullptr);
+-        ggml_cuda_pool_alloc<half> a_f16(ctx.pool(), (size_t) N * K);
+-        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+-        GGML_ASSERT(to_fp16 != nullptr);
+-        to_fp16(src1->data, a_f16.get(), N * K, stream);
+-
+-        const float alpha = 1.0f;
+-        const float beta = 0.0f;
+-        cublasHandle_t handle = ctx.cublas_handle();
+-        CUBLAS_CHECK(cublasSetStream(handle, stream));
+-        CUBLAS_CHECK(cublasGemmEx(
+-            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+-            (int) M, (int) N, (int) K,
+-            &alpha, planes.f16, CUDA_R_16F, (int) K,
+-            a_f16.get(), CUDA_R_16F, (int) K,
+-            &beta, dst->data, CUDA_R_32F, (int) M,
+-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+-        if (bias != nullptr) {
+-            const int64_t count = M * N;
+-            skq8_add_bias_f32<<<(count + 255) / 256, 256, 0, stream>>>(
+-                (float *) dst->data, (const float *) bias->data, (int) M, count);
++        auto gemm = [&](const half* activation) {
++            const float alpha = 1.0f;
++            const bool residual_in_place =
++                residual != nullptr && residual->data == dst->data;
++            const float beta = residual_in_place ? 1.0f : 0.0f;
++            cublasHandle_t handle = ctx.cublas_handle();
++            CUBLAS_CHECK(cublasSetStream(handle, stream));
++            CUBLAS_CHECK(cublasGemmEx(
++                handle, CUBLAS_OP_T, CUBLAS_OP_N,
++                (int) M, (int) N, (int) K,
++                &alpha, planes.f16, CUDA_R_16F, (int) K,
++                activation, CUDA_R_16F, (int) K,
++                &beta, dst->data, CUDA_R_32F, (int) M,
++                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++            if (bias != nullptr || (residual != nullptr && !residual_in_place)) {
++                const int64_t count = M * N;
++                skq8_add_epilogue_f32<<<(count + 255) / 256, 256, 0, stream>>>(
++                    (float *) dst->data,
++                    bias != nullptr ? (const float *) bias->data : nullptr,
++                    residual != nullptr && !residual_in_place
++                        ? (const float *) residual->data
++                        : nullptr,
++                    (int) M, count);
++            }
++        };
++        if (src1->type == GGML_TYPE_F16) {
++            gemm((const half*) src1->data);
++        } else {
++            ggml_cuda_pool_alloc<half> a_f16(ctx.pool(), (size_t) N * K);
++            const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
++            GGML_ASSERT(to_fp16 != nullptr);
++            to_fp16(src1->data, a_f16.get(), N * K, stream);
++            gemm(a_f16.get());
+         }
+         return;
+     }
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(residual == nullptr);
+ #endif
+
+     // Quantize activations into the zero-padded buffer (all columns, once —
+@@ -691,11 +737,17 @@ static void skq8_run(
+ void ggml_cuda_mul_mat_skinny_q8(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     ggml_tensor * dst) {
+-    skq8_run(ctx, src0, src1, nullptr, dst);
++    skq8_run(ctx, src0, src1, nullptr, nullptr, dst);
+ }
+
+ void ggml_cuda_mul_mat_skinny_q8_bias(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     const ggml_tensor * bias, ggml_tensor * dst) {
+-    skq8_run(ctx, src0, src1, bias, dst);
++    skq8_run(ctx, src0, src1, bias, nullptr, dst);
++}
++
++void ggml_cuda_mul_mat_skinny_q8_bias_residual(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, const ggml_tensor * residual, ggml_tensor * dst) {
++    skq8_run(ctx, src0, src1, bias, residual, dst);
+ }
+diff --git a/src/ggml-cuda/skinny-q8.cuh b/src/ggml-cuda/skinny-q8.cuh
+index 17175bb..30238fe 100644
+--- a/src/ggml-cuda/skinny-q8.cuh
++++ b/src/ggml-cuda/skinny-q8.cuh
+@@ -7,6 +7,9 @@
+ bool ggml_cuda_skinny_q8_supported(
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
++bool ggml_cuda_skinny_q8_residual_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++
+ void ggml_cuda_mul_mat_skinny_q8(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     ggml_tensor * dst);
+@@ -16,3 +19,7 @@ void ggml_cuda_mul_mat_skinny_q8(
+ void ggml_cuda_mul_mat_skinny_q8_bias(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     const ggml_tensor * bias, ggml_tensor * dst);
++
++void ggml_cuda_mul_mat_skinny_q8_bias_residual(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, const ggml_tensor * residual, ggml_tensor * dst);
+diff --git a/src/ggml-cuda/unary.cu b/src/ggml-cuda/unary.cu
+index 4c68411..24b3ff7 100644
+--- a/src/ggml-cuda/unary.cu
++++ b/src/ggml-cuda/unary.cu
+@@ -183,11 +183,20 @@ void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_silu>(ctx, dst);
+ }
+
++static __global__ void silu_f32_to_f16(
++        const float * __restrict__ x, half * __restrict__ dst,
++        const int64_t nelements) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < nelements) {
++        dst[i] = __float2half(op_silu(x[i]));
++    }
++}
++
+ static __global__ void silu_f32_to_bf16(
+         const float * __restrict__ x, nv_bfloat16 * __restrict__ dst,
+         const int64_t nelements) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+     if (i < nelements) {
+         dst[i] = __float2bfloat16(op_silu(x[i]));
+     }
+@@ -197,21 +206,26 @@ static __global__ void silu_f32_to_bf16(
+ #endif
+ }
+
+-void ggml_cuda_op_silu_f32_to_bf16(
++void ggml_cuda_op_silu_f32_to_16(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * silu_node,
+         ggml_tensor * dst) {
+     const ggml_tensor * src = silu_node->src[0];
+     GGML_ASSERT(src->type == GGML_TYPE_F32);
+     GGML_ASSERT(silu_node->type == GGML_TYPE_F32);
+-    GGML_ASSERT(dst->type == GGML_TYPE_BF16);
++    GGML_ASSERT(dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_F16);
+     GGML_ASSERT(ggml_are_same_shape(src, dst));
+     GGML_ASSERT(ggml_is_contiguous(src));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+
+     const int64_t nelements = ggml_nelements(src);
+     const int64_t num_blocks = (nelements + CUDA_SILU_BLOCK_SIZE - 1) / CUDA_SILU_BLOCK_SIZE;
+-    silu_f32_to_bf16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
+-        (const float *) src->data, (nv_bfloat16 *) dst->data, nelements);
++    if (dst->type == GGML_TYPE_BF16) {
++        silu_f32_to_bf16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
++            (const float *) src->data, (nv_bfloat16 *) dst->data, nelements);
++    } else {
++        silu_f32_to_f16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
++            (const float *) src->data, (half *) dst->data, nelements);
++    }
+ }
+
+ void ggml_cuda_op_tanh(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/src/ggml-cuda/unary.cuh b/src/ggml-cuda/unary.cuh
+index 5307327..5bfc74f 100644
+--- a/src/ggml-cuda/unary.cuh
++++ b/src/ggml-cuda/unary.cuh
+@@ -31,7 +31,7 @@ void ggml_cuda_op_gelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+ void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+-void ggml_cuda_op_silu_f32_to_bf16(
++void ggml_cuda_op_silu_f32_to_16(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * silu_node, ggml_tensor * dst);
+
+ void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

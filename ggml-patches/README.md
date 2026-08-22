@@ -13,7 +13,44 @@ Patched CUDA builds expect the patches before CMake configuration; CPU, Metal,
 Vulkan, and stock-CUDA builds do not. `apply-ggml-patches.sh` uses `git apply`,
 skips patches that are already applied, and applies new patches in filename
 order. Later patches may build on files changed by earlier patches; 0006 carries
-the dispatch wiring for the ops/kernels introduced by 0001/0003/0005.
+the dispatch wiring for the ops/kernels introduced by 0001/0003/0005. Docker
+builds and `scripts/configure.sh` apply the series automatically; apply it
+explicitly before a raw CUDA CMake configuration.
+
+## Building against patched vs stock ggml
+
+`NEMO_SPEECH_GGML_PATCHED` tells the build whether the vendored ggml contains
+this patch series. It defaults to `ON` because the ASR encoder directly uses
+the fused relative-position attention op from 0001 and the F16 depthwise-conv
+behavior from 0004.
+
+```sh
+# Patched ggml (default): apply the patches before configuring CMake.
+scripts/apply-ggml-patches.sh
+cmake -S . -B build -DGGML_CUDA=ON
+
+# Pristine upstream ggml: do not apply the patches and opt out explicitly.
+cmake -S . -B build -DGGML_CUDA=ON -DNEMO_SPEECH_GGML_PATCHED=OFF
+```
+
+With `NEMO_SPEECH_GGML_PATCHED=OFF`, the encoder uses stock ggml operations:
+unfused relative-position attention and `ggml_conv_1d_dw` im2col lowering.
+These paths remain correct across backends but cost latency on CUDA. The
+dependent options below default to `ON` only when both `GGML_CUDA` and
+`NEMO_SPEECH_GGML_PATCHED` are enabled, and are otherwise forced `OFF`:
+
+| option | effect when enabled |
+|---|---|
+| `NEMO_SPEECH_FUSED_RELPOS_ATTN` | emit the fused relative-position attention CUDA op |
+| `NEMO_SPEECH_DIRECT_DW_CONV` | use the direct CUDA depthwise-convolution kernel |
+| `NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS` | emit patched sigmoid-GLU and BF16-fusion graph patterns |
+
+The options can be disabled independently for correctness or performance
+bisection even in a patched build. Other patches optimize ordinary ggml
+operations through their own eligibility checks and may still activate when
+`NEMO_SPEECH_GGML_PATCHED=OFF` if the patched sources are present. A genuine
+stock comparison therefore requires both a pristine ggml checkout and
+`NEMO_SPEECH_GGML_PATCHED=OFF`.
 
 ## Patches
 
@@ -25,7 +62,11 @@ the dispatch wiring for the ops/kernels introduced by 0001/0003/0005.
   (it is re-read per query, so F16 halves the dominant traffic; math stays F32)
   and uses a warp-cooperative, vectorized score loop for d_k == 128 (the
   thread-per-key scalar loop is load-issue-bound and left as the generic
-  fallback). The op is stride-general: Q/K/V/P may be non-contiguous views
+  fallback). For the SM100 streaming shape (`d_k=128`, `q=2`, `kv=72`), an
+  occupancy query selects between one block per query and a two-query block
+  that reuses K/V after the grid exceeds one resident wave. Other CUDA shapes
+  retain the generic fused kernel.
+  The op is stride-general: Q/K/V/P may be non-contiguous views
   (only d_k rows must be contiguous; the CUDA op derives all addressing from
   tensor `nb[]`), `merge_heads` emits a head-merged output layout whose
   permute view is a contiguous `(n_feat, q, batch)` matrix, and the rel-pos
@@ -61,15 +102,17 @@ the dispatch wiring for the ops/kernels introduced by 0001/0003/0005.
   streaming-encoder shape where mul_mat_q runs latency-bound). int8 tensor-core
   `mma.m16n8k32` with per-q8-block scaling, K128 two-buffer cp.async pipeline,
   once-per-tensor weight repack into aligned planes (cached; weight buffers
-  only), warp-coalesced activation quantizer, K-split + atomicAdd for small-M
-  shapes, one grid.z launch for all 64-column outer-batch tiles, and an optional
-  fused row-vector bias epilogue. It is enabled by default; logical
+  only), warp-coalesced activation quantizer, deterministic K-split reduction
+  for small-M shapes, one grid.z launch for all 64-column outer-batch tiles,
+  and an optional fused row-vector bias epilogue. It is enabled by default; logical
   per-sequence-width dispatch prevents outer batch size from selecting different
   math (`GGML_SKINNY_Q8_OUTER_BATCH=1` opts into dense outer-batch flattening -
   use with `GGML_SKINNY_Q8_INPLACE=0` under a multi-stream scheduler). Accepts
   serialized tensor-planar Q8 weights
   (`GGML_TENSOR_FLAG_Q8_PLANAR`, see 0006) without a runtime repack. Kill
-  switch: `GGML_SKINNY_Q8=0`. The repack is in-place by default (reuses the
+  switch: `GGML_SKINNY_Q8=0`. Turing and older GPUs retain stock block-Q8
+  matmul; wide planar Q8 fails explicitly because its tensor-wide layout has
+  no stock fallback. The repack is in-place by default (reuses the
   weight buffer, saving the ~1.07 GB cudaMalloc duplicate on parakeet-xxl),
   which is correct and fast for the streaming-ASR encoder runtime. Two
   caveats for the llama.cpp NMT decoder, which the NMT pipeline handles by
@@ -136,17 +179,46 @@ the dispatch wiring for the ops/kernels introduced by 0001/0003/0005.
   The shape/alignment guards keep all other COPY, GET_ROWS, and SET_ROWS cases
   on their existing kernels.
 
-- **0013-blackwell-sm100-cached-f16.patch** - SM100-only cached-F16 skinny-Q8 path.
-  It normalizes plain CMake architecture `100` to feature-specific `100a`,
-  compiles the cached-F16/cuBLAS path only when an SM100a target is
-  present, and additionally runtime-gates it on the active device being exactly
-  SM100.
+- **0013-cuda-cached-f16-cublas.patch** - optional cached-F16/cuBLAS path for
+  skinny Q8 projections on NVIDIA SM80+. It expands immutable Q8 weights once,
+  converts only the live activation, and retains FP32 accumulation/output.
+  Runtime selection is controlled by `GGML_SKINNY_Q8_CUBLAS_F16` and its
+  minimum-N threshold; cuBLAS chooses the implementation for the active GPU.
+  Keep it opt-in because the F16 cache consumes additional device memory and
+  the performance crossover depends on the GPU and physical batch size.
+
+- **0014-cuda-relpos-extensions.patch** - extends fused relative-position
+  attention for the cache-aware and offline FastConformer paths. The
+  cache-aware path reads persistent K/V rows directly by state slot and
+  circular head, then overwrites only the rows replaced by the current chunk.
+  Register-resident NVIDIA SM80+ kernels cover the common R=0, 1, 3, 6, and 13
+  streaming shapes for both Nemotron cache geometries, with exact-shape kernels
+  retained where they are faster. The offline mask contract accepts both
+  per-batch key-padding masks and `[key, query]` L/R masks. Set
+  `GGML_CUDA_RELPOS_REGISTER_RESIDENT=0` before process start to
+  disable the register-resident specializations without changing the direct
+  circular-cache path.
+
+- **0015-cuda-ctc-batch-fusions.patch** - reduces large-batch FastConformer
+  overhead by fusing BatchNorm and BatchNorm+transpose+SiLU graph patterns,
+  extending SiLU and affine LayerNorm output conversion to F16, and folding
+  bias and residual addition into the cached-F16 cuBLASLt projection. The
+  eligibility checks preserve the unfused path for unsupported layouts,
+  precisions, and GPUs.
+
+- **0016-fix-batched-conv1d-layout.patch** - restores the batch and output-channel
+  axes after the flattened Conv1D matrix multiplication. The upstream direct
+  reshape interleaves those axes for batches larger than one; batch one keeps
+  its original zero-copy path.
 
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the
 fully patched submodule can accidentally fold later changes into it. Edit and
 diff at the patch's actual point in the series:
+Most base files belong to one patch; 0013 and 0014 are explicit layered
+exceptions. Do not regenerate 0001 from a fully patched live tree without first
+removing the 0014 delta, or the circular-cache extension will be folded into it.
 
 ```sh
 # Create a disposable worktree at the pinned upstream commit.
@@ -176,6 +248,18 @@ git -C ggml worktree remove --force "$PWD/ggml-patch-work"
 Adjust paths when the disposable worktree is placed elsewhere. If an edited
 patch changes context used by later patches, rebase those later patches in the
 same way.
+
+Patch 0013 is intentionally layered on top of 0005. To regenerate it without
+folding the generic skinny-Q8 implementation into the cached-F16 patch, use a
+temporary ggml worktree, apply and stage patches 0001 through 0012 as the
+baseline, then copy in only the cached-F16 changes and the SM100 CMake target
+correction and run `git diff` against that staged baseline for `CMakeLists.txt`
+and `skinny-q8.cu`.
+
+Patch 0014 is intentionally layered on top of 0001 and 0013. Apply and stage
+patches 0001 through 0013 in a temporary worktree, copy the edited
+`include/ggml.h`, `src/ggml.c`, and `src/ggml-cuda/fused-relpos-attn.cu` into
+that worktree, then generate 0014 with `git diff` against the staged baseline.
 
 Generate patches with `git diff` only (GNU `diff`/editors can strip the
 leading space on blank context lines, which `git apply` rejects as corrupt).

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Protobuf + gRPC codegen for the vendored riva proto files, compiled into the
 # static riva_proto lib. Two dependency-resolution paths:
-#   * Windows / vcpkg: protobuf + gRPC come as CMake config packages exporting
-#     imported targets (protobuf::protoc, gRPC::grpc_cpp_plugin, gRPC::grpc++).
-#     gRPC::grpc++ transitively pulls protobuf + the matching Abseil.
+#   * Config packages (Windows/vcpkg or an explicit Linux prefix): protobuf +
+#     gRPC export imported targets (protobuf::protoc, gRPC::grpc_cpp_plugin,
+#     gRPC::grpc++_unsecure).
+#     gRPC::grpc++_unsecure transitively pulls protobuf + the matching Abseil.
 #   * Linux (NGC-style dev image): system protobuf v25 + gRPC 1.62, resolved via
 #     find_library with version pinning + an Abseil link set probed by name.
 
@@ -20,16 +21,19 @@ set(PROTO_FILES
     riva/proto/riva_nmt.proto
 )
 
-if(WIN32)
-    # vcpkg config packages. The imported targets carry their own include dirs +
-    # transitive deps, so no path pinning / absl name list is needed here.
+if(WIN32 OR NEMO_SPEECH_GRPC_USE_CONFIG)
+    # Imported targets carry their own include dirs and transitive dependencies,
+    # so no path pinning or hand-maintained Abseil library list is needed here.
     find_package(protobuf CONFIG REQUIRED)
     find_package(gRPC CONFIG REQUIRED)
     set(_PROTOC_CMD protobuf::protoc)
     set(_GRPC_PLUGIN $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
-    set(RIVA_PROTO_LINK_LIBS gRPC::grpc++ protobuf::libprotobuf)
+    if(NOT TARGET gRPC::grpc++_unsecure)
+        message(FATAL_ERROR "The installed gRPC package does not provide gRPC::grpc++_unsecure")
+    endif()
+    set(RIVA_PROTO_LINK_LIBS gRPC::grpc++_unsecure protobuf::libprotobuf)
     set(_PROTO_INCLUDE_DIRS "")
-    message(STATUS "riva_proto: using vcpkg protobuf + gRPC config packages")
+    message(STATUS "riva_proto: using protobuf + gRPC config packages")
 else()
     find_package(Protobuf REQUIRED)
     find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
@@ -55,10 +59,10 @@ else()
     endif()
     message(STATUS "Using protobuf runtime: ${PROTOBUF_LIB_PINNED}")
 
-    # grpc++ / grpc / gpr: resolve to full paths where findable, else fall back to
-    # the bare name (system default search paths).
+    # The server exposes plaintext gRPC only. Link gRPC's unsecure libraries so
+    # the runtime does not carry unused TLS and cryptography implementations.
     set(_GRPC_LIBS "")
-    foreach(_g grpc++ grpc gpr)
+    foreach(_g grpc++_unsecure grpc_unsecure gpr)
         find_library(_RIVA_PROTO_${_g} ${_g})
         if(_RIVA_PROTO_${_g})
             list(APPEND _GRPC_LIBS ${_RIVA_PROTO_${_g}})

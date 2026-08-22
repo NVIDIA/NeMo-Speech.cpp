@@ -222,14 +222,23 @@ class OfflineRunner final : public AsrRunner {
     void force_eou() override {}
 
    private:
+    void pad_audio_to_bucket_();
+    size_t max_offline_samples_() const;
+    size_t snap_to_quiet_(size_t target, size_t search_span) const;
+    std::vector<std::pair<size_t, size_t>> offline_segments_() const;
+
     AsrModel* model_;
+    DecoderConfig decoder_cfg_;
     std::unique_ptr<Decoder> ctc_decoder_;
     AsrRequestOptions opts_;
     std::vector<float> audio_;
     int prompt_index_ = -1;
+    size_t bucket_samples_ = 0;  // BatchingConfig::offline_bucket_ms in samples; 0 = off
     bool finalized_ = false;
     std::vector<std::string> detected_languages_;
 };
+
+bool exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int input_sample_rate);
 
 // Drives a fixed-shape encoder graph (chunk_size_mel in, chunk_enc_frames
 // out) with per-layer K/V/conv caches threaded across chunks in a
@@ -279,6 +288,7 @@ class CacheStreamRunner final : public AsrRunner {
     bool poll_endpoint(StreamingUpdate& update, bool after_chunk);
     // Drop the audio prefix that FE and VAD have both consumed.
     void trim_buffers();
+    void compact_mel_buffer();
 
     RnntModel* model_ = nullptr;
     AsrRequestOptions opts_;
@@ -327,6 +337,7 @@ class CacheStreamRunner final : public AsrRunner {
     std::vector<float> audio_buf_;
     size_t audio_base_ = 0;
     std::vector<float> mel_buf_;  // (n_mels, T) flat, frame-major
+    size_t mel_offset_ = 0;
     // Total number of mel frames produced from audio_buf_ across all step()
     // calls (monotonic). NB: mel_buf_ also gets frames *consumed* from the
     // front each chunk, so its current size is smaller than this counter.

@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """cpWER for the ggml ASR+Sortformer pipeline (meeteval).
 
-Drives test_diar_recognizer --seglst over a wav directory, assembles the
-hypothesis SegLST, and scores concatenated-minimum-permutation WER against a
-reference seglst.json.
+Scores existing batched CLI JSON output, or drives test_diar_recognizer over a
+WAV directory, then computes concatenated minimum-permutation WER against a
+reference SegLST.
 
 Usage:
     python score_cpwer.py --cli <build>/bin/test_diar_recognizer \
@@ -14,6 +14,9 @@ Usage:
         --wav-dir /path/to/audio \
         --ref /path/to/reference.seglst.json \
         [--gpu N] [--out hyp.seglst.json] [--max-files N]
+
+    python score_cpwer.py --hyp-dir /path/to/transcript-json \
+        --wav-dir /path/to/audio --ref /path/to/reference.seglst.json
 """
 
 from __future__ import annotations
@@ -40,15 +43,22 @@ def normalize_text(s: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cli", required=True, help="test_diar_recognizer binary")
-    ap.add_argument("--asr", required=True, help="ASR GGUF")
-    ap.add_argument("--diar", required=True, help="Sortformer GGUF")
+    ap.add_argument("--cli", help="test_diar_recognizer binary")
+    ap.add_argument("--asr", help="ASR GGUF")
+    ap.add_argument("--diar", help="Sortformer GGUF")
+    ap.add_argument(
+        "--hyp-dir",
+        help="score JSON files already produced by batched 'nemo-speech transcribe'",
+    )
     ap.add_argument("--wav-dir", required=True)
     ap.add_argument("--ref", required=True, help="reference seglst.json")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--out", default=None, help="write the hypothesis seglst.json here")
     ap.add_argument("--max-files", type=int, default=0)
     args = ap.parse_args()
+
+    if not args.hyp_dir and (not args.cli or not args.asr or not args.diar):
+        ap.error("--cli, --asr, and --diar are required unless --hyp-dir is used")
 
     ref = SegLST.load(args.ref)
     sessions = sorted({e["session_id"] for e in ref})
@@ -59,29 +69,68 @@ def main() -> int:
     sessions = [s for s in sessions if s in wavs]
     if args.max_files > 0:
         sessions = sessions[: args.max_files]
+    if not sessions:
+        print("no WAVs matched the reference SegLST", file=sys.stderr)
+        return 1
+    selected = set(sessions)
+    ref = SegLST([entry for entry in ref if entry["session_id"] in selected])
     print(f"[cpwer] {len(sessions)} sessions")
+
+    # Preflight validation: check all hypothesis files exist before scoring
+    if args.hyp_dir:
+        missing_files = []
+        for s in sessions:
+            hyp_file = Path(args.hyp_dir) / f"{s}.json"
+            if not hyp_file.exists():
+                missing_files.append(str(hyp_file))
+        if missing_files:
+            print("[cpwer] ERROR: missing hypothesis files:", file=sys.stderr)
+            for mf in missing_files:
+                print(f"  {mf}", file=sys.stderr)
+            return 1
 
     hyp_entries = []
     for s in sessions:
-        cmd = [args.cli, args.asr, args.diar, str(wavs[s]), "--seglst", s]
-        if args.gpu is not None:
-            cmd += ["--gpu", str(args.gpu)]
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
         n_seg = 0
-        for ln in out.stdout.splitlines():
-            if not ln.startswith("SEG\t"):
-                continue
-            _, session, spk, t0, t1, text = ln.split("\t", 5)
-            hyp_entries.append(
-                {
-                    "session_id": session,
-                    "speaker": spk,
-                    "start_time": float(t0),
-                    "end_time": float(t1),
-                    "words": normalize_text(text),
-                }
-            )
-            n_seg += 1
+        if args.hyp_dir:
+            document = json.loads((Path(args.hyp_dir) / f"{s}.json").read_text())
+            words = document.get("words", [])
+            begin = 0
+            while begin < len(words):
+                end = begin + 1
+                speaker = words[begin].get("speaker", 0)
+                while end < len(words) and words[end].get("speaker", 0) == speaker:
+                    end += 1
+                hyp_entries.append(
+                    {
+                        "session_id": s,
+                        "speaker": f"spk{speaker}",
+                        "start_time": float(words[begin]["start"]),
+                        "end_time": float(words[end - 1]["end"]),
+                        "words": normalize_text(" ".join(w["word"] for w in words[begin:end])),
+                    }
+                )
+                n_seg += 1
+                begin = end
+        else:
+            cmd = [args.cli, args.asr, args.diar, str(wavs[s]), "--seglst", s]
+            if args.gpu is not None:
+                cmd += ["--gpu", str(args.gpu)]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            for ln in out.stdout.splitlines():
+                if not ln.startswith("SEG\t"):
+                    continue
+                _, session, spk, t0, t1, text = ln.split("\t", 5)
+                hyp_entries.append(
+                    {
+                        "session_id": session,
+                        "speaker": spk,
+                        "start_time": float(t0),
+                        "end_time": float(t1),
+                        "words": normalize_text(text),
+                    }
+                )
+                n_seg += 1
         print(f"[cpwer]   {s}: {n_seg} segments")
 
     hyp = SegLST(hyp_entries)
