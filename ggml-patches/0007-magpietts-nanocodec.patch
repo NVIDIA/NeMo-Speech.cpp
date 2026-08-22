@@ -534,7 +534,7 @@ index aad4c34a..628d8718 100644
          if (src0_ne[1] <= 1024 && src1_ncols > 512) {
              return false;
 diff --git a/src/ggml-cuda/mmvf.cu b/src/ggml-cuda/mmvf.cu
-index d9147202..0c974164 100644
+index d9147202..a347447c 100644
 --- a/src/ggml-cuda/mmvf.cu
 +++ b/src/ggml-cuda/mmvf.cu
 @@ -383,7 +383,10 @@ static void mul_mat_vec_f_switch_fusion(
@@ -558,7 +558,19 @@ index d9147202..0c974164 100644
  
      mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
          (x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
-@@ -650,7 +653,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -436,6 +439,11 @@ void launch_mul_mat_vec_f_cuda(
+             block_size_best = block_size;
+         }
+     }
++    if constexpr (std::is_same_v<T, half>) {
++        if (warp_size == 32 && ncols >= 768 && ncols_dst <= 2) {
++            block_size_best = 96;
++        }
++    }
+
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+@@ -650,7 +658,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
  
      if (fusion) {
          GGML_ASSERT( !ids || dst->ne[2] == 1);
@@ -567,7 +579,7 @@ index d9147202..0c974164 100644
          if (fusion->x_bias) {
              GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
              GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
-@@ -793,9 +796,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -793,9 +801,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
          }
      }
  
@@ -583,7 +595,7 @@ index d9147202..0c974164 100644
                  if (ampere_mma_available(cc)) {
                      return ne11 <= 3;
                  }
-@@ -812,9 +821,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -812,9 +826,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
              return ne11 <= 8;
          case GGML_TYPE_F16:
              if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
@@ -597,7 +609,7 @@ index d9147202..0c974164 100644
                  }
                  if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                      return src0_small && ne11 <= 4;
-@@ -838,6 +850,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+@@ -838,6 +855,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
              return ne11 <= 8;
          case GGML_TYPE_BF16:
              if (GGML_CUDA_CC_IS_NVIDIA(cc)) {

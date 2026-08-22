@@ -11,6 +11,11 @@ target_link_libraries(test_magpietts_attention_prior PRIVATE nemo_speech_tts_mag
 add_executable(test_magpietts_frame_stacking test_magpietts_frame_stacking.cpp)
 target_link_libraries(test_magpietts_frame_stacking PRIVATE nemo_speech_tts_magpietts)
 
+if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
+    add_executable(test_magpietts_cached_attention test_magpietts_cached_attention.cpp)
+    target_link_libraries(test_magpietts_cached_attention PRIVATE nemo_speech_tts_magpietts)
+endif()
+
 add_executable(test_magpietts_asr test_magpietts_asr.cpp)
 target_link_libraries(test_magpietts_asr PRIVATE
     tests_cpp_wer

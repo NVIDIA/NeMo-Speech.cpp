@@ -284,7 +284,27 @@ index 555c951..e30c025 100644
  template <int block_size>
  static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
      // blockIdx.x: num_groups idx
-@@ -343,10 +399,9 @@ static void norm_mul_add_cuda(
+@@ -334,7 +390,18 @@ static void norm_mul_add_cuda(
+         const int64_t stride_sample, const float eps, cudaStream_t stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    if (ncols < 1024) {
++    if (ncols == 768 && WARP_SIZE == 32) {
++        constexpr int block_size = 384;
++        if (add) {
++            norm_mul_add_f32<block_size, true, T>
++                <<<blocks_num, block_size, 12 * sizeof(float2), stream>>>(
++                    x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        } else {
++            norm_mul_add_f32<block_size, false, T>
++                <<<blocks_num, block_size, 12 * sizeof(float2), stream>>>(
++                    x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        }
++    } else if (ncols < 1024) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         if (add) {
+             norm_mul_add_f32<WARP_SIZE, true, T><<<blocks_num, block_dims, 0, stream>>>(
+@@ -343,10 +410,8 @@ static void norm_mul_add_cuda(
              norm_mul_add_f32<WARP_SIZE, false, T><<<blocks_num, block_dims, 0, stream>>>(
                  x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
          }
@@ -293,12 +313,11 @@ index 555c951..e30c025 100644
 -        // while reducing the affine LayerNorm reduction from 32 warps/block
 -        // to 8. Retain the established 1024-thread path on older devices.
 +    } else if (ncols == 1024 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
-+        // Four elements per thread keeps high occupancy while reducing the
-+        // affine LayerNorm reduction from 32 warps/block to 8.
++        // Four elements per thread balances reduction work and occupancy.
          const dim3 block_dims(256, 1, 1);
          if (add) {
              norm_mul_add_f32<256, true, T><<<blocks_num, block_dims, 8 * sizeof(float2), stream>>>(
-@@ -519,7 +574,7 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -519,7 +584,7 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  // or add_tensor), mirroring ggml_cuda_op_rms_norm_fused(_add). Eligibility
  // (row-vector operands, F32, contiguity) is enforced in ggml_cuda_can_fuse.
  void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
@@ -307,7 +326,7 @@ index 555c951..e30c025 100644
      const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
      float eps = 0.0f;
      memcpy(&eps, dst->op_params, sizeof(float));
-@@ -563,13 +618,19 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+@@ -563,13 +628,19 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
      const int64_t s02 = norm_src->nb[2] / ts0;
      const int64_t s03 = norm_src->nb[3] / ts0;
 
@@ -334,7 +353,7 @@ index 555c951..e30c025 100644
      } else {
          norm_mul_add_cuda(
              src0_d, mul_d, add_d, dst_d,
-@@ -577,6 +638,50 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+@@ -577,6 +648,50 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
      }
  }
 
