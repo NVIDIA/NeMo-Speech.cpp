@@ -36,9 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8081/v1/audio/transcriptions")
     parser.add_argument("--language", default="en")
-    parser.add_argument("--device", help="Input-device index or a case-insensitive part of its name.")
+    parser.add_argument(
+        "--device", help="Input-device index or a case-insensitive part of its name."
+    )
     parser.add_argument("--list-devices", action="store_true", help="List input devices and exit.")
-    parser.add_argument("--show-words", action="store_true", help="Print word timestamps when present.")
+    parser.add_argument(
+        "--show-words", action="store_true", help="Print word timestamps when present."
+    )
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds.")
     return parser
 
@@ -68,7 +72,9 @@ def resolve_device(selector: str | None) -> tuple[int | None, str]:
             raise ValueError(f"No input device contains {selector!r}. Use --list-devices.")
         if len(matches) > 1:
             choices = ", ".join(f"{i}: {d['name']}" for i, d in matches)
-            raise ValueError(f"More than one input device matches {selector!r}: {choices}. Use its index.")
+            raise ValueError(
+                f"More than one input device matches {selector!r}: {choices}. Use its index."
+            )
         index, device = matches[0]
         return index, str(device["name"])
     for available_index, device in devices:
@@ -84,7 +90,9 @@ def calculate_rms(samples: np.ndarray) -> float:
 def record_until_enter(device: int | None) -> RecordedAudio:
     blocks: queue.Queue[np.ndarray] = queue.Queue()
 
-    def callback(input_data: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
+    def callback(
+        input_data: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags
+    ) -> None:
         del frames, time_info
         if status:
             print(f"Microphone warning: {status}", file=sys.stderr)
@@ -92,11 +100,17 @@ def record_until_enter(device: int | None) -> RecordedAudio:
 
     input("Press Enter to start recording...")
     started = time.perf_counter()
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32", device=device, callback=callback):
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32", device=device, callback=callback
+    ):
         input("Recording. Press Enter again to stop...")
     capture_ms = (time.perf_counter() - started) * 1000
     captured = [blocks.get_nowait() for _ in range(blocks.qsize())]
-    samples = np.ascontiguousarray(np.concatenate(captured), dtype=np.float32) if captured else np.empty(0, dtype=np.float32)
+    samples = (
+        np.ascontiguousarray(np.concatenate(captured), dtype=np.float32)
+        if captured
+        else np.empty(0, dtype=np.float32)
+    )
     return RecordedAudio(samples, samples.size / SAMPLE_RATE, calculate_rms(samples), capture_ms)
 
 
@@ -126,9 +140,16 @@ def check_server(url: str, timeout: float) -> None:
     response.raise_for_status()
 
 
-def request_transcription(session: requests.Session, url: str, wav_data: bytes, language: str, timeout: float) -> tuple[dict[str, Any], float]:
+def request_transcription(
+    session: requests.Session, url: str, wav_data: bytes, language: str, timeout: float
+) -> tuple[dict[str, Any], float]:
     started = time.perf_counter()
-    response = session.post(url, files={"file": ("microphone.wav", wav_data, "audio/wav")}, data={"model": "default", "language": language, "response_format": "verbose_json"}, timeout=timeout)
+    response = session.post(
+        url,
+        files={"file": ("microphone.wav", wav_data, "audio/wav")},
+        data={"model": "default", "language": language, "response_format": "verbose_json"},
+        timeout=timeout,
+    )
     elapsed_ms = (time.perf_counter() - started) * 1000
     response.raise_for_status()
     try:
@@ -148,7 +169,13 @@ def result_words(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return collected
 
 
-def print_result(audio: RecordedAudio, preparation_ms: float, request_ms: float, payload: dict[str, Any], show_words: bool) -> None:
+def print_result(
+    audio: RecordedAudio,
+    preparation_ms: float,
+    request_ms: float,
+    payload: dict[str, Any],
+    show_words: bool,
+) -> None:
     text = str(payload.get("text", "")).strip()
     print("\n" + "=" * 64)
     print(f'Text: "{text}"')
@@ -172,8 +199,16 @@ def print_result(audio: RecordedAudio, preparation_ms: float, request_ms: float,
             for word in words:
                 token = str(word.get("word", word.get("text", ""))).strip()
                 start, end = word.get("start"), word.get("end")
-                timing = f"{float(start):.3f}–{float(end):.3f}" if start is not None and end is not None else "unknown time"
-                confidence = f" | confidence={word['confidence']}" if word.get("confidence") is not None else ""
+                timing = (
+                    f"{float(start):.3f}–{float(end):.3f}"
+                    if start is not None and end is not None
+                    else "unknown time"
+                )
+                confidence = (
+                    f" | confidence={word['confidence']}"
+                    if word.get("confidence") is not None
+                    else ""
+                )
                 print(f"  {timing} {token}{confidence}")
         else:
             print("\nWords: not returned by the server.")
@@ -211,7 +246,9 @@ def main() -> int:
                 continue
             wav_data, preparation_ms = encode_wav(audio.samples)
             try:
-                payload, request_ms = request_transcription(session, args.url, wav_data, args.language, args.timeout)
+                payload, request_ms = request_transcription(
+                    session, args.url, wav_data, args.language, args.timeout
+                )
                 print_result(audio, preparation_ms, request_ms, payload, args.show_words)
             except requests.HTTPError as error:
                 body = error.response.text if error.response is not None else str(error)

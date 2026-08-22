@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <csignal>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -165,10 +165,10 @@ main(int argc, char** argv) {
             skinny_q8_mode = arg.substr(std::strlen("--skinny-q8="));
         else if (arg == "--skinny-q8") {
             if (++i >= argc)
-                return print_cli_error("", "--skinny-q8 requires auto, on, or off", 2, "invalid_argument");
+                return print_cli_error(
+                    "", "--skinny-q8 requires auto, on, or off", 2, "invalid_argument");
             skinny_q8_mode = argv[i];
-        }
-        else
+        } else
             filtered.push_back(argv[i]);
     }
     configure_cli_output(json, quiet, verbose);
@@ -176,8 +176,7 @@ main(int argc, char** argv) {
         return print_cli_error(
             "", "--quiet and --verbose cannot be used together", 2, "invalid_argument");
     if (!skinny_q8_mode.empty() && !parse_skinny_q8_mode(skinny_q8_mode))
-        return print_cli_error(
-            "", "--skinny-q8 must be auto, on, or off", 2, "invalid_argument");
+        return print_cli_error("", "--skinny-q8 must be auto, on, or off", 2, "invalid_argument");
     if (suppress_cuda_graph_log)
         set_process_environment("NEMO_SPEECH_SUPPRESS_CUDA_GRAPH_LOG", "1");
     if (!skinny_q8_mode.empty()) {
