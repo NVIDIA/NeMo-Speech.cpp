@@ -46,7 +46,7 @@ usage(const char* argv0) {
         "  --tts.steps N                Max decoder frames\n"
         "  --threads N                  CPU threads (default 4)\n"
         "  --tts.codec-threads N        Codec CPU threads (default --threads)\n"
-        "  --tts.chunk-frames N         Codec frames per internal callback chunk (default 3)\n"
+        "  --tts.chunk-frames N         Codec frames per internal callback chunk (default 4)\n"
         "  --tts.language-code LANG     Tokenizer language (default en-US)\n"
         "  --tts.lt-backend auto|cpu|cuda\n"
         "                               Local-transformer backend\n"
@@ -293,7 +293,8 @@ main(int argc, char** argv) {
         }
     } else if (!params.tokens.empty()) {
         token_chunks.push_back(params.tokens);
-        std::fprintf(stderr, "benchmark_input=synthetic_token_ids tokens=%zu\n", params.tokens.size());
+        std::fprintf(
+            stderr, "benchmark_input=synthetic_token_ids tokens=%zu\n", params.tokens.size());
     }
     params.warmup_tokens = params.tokens;
     params.warmup_token_chunks = token_chunks;
@@ -317,8 +318,8 @@ main(int argc, char** argv) {
     for (int run = 0; run < warmup_runs; ++run) {
         tts::stream_run_metrics warmup_metrics;
         const bool ok = runtime.synthesize(
-            params, token_chunks, [](const std::vector<uint8_t>&) { return true; },
-            warmup_metrics, "warmup", false);
+            params, token_chunks, [](const std::vector<uint8_t>&) { return true; }, warmup_metrics,
+            "warmup", false);
         if (!ok) {
             return 1;
         }

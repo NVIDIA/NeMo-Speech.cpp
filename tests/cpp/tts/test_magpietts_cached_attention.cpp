@@ -8,6 +8,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "tts/magpietts/model.h"
 
 namespace {
 
@@ -88,6 +89,19 @@ main() {
         std::fprintf(stderr, "FAIL: CUDA backend unavailable\n");
         return 1;
     }
+
+    nemo_speech::tts::magpietts_model backend_model;
+    backend_model.backend = backend;
+    bool use_cuda_sampling = false;
+    if (!nemo_speech::tts::magpietts_resolve_sampling_backend(
+            backend_model, nemo_speech::tts::MAGPIETTS_BACKEND_AUTO, use_cuda_sampling) ||
+        !use_cuda_sampling) {
+        std::fprintf(stderr, "FAIL: automatic sampling did not select CUDA\n");
+        backend_model.backend = nullptr;
+        ggml_backend_free(backend);
+        return 1;
+    }
+    backend_model.backend = nullptr;
 
     const size_t tensor_count = 7;
     ggml_init_params params = {

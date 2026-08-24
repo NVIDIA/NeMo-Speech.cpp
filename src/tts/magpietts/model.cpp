@@ -1836,12 +1836,17 @@ bool
 magpietts_resolve_sampling_backend(
     const magpietts_model& model, magpietts_backend_preference requested, bool& use_cuda_sampling) {
     use_cuda_sampling = false;
-    if (requested == MAGPIETTS_BACKEND_AUTO || requested == MAGPIETTS_BACKEND_CPU) {
+    if (requested == MAGPIETTS_BACKEND_CPU) {
         return true;
     }
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
-    if (!magpietts_backend_is_cuda(model.backend)) {
+    const bool cuda_backend = magpietts_backend_is_cuda(model.backend);
+    if (requested == MAGPIETTS_BACKEND_AUTO) {
+        use_cuda_sampling = cuda_backend;
+        return true;
+    }
+    if (!cuda_backend) {
         fprintf(
             stderr, "--sampling-backend cuda requires a CUDA ggml backend; current backend is %s\n",
             ggml_backend_name(model.backend));
@@ -1851,6 +1856,9 @@ magpietts_resolve_sampling_backend(
     return true;
 #else
     (void)model;
+    if (requested == MAGPIETTS_BACKEND_AUTO) {
+        return true;
+    }
     fprintf(
         stderr,
         "--sampling-backend cuda requires building MagpieTTS with GGML_CUDA=ON and CUDAToolkit\n");
@@ -1875,6 +1883,10 @@ MagpieCodeGenerator::generate(
     bool use_cuda_sampling = false;
     if (!magpietts_resolve_sampling_backend(model, params.sampling_backend, use_cuda_sampling)) {
         return false;
+    }
+    if (params.sampling_backend == MAGPIETTS_BACKEND_AUTO && params.use_local_transformer &&
+        !use_cuda_lt) {
+        use_cuda_sampling = false;
     }
     if (params.use_local_transformer && !use_cuda_lt && use_cuda_sampling) {
         fprintf(

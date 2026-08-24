@@ -911,11 +911,12 @@ struct codec_stream_worker {
             if (end <= read_idx) {
                 return out;
             }
+            const int chunk_end = std::min(end, read_idx + chunk_size);
             out.history_frames = 0;
             out.chunk_index = chunks_done;
-            out.final_read = is_last_token_in && last_token_id <= end;
-            out.frames.assign(audio_codes.begin() + read_idx, audio_codes.begin() + end);
-            read_idx = end;
+            out.final_read = is_last_token_in && last_token_id <= chunk_end;
+            out.frames.assign(audio_codes.begin() + read_idx, audio_codes.begin() + chunk_end);
+            read_idx = chunk_end;
             has_room.notify_one();
             return out;
         }
@@ -1089,6 +1090,10 @@ stream_magpie_to_audio(
     bool use_cuda_sampling = false;
     if (!magpietts_resolve_sampling_backend(magpie, params.sampling_backend, use_cuda_sampling)) {
         return false;
+    }
+    if (params.sampling_backend == MAGPIETTS_BACKEND_AUTO && params.use_local_transformer &&
+        !use_cuda_lt) {
+        use_cuda_sampling = false;
     }
     if (params.use_local_transformer && !use_cuda_lt && use_cuda_sampling) {
         fprintf(

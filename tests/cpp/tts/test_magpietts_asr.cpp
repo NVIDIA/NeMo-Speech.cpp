@@ -46,7 +46,7 @@ struct Args {
     int top_k = -1;
     int threads = 4;
     int codec_threads = 0;
-    int chunk_frames = 3;
+    int chunk_frames = 4;
     int gpu = 0;
     int chunk_ms = 160;
     int right_ctx = 1;
@@ -98,7 +98,7 @@ usage(const char* argv0) {
         "  --tts.sampling-backend auto|cpu|cuda\n"
         "  --threads N                  CPU threads (default 4)\n"
         "  --tts.codec-threads N        Codec CPU threads (default --threads)\n"
-        "  --tts.chunk-frames N         Codec frames per internal audio chunk (default 3)\n"
+        "  --tts.chunk-frames N         Codec frames per internal audio chunk (default 4)\n"
         "  --tts.codec-cpu              Force NanoCodec decoder onto CPU backend\n"
         "  --gpu N                      ASR GPU index (default 0; -1 for CPU)\n"
         "  --chunk-ms N                 ASR streaming chunk size (default 160)\n"
