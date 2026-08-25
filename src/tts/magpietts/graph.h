@@ -23,6 +23,11 @@ ggml_tensor* cross_attention(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     ggml_tensor* x, ggml_tensor* memory, ggml_tensor* attn_prior = nullptr,
     ggml_tensor** last_attn = nullptr);
+ggml_tensor* cross_attention_cached(
+    ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
+    const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x,
+    ggml_tensor* attn_prior = nullptr, ggml_tensor** last_attn = nullptr,
+    bool prior_is_log = false);
 ggml_tensor* transformer_forward(
     ggml_context* ctx, const magpietts_transformer& tr, ggml_tensor* x, ggml_tensor* pos,
     ggml_tensor* cond, ggml_tensor* attn_prior = nullptr,

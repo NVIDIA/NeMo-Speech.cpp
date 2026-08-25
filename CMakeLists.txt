@@ -147,12 +147,9 @@ option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (libcu
 # norm/BF16 fusions, CUDA graph and launch fixes) are transparent ggml-cuda internals.
 option(NEMO_SPEECH_GGML_PATCHED "Linked ggml has the project ASR patches applied (fused rel-pos op, F16 dw-conv)" ON)
 
-# Fused rel-pos attention CUDA op (GGML_OP_FUSED_RELPOS_ATTN). Replaces the
-# unfused 3-GEMM + rel-shift + softmax attention sequence with one kernel in the
-# non-cache-aware encoder path. Defaults ON whenever GGML_CUDA + a patched ggml
-# are present (it links a patch-only op symbol); forced OFF otherwise, where the
-# encoder runs the unfused stock-ggml path. Kept as an explicit option so it can
-# be toggled OFF for debugging / WER bisection (the kernel stores k/v/p F16).
+# Relative-position mode of the fused CUDA attention op. Replaces the unfused
+# encoder attention sequence with one kernel. Defaults ON with CUDA and the
+# patched ggml; the encoder otherwise uses stock ggml ops.
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     option(NEMO_SPEECH_FUSED_RELPOS_ATTN "Use the fused rel-pos attention CUDA op in the encoder" ON)
 else()

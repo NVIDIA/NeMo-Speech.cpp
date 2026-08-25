@@ -137,6 +137,29 @@ TensorContainer::cache_tensor(std::string name, ggml_bf_tensor tensor) {
 }
 
 ggml_bf_tensor
+TensorContainer::import_tensor(std::string name, ggml_tensor* tensor) {
+    if (!tensor || !tensor->buffer || !tensor->data) {
+        throw std::invalid_argument("cannot import an unallocated tensor: " + name);
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+    bool supported = false;
+    for (const auto& entry : buft_list) {
+        if (entry.second == buft) {
+            supported = true;
+            break;
+        }
+    }
+    if (!supported) {
+        throw std::invalid_argument("imported tensor uses an unregistered buffer type: " + name);
+    }
+    ggml_bf_tensor result(tensor, buft);
+    if (!tensor_lookup.insert(std::make_pair(name, result)).second) {
+        throw std::runtime_error("duplicate tensor name imported: " + name);
+    }
+    return result;
+}
+
+ggml_bf_tensor
 TensorContainer::create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0) {
     ggml_tensor* meta = ggml_new_tensor_1d(get_temp_ctx(), data_type, ne0);
     return m_create_tensor(meta, name);

@@ -151,7 +151,7 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 
 | key | CLI alias | default | meaning |
 |---|---|---|---|
-| `tts.chunk-frames` | - | `3` | codec frames per streamed audio chunk |
+| `tts.chunk-frames` | - | `4` | codec frames per streamed audio chunk |
 | `tts.codec-queue-depth` | - | `4` | codec worker queue depth |
 | `tts.codec-history-frames` | - | `-1` | rolling codec history frames |
 | `tts.codec-future-frames` | - | `1` | rolling codec future frames |
@@ -168,7 +168,7 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.codec-threads` | - | `0` | codec CPU threads; `0` = use `threads` |
 | `tts.lt-backend` | - | `auto` | local-transformer backend: `auto`/`cpu`/`cuda` |
 | `tts.lt-fp32` | `--tts.local-transformer-fp32` | `false` | run the local transformer in FP32 |
-| `tts.sampling-backend` | - | `auto` | sampling backend: `auto`/`cpu`/`cuda` |
+| `tts.sampling-backend` | - | `auto` | sampling backend; `auto` uses CUDA when the Magpie/local-transformer path is CUDA, otherwise CPU |
 | `tts.uma-mode` | - | `auto` | CUDA managed memory: `auto`/`off`/`on` |
 | `tts.longform` | - | `auto` | sentence-chunk longform mode: `auto`/`off`/`on` |
 

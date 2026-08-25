@@ -65,7 +65,7 @@ tts:
   steps: -1                     # -1 = model default
   top-k: -1                     # -1 = model default
 
-  chunk-frames: 3
+  chunk-frames: 4
   codec-queue-depth: 4
   codec-history-frames: -1
   codec-future-frames: 1
@@ -79,7 +79,7 @@ tts:
   codec-cpu: false
 
   lt-backend: auto              # auto | cpu | cuda
-  sampling-backend: auto        # auto | cpu | cuda
+  sampling-backend: auto        # CUDA with a CUDA Magpie/LT path; otherwise CPU
   uma-mode: auto                # auto | off | on
   longform: auto                # auto | off | on
 

@@ -191,7 +191,7 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
         [&c](const std::string& value) {
             c.sampling_backend = runtime_backend_from_string("tts.sampling-backend", value);
         },
-        "Sampling backend: auto, cpu, or cuda");
+        "Sampling backend: auto (CUDA when compatible with the Magpie/LT path), cpu, or cuda");
     p.Register(
         "uma-mode",
         [&c](const std::string& value) {
@@ -284,7 +284,7 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
         [&c](const std::string& value) {
             c.sampling_backend = stream_backend_from_string("tts.sampling-backend", value);
         },
-        "Sampling backend: auto, cpu, or cuda");
+        "Sampling backend: auto (CUDA when compatible with the Magpie/LT path), cpu, or cuda");
     p.Register(
         "uma-mode",
         [&c](const std::string& value) {
