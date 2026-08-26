@@ -9,6 +9,27 @@ namespace tts = nemo_speech::tts;
 
 int
 main() {
+    tts::magpietts_hparams v2602;
+    v2602.text_vocab_size = 2362;
+    v2602.frame_stacking_factor = 1;
+    tts::magpietts_hparams v2607;
+    v2607.text_vocab_size = 3359;
+    v2607.frame_stacking_factor = 2;
+    if (tts::magpietts_infer_tokenizer_profile(v2602) != "v2602" ||
+        tts::magpietts_infer_tokenizer_profile(v2607) != "v2607" ||
+        !tts::magpietts_tokenizer_profile_matches("v2602", v2602) ||
+        !tts::magpietts_tokenizer_profile_matches("v2607", v2607) ||
+        tts::magpietts_tokenizer_profile_matches("v2602", v2607) ||
+        tts::magpietts_tokenizer_profile_matches("v2607", v2602)) {
+        std::fprintf(stderr, "tokenizer profile compatibility check failed\n");
+        return 1;
+    }
+    v2607.text_vocab_size = 2362;
+    if (!tts::magpietts_infer_tokenizer_profile(v2607).empty()) {
+        std::fprintf(stderr, "unknown tokenizer dimensions were accepted\n");
+        return 1;
+    }
+
     tts::magpietts_hparams h;
     h.audio_codebooks = 2;
     h.frame_stacking_factor = 2;

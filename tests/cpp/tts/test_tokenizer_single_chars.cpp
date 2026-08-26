@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -73,6 +72,21 @@ check_chunk_count(
     return false;
 }
 
+bool
+check_supported_languages(
+    const tts::MagpieNativeTokenizer& tokenizer, const std::vector<std::string>& expected) {
+    const auto actual = tokenizer.supported_language_codes();
+    if (actual == expected) {
+        return true;
+    }
+    std::fprintf(stderr, "supported language mismatch\nexpected:");
+    for (const auto& language : expected) std::fprintf(stderr, " %s", language.c_str());
+    std::fprintf(stderr, "\nactual:");
+    for (const auto& language : actual) std::fprintf(stderr, " %s", language.c_str());
+    std::fprintf(stderr, "\n");
+    return false;
+}
+
 int
 count_words_ascii_space(const std::string& text) {
     int count = 0;
@@ -131,13 +145,35 @@ main(int argc, char** argv) {
     }
 
     tts::MagpieNativeTokenizer tokenizer(argv[1]);
-    std::ifstream tokenizer_config(std::string(argv[1]) + "/model_config.yaml");
-    const std::string config_text(
-        (std::istreambuf_iterator<char>(tokenizer_config)), std::istreambuf_iterator<char>());
-    const bool v2607 = config_text.find("portuguese_Brazilian_phoneme") != std::string::npos;
+    const bool v2607 = tokenizer.profile_id() == "v2607";
     if (v2607) {
         bool v2607_ok = true;
+        if (tokenizer.text_vocab_size() != 3359) {
+            std::fprintf(stderr, "v2607 tokenizer reported the wrong text vocabulary size\n");
+            v2607_ok = false;
+        }
+        std::vector<std::string> expected_languages = {
+            "en-US", "es-ES", "de-DE", "fr-FR", "it-IT", "vi-VN",
+#ifdef NEMO_SPEECH_TTS_WITH_ZH
+            "zh-CN",
+#endif
+            "hi-IN",
+#ifdef NEMO_SPEECH_TTS_WITH_JA
+            "ja-JP",
+#endif
+            "ar-AE", "ar-SA", "ar-MSA", "ko-KR", "pt-BR",
+        };
+        v2607_ok &= check_supported_languages(tokenizer, expected_languages);
         v2607_ok &= check_tokens(tokenizer, "A", "en-US", {90, 94, 94, 94, 88, 3358});
+        v2607_ok &= check_tokens(tokenizer, "T", "es-ES", {580, 581, 581, 511, 580, 3358});
+        v2607_ok &= check_tokens(
+            tokenizer, "er ist sehr gut", "de-DE",
+            {730, 615, 628, 730, 619, 629, 630, 730, 691, 716, 672, 718, 711, 730, 617, 631,
+             630, 730, 3358});
+        v2607_ok &= check_tokens(
+            tokenizer, "नमस्ते दुनिया।", "hi-IN",
+            {1326, 1190, 1216, 1189, 1234, 1195, 1196, 1182, 1239, 1326, 1279, 1305, 1281,
+             1303, 1288, 1302, 1322, 1326, 3358});
         v2607_ok &= check_tokens(
             tokenizer, "مرحبا", "ar-AE", {1329, 1405, 1391, 1387, 1382, 1381, 1329, 3358});
         v2607_ok &= check_tokens(
@@ -150,9 +186,35 @@ main(int argc, char** argv) {
              3124, 3022, 2974, 3358});
         v2607_ok &= check_tokens(
             tokenizer, "Olá!", "pt-BR", {1125, 1082, 1079, 1119, 1070, 1017, 1125, 3358});
+        v2607_ok &= check_tokens(tokenizer, "A", "fr-FR", {1889, 1821, 1821, 1821, 1822, 3358});
+        v2607_ok &= check_tokens(tokenizer, "A", "it-IT", {2273, 2205, 2205, 2205, 2206, 3358});
+        v2607_ok &= check_tokens(tokenizer, "A", "vi-VN", {2657, 2589, 2589, 2589, 2590, 3358});
+#ifdef NEMO_SPEECH_TTS_WITH_JA
+        v2607_ok &= check_tokens(tokenizer, "あ", "ja-JP", {842, 1015, 843, 846, 842, 3358});
+#else
+        v2607_ok &= check_unsupported(tokenizer, "こんにちは世界。", "ja-JP");
+#endif
+#ifndef NEMO_SPEECH_TTS_WITH_ZH
+        v2607_ok &= check_unsupported(tokenizer, "你好。", "zh-CN");
+#endif
         return v2607_ok ? 0 : 1;
     }
+    if (tokenizer.profile_id() != "v2602" || tokenizer.text_vocab_size() != 2362) {
+        std::fprintf(stderr, "v2602 tokenizer reported the wrong profile metadata\n");
+        return 1;
+    }
     bool ok = true;
+    std::vector<std::string> expected_languages = {
+        "en-US", "es-ES", "de-DE", "fr-FR", "it-IT", "vi-VN",
+#ifdef NEMO_SPEECH_TTS_WITH_ZH
+        "zh-CN",
+#endif
+        "hi-IN",
+#ifdef NEMO_SPEECH_TTS_WITH_JA
+        "ja-JP",
+#endif
+    };
+    ok &= check_supported_languages(tokenizer, expected_languages);
 
     ok &= check_tokens(tokenizer, "A", "en-US", {90, 94, 94, 53, 84, 2361});
     ok &= check_tokens(tokenizer, "T", "en-US", {90, 94, 94, 65, 56, 2361});

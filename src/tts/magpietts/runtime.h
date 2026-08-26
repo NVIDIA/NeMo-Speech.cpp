@@ -129,6 +129,8 @@ class MagpieTtsRuntime {
     int speaker_count() const;
     const std::vector<std::string>& speaker_names() const;
     const std::string& model_name() const;
+    const std::string& tokenizer_profile() const;
+    int text_vocab_size() const;
 
     MagpieSynthesisStats synthesize(
         const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,

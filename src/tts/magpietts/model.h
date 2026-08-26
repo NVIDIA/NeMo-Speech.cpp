@@ -92,6 +92,23 @@ struct magpietts_hparams {
     std::vector<int32_t> apply_prior_to_layers;
 };
 
+inline std::string
+magpietts_infer_tokenizer_profile(const magpietts_hparams& h) {
+    if (h.text_vocab_size == 2362 && h.frame_stacking_factor == 1) {
+        return "v2602";
+    }
+    if (h.text_vocab_size == 3359 && h.frame_stacking_factor == 2) {
+        return "v2607";
+    }
+    return {};
+}
+
+inline bool
+magpietts_tokenizer_profile_matches(
+    const std::string& profile, const magpietts_hparams& h) {
+    return profile == magpietts_infer_tokenizer_profile(h) && !profile.empty();
+}
+
 inline bool
 magpietts_unstack_codes(
     const std::vector<int32_t>& stacked_codes, const magpietts_hparams& h,
@@ -244,6 +261,8 @@ class MagpieModel {
     bool loaded() const { return gguf != nullptr && ctx != nullptr && backend != nullptr; }
 
     magpietts_hparams hparams;
+    std::string tokenizer_profile;
+    std::string nemo_version;
 
     gguf_context* gguf = nullptr;
     ggml_context* ctx = nullptr;

@@ -46,6 +46,15 @@ they are not part of the GGUF. Extract the `.nemo` and pass that directory to
 the server as `--tts.tokenizer-model-dir` (here
 `models/magpie-tts/extracted`).
 The model-specific IPA/text tokenizer assets are loaded from this directory.
+The GGUF and extracted directory must come from the same model revision. The
+runtime recognizes the exact v2602 and v2607 tokenizer layouts from
+`model_config.yaml` and rejects unknown layouts or a profile mismatch at
+startup. Newly converted GGUFs record the profile explicitly; older v2602 and
+v2607 GGUFs are identified from their text-vocabulary and frame-stacking
+dimensions. In particular, v2602 uses the Hindi character tokenizer, while
+v2607 uses the bundled Hindi IPA dictionary and also changes tokenizer order,
+Japanese ASCII casing, Italian/Vietnamese tokenizer names, and the supported
+language set.
 Japanese tokenization requires a build with `NEMO_SPEECH_TTS_WITH_JA=ON`
 (disabled by default), which builds Open JTalk, MeCab, and the NAIST dictionary.
 Mandarin requires `NEMO_SPEECH_TTS_WITH_ZH=ON` (disabled by default) and

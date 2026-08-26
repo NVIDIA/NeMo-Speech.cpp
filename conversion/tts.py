@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from .source import extract_archive, find_checkpoint_files, load_state_dict, read_checkpoint_config
+from .tts_tokenizer_profiles import tokenizer_profile
 
 SPECIAL_AUDIO_TOKENS = 8
 SPEAKER_NAMES = ["John", "Sofia", "Aria", "Jason", "Leo"]
@@ -93,6 +94,7 @@ def add_metadata(
     decoder = cfg["decoder"]
     lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
     frame_stacking = int(cfg.get("frame_stacking_factor", 1))
+    profile = tokenizer_profile(cfg, text_vocab, frame_stacking)
     n_stacked_codebooks = int(
         len([k for k in sd if k.startswith("audio_embeddings.") and k.endswith(".weight")])
     )
@@ -128,6 +130,7 @@ def add_metadata(
         "model_type": cfg.get("model_type"),
         "nemo_target": cfg.get("target"),
         "nemo_version": cfg.get("nemo_version"),
+        "tokenizer_profile": profile,
         "codec_model": cfg.get("codecmodel_path"),
         "text_vocab_size": text_vocab,
         "audio_codebooks": n_codebooks,
@@ -151,6 +154,7 @@ def add_metadata(
     )
     writer.add_string("magpietts.nemo_target", str(cfg.get("target", "")))
     writer.add_string("magpietts.nemo_version", str(cfg.get("nemo_version", "")))
+    writer.add_string("magpietts.tokenizer_profile", profile)
     writer.add_string("magpietts.model_type", str(cfg.get("model_type", "")))
     writer.add_string("magpietts.codec_model", str(cfg.get("codecmodel_path", "")))
     writer.add_string("magpietts.config_json", json.dumps(cfg, ensure_ascii=False, sort_keys=True))

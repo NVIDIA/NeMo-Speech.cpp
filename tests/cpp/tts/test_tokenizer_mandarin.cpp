@@ -83,10 +83,16 @@ main(int argc, char** argv) {
         }
 
         nemo_speech::tts::MagpieNativeTokenizer tokenizer(argv[1]);
+        const bool v2607 = tokenizer.profile_id() == "v2607";
         std::vector<std::vector<int32_t>> expected;
         bool ok = true;
         for (size_t index = 0; index < utterances.size(); ++index) {
             expected.push_back(parse_tokens(golden_lines[index]));
+            if (v2607) {
+                for (auto& token : expected.back()) {
+                    token = token == 2361 ? 3358 : token + 384;
+                }
+            }
             const auto result = tokenizer.tokenize(utterances[index], "zh-CN");
             ok &= result.language == "zh";
             ok &= result.tokenizer_name == "mandarin_phoneme";

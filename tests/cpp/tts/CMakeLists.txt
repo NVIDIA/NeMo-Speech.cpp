@@ -46,6 +46,16 @@ endif()
 if(NEMO_SPEECH_TTS_WITH_ZH)
     target_compile_definitions(test_tokenizer_single_chars PRIVATE NEMO_SPEECH_TTS_WITH_ZH=1)
 endif()
+if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2602})
+    add_test(
+        NAME tokenizer_v2602
+        COMMAND test_tokenizer_single_chars $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2602})
+endif()
+if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
+    add_test(
+        NAME tokenizer_v2607
+        COMMAND test_tokenizer_single_chars $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
+endif()
 
 if(NEMO_SPEECH_TTS_WITH_ZH)
     add_executable(test_tokenizer_mandarin test_tokenizer_mandarin.cpp)
@@ -53,6 +63,16 @@ if(NEMO_SPEECH_TTS_WITH_ZH)
         test_tokenizer_mandarin PRIVATE nemo_speech_tts_tokenizer Threads::Threads)
     target_compile_definitions(test_tokenizer_mandarin PRIVATE
         MANDARIN_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2602})
+        add_test(
+            NAME tokenizer_mandarin_v2602
+            COMMAND test_tokenizer_mandarin $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2602})
+    endif()
+    if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
+        add_test(
+            NAME tokenizer_mandarin_v2607
+            COMMAND test_tokenizer_mandarin $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
+    endif()
 endif()
 
 add_executable(test_tts_terminal_punctuation test_tts_terminal_punctuation.cpp)

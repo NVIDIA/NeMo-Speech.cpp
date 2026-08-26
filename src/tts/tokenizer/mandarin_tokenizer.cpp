@@ -26,8 +26,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kMandarinOffset = 349;
-
 struct utf8_char {
     uint32_t codepoint = 0;
     std::string text;
@@ -155,14 +153,16 @@ ascii_upper(std::string text) {
 
 class mandarin_tokenizer::impl {
    public:
-    explicit impl(const fs::path& model_dir) {
+    explicit impl(const fs::path& model_dir, int offset, const std::string& phoneme_dict)
+        : offset_(offset) {
         data_dir_ = find_data_dir(model_dir);
         if (data_dir_.empty()) {
             throw std::runtime_error(
                 "failed to find Mandarin G2P data; set MAGPIE_MANDARIN_G2P_DIR");
         }
-        const fs::path phoneme_path = find_phoneme_dict(model_dir);
-        if (phoneme_path.empty()) {
+        const fs::path phoneme_path =
+            phoneme_dict.empty() ? find_phoneme_dict(model_dir) : model_dir / phoneme_dict;
+        if (!fs::is_regular_file(phoneme_path)) {
             throw std::runtime_error("failed to find Mandarin pinyin-to-phoneme dictionary");
         }
 
@@ -326,9 +326,11 @@ class mandarin_tokenizer::impl {
                 "Mandarin vocabulary does not match the Magpie model (expected 109 tokens)");
         }
         for (size_t index = 0; index < tokens.size(); ++index) {
-            token_to_id_[tokens[index]] = kMandarinOffset + static_cast<int>(index);
+            token_to_id_[tokens[index]] = offset_ + static_cast<int>(index);
         }
     }
+
+    int offset_ = 349;
 
     void append_word_pinyin(const std::string& word, std::vector<std::string>& output) const {
         const auto chars = decode_utf8(word);
@@ -378,8 +380,9 @@ class mandarin_tokenizer::impl {
     }
 };
 
-mandarin_tokenizer::mandarin_tokenizer(const fs::path& model_dir)
-    : impl_(std::make_unique<impl>(model_dir)) {}
+mandarin_tokenizer::mandarin_tokenizer(
+    const fs::path& model_dir, int offset, std::string phoneme_dict)
+    : impl_(std::make_unique<impl>(model_dir, offset, phoneme_dict)) {}
 
 mandarin_tokenizer::~mandarin_tokenizer() = default;
 

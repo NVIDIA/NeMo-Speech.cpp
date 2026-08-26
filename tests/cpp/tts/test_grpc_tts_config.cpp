@@ -111,6 +111,8 @@ main() {
     synthesizer_config.tokenizer_model_dir = tokenizer_dir;
     synthesizer_config.default_language_code = "en-US";
     auto synthesizer = std::make_shared<tts::Synthesizer>(std::move(synthesizer_config));
+    const std::vector<std::string> supported_languages =
+        synthesizer->supported_language_codes();
     nemo_speech::GrpcTtsService service(std::move(synthesizer));
 
     nr_tts::RivaSynthesisConfigRequest req;
@@ -120,7 +122,6 @@ main() {
 
     bool ok = true;
     ok &= expect(status.ok(), "GetRivaSynthesisConfig succeeds");
-    const std::vector<std::string> supported_languages = tts::supported_language_codes();
     ok &= expect(
         resp.model_config_size() == static_cast<int>(supported_languages.size()),
         "one TTS model config is returned per supported language");

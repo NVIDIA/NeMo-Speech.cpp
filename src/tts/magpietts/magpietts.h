@@ -143,6 +143,8 @@ class MagpieStreamingRuntime {
     int sampleRate() const;
     int speakerCount() const;
     std::vector<std::string> speakerNames() const;
+    const std::string& tokenizerProfile() const;
+    int textVocabSize() const;
     bool synthesize(
         magpie_stream_params& params, const std::vector<int32_t>& tokens,
         const magpie_pcm_callback& pcm_callback, stream_run_metrics& metrics);
