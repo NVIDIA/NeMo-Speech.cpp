@@ -617,6 +617,8 @@ MagpieModel::operator=(MagpieModel&& other) noexcept {
     if (this != &other) {
         reset();
         hparams = other.hparams;
+        tokenizer_profile = std::move(other.tokenizer_profile);
+        nemo_version = std::move(other.nemo_version);
         gguf = other.gguf;
         ctx = other.ctx;
         backend = other.backend;
@@ -678,6 +680,8 @@ MagpieModel::reset() {
         ctx = nullptr;
     }
     hparams = {};
+    tokenizer_profile.clear();
+    nemo_version.clear();
     cuda_unified_memory = false;
     text_embedding = nullptr;
     audio_embeddings.clear();
@@ -721,6 +725,8 @@ magpietts_model_load_impl(
     h.mask_token_id = gguf_i32(model.gguf, "magpietts.mask_token_id", h.mask_token_id);
     h.frame_stacking_factor =
         gguf_i32(model.gguf, "magpietts.frame_stacking_factor", h.frame_stacking_factor);
+    model.tokenizer_profile = gguf_string(model.gguf, "magpietts.tokenizer_profile");
+    model.nemo_version = gguf_string(model.gguf, "magpietts.nemo_version");
     const int32_t stored_stacked_codebooks =
         gguf_i32(model.gguf, "magpietts.stacked_audio_codebooks", h.stacked_audio_codebooks());
     h.n_embd = gguf_i32(model.gguf, "magpietts.embedding_dim", h.n_embd);
@@ -803,6 +809,17 @@ magpietts_model_load_impl(
 
     if (h.frame_stacking_factor < 1) {
         fprintf(stderr, "invalid frame_stacking_factor=%d\n", h.frame_stacking_factor);
+        return false;
+    }
+    if (model.tokenizer_profile.empty()) {
+        model.tokenizer_profile = magpietts_infer_tokenizer_profile(h);
+    }
+    if (!magpietts_tokenizer_profile_matches(model.tokenizer_profile, h)) {
+        fprintf(
+            stderr,
+            "unsupported or inconsistent Magpie tokenizer profile '%s': "
+            "text_vocab_size=%d frame_stacking_factor=%d\n",
+            model.tokenizer_profile.c_str(), h.text_vocab_size, h.frame_stacking_factor);
         return false;
     }
     if (h.audio_codebooks < 1 || stored_stacked_codebooks != h.stacked_audio_codebooks()) {

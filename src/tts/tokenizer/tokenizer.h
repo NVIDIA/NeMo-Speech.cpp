@@ -83,6 +83,8 @@ class MagpieNativeTokenizer {
 
     static std::string normalize_language_code(const std::string& language_code);
     std::vector<std::string> supported_language_codes() const;
+    const std::string& profile_id() const;
+    int text_vocab_size() const;
 
    private:
     class Impl;

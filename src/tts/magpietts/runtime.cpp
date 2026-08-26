@@ -111,6 +111,8 @@ class MagpieTtsRuntime::Impl {
                 config_.magpie_cpu, config_.codec_cpu)) {
             throw std::runtime_error("failed to load MagpieTTS/NanoCodec GGUFs");
         }
+        tokenizer_profile_ = stream_->tokenizerProfile();
+        text_vocab_size_ = stream_->textVocabSize();
 
         speaker_names_ = stream_->speakerNames();
         if (speaker_names_.empty()) {
@@ -125,6 +127,8 @@ class MagpieTtsRuntime::Impl {
     int speaker_count() const { return stream_->speakerCount(); }
     const std::vector<std::string>& speaker_names() const { return speaker_names_; }
     const std::string& model_name() const { return model_name_; }
+    const std::string& tokenizer_profile() const { return tokenizer_profile_; }
+    int text_vocab_size() const { return text_vocab_size_; }
 
     MagpieSynthesisStats synthesize(
         const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,
@@ -255,6 +259,8 @@ class MagpieTtsRuntime::Impl {
     std::unique_ptr<MagpieStreamingRuntime> stream_;
     std::vector<std::string> speaker_names_;
     std::string model_name_;
+    std::string tokenizer_profile_;
+    int text_vocab_size_ = 0;
     std::mutex mutex_;
 };
 
@@ -281,6 +287,16 @@ MagpieTtsRuntime::speaker_names() const {
 const std::string&
 MagpieTtsRuntime::model_name() const {
     return impl_->model_name();
+}
+
+const std::string&
+MagpieTtsRuntime::tokenizer_profile() const {
+    return impl_->tokenizer_profile();
+}
+
+int
+MagpieTtsRuntime::text_vocab_size() const {
+    return impl_->text_vocab_size();
 }
 
 MagpieSynthesisStats

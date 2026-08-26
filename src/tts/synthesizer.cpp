@@ -61,6 +61,15 @@ struct Synthesizer::Impl {
         if (!config.tokenizer_model_dir.empty()) {
             tokenizer = std::make_unique<MagpieNativeTokenizer>(
                 std::move(config.tokenizer_model_dir), config.tokenizer);
+            if (tokenizer->profile_id() != runtime.tokenizer_profile() ||
+                tokenizer->text_vocab_size() != runtime.text_vocab_size()) {
+                throw std::invalid_argument(
+                    "Magpie model/tokenizer mismatch: GGUF requires tokenizer profile '" +
+                    runtime.tokenizer_profile() + "' with text vocabulary " +
+                    std::to_string(runtime.text_vocab_size()) + ", but tokenizer directory is '" +
+                    tokenizer->profile_id() + "' with text vocabulary " +
+                    std::to_string(tokenizer->text_vocab_size()));
+            }
         }
     }
 

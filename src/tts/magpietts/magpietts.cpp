@@ -345,6 +345,17 @@ MagpieStreamingRuntime::speakerNames() const {
     return out;
 }
 
+const std::string&
+MagpieStreamingRuntime::tokenizerProfile() const {
+    static const std::string empty;
+    return impl_ ? impl_->magpie.tokenizer_profile : empty;
+}
+
+int
+MagpieStreamingRuntime::textVocabSize() const {
+    return impl_ ? impl_->magpie.hparams.text_vocab_size : 0;
+}
+
 void
 stream_latency_metrics::begin(int64_t now_us) {
     *this = {};
