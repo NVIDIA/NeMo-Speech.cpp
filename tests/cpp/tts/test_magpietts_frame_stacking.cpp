@@ -83,10 +83,9 @@ main() {
     const int decoder_positions =
         (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
     for (int step = 0; step < decoder_positions; ++step) {
-        const int frames_remaining =
-            h.max_decoder_steps - step * h.frame_stacking_factor;
-        final_position_frames = tts::magpietts_frames_to_emit(
-            frames_remaining, h.frame_stacking_factor, -1);
+        const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
+        final_position_frames =
+            tts::magpietts_frames_to_emit(frames_remaining, h.frame_stacking_factor, -1);
         emitted_frames += final_position_frames;
     }
     if (emitted_frames != h.max_decoder_steps || final_position_frames != 1) {

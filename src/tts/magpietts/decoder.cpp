@@ -831,10 +831,9 @@ MagpieDecoder::evalCachedPair(
     const std::vector<std::vector<int32_t>>& audio_codes, int speaker, int threads,
     DecoderKvCache& cond_kv, DecoderKvCache& uncond_kv, decoder_result& cond_result,
     decoder_result& uncond_result, int stacked_position_budget,
-    magpietts_cuda_sample_request* cuda_sample,
-    const magpietts_backend_tensor* text_cond_device, magpietts_backend_tensor* cond_hidden_out,
-    magpietts_backend_tensor* uncond_hidden_out, DecoderCrossKvCache* cond_cross_kv,
-    const magpietts_decoder_attention* attention) const {
+    magpietts_cuda_sample_request* cuda_sample, const magpietts_backend_tensor* text_cond_device,
+    magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out,
+    DecoderCrossKvCache* cond_cross_kv, const magpietts_decoder_attention* attention) const {
     const bool persistent_candidate =
         cuda_sample == nullptr && cond_hidden_out != nullptr && uncond_hidden_out != nullptr &&
         cond_cross_kv != nullptr && cond_cross_kv->validFor(model_, text_len) &&
@@ -843,17 +842,15 @@ MagpieDecoder::evalCachedPair(
     if (persistent_candidate) {
         try {
             if (persistent_runtime_ &&
-                !persistent_runtime_->matches(
-                    cond_cross_kv, text_len, stacked_position_budget)) {
+                !persistent_runtime_->matches(cond_cross_kv, text_len, stacked_position_budget)) {
                 // Cross-cache address, shape, or request budget changes require a new graph.
                 persistent_runtime_.reset();
                 cond_kv.clear();
                 uncond_kv.clear();
             }
             if (cond_kv.n_tokens > 0 && !persistent_runtime_) {
-                persistent_runtime_ =
-                    std::make_unique<PersistentDecoderRuntime>(
-                        model_, *cond_cross_kv, text_len, stacked_position_budget);
+                persistent_runtime_ = std::make_unique<PersistentDecoderRuntime>(
+                    model_, *cond_cross_kv, text_len, stacked_position_budget);
                 persistent_runtime_->seed(cond_kv, uncond_kv);
                 fprintf(
                     stderr,
