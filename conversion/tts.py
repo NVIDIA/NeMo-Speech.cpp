@@ -80,29 +80,52 @@ def add_i32_array(writer: gguf.GGUFWriter, key: str, value: Any) -> None:
         writer.add_array(key, items)
 
 
+def _indexed_weight_indices(sd: dict[str, torch.Tensor], prefix: str) -> list[int]:
+    suffix = ".weight"
+    indices: list[int] = []
+    for name in sd:
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        raw_index = name[len(prefix) : -len(suffix)]
+        if not raw_index.isascii() or not raw_index.isdigit():
+            raise ValueError(f"{prefix} contains a non-numeric weight index: {name}")
+        indices.append(int(raw_index))
+    return indices
+
+
+def _require_contiguous_indices(label: str, indices: list[int], expected_count: int) -> None:
+    expected = list(range(expected_count))
+    actual = sorted(indices)
+    if actual != expected:
+        raise ValueError(
+            f"{label} indexes must be contiguous from 0 through {expected_count - 1}: "
+            f"found={actual}"
+        )
+
+
 def add_metadata(
     writer: gguf.GGUFWriter, cfg: dict[str, Any], sd: dict[str, torch.Tensor]
 ) -> dict[str, Any]:
+    encoder = cfg["encoder"]
+    decoder = cfg["decoder"]
+    lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
+    frame_stacking = int(cfg.get("frame_stacking_factor", 1))
+    audio_embedding_indices = _indexed_weight_indices(sd, "audio_embeddings.")
+    n_stacked_codebooks = len(audio_embedding_indices)
+    if frame_stacking < 1 or n_stacked_codebooks == 0 or n_stacked_codebooks % frame_stacking:
+        raise ValueError(
+            "audio embedding count must be a positive multiple of frame_stacking_factor: "
+            f"embeddings={n_stacked_codebooks} frame_stacking_factor={frame_stacking}"
+        )
+    _require_contiguous_indices("audio embedding", audio_embedding_indices, n_stacked_codebooks)
+
     audio_vocab = int(sd["audio_embeddings.0.weight"].shape[0])
     codebook_size = audio_vocab - SPECIAL_AUDIO_TOKENS
     text_vocab = int(sd["text_embedding.weight"].shape[0])
     baked_t = int(sd["_baked_embedding_T"].item())
     baked_d = int(sd["_baked_embedding_D"].item())
     baked_lens = [int(x) for x in sd["baked_context_embedding_len"].tolist()]
-
-    encoder = cfg["encoder"]
-    decoder = cfg["decoder"]
-    lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
-    frame_stacking = int(cfg.get("frame_stacking_factor", 1))
     profile = tokenizer_profile(cfg, text_vocab, frame_stacking)
-    n_stacked_codebooks = int(
-        len([k for k in sd if k.startswith("audio_embeddings.") and k.endswith(".weight")])
-    )
-    if frame_stacking < 1 or n_stacked_codebooks == 0 or n_stacked_codebooks % frame_stacking:
-        raise ValueError(
-            "audio embedding count must be a positive multiple of frame_stacking_factor: "
-            f"embeddings={n_stacked_codebooks} frame_stacking_factor={frame_stacking}"
-        )
     n_codebooks = n_stacked_codebooks // frame_stacking
     expected_logits = n_stacked_codebooks * audio_vocab
     if int(sd["final_proj.weight"].shape[0]) != expected_logits:
@@ -110,18 +133,16 @@ def add_metadata(
             "final_proj rows do not match stacked audio layout: "
             f"rows={sd['final_proj.weight'].shape[0]} expected={expected_logits}"
         )
-    n_lt_heads = len(
-        [
-            k
-            for k in sd
-            if k.startswith("local_transformer_out_projections.") and k.endswith(".weight")
-        ]
-    )
+    lt_head_indices = _indexed_weight_indices(sd, "local_transformer_out_projections.")
+    n_lt_heads = len(lt_head_indices)
     if n_lt_heads != n_stacked_codebooks:
         raise ValueError(
             "local transformer output heads do not match audio embeddings: "
             f"heads={n_lt_heads} embeddings={n_stacked_codebooks}"
         )
+    _require_contiguous_indices(
+        "local transformer output projection", lt_head_indices, n_stacked_codebooks
+    )
 
     inf = cfg.get("inference_parameters", {})
 
