@@ -736,8 +736,7 @@ magpietts_model_load_impl(
             static_cast<long long>(stacked_audio_codebooks_64));
         return false;
     }
-    const int32_t expected_stacked_codebooks =
-        static_cast<int32_t>(stacked_audio_codebooks_64);
+    const int32_t expected_stacked_codebooks = static_cast<int32_t>(stacked_audio_codebooks_64);
     model.tokenizer_profile = gguf_string(model.gguf, "magpietts.tokenizer_profile");
     model.nemo_version = gguf_string(model.gguf, "magpietts.nemo_version");
     const int32_t stored_stacked_codebooks =

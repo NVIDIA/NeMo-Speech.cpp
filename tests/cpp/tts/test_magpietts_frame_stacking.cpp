@@ -55,15 +55,13 @@ main() {
     }
     const std::vector<std::vector<int32_t>> incomplete_forced_frames = {
         {10, 11}, {20, 21}, {30, 31}};
-    if (tts::magpietts_stack_forced_code_frames(
-            incomplete_forced_frames, 0, h, stacked_forced) ||
+    if (tts::magpietts_stack_forced_code_frames(incomplete_forced_frames, 0, h, stacked_forced) ||
         !stacked_forced.empty()) {
         std::fprintf(stderr, "incomplete forced-code frame group was accepted\n");
         return 1;
     }
     const std::vector<std::vector<int32_t>> malformed_forced_frames = {{10}, {20, 21}};
-    if (tts::magpietts_stack_forced_code_frames(
-            malformed_forced_frames, 0, h, stacked_forced)) {
+    if (tts::magpietts_stack_forced_code_frames(malformed_forced_frames, 0, h, stacked_forced)) {
         std::fprintf(stderr, "malformed forced-code frame was accepted\n");
         return 1;
     }
