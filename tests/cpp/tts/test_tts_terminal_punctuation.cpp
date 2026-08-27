@@ -48,6 +48,9 @@ main() {
     check(ensure_terminal_punctuation("你好。", "zh"), "你好。", "existing Chinese full stop");
     check(ensure_terminal_punctuation("你好？", "zh"), "你好？", "existing Chinese question mark");
     check(
+        ensure_terminal_punctuation("كيف حالك؟", "ar-MSA"), "كيف حالك؟",
+        "existing Arabic question mark");
+    check(
         ensure_terminal_punctuation("你好！", "zh"), "你好！", "existing Chinese exclamation mark");
     check(
         ensure_terminal_punctuation("こんにちは。", "ja"), "こんにちは。",
