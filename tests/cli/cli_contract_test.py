@@ -74,8 +74,10 @@ def main() -> None:
             assert error["exit_code"] in (3, 4), error
 
         serve_help = run(binary, "serve", "--help")
+        has_tts_options = "--tts-model" in serve_help.stdout
         if "--cors-origin" in serve_help.stdout:
-            assert "--tts.preempt" in serve_help.stdout
+            if has_tts_options:
+                assert "--tts.preempt" in serve_help.stdout
             with socket.socket() as stalled_server:
                 stalled_server.bind(("127.0.0.1", 0))
                 stalled_server.listen()
@@ -147,7 +149,7 @@ def main() -> None:
                         binary,
                         "--json",
                         "serve",
-                        "--tts.preempt",
+                        *(["--tts.preempt"] if has_tts_options else []),
                         *missing_arguments,
                         "--no-warmup",
                     ),
