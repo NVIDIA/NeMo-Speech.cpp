@@ -311,7 +311,8 @@ main(int argc, char** argv) {
 
     tts::MagpieStreamingRuntime runtime;
     if (!runtime.load(
-            params.magpie_model, params.codec_model, params.uma_mode, false, params.codec_cpu)) {
+            params.magpie_model, params.codec_model, params.uma_mode, false, params.codec_cpu,
+            params.verbose)) {
         return 1;
     }
 

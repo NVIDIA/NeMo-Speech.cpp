@@ -42,6 +42,24 @@ ggml_graph_compute_helper_async(
     return ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS;
 }
 
+// A scheduler split can cover a graph range containing nodes that are not
+// active for the current run. Before bypassing the scheduler on a cache hit,
+// verify the backend can execute every active node in the full graph. This is
+// especially important for accelerator backends such as BLAS, which support
+// large matrix multiplications but rely on the CPU backend for ops such as PAD.
+static bool
+backend_supports_compute_graph(ggml_backend_t backend, ggml_cgraph* graph) {
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* node = ggml_graph_node(graph, i);
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+            !ggml_backend_supports_op(backend, node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Cache-aware encoder graphs grow with the true batch dimension. Keep enough
 // scheduler capacity for large batches while bounding its proportional hash,
 // backend-ID, and graph-copy allocations. Near-capacity graphs fail explicitly.
@@ -830,8 +848,9 @@ Session::run_impl(
         }
 
         // Record direct-compute eligibility for subsequent hits: one split,
-        // one non-CPU backend (the CPU path routes thread-count setup through
-        // ggml_graph_compute_helper, so keep it on the scheduler).
+        // one non-CPU backend that supports every active node in the complete
+        // graph. The CPU path routes thread-count setup through
+        // ggml_graph_compute_helper, so keep it on the scheduler.
         cr.direct_ok = false;
         cr.direct_backend = nullptr;
         if (ggml_backend_sched_get_n_splits(sched.get()) == 1 && ggml_graph_n_nodes(cr.gf) > 0) {
@@ -839,7 +858,8 @@ Session::run_impl(
                 ggml_backend_sched_get_tensor_backend(sched.get(), ggml_graph_node(cr.gf, 0));
             if (b != nullptr) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(b);
-                if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    backend_supports_compute_graph(b, cr.gf)) {
                     cr.direct_ok = true;
                     cr.direct_backend = b;
                 }

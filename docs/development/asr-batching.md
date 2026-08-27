@@ -62,6 +62,7 @@ asr:
     max_queue_depth: 2048
     ingress_cohort_delay_us: 20000
     state_arena_slots: 32
+    offline_bucket_ms: 1000
 ```
 
 | Key | Tuning effect |
@@ -72,10 +73,14 @@ asr:
 | `max_queue_depth` | Bounds pending work and provides backpressure. |
 | `ingress_cohort_delay_us` | Aligns streaming audio arrivals before frontend and encoder work. |
 | `state_arena_slots` | Reserves recurrent/cache state rows; provision at least the maximum concurrent stateful streams. |
+| `offline_bucket_ms` | Silence-pads offline utterances to a duration multiple so similar lengths can share graph shapes; `0` disables bucketing. |
 
 More streams than `max_batch_size` are processed in multiple waves. Increasing
 the cap or either delay does not guarantee better throughput; tune them on the
 target GPU with the expected request cadence and audio chunk size.
+Offline bucketing is useful only for concurrent offline workloads, and its
+padding cost grows with the bucket size. Start with a modest value such as
+`1000` ms and measure it on the expected duration distribution.
 
 The gRPC and HTTP streaming adapters opt into ingress coordination. Direct
 library streams and benchmark calls do not, so they avoid the transport

@@ -256,7 +256,7 @@ class MagpieModel {
 
     bool load(
         const std::string& fname, magpietts_uma_mode uma_mode = MAGPIETTS_UMA_AUTO,
-        bool force_cpu = false);
+        bool force_cpu = false, bool verbose = false);
     void reset();
     bool loaded() const { return gguf != nullptr && ctx != nullptr && backend != nullptr; }
 

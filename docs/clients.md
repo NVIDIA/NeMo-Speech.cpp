@@ -3,13 +3,25 @@
 Start a local server with the models needed by your application:
 
 ```bash
-nemo-speech serve --asr-model models/asr.q8_0.gguf
+nemo-speech serve --asr-model nemotron-3.5
 ```
 
-The HTTP server implements the OpenAI audio API subset documented in the
-[HTTP API reference](api.md).
+Model listing, transcription, and speech expose the OpenAI-compatible subsets
+documented in the [HTTP API reference](api.md). Other OpenAI APIs are not
+implemented. Realtime transcription uses the project's WebSocket protocol
+rather than the OpenAI Realtime API.
 An API key is only required when the server was started with `--api-key`; SDKs
 still require a nonempty placeholder locally.
+
+OpenAI SDKs also require a `model` argument. NeMo-Speech.cpp currently loads
+one model per capability, so this compatibility field does not switch models;
+use `GET /v1/models` to inspect the active model IDs.
+
+For speech, use a local voice from the speech model's `voices` list. The
+`default` and supported OpenAI voice aliases such as `alloy` select the
+configured default local speaker; they do not select hosted OpenAI voices.
+Local names are case-insensitive and can also be written as
+`<model-id>.<voice>` or as a zero-based speaker index.
 
 ## OpenAI Python SDK
 
@@ -44,13 +56,17 @@ than placing an API key in a public page.
 
 ## curl
 
+The speech example requires a TTS model. Start a TTS-only server with
+`nemo-speech serve --tts-model magpie`, or add `--tts-model magpie` to the ASR
+server command above.
+
 ```bash
 curl -s http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@recording.wav -F model=default -F response_format=verbose_json
 
 curl -s http://127.0.0.1:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"model":"default","voice":"default","input":"Hello","response_format":"wav"}' \
+  -d '{"model":"default","voice":"alloy","input":"Hello","response_format":"wav"}' \
   -o hello.wav
 ```
 

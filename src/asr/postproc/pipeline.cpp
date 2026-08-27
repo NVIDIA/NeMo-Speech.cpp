@@ -22,6 +22,7 @@
 #include "itn_align.h"
 #include "pnc_model.h"
 #include "pnc_runner.h"
+#include "runtime.h"
 
 namespace nemo_speech::asr::postproc {
 namespace {
@@ -126,8 +127,9 @@ struct Postprocessor::ItnRegistry {
             throw std::runtime_error(
                 "ITN: no two-FAR grammar directories found under " + root.string());
         }
-        std::cerr << "[itn] discovered " << grammar_dirs.size()
-                  << " language grammar directories under " << root.string() << "\n";
+        GGMLF_LOG_INFO(
+            "[itn] discovered %zu language grammar directories under %s\n", grammar_dirs.size(),
+            root.string().c_str());
 #else
         // Preserve the existing warning for a configured grammar in a build
         // without text-normalization support.

@@ -9,4 +9,9 @@ std::filesystem::path require_model_file(const std::string& path, const std::str
 std::filesystem::path require_model_directory(
     const std::string& path, const std::string& description);
 
+std::filesystem::path resolve_model_file(
+    const std::string& reference, const std::string& role, const std::string& description);
+std::filesystem::path resolve_model_directory(
+    const std::string& reference, const std::string& role, const std::string& description);
+
 std::string inspect_gguf_json(const std::filesystem::path& path);

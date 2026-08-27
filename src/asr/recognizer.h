@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -43,6 +44,9 @@ struct RecognizerConfig {
     VadEndpointerCfg endpointing;
     DiarConfig diar;  // speaker diarization sidecar (Sortformer)
     postproc::PostprocConfig postproc;
+    // Human-readable model and execution summaries. The CLI disables these
+    // for --quiet and --json; verbose implementation logs are separate.
+    bool log_status = true;
 
     void Register(common::ParameterParser& p) {
         p.Register("backend", backend);
@@ -139,6 +143,8 @@ class Recognizer {
 
    private:
     friend class RecognitionStream;
+    void log_model_status() const;
+    void log_execution_status(bool streaming) const;
     void register_streaming_ingress() {
         active_streaming_ingress_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -166,6 +172,8 @@ class Recognizer {
     std::unique_ptr<postproc::Postprocessor> postproc_;
     // Shared immutable VAD model; each stream owns recurrent state.
     std::shared_ptr<SileroVadModel> vad_model_;
+    mutable std::once_flag offline_status_once_;
+    mutable std::once_flag streaming_status_once_;
 };
 
 }  // namespace nemo_speech::asr

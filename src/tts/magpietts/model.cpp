@@ -26,14 +26,6 @@
 
 namespace nemo_speech::tts {
 
-static void
-magpietts_log_callback(ggml_log_level level, const char* text, void* user_data) {
-    (void)level;
-    (void)user_data;
-    fputs(text, stderr);
-    fflush(stderr);
-}
-
 const char*
 magpietts_backend_preference_name(magpietts_backend_preference backend) {
     switch (backend) {
@@ -602,7 +594,8 @@ load_transformer(
 }
 
 static bool magpietts_model_load_impl(
-    const std::string& fname, magpietts_model& model, magpietts_uma_mode uma_mode, bool force_cpu);
+    const std::string& fname, magpietts_model& model, magpietts_uma_mode uma_mode, bool force_cpu,
+    bool verbose);
 
 MagpieModel::~MagpieModel() {
     reset();
@@ -653,8 +646,9 @@ MagpieModel::operator=(MagpieModel&& other) noexcept {
 }
 
 bool
-MagpieModel::load(const std::string& fname, magpietts_uma_mode uma_mode, bool force_cpu) {
-    if (!magpietts_model_load_impl(fname, *this, uma_mode, force_cpu)) {
+MagpieModel::load(
+    const std::string& fname, magpietts_uma_mode uma_mode, bool force_cpu, bool verbose) {
+    if (!magpietts_model_load_impl(fname, *this, uma_mode, force_cpu, verbose)) {
         reset();
         return false;
     }
@@ -699,10 +693,10 @@ MagpieModel::reset() {
 
 static bool
 magpietts_model_load_impl(
-    const std::string& fname, magpietts_model& model, magpietts_uma_mode uma_mode, bool force_cpu) {
+    const std::string& fname, magpietts_model& model, magpietts_uma_mode uma_mode, bool force_cpu,
+    bool verbose) {
     const ggml_nvtx::range nvtx_range("magpietts_model_load");
     model.reset();
-    ggml_log_set(magpietts_log_callback, nullptr);
 
     gguf_init_params params = {
         /*.no_alloc =*/true,
@@ -844,13 +838,16 @@ magpietts_model_load_impl(
     }
 
     ggml_backend_dev_t dev = ggml_backend_get_device(model.backend);
-    fprintf(
-        stderr, "MagpieTTS backend: %s%s%s%s\n", ggml_backend_name(model.backend), dev ? " - " : "",
-        dev ? ggml_backend_dev_description(dev) : "", force_cpu ? " (forced CPU)" : "");
-    if (magpietts_backend_is_cuda(model.backend)) {
+    if (verbose) {
         fprintf(
-            stderr, "MagpieTTS CUDA managed memory: %s (uma-mode=%s)\n",
-            model.cuda_unified_memory ? "on" : "off", magpietts_uma_mode_name(uma_mode));
+            stderr, "MagpieTTS backend: %s%s%s%s\n", ggml_backend_name(model.backend),
+            dev ? " - " : "", dev ? ggml_backend_dev_description(dev) : "",
+            force_cpu ? " (forced CPU)" : "");
+        if (magpietts_backend_is_cuda(model.backend)) {
+            fprintf(
+                stderr, "MagpieTTS CUDA managed memory: %s (uma-mode=%s)\n",
+                model.cuda_unified_memory ? "on" : "off", magpietts_uma_mode_name(uma_mode));
+        }
     }
 
     model.buffer = ggml_backend_alloc_ctx_tensors(model.ctx, model.backend);

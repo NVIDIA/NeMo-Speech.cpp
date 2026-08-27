@@ -3,7 +3,6 @@
 #include "translator.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstdio>
@@ -11,6 +10,7 @@
 #include <mutex>
 #include <stdexcept>
 
+#include "ggml_log_filter.h"
 #include "langpairs.h"
 #include "llama.h"
 
@@ -18,27 +18,12 @@ namespace nemo_speech::nmt {
 
 namespace {
 
-std::atomic<bool> verbose_llama_logs{false};
-std::atomic<bool> continue_llama_log{false};
-
-void
-llama_log_callback(ggml_log_level level, const char* text, void*) {
-    bool emit = verbose_llama_logs.load(std::memory_order_relaxed);
-    if (level == GGML_LOG_LEVEL_CONT)
-        emit = emit || continue_llama_log.load(std::memory_order_relaxed);
-    else {
-        emit = emit || level >= GGML_LOG_LEVEL_WARN;
-        continue_llama_log.store(emit, std::memory_order_relaxed);
-    }
-    if (emit)
-        std::fputs(text, stderr);
-}
+GgmlLogFilter llama_logs;
 
 void
 configure_llama_logging(bool verbose) {
-    verbose_llama_logs.store(verbose, std::memory_order_relaxed);
-    continue_llama_log.store(false, std::memory_order_relaxed);
-    llama_log_set(llama_log_callback, nullptr);
+    llama_logs.set_verbose(verbose);
+    llama_log_set(GgmlLogFilter::callback, &llama_logs);
 }
 
 void

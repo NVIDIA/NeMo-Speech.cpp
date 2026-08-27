@@ -3,14 +3,21 @@
 Published NeMo-Speech.cpp models provide ready-to-run GGUF files on their
 Hugging Face pages; see the [ASR](asr/models.md) and [TTS](tts/models.md) model
 guides. Use the converter for compatible custom checkpoints, alternate
-quantization choices, and optional sidecar models that do not publish a GGUF.
+quantization choices, and supporting models that do not publish a GGUF.
 
-All model families use the same root entry point:
+The converters are Python source tools and are not included in the native
+release archives. Run them from a source checkout in a virtual environment;
+the C++ runtime itself does not require Python. All model families use the same
+root entry point:
 
 ```bash
-pip install -r requirements.txt
-python3 convert_model.py SOURCE --outfile MODEL.gguf
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python convert_model.py SOURCE --outfile MODEL.gguf
 ```
+
+On Windows PowerShell, activate with `.\.venv\Scripts\Activate.ps1`.
 
 `SOURCE` may be a local `.nemo` archive, an extracted NeMo checkpoint, a local
 Hugging Face model directory, or a Hugging Face repository ID. For NeMo model
@@ -46,7 +53,7 @@ install it only when converting an NMT model:
 
 ```bash
 git submodule update --init llama.cpp
-pip install -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+python -m pip install -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
 python3 convert_model.py nvidia/Riva-Translate-4B-Instruct-v2 \
     --outfile models/translate.q8_0.gguf --outtype q8_0
 ```

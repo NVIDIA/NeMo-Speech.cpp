@@ -3,14 +3,14 @@
 The project provides two server executables over the same core C++ engines:
 
 - `nemo-speech serve` hosts HTTP, realtime WebSocket, and the browser
-  playground. It loads configured models once into an `EngineRegistry`.
+  playground. It loads each configured model once.
 - `riva_server` hosts the Riva-compatible gRPC services.
 
-They are separate processes and do not share loaded model instances. The
-source installer and `*-server` presets build the HTTP executable for ASR and
-diarization plus TTS without the gRPC dependency chain. `cuda-full`, `developer`,
-or explicit component options add NMT, optional language frontends, and
-`riva_server` (presets: [build guide](build.md)).
+They are separate processes and do not share loaded models. The `*-server`
+presets include HTTP support for ASR, diarization, NMT, and TTS without gRPC.
+`cuda-full` adds gRPC, text normalization, and optional TTS language frontends;
+`developer` also adds examples, tests, and tools. Individual features can be
+selected explicitly (presets: [build guide](build.md)).
 
 ```bash
 nemo-speech serve \
@@ -23,6 +23,9 @@ nemo-speech serve \
 # Open the playground after the listener is ready.
 nemo-speech serve --asr-model models/asr.q8_0.gguf --open
 
+# Serve standalone speaker diarization (downloads the indexed model if needed).
+nemo-speech serve --diar-model sortformer
+
 # Start the separate Riva-compatible gRPC server.
 riva_server --asr.model.path models/asr.q8_0.gguf --bind 0.0.0.0:50051
 ```
@@ -31,6 +34,8 @@ riva_server --asr.model.path models/asr.q8_0.gguf --bind 0.0.0.0:50051
 
 Both servers accept the same dotted engine keys, such as
 `asr.vad.masker.onset`, through YAML, environment variables, or CLI options.
+The HTTP server additionally accepts top-level `diar.*` keys for standalone
+diarization; use `asr.diar.*` to add speaker labels to ASR results.
 Settings are applied in this order:
 
 ```text
@@ -45,7 +50,7 @@ Nested YAML maps mirror the dotted keys. Start from a checked-in example:
 | [`config/diar.example.yaml`](../config/diar.example.yaml) | standalone diarization |
 | [`config/tts.example.yaml`](../config/tts.example.yaml) | TTS-only server |
 | [`config/nmt.example.yaml`](../config/nmt.example.yaml) | NMT-only server |
-| [`config/server.example.yaml`](../config/server.example.yaml) | combined HTTP speech server |
+| [`config/server.example.yaml`](../config/server.example.yaml) | combined ASR, diarization, NMT, and TTS server |
 
 ```bash
 nemo-speech serve --config config/asr.example.yaml
@@ -76,7 +81,7 @@ HTTP listener settings use the same precedence:
 | `--host` / `http.host` | `127.0.0.1` | HTTP bind address |
 | `--port` / `http.port` | `8080` | HTTP port |
 | `--api-key` / `http.api-key` | none | require `Authorization: Bearer <key>` on API routes |
-| `--tls-cert` / `http.tls-cert` | none | TLS certificate path (with `--tls-key`, enables HTTPS) |
+| `--tls-cert` / `http.tls-cert` | none | TLS certificate path (with `--tls-key`; requires a build with `NEMO_SPEECH_HTTP_TLS=ON`) |
 | `--tls-key` / `http.tls-key` | none | TLS private-key path |
 | `--cors-origin` / `http.cors-origin` | none | allowed browser origin |
 | `--no-ui` / `http.playground` | playground on | disable the embedded playground |
@@ -99,12 +104,14 @@ The complete engine key references are in [ASR configuration](asr/configuration.
 [NMT configuration](nmt/configuration.md).
 
 The default loopback binding is intentional. For remote access, set
-`--host 0.0.0.0`, TLS (`--tls-cert` + `--tls-key`), and an API key explicitly. Prefer the
-`NEMO_SPEECH_HTTP_API_KEY` environment variable over placing a secret in
-command-line arguments. API keys require `Authorization: Bearer <key>`;
-browser WebSockets may supply `?api_key=<key>`. NVIDIA NIM is the supported
-production deployment path; this server is intended for local use and direct
-integration.
+`--host 0.0.0.0`, TLS (`--tls-cert` + `--tls-key`), and an API key explicitly.
+TLS must be enabled at source-build time with `NEMO_SPEECH_HTTP_TLS=ON` and is
+not part of the default server presets. Prefer the `NEMO_SPEECH_HTTP_API_KEY`
+environment variable over placing a secret in command-line arguments. API
+routes require `Authorization: Bearer <key>`; browser WebSockets may supply
+`?api_key=<key>`. The playground, health, readiness, and version routes remain
+unauthenticated. NVIDIA NIM is the supported production deployment path; this
+server is intended for local use and direct integration.
 
 Cross-origin browser access is disabled by default. `--cors-origin ORIGIN`
 allows one explicit origin; use `*` only for an intentionally public API.
@@ -124,10 +131,10 @@ nemo-speech --json serve --access-log --asr-model models/asr.q8_0.gguf
 
 ## Health and readiness
 
-`GET /health` returns the engine status and runtime version. `GET /ready`
+`GET /health` returns a compact engine status and runtime version. `GET /ready`
 returns readiness, selected device, and loaded capabilities. Both return HTTP
-503 until the configured engines are ready. The CLI can check either endpoint;
-it uses `/ready` by default:
+503 when no engine is ready. The CLI can check either endpoint; it uses
+`/ready` by default:
 
 ```bash
 nemo-speech health --url http://127.0.0.1:8080/ready
@@ -138,7 +145,8 @@ nemo-speech health --url http://127.0.0.1:8080/ready
 Full request/response field reference: **[HTTP API reference](api.md)**.
 
 - `GET /`, `GET /health`, `GET /ready`, and `GET /version`
-- `GET /v1/models`
+- `GET /v1/models` - loaded model inventory (OpenAI SDK-compatible, with
+  capability metadata)
 - `POST /v1/audio/transcriptions` - speech-to-text (OpenAI-compatible subset)
 - `POST /v1/audio/speech` - text-to-speech (OpenAI-compatible subset)
 - `POST /v1/translations` - text translation
@@ -146,6 +154,10 @@ Full request/response field reference: **[HTTP API reference](api.md)**.
 - `POST /v1/audio/speech/translations` - speech-to-speech translation (extension)
 - `POST /v1/audio/diarizations` - speaker segments (`/v1/diarizations` alias)
 - WebSocket `/v1/realtime` - live PCM16 transcription
+
+OpenAI SDK compatibility is limited to model listing and the documented
+transcription and speech subsets. The translation and diarization routes are
+project extensions, and the realtime socket is not the OpenAI Realtime API.
 
 The realtime socket accepts binary little-endian PCM16 frames; an optional
 `session.update` JSON event before the first frame sets session options. See
@@ -168,10 +180,10 @@ Uploads are capped at 512 MiB by default (`--max-upload-mb`); the same limit
 applies to cumulative audio on a realtime WebSocket stream. Socket reads and
 writes time out after 30 seconds by default (`--read-timeout` and
 `--write-timeout`); inference work runs on a bounded worker pool (`--threads`).
-The NMT context pool remains an engine setting (`nmt.pool.contexts`) and is not
-silently expanded to match HTTP workers. SIGINT/SIGTERM stops HTTP admission and
-releases its loaded models. `--no-warmup` is available for HTTP diagnostics but
-is not recommended when startup readiness matters.
+`--threads` does not change the NMT context pool (`nmt.pool.contexts`).
+SIGINT/SIGTERM stops HTTP admission and releases loaded models. `--no-warmup`
+is available for diagnostics but is not recommended when startup readiness
+matters.
 
 The separate `riva_server` accepts messages up to gRPC's signed 32-bit limit and
 drains active RPCs for up to 10 seconds on SIGINT/SIGTERM. It currently uses

@@ -16,6 +16,7 @@
 #include "audio_file.h"
 #include "cli_util.h"
 #include "engine_registry.h"
+#include "ggml_log_filter.h"
 #include "json.h"
 
 namespace {
@@ -145,6 +146,17 @@ main() {
         require(registry.capabilities().empty(), "empty engine registry capabilities");
         registry.set_device_label("cpu");
         require(registry.device_label() == "cpu", "engine registry device label");
+
+        nemo_speech::GgmlLogFilter log_filter;
+        log_filter.set_verbose(false);
+        require(!log_filter.should_emit(GGML_LOG_LEVEL_INFO), "default info log filtering");
+        require(!log_filter.should_emit(GGML_LOG_LEVEL_CONT), "filtered continuation log");
+        require(!log_filter.should_emit(GGML_LOG_LEVEL_WARN), "default warning log filtering");
+        require(log_filter.should_emit(GGML_LOG_LEVEL_ERROR), "error log retention");
+        require(log_filter.should_emit(GGML_LOG_LEVEL_CONT), "error continuation log");
+        log_filter.set_verbose(true);
+        require(log_filter.should_emit(GGML_LOG_LEVEL_DEBUG), "verbose debug logging");
+        require(log_filter.should_emit(GGML_LOG_LEVEL_CONT), "verbose continuation log");
 
         namespace fs = std::filesystem;
         const fs::path root = fs::temp_directory_path() / "nemo-speech-input";

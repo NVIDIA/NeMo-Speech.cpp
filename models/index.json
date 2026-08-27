@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "asr": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+    "diarization": "nvidia/diar_streaming_sortformer_4spk-v2",
+    "tts": "nvidia/magpie_tts_multilingual_357m",
+    "codec": "nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps",
+    "tokenizer": "nvidia/magpie_tts_multilingual_357m"
+  },
+  "models": [
+    {
+      "repo": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "aliases": ["nemotron-3.5", "nemotron-asr"],
+      "revision": "1c8deaecc64b91f034d73e08dd8b64625eb3395d",
+      "license": "NVIDIA Open Model License (OpenMDW 1.1)",
+      "license_url": "https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "artifacts": [
+        {
+          "role": "asr",
+          "type": "file",
+          "filename": "nemotron-3.5-asr-streaming-0.6b.q8_0.gguf",
+          "size": 741548352,
+          "sha256": "a5c435f294eea8f88ce68dd27b8c3bfea7f777cb2fbba04fcd30eaa555f429ae"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/nemotron-speech-streaming-en-0.6b",
+      "aliases": ["nemotron-en"],
+      "revision": "ebe59e5a817142986528bbbee5dba8db7b38ed50",
+      "license": "NVIDIA Open Model License",
+      "license_url": "https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b",
+      "artifacts": [
+        {
+          "role": "asr",
+          "type": "file",
+          "filename": "nemotron-speech-streaming-en-0.6b.q8_0.gguf",
+          "size": 699872960,
+          "sha256": "d9a01898d2a611c8764e23a1c2f45e70bbd5a425dc4de93692ac951dd603812d"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/parakeet-ctc-1.1b",
+      "aliases": ["parakeet-ctc"],
+      "revision": "20e63a0fed6aedba145b74b826dbd41df0941730",
+      "license": "CC-BY-4.0",
+      "license_url": "https://huggingface.co/nvidia/parakeet-ctc-1.1b",
+      "artifacts": [
+        {
+          "role": "asr",
+          "type": "file",
+          "filename": "parakeet-ctc-1.1b.q8_0.gguf",
+          "size": 1178100960,
+          "sha256": "6584fc0fdacf1c220401ea4c3a1d5b44454b655c141cb8672178072c203d92b8"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/parakeet-tdt-0.6b-v3",
+      "aliases": ["parakeet-tdt"],
+      "revision": "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+      "license": "CC-BY-4.0",
+      "license_url": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3",
+      "artifacts": [
+        {
+          "role": "asr",
+          "type": "file",
+          "filename": "parakeet-tdt-0.6b-v3.q8_0.gguf",
+          "size": 713975456,
+          "sha256": "e3880d0aaaaf2c308ea2c35016b2b895c423eb3fda924c1b463d1c19b7f4d32e"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/diar_streaming_sortformer_4spk-v2",
+      "aliases": ["sortformer", "sortformer-diar"],
+      "revision": "5240a64075176943f677d30fa2171c780229f341",
+      "license": "CC-BY-4.0",
+      "license_url": "https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2",
+      "artifacts": [
+        {
+          "role": "diarization",
+          "type": "file",
+          "filename": "diar_streaming_sortformer_4spk-v2.q8_0.gguf",
+          "size": 147075776,
+          "sha256": "0679cfeb1ce356d0dea9470b31274f4bfc7eb927497d82005483770666da998a"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/magpie_tts_multilingual_357m",
+      "aliases": ["magpie", "magpie-tts"],
+      "revision": "452ef560f972c38d5fc16476259aac9456453547",
+      "license": "NVIDIA Open Model License",
+      "license_url": "https://huggingface.co/nvidia/magpie_tts_multilingual_357m",
+      "companions": [
+        "nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps"
+      ],
+      "artifacts": [
+        {
+          "role": "tts",
+          "type": "file",
+          "filename": "magpie_tts_multilingual_357m.v2602.f16.gguf",
+          "size": 448604832,
+          "sha256": "901d299a8b1df016cf81cae0089a7a7c15627b9633d033357e15a47d9a219a75"
+        },
+        {
+          "role": "tokenizer",
+          "type": "tar-prefix",
+          "filename": "magpie_tts_multilingual_357m.nemo",
+          "directory": "tokenizer",
+          "size": 33554432,
+          "sha256": "2b930b399933dd384b17ec16a5f1ebf921e2017b760c4fd608c11077a68793fc",
+          "range_end": 33554431,
+          "stop_before": "model_weights.ckpt",
+          "members": [
+            {
+              "name": "05adc40366e149b69319acd4b28a4919_pt_br_prondict-v1.0.dict",
+              "size": 3580284,
+              "sha256": "6492abc404db16bbad83dd9d7f9a60eb617699f0a3ff54b3be6184e14507b745"
+            },
+            {
+              "name": "339da71c54b046f98cbcf38ef6d4ff67_hindi_phoneme_merged_phoneme_dict.dict",
+              "size": 7320312,
+              "sha256": "978a7aa5a0e3334b13c19015cc61f3ff1b96ce6ac7a31c482e5c22a61f19586c"
+            },
+            {
+              "name": "41913ebaa70342058574da74293b7630_magpie_tts_multilingual_357m.nemo.speakers.json",
+              "size": 68,
+              "sha256": "36cdcf01ebc0afb506660ac71f2d0a211236374ad5c872d7d8d985a3f9f6ccaf"
+            },
+            {
+              "name": "61d57a4ccb064d1e8e3d9f871c571932_heteronyms-052722",
+              "size": 1606,
+              "sha256": "b701909aedf753172eff223950f8859cd4b9b4c80199cf0a6e9ac4a307c8f8ec"
+            },
+            {
+              "name": "74b3e832fe914a569fcd42b51d06b2f1_ipa_dict_nv23.05.txt",
+              "size": 5419,
+              "sha256": "252e8eaf60dfd891520759913dc8534393eebfa8d57192365f76f9229f294e9e"
+            },
+            {
+              "name": "7dbc31751f224f2486090d59dc95b9f7_es_ES_nv230301.dict",
+              "size": 2230910,
+              "sha256": "94c9a25bb359f733cd863c887d0112e7ae19a744b0333ef64b6a88e576428669"
+            },
+            {
+              "name": "c5e4ec2af5a14ce294f4b9edcc936535_de_nv230119.heteronym",
+              "size": 44566,
+              "sha256": "771cc585a574fd35bd14f4ce6108edf1e0e512a8dbc810db7de4c1165ba9d0ef"
+            },
+            {
+              "name": "cf01ab5c48c84f3282ef7888263361e5_de_nv230119.dict",
+              "size": 4313907,
+              "sha256": "5c7bbf3346ebd6dc57769b5cc805124215cb1bcc3b8174c4254e9e928c5d6094"
+            },
+            {
+              "name": "dc7d60d6b15a4651b21c9ca2932b62c6_ipa_cmudict-0.7b_nv23.01.txt",
+              "size": 3093097,
+              "sha256": "dd0927fffc89e8539ea0a26ccbc164a908f4b3de9613d924c90afa5300e00f72"
+            },
+            {
+              "name": "model_config.yaml",
+              "size": 7496,
+              "sha256": "fda01948a40a04316b26553b53546cbd2103952b8d0e2813176ea33852bb96a2"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps",
+      "aliases": ["nano-codec", "nanocodec"],
+      "revision": "fc00890b604aa2de298d2641ffc6c5f6caf8c4d7",
+      "license": "NVIDIA Open Model License",
+      "license_url": "https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps",
+      "artifacts": [
+        {
+          "role": "codec",
+          "type": "file",
+          "filename": "nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf",
+          "size": 78823104,
+          "sha256": "cc86d36d821a27cdc1d4ef600a3e2b0dabe76e88fcc2a8652d9543134c07ef2d"
+        }
+      ]
+    }
+  ]
+}

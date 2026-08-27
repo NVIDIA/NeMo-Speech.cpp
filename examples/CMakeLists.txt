@@ -83,7 +83,7 @@ endif()
 # If it isn't found, transcribe_live is skipped (a STATUS message says so)
 # rather than failing the build - transcribe_file and the core library don't
 # need it.
-if(NOT NEMO_SPEECH_BUILD_ASR)
+if(NOT NEMO_SPEECH_BUILD_ASR OR NOT NEMO_SPEECH_BUILD_MIC_CAPTURE)
     return()
 endif()
 

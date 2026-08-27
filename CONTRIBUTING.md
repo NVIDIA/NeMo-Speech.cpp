@@ -2,6 +2,29 @@
 
 We welcome external contributions to NeMo-Speech.cpp.
 
+## Development checks
+
+Follow the [source-build guide](docs/build.md) for prerequisites and submodules.
+For a model-independent CPU ASR test build:
+
+```bash
+git submodule update --init ggml llama.cpp
+scripts/configure.sh cpu-asr -DNEMO_SPEECH_BUILD_TESTS=ON
+cmake --build --preset cpu-asr
+ctest --test-dir build/cpu-asr --output-on-failure
+```
+
+Install [pre-commit](https://pre-commit.com/) and run the same formatting,
+license-header, and static file checks used by CI:
+
+```bash
+pre-commit run --all-files
+```
+
+Use the closest matching CUDA, Metal, Vulkan, server, or component preset when
+the change affects code outside the CPU ASR path. Include the commands and
+results relevant to the change in the pull request.
+
 ## Contribution license and provenance
 
 Unless a file states otherwise, contributions are submitted under the

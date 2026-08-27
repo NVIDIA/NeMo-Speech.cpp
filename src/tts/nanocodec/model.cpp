@@ -22,14 +22,6 @@
 
 static constexpr int NANO_CODEC_MAX_NODES = 32768;
 
-static void
-nano_codec_log_callback(ggml_log_level level, const char* text, void* user_data) {
-    (void)level;
-    (void)user_data;
-    fputs(text, stderr);
-    fflush(stderr);
-}
-
 using nc_hparams = nemo_speech::tts::nanocodec::NanoCodecHParams;
 
 static bool
@@ -196,9 +188,9 @@ load_conv(const nc_model& model, const std::string& prefix, int stride = 1, int 
 }
 
 static bool
-nc_model_load(const std::string& fname, nc_model& model, bool force_cpu = false) {
+nc_model_load(
+    const std::string& fname, nc_model& model, bool force_cpu = false, bool verbose = false) {
     const ggml_nvtx::range nvtx_range("nanocodec_model_load");
-    ggml_log_set(nano_codec_log_callback, nullptr);
 
     gguf_init_params params = {
         /*.no_alloc =*/true,
@@ -245,9 +237,12 @@ nc_model_load(const std::string& fname, nc_model& model, bool force_cpu = false)
     }
 
     ggml_backend_dev_t dev = ggml_backend_get_device(model.backend);
-    fprintf(
-        stderr, "NanoCodec backend: %s%s%s%s\n", ggml_backend_name(model.backend), dev ? " - " : "",
-        dev ? ggml_backend_dev_description(dev) : "", force_cpu ? " (forced CPU)" : "");
+    if (verbose) {
+        fprintf(
+            stderr, "NanoCodec backend: %s%s%s%s\n", ggml_backend_name(model.backend),
+            dev ? " - " : "", dev ? ggml_backend_dev_description(dev) : "",
+            force_cpu ? " (forced CPU)" : "");
+    }
 
     model.buffer = ggml_backend_alloc_ctx_tensors(model.ctx, model.backend);
     if (!model.buffer) {
@@ -320,10 +315,13 @@ nc_model_load(const std::string& fname, nc_model& model, bool force_cpu = false)
     model.post_activation = load_activation(model, "dec.post_act");
     model.post_conv = load_conv(model, "dec.post");
 
-    fprintf(
-        stderr,
-        "loaded NanoCodec GGUF: sample_rate=%d codebooks=%d codebook_size=%d frame=%d samples\n",
-        h.sample_rate, h.num_codebooks, h.codebook_size, h.samples_per_frame);
+    if (verbose) {
+        fprintf(
+            stderr,
+            "loaded NanoCodec GGUF: sample_rate=%d codebooks=%d codebook_size=%d frame=%d "
+            "samples\n",
+            h.sample_rate, h.num_codebooks, h.codebook_size, h.samples_per_frame);
+    }
     return true;
 }
 
@@ -1106,12 +1104,12 @@ NanoCodecModel::operator=(NanoCodecModel&& other) noexcept {
 }
 
 bool
-NanoCodecModel::load(const std::string& path, bool force_cpu) {
+NanoCodecModel::load(const std::string& path, bool force_cpu, bool verbose) {
     if (!impl_) {
         impl_ = std::make_unique<Impl>();
     }
     reset();
-    impl_->loaded = nc_model_load(path, impl_->model, force_cpu);
+    impl_->loaded = nc_model_load(path, impl_->model, force_cpu, verbose);
     if (!impl_->loaded) {
         reset();
     }

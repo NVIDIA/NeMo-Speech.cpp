@@ -9,3 +9,6 @@ if(NEMO_SPEECH_BUILD_NMT)
     target_link_libraries(riva_server PRIVATE nemo_speech_grpc_nmt)
     target_compile_definitions(riva_server PRIVATE NEMO_SPEECH_BUILD_NMT=1)
 endif()
+
+install(TARGETS riva_server
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

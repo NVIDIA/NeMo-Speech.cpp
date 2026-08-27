@@ -19,6 +19,7 @@
 #include "flashlight/lib/text/decoder/lm/KenLM.h"
 #include "flashlight/lib/text/dictionary/Dictionary.h"
 #include "flashlight/lib/text/dictionary/Utils.h"
+#include "runtime.h"
 
 namespace nemo_speech::asr {
 
@@ -243,8 +244,9 @@ FlashlightDecoder::ensure_private_resources() {
     // + trie for OOV boost words. The trie is rebuilt (KenLM-score + insert +
     // smear over the whole lexicon) since flashlight's Trie has no deep-copy -
     // a one-time per-stream cost paid only on an OOV boost.
-    std::cerr << "[flashlight] OOV speech_context: building private lexicon trie "
-                 "(one-time for this stream; shared KenLM reused, no reload)\n";
+    GGMLF_LOG_INFO(
+        "[flashlight] OOV speech_context: building private lexicon trie "
+        "(one-time for this stream; shared KenLM reused, no reload)\n");
     adopt_resources(shared_resources_->clone_for_mutation());
     shared_resources_.reset();  // now private: shared_resources_ == nullptr means owned
 }

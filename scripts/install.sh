@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 set -eu
 
-release_base=${NEMO_SPEECH_RELEASE_BASE_URL:-}
-source_url=${NEMO_SPEECH_SOURCE_URL:-.}
+release_base=${NEMO_SPEECH_RELEASE_BASE_URL:-https://github.com/NVIDIA/NeMo-Speech.cpp/releases}
+source_url=${NEMO_SPEECH_SOURCE_URL:-https://github.com/NVIDIA/NeMo-Speech.cpp.git}
+version_url=${NEMO_SPEECH_VERSION_URL:-https://raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/main/VERSION}
 version=latest
 channel=stable
 prefix=
@@ -64,7 +65,8 @@ Usage: install.sh [options]
   -h, --help
 
 Set NEMO_SPEECH_RELEASE_BASE_URL to use a release mirror or local test server.
-Set NEMO_SPEECH_SOURCE_URL or NEMO_SPEECH_SOURCE_REF to override the source.
+Set NEMO_SPEECH_SOURCE_URL or NEMO_SPEECH_SOURCE_REF to override GitHub.
+Set NEMO_SPEECH_VERSION_URL to override the current-version manifest.
 EOF
 }
 
@@ -98,6 +100,10 @@ case "$machine" in
     arm64|aarch64) arch=aarch64 ;;
     *) echo "unsupported architecture: $machine" >&2; exit 1 ;;
 esac
+device_model=
+if [ -r /proc/device-tree/model ]; then
+    device_model=$(tr -d '\000' </proc/device-tree/model | tr '[:upper:]' '[:lower:]')
+fi
 
 if [ "$backend" = metal ] && { [ "$os" != macos ] || [ "$arch" != aarch64 ]; }; then
     echo "Metal requires macOS on Apple Silicon; detected $os/$arch." >&2
@@ -113,9 +119,47 @@ if [ "$backend" = auto ]; then
         backend=metal
     elif command -v nvidia-smi >/dev/null 2>&1; then
         backend=cuda
+    elif [ "$os" = linux ] && [ "$arch" = aarch64 ]; then
+        case "$device_model" in
+            *jetson*|*thor*|*dgx*spark*|*gb10*) backend=cuda ;;
+            *) backend=cpu ;;
+        esac
     else
         backend=cpu
     fi
+fi
+
+artifact_backend=$backend
+if [ "$os" = linux ] && [ "$arch" = aarch64 ] && [ "$backend" = cuda ]; then
+    cuda_series=${NEMO_SPEECH_CUDA_SERIES:-}
+    if [ -z "$cuda_series" ]; then
+        case "$device_model" in
+            *orin*) cuda_series=12 ;;
+            *thor*|*dgx*spark*|*gb10*) cuda_series=13 ;;
+        esac
+    fi
+    if [ -z "$cuda_series" ] && command -v nvidia-smi >/dev/null 2>&1; then
+        driver_version=$(nvidia-smi --query-gpu=driver_version \
+            --format=csv,noheader 2>/dev/null | sed -n '1p' || true)
+        driver_major=${driver_version%%.*}
+        case "$driver_major" in
+            ''|*[!0-9]*) ;;
+            *) [ "$driver_major" -ge 580 ] && cuda_series=13 || cuda_series=12 ;;
+        esac
+    fi
+    if [ -z "$cuda_series" ] && command -v nvcc >/dev/null 2>&1; then
+        cuda_series=$(nvcc --version 2>/dev/null |
+            sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' | head -n 1)
+    fi
+    cuda_series=${cuda_series:-12}
+    case "$cuda_series" in
+        12|13) ;;
+        *)
+            echo "NEMO_SPEECH_CUDA_SERIES must be 12 or 13; found '$cuda_series'." >&2
+            exit 2
+            ;;
+    esac
+    artifact_backend=cuda$cuda_series
 fi
 
 binary_candidate=1
@@ -134,10 +178,10 @@ if [ "$version" = latest ]; then
         echo "No release endpoint is configured; building from the current source branch."
     else
         require_command curl "curl is required to resolve and download releases"
-        if effective=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$release_base/latest"); then
-            version=${effective##*/}
-            if [ -z "$version" ]; then binary_candidate=0; fi
-        else
+        version_manifest=$(curl -fsSL "$version_url" 2>/dev/null || true)
+        version=$(printf '%s\n' "$version_manifest" |
+            sed -n 's/^NEMO_SPEECH_VERSION:[[:space:]]*//p' | head -n 1)
+        if [ -z "$version" ]; then
             binary_candidate=0
         fi
         if [ "$binary_candidate" -eq 0 ]; then
@@ -180,11 +224,11 @@ if [ -z "$prefix" ]; then
     fi
 fi
 bin_dir=$HOME/.local/bin
-archive=nemo-speech-$release_version-$os-$arch-$backend.tar.gz
+archive=nemo-speech-$release_version-$os-$arch-$artifact_backend.tar.gz
 url=$release_base/download/$tag/$archive
 checksum_url=$url.sha256
 
-echo "NeMo-Speech.cpp $release_version ($os/$arch, $backend)"
+echo "NeMo-Speech.cpp $release_version ($os/$arch, $artifact_backend)"
 if [ "$install_mode" != source ] && [ "$binary_candidate" -eq 1 ]; then
     echo "Artifact: $url"
 fi
@@ -194,8 +238,8 @@ fi
 echo "Prefix:   $prefix"
 [ "$dry_run" -eq 0 ] || exit 0
 
-install_identity="$release_version $os $arch $backend"
-source_identity="$install_identity source:$source_ref profile:speech-server"
+install_identity="$release_version $os $arch $artifact_backend"
+source_identity="$release_version $os $arch $backend source:$source_ref profile:speech-server"
 install_metadata=$prefix/.nemo-speech-install
 if [ "$install_mode" != source ] && [ "$binary_candidate" -eq 1 ] &&
    [ -x "$prefix/bin/nemo-speech" ] && [ -f "$install_metadata" ] &&
@@ -302,6 +346,7 @@ else
         fi
     }
     initialize_submodule ggml
+    initialize_submodule llama.cpp
     initialize_submodule third_party/cpp-httplib
 
     root=$tmp/source-install
@@ -332,7 +377,8 @@ rm -rf "$prefix.old"
 ln -sf "$prefix/bin/nemo-speech" "$bin_dir/nemo-speech"
 
 if [ "$modify_path" -eq 1 ] && ! printf '%s' ":$PATH:" | grep -q ":$bin_dir:"; then
-    shell_name=${SHELL##*/}
+    shell_name=${SHELL:-}
+    shell_name=${shell_name##*/}
     case "$shell_name" in
         zsh) rc=$HOME/.zshrc ;;
         bash) rc=$HOME/.bashrc ;;

@@ -8,6 +8,7 @@ Start with:
 
 - [Installation](install.md)
 - [Command-line workflows](cli.md)
+- [Configuration examples](../config/README.md)
 - [Model conversion](model-conversion.md)
 - [HTTP/realtime and optional gRPC server](server.md)
 - [HTTP API reference](api.md)
