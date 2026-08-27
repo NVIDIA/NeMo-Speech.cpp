@@ -1331,6 +1331,9 @@ stream_magpie_to_audio(
                 const ggml_nvtx::range nvtx_step("magpietts_stream_generation_step");
                 const int frames_remaining =
                     h.max_decoder_steps - step * h.frame_stacking_factor;
+                if (frames_remaining <= 0) {
+                    break;
+                }
                 if (codec_worker.is_failed()) {
                     codec_worker.join();
                     return false;
@@ -1601,8 +1604,8 @@ stream_magpie_to_audio(
                 }
 
                 decoder_frames_generated += h.frame_stacking_factor;
-                const int frames_to_emit = std::min(
-                    frames_remaining, has_eos ? eos_lane : h.frame_stacking_factor);
+                const int frames_to_emit = magpietts_frames_to_emit(
+                    frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
                 if (!suppress_nonfinal_codec_output) {
                     for (int lane = 0; lane < frames_to_emit; ++lane) {
                         const auto& frame = codec_frames[(size_t)lane];

@@ -2031,6 +2031,9 @@ MagpieCodeGenerator::generate(
             const int64_t frame_start_us = ggml_time_us();
             const int frames_remaining =
                 h.max_decoder_steps - step * h.frame_stacking_factor;
+            if (frames_remaining <= 0) {
+                break;
+            }
             if (step % 10 == 0) {
                 fprintf(stderr, "%s decoding frame %d/%d\n", label, step, max_decoder_positions);
             }
@@ -2201,31 +2204,45 @@ MagpieCodeGenerator::generate(
                     audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
                 }
             }
-            const int frames_to_emit = std::min(
-                frames_remaining, eos_lane >= 0 ? eos_lane : h.frame_stacking_factor);
+            const int frames_to_emit = magpietts_frames_to_emit(
+                frames_remaining, h.frame_stacking_factor, eos_lane);
             for (int lane = 0; lane < frames_to_emit; ++lane) {
                 generated_frames.push_back(codec_frames[(size_t)lane]);
             }
             if (eos_lane >= 0) {
                 ggml_nvtx::mark("magpietts_eos");
                 fprintf(stderr, "%s EOS detected at frame %d\n", label, step);
-                break;
             }
 
-            bool first_frame = false;
-            const int64_t frame_done_us = ggml_time_us();
-            const double inter_ms = metrics.record_frame(frame_done_us, first_frame);
-            const double frame_latency_ms = (double)(frame_done_us - frame_start_us) / 1000.0;
-            if (step < 4 || step % 10 == 0) {
-                if (first_frame) {
-                    fprintf(
-                        stderr, "%s frame %d latency=%.2f ms ttff=%.2f ms\n", label, step,
-                        frame_latency_ms, metrics.ttff_ms);
-                } else {
-                    fprintf(
-                        stderr, "%s frame %d latency=%.2f ms inter=%.2f ms\n", label, step,
-                        frame_latency_ms, inter_ms);
+            if (frames_to_emit > 0) {
+                const int64_t frame_done_us = ggml_time_us();
+                bool first_frame = false;
+                double inter_ms = 0.0;
+                for (int lane = 0; lane < frames_to_emit; ++lane) {
+                    bool lane_is_first = false;
+                    const double lane_inter_ms =
+                        metrics.record_frame(frame_done_us, lane_is_first);
+                    if (lane == 0) {
+                        first_frame = lane_is_first;
+                        inter_ms = lane_inter_ms;
+                    }
                 }
+                const double frame_latency_ms =
+                    (double)(frame_done_us - frame_start_us) / 1000.0;
+                if (step < 4 || step % 10 == 0) {
+                    if (first_frame) {
+                        fprintf(
+                            stderr, "%s frame %d latency=%.2f ms ttff=%.2f ms\n", label, step,
+                            frame_latency_ms, metrics.ttff_ms);
+                    } else {
+                        fprintf(
+                            stderr, "%s frame %d latency=%.2f ms inter=%.2f ms\n", label, step,
+                            frame_latency_ms, inter_ms);
+                    }
+                }
+            }
+            if (eos_lane >= 0) {
+                break;
             }
         }
     }
