@@ -108,11 +108,13 @@ are explicitly excluded and are not compiled or linked.
 - Copyright The OpenSSL Project Authors and other contributors
 - License: Apache License 2.0
 
-OpenSSL is dynamically linked only when optional HTTP-server TLS is enabled. It
-is not incorporated into the source tree. The default container disables HTTP
-TLS, links gRPC's unsecure libraries, and does not distribute OpenSSL.
-Distributions that enable HTTP TLS must include the applicable OpenSSL
-attribution and Apache 2.0 terms.
+OpenSSL is linked only when HTTP-server TLS is enabled. Windows packages include
+its license. The default Linux container does not include OpenSSL.
+
+### Windows vcpkg dependencies
+
+Windows builds obtain optional dependencies through vcpkg. Installed packages
+include each selected dependency's license.
 
 ### Container system libraries
 
@@ -127,7 +129,44 @@ Debian/Ubuntu shared library under
 project notice set is installed under
 `/opt/nemo-speech/share/licenses/nemo-speech/`.
 
+### NVIDIA CUDA Runtime
+
+- Source: [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
+- Copyright (c) NVIDIA CORPORATION & AFFILIATES
+- License: NVIDIA Software License Agreement and CUDA Supplement
+
+CUDA release archives include the redistributable CUDA runtime library. The
+applicable agreement is installed with the archive under
+`share/licenses/nemo-speech/nvidia/cuda-runtime/`.
+
 ## Other incorporated third-party code and data
+
+### miniaudio
+
+- Source: [`mackron/miniaudio`](https://github.com/mackron/miniaudio), version
+  0.11.25 at commit `9634bedb5b5a2ca38c1ee7108a9358a4e233f14d`, vendored by
+  the pinned llama.cpp checkout
+- Path: `llama.cpp/vendor/miniaudio/miniaudio.h`
+- Copyright 2025 David Reid
+- License: Public Domain (Unlicense) or MIT No Attribution (MIT-0); upstream
+  text is reproduced at
+  [`third_party/miniaudio/LICENSE`](third_party/miniaudio/LICENSE)
+
+The command-line microphone capture layer compiles miniaudio directly into
+`nemo-speech`. Release archives install its license under
+`share/licenses/nemo-speech/third_party/miniaudio/`.
+
+### SentencePiece
+
+- Source: [`google/sentencepiece`](https://github.com/google/sentencepiece),
+  revision `17d7580d6407802f85855d2cc9190634e2c95624`
+- Copyright 2018 Google Inc.
+- License: Apache License 2.0
+
+Default Windows ASR, macOS, and Linux release builds statically link the
+SentencePiece runtime and its bundled Abseil, protobuf-lite, and Darts-clone
+components. Their Apache 2.0 and BSD license texts are installed under
+`share/licenses/nemo-speech/third_party/sentencepiece/`.
 
 ### whisper.cpp sample audio
 

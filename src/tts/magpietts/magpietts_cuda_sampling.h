@@ -58,8 +58,8 @@ bool magpietts_cuda_sample_codebooks_device(
 // Launch using the most recently uploaded configuration.
 bool magpietts_cuda_sample_codebooks_device_configured(
     magpietts_cuda_sampler* sampler, const float* logits_cond, const float* logits_uncond,
-    int codebooks, int vocab_size, int audio_codebook_size, int audio_eos_id,
-    int codebook_offset, int output_offset, char* error, size_t error_size);
+    int codebooks, int vocab_size, int audio_codebook_size, int audio_eos_id, int codebook_offset,
+    int output_offset, char* error, size_t error_size);
 
 bool magpietts_cuda_copy_sampled_code_to_device(
     magpietts_cuda_sampler* sampler, int codebook, void* dst_device, char* error,

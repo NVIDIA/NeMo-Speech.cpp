@@ -8,6 +8,7 @@ int command_translate(int argc, char** argv);
 int command_synthesize(int argc, char** argv);
 int command_bench(int argc, char** argv);
 int command_model(int argc, char** argv);
+int command_pull(int argc, char** argv);
 int command_doctor(int argc, char** argv);
 int command_health(int argc, char** argv);
 int command_serve(int argc, char** argv);

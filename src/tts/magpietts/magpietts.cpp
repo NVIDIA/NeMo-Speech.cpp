@@ -25,6 +25,7 @@
 #include "audio_pp.h"
 #include "decoder.h"
 #include "encoder.h"
+#include "ggml_log_filter.h"
 #include "lt.h"
 #include "nvtx_utils.h"
 #include "token_utils.h"
@@ -293,6 +294,10 @@ class MagpieStreamingRuntime::Impl {
     std::unique_ptr<MagpieStreamingWorkspace> workspace;
 };
 
+namespace {
+GgmlLogFilter magpie_ggml_logs;
+}
+
 MagpieStreamingRuntime::MagpieStreamingRuntime() : impl_(std::make_unique<Impl>()) {}
 
 MagpieStreamingRuntime::~MagpieStreamingRuntime() = default;
@@ -300,12 +305,14 @@ MagpieStreamingRuntime::~MagpieStreamingRuntime() = default;
 bool
 MagpieStreamingRuntime::load(
     const std::string& magpie_model, const std::string& codec_model, magpietts_uma_mode uma_mode,
-    bool magpie_cpu, bool codec_cpu) {
+    bool magpie_cpu, bool codec_cpu, bool verbose) {
+    magpie_ggml_logs.set_verbose(verbose);
+    ggml_log_set(GgmlLogFilter::callback, &magpie_ggml_logs);
     impl_->workspace.reset();
-    if (!impl_->magpie.load(magpie_model, uma_mode, magpie_cpu)) {
+    if (!impl_->magpie.load(magpie_model, uma_mode, magpie_cpu, verbose)) {
         return false;
     }
-    if (!impl_->codec.load(codec_model, codec_cpu)) {
+    if (!impl_->codec.load(codec_model, codec_cpu, verbose)) {
         impl_->magpie.reset();
         return false;
     }

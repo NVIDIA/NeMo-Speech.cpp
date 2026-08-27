@@ -7,8 +7,8 @@ Use `config/asr.example.yaml` for ASR-only, `config/diar.example.yaml` for
 standalone diarization, `config/tts.example.yaml` for TTS-only,
 `config/nmt.example.yaml` for NMT-only, or
 `config/server.example.yaml` for a combined server. Capabilities are enabled
-automatically when their required model paths are present; each `enabled` key
-may be set to `true`, `false`, or `auto`.
+automatically when their required model paths are present. The `asr.enabled`,
+`nmt.enabled`, and `tts.enabled` keys may be set to `true`, `false`, or `auto`.
 
 See [Server configuration](../docs/server.md#engine-and-listener-configuration)
 for YAML, environment-variable, and CLI precedence.

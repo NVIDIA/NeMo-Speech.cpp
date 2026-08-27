@@ -73,7 +73,7 @@ DiarStream::DiarStream(DiarModel& model, const DiarGeometry& geometry)
       sub_(model.cfg().encoder.subsampling_factor),
       sec_per_frame_(
           model.cfg().encoder.subsampling_factor * static_cast<double>(model.cfg().window_stride)),
-      state_(geo_, model.cfg().scoring, n_spk_, model.cfg().encoder.d_model) {
+      state_(geo_, model.cfg().scoring, n_spk_, model.cfg().encoder.d_model), birth_gate_(n_spk_) {
     n_mels_ = m_.fe().n_mels();
     geo_.validate(
         n_spk_, model.cfg().scoring.sil_frames_per_spk, model.cfg().encoder.pos_emb_max_len);
@@ -82,6 +82,7 @@ DiarStream::DiarStream(DiarModel& model, const DiarGeometry& geometry)
 void
 DiarStream::reset() {
     state_ = AoscState(geo_, m_.cfg().scoring, n_spk_, m_.cfg().encoder.d_model);
+    birth_gate_.reset();
     audio_buf_.clear();
     audio_base_ = 0;
     mel_buf_.clear();
@@ -183,7 +184,7 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
     const int rc_enc = static_cast<int>(std::ceil(rc_mel / static_cast<double>(sub_)));
     auto emitted =
         state_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
-    probs_.insert(probs_.end(), emitted.begin(), emitted.end());
+    birth_gate_.append(emitted, probs_);
     maybe_compact();
     mel_consumed_ = end;
 
@@ -244,6 +245,13 @@ DiarStream::speaker_for_time(double t0, double t1) const {
     const int64_t f0 = static_cast<int64_t>(t0 / sec_per_frame_);
     const int64_t f1 = static_cast<int64_t>(std::ceil(t1 / sec_per_frame_));
     return speaker_for_frames(f0, f1);
+}
+
+int
+DiarStream::speaker_for_word_time(double t0, double t1) const {
+    const int64_t f0 = static_cast<int64_t>(t0 / sec_per_frame_);
+    const int64_t f1 = static_cast<int64_t>(std::ceil(t1 / sec_per_frame_));
+    return speaker_for_frames(f0, std::min(f1, f0 + 2));
 }
 
 std::vector<DiarSegment>

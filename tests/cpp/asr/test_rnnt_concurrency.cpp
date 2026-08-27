@@ -193,11 +193,13 @@ verify_encoder_batch(RnntModel& model, int right_context) {
     }
 
     struct BatchResult {
-        std::vector<std::vector<float>> values = std::vector<std::vector<float>>(B);
-        std::vector<int> frames = std::vector<int>(B);
+        explicit BatchResult(int batch_size) : values(batch_size), frames(batch_size) {}
+
+        std::vector<std::vector<float>> values;
+        std::vector<int> frames;
     };
     auto run_batch = [&]() {
-        BatchResult result;
+        BatchResult result(B);
         std::vector<CacheAwareEncoder::State> states;
         for (int b = 0; b < B; ++b) states.push_back(model.make_cache_state());
         std::atomic<int> ready{0};

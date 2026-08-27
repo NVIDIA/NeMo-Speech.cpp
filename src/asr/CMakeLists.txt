@@ -89,7 +89,7 @@ if(SENTENCEPIECE_STATIC_LIB)
         nemo_speech_asr PRIVATE "LINKER:--exclude-libs,libsentencepiece.a")
 elseif(NEMO_SPEECH_WITH_NORM AND UNIX AND NOT APPLE)
     message(FATAL_ERROR
-        "ITN + Flashlight requires private static SentencePiece; "
+        "normalization requires private static SentencePiece; "
         "run scripts/build_sentencepiece_static.sh")
 else()
     # vcpkg's imported target carries its platform-specific usage requirements.
@@ -103,6 +103,12 @@ else()
         target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_LIB})
         target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
     endif()
+endif()
+set(_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR
+    "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/share/licenses/nemo-speech/third_party/sentencepiece")
+if(EXISTS "${_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR}/LICENSE")
+    install(DIRECTORY "${_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR}/"
+        DESTINATION "${NEMO_SPEECH_LICENSE_INSTALL_DIR}/third_party/sentencepiece")
 endif()
 # SentencePiece (vcpkg) uses absl::flat_hash_map + protobuf internally, but its
 # config target doesn't propagate those link deps. On Windows/vcpkg, add them

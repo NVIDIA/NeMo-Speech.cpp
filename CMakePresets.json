@@ -206,49 +206,53 @@
     {
       "name": "cpu-server",
       "inherits": "cpu-asr",
-      "displayName": "CPU ASR and TTS HTTP server and playground",
+      "displayName": "CPU speech CLI, HTTP server, and playground",
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF",
         "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "OFF"
+        "NEMO_SPEECH_WITH_NMT": "ON"
       }
     },
     {
       "name": "cuda-server",
       "inherits": "cuda-asr",
-      "displayName": "CUDA ASR and TTS HTTP server and playground",
+      "displayName": "CUDA speech CLI, HTTP server, and playground",
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF",
         "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "OFF"
+        "NEMO_SPEECH_WITH_NMT": "ON"
       }
     },
     {
       "name": "metal-server",
       "inherits": "metal-asr",
-      "displayName": "Metal ASR and TTS HTTP server and playground",
+      "displayName": "Metal speech CLI, HTTP server, and playground",
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF",
         "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "OFF"
+        "NEMO_SPEECH_WITH_NMT": "ON"
       }
     },
     {
       "name": "vulkan-server",
       "inherits": "vulkan-asr",
-      "displayName": "Vulkan ASR and TTS HTTP server and playground",
+      "displayName": "Vulkan speech CLI, HTTP server, and playground",
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
+        "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF",
         "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "OFF"
+        "NEMO_SPEECH_WITH_NMT": "ON"
       }
     },
     {

@@ -49,9 +49,7 @@ TOKENIZER_PROFILE_NEMO_VERSIONS = {
     "v2607": "2.8.0rc0",
 }
 
-IPA_TARGET = (
-    "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer"
-)
+IPA_TARGET = "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer"
 BYT5_TARGET = "AutoTokenizer"
 TOKENIZER_TARGETS = {
     "v2602": {
@@ -137,9 +135,7 @@ def tokenizer_profile(cfg: dict[str, Any], text_vocab: int, frame_stacking: int)
         raise ValueError(f"unsupported Magpie tokenizer layout: {list(order)}")
     profile = matches[0]
     if str(cfg.get("nemo_version", "")) != TOKENIZER_PROFILE_NEMO_VERSIONS[profile]:
-        raise ValueError(
-            f"unsupported {profile} nemo_version: {cfg.get('nemo_version')!r}"
-        )
+        raise ValueError(f"unsupported {profile} nemo_version: {cfg.get('nemo_version')!r}")
     for name, target in TOKENIZER_TARGETS[profile].items():
         if tokenizers[name].get("_target_") != target:
             raise ValueError(
@@ -147,24 +143,14 @@ def tokenizer_profile(cfg: dict[str, Any], text_vocab: int, frame_stacking: int)
                 f"{tokenizers[name].get('_target_')!r}"
             )
     expected_japanese_case = "upper" if profile == "v2602" else "lower"
-    japanese_case = (
-        tokenizers["japanese_phoneme"].get("g2p", {}).get("ascii_letter_case")
-    )
+    japanese_case = tokenizers["japanese_phoneme"].get("g2p", {}).get("ascii_letter_case")
     if japanese_case != expected_japanese_case:
-        raise ValueError(
-            f"unsupported {profile} Japanese ascii_letter_case: {japanese_case!r}"
-        )
+        raise ValueError(f"unsupported {profile} Japanese ascii_letter_case: {japanese_case!r}")
     if profile == "v2607":
         hindi = tokenizers["hindi_phoneme"]
-        if (
-            hindi.get("locale") != "hi-IN"
-            or hindi.get("g2p", {}).get("locale") != "hi-IN"
-        ):
+        if hindi.get("locale") != "hi-IN" or hindi.get("g2p", {}).get("locale") != "hi-IN":
             raise ValueError("unsupported v2607 Hindi IPA locale")
-        if (
-            tokenizers["portuguese_Brazilian_phoneme"].get("locale_specific_punct")
-            is not False
-        ):
+        if tokenizers["portuguese_Brazilian_phoneme"].get("locale_specific_punct") is not False:
             raise ValueError("unsupported v2607 Portuguese punctuation mode")
         if cfg.get("language_to_tokenizer_mapping") != V2607_LANGUAGE_MAPPING:
             raise ValueError("unsupported v2607 language_to_tokenizer_mapping")

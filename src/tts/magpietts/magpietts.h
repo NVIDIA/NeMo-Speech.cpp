@@ -139,7 +139,7 @@ class MagpieStreamingRuntime {
 
     bool load(
         const std::string& magpie_model, const std::string& codec_model,
-        magpietts_uma_mode uma_mode, bool magpie_cpu, bool codec_cpu);
+        magpietts_uma_mode uma_mode, bool magpie_cpu, bool codec_cpu, bool verbose = false);
     int sampleRate() const;
     int speakerCount() const;
     std::vector<std::string> speakerNames() const;

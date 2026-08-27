@@ -41,7 +41,6 @@ namespace ggml_runtime {
 GGMLF_ATTRIBUTE_FORMAT(5, 6)
 void log_internal(
     ggml_log_level level, const char* file, int line, const char* func, const char* format, ...);
-void log_callback_default(ggml_log_level level, const char* text, void* user_data);
 }  // namespace ggml_runtime
 
 // Kept in the global namespace because llama_file and other global-scope

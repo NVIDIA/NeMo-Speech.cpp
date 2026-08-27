@@ -8,12 +8,14 @@ platform without a suitable release artifact.
 
 - Git;
 - CMake 3.26 or newer and Ninja;
-- C and C++17 compilers (GCC 13 or newer on Linux); and
-- the toolkit required by the selected GPU backend.
+- a C compiler and a C++17-capable compiler compatible with the selected
+  backend and, when applicable, its toolkit;
+- SentencePiece development files for ASR and diarization; and
+- any toolkit required by the selected backend.
 
-CUDA 12 and 13 are supported. gRPC builds additionally need compatible gRPC,
-Protobuf compiler/runtime, and Abseil development packages from a mutually
-compatible package set.
+CUDA 12 and 13 are supported. Outside the Windows build driver, gRPC builds
+additionally need compatible gRPC, Protobuf compiler/runtime, and Abseil
+development packages from a mutually compatible package set.
 
 ### Install the basic tools
 
@@ -21,20 +23,22 @@ Ubuntu/Debian:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build git pkg-config
+sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+  libsentencepiece-dev
 ```
 
-Fedora/RHEL-family:
+Fedora:
 
 ```bash
-sudo dnf install -y gcc gcc-c++ cmake ninja-build git pkgconf-pkg-config
+sudo dnf install -y gcc gcc-c++ cmake ninja-build git pkgconf-pkg-config \
+  sentencepiece-devel
 ```
 
 macOS with Homebrew:
 
 ```bash
 xcode-select --install  # skip if the Command Line Tools are already installed
-brew install cmake ninja
+brew install cmake ninja sentencepiece
 ```
 
 Windows from an elevated PowerShell with Chocolatey:
@@ -48,6 +52,19 @@ that ship an older CMake require a newer package before configuration. CUDA,
 Vulkan, Metal, gRPC, and optional language frontend dependencies are installed
 only when selecting those features; see the platform sections below.
 
+### Backend toolkits
+
+- CPU builds need no accelerator toolkit.
+- CUDA builds need a supported CUDA 12 or 13 toolkit (including `nvcc`) at
+  build time and a compatible NVIDIA driver at run time. Set
+  `CMAKE_CUDA_ARCHITECTURES` when the output must run on GPUs other than the
+  build host.
+- Vulkan builds need Vulkan headers and loader development files, `glslc`, and
+  SPIR-V headers at build time, plus a vendor Vulkan driver at run time. On
+  Ubuntu these are available as `libvulkan-dev`, `glslc`, and `spirv-headers`.
+- Metal builds require macOS on Apple Silicon and the Xcode Command Line Tools;
+  no separate Metal SDK is needed.
+
 ## Prepare the checkout
 
 Initialize the submodules needed by the selected components:
@@ -55,12 +72,18 @@ Initialize the submodules needed by the selected components:
 ```bash
 git submodule update --init ggml
 git submodule update --init third_party/cpp-httplib  # HTTP server only
-git submodule update --init llama.cpp                # NMT only
+git submodule update --init llama.cpp                # ASR live capture or NMT
 git submodule update --init proto/riva-common        # gRPC only
+git submodule update --init third_party/flashlight-text third_party/kenlm  # Flashlight only
+git submodule update --init third_party/open_jtalk   # Japanese TTS only
+git submodule update --init --recursive third_party/cppjieba  # Mandarin TTS only
 ```
 
 `scripts/configure.sh` checks required submodules before CMake runs. CUDA
-presets also apply the pinned patches from `ggml-patches/` in order.
+presets also apply the pinned patches from `ggml-patches/` in order. Mandarin
+TTS also requires the Git LFS files under `src/tts/tokenizer/mandarin_data/`;
+the helper reports any files that are still LFS pointers. Materialize them with
+`git lfs pull --include='src/tts/tokenizer/mandarin_data/*'`.
 
 ## Configure and build
 
@@ -82,13 +105,13 @@ landmarks are:
 | `cuda-speech` | CUDA ASR, diarization, NMT, and TTS |
 | `metal-nmt` | Metal-enabled NMT build |
 | `vulkan-diar` | Vulkan standalone diarization build |
-| `<backend>-server` | ASR, diarization, TTS, HTTP API, realtime WebSocket, and playground |
-| `cuda-full` | CUDA server plus normalization, Flashlight, and language frontends |
+| `<backend>-server` | ASR, diarization, NMT, TTS, HTTP API, realtime WebSocket, and playground |
+| `cuda-full` | CUDA server plus normalization, Flashlight, and language frontends (prepare the [optional dependencies](#optional-dependencies) first) |
 | `developer` | CPU speech components plus HTTP, gRPC, examples, tests, and tools |
 
-The `<backend>-server` presets are what the source installer uses. They do not
-pull in NMT, protobuf, or gRPC. Use `cuda-full`, `developer`, or explicit CMake options when
-those features and the separate `riva_server` executable are needed.
+The `<backend>-server` presets include NMT but not protobuf or gRPC. Use
+`cuda-full`, `developer`, or explicit CMake options when the Riva-compatible
+adapters and separate `riva_server` executable are needed.
 
 The preset selects which components and ggml backend are compiled.
 
@@ -121,6 +144,7 @@ runtime tradeoffs.
 | `NEMO_SPEECH_BUILD_TTS` | ON | TTS runtime, C ABI, and CLI |
 | `NEMO_SPEECH_BUILD_NMT` | OFF | NMT through llama.cpp |
 | `NEMO_SPEECH_BUILD_CLI` | ON | Unified `nemo-speech` executable |
+| `NEMO_SPEECH_BUILD_MIC_CAPTURE` | ON | Microphone capture in the CLI and live example |
 | `NEMO_SPEECH_BUILD_HTTP` | OFF | HTTP, realtime WebSocket, and playground |
 | `NEMO_SPEECH_BUILD_GRPC` | OFF | Riva-compatible gRPC adapters |
 | `NEMO_SPEECH_BUILD_EXAMPLES` | OFF | Public in-process C ABI examples |
@@ -137,21 +161,39 @@ frontends are selected.
 
 ## Optional dependencies
 
-The HTTP server uses the `third_party/cpp-httplib` submodule and OpenSSL for
-optional TLS. CLI-only builds require neither dependency.
+The HTTP server uses the `third_party/cpp-httplib` submodule and OpenSSL
+development files for optional TLS (`libssl-dev` on Ubuntu/Debian). CLI-only
+builds require neither dependency.
+
+On Ubuntu/Debian, the optional gRPC adapters can use one compatible system
+package set:
+
+```bash
+sudo apt-get install -y libgrpc++-dev libprotobuf-dev protobuf-compiler \
+  protobuf-compiler-grpc libabsl-dev
+```
 
 Flashlight decoding requires the `third_party/flashlight-text` and
 `third_party/kenlm` submodules. KenLM is built as a replaceable dynamic library
 (`libkenlm` or `kenlm.dll`).
 
-ITN and TN dependencies install into a project-local prefix without `sudo`:
+Linux ITN/TN builds additionally require Autotools, Protobuf headers and
+`protoc`, RE2 development files, and GCC 12. For example, on Ubuntu:
 
 ```bash
-scripts/build_itn_deps.sh
+sudo apt-get install -y autoconf automake bison libtool gcc-12 g++-12 \
+  libprotobuf-dev protobuf-compiler libre2-dev
 ```
 
-When combining normalization with Flashlight on Linux, build the private static
-SentencePiece dependency as well:
+Build the pinned OpenFST and Sparrowhawk dependencies into the project-local
+prefix without `sudo`:
+
+```bash
+CC=gcc-12 CXX=g++-12 scripts/build_itn_deps.sh
+```
+
+On Linux, normalization builds also require the static SentencePiece
+dependency:
 
 ```bash
 scripts/build_sentencepiece_static.sh
@@ -195,7 +237,8 @@ notes.
 ## Containers
 
 `docker/Dockerfile` provides a minimal `runtime` target and a `builder`
-target containing the toolchain and sources:
+target containing the toolchain and sources. Put an ASR GGUF in
+`$PWD/models` before starting the model-free runtime image:
 
 ```bash
 docker build --platform=linux/amd64 -f docker/Dockerfile --target runtime \
@@ -203,7 +246,8 @@ docker build --platform=linux/amd64 -f docker/Dockerfile --target runtime \
 
 docker run --gpus all -p 8080:8080 \
   -v "$PWD/models:/models:ro" nemo-speech-runtime:x86_64 \
-  serve --host 0.0.0.0 --config /models/server.yaml
+  serve --host 0.0.0.0 \
+  --asr-model /models/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf
 ```
 
 The runtime image entry point is `nemo-speech`; models remain outside the
@@ -225,5 +269,5 @@ Selected artifacts are written under the configured build directory's `bin/`:
 | `transcribe_file`, `diarize_file` | Native ASR and diarization examples |
 | `translate_text`, `synthesize_text` | Native NMT and TTS examples |
 
-Tests and developer tools are emitted only when their corresponding build
-options are enabled.
+Examples, tests, and developer tools are emitted only when their corresponding
+build options are enabled.

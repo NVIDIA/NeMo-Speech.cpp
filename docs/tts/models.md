@@ -1,12 +1,16 @@
 # TTS models
 
 The TTS pipeline loads two GGUFs: a **MagpieTTS** token generator and a **NeMo
-NanoCodec** decoder. Ready-to-run F16 GGUFs are published in their Hugging Face
-repositories. Install the Hugging Face CLI if needed:
+NanoCodec** decoder. The CLI downloads the complete default stack, including
+Magpie's tokenizer assets, with one command:
 
 ```bash
-pip install -U huggingface_hub
+nemo-speech pull magpie
+nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 ```
+
+`synthesize` performs the same verified pull automatically when its model
+options are omitted.
 
 ## MagpieTTS token generator
 
@@ -42,9 +46,10 @@ tar -xf models/magpie-tts-v2607/magpie_tts_multilingual_357m.nemo \
 Both v2602 (factor 1) and v2607 (factor 2) use the same NanoCodec decoder.
 
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
-they are not part of the GGUF. Extract the `.nemo` and pass that directory to
-the server as `--tts.tokenizer-model-dir` (here
-`models/magpie-tts/extracted`).
+they are not part of the GGUF. The built-in pull extracts only the required,
+pinned tokenizer members and verifies each one. For a custom Magpie checkpoint,
+extract its `.nemo` archive and pass that directory as `--tokenizer-dir` or
+`--tts.tokenizer-model-dir`.
 The model-specific IPA/text tokenizer assets are loaded from this directory.
 The GGUF and extracted directory must come from the same model revision. The
 runtime recognizes the exact v2602 and v2607 tokenizer layouts from
@@ -81,20 +86,13 @@ server, YAML, and offline runner examples.
 Hugging Face: [nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps)
 (no tokenizer is needed for the codec decoder).
 
-```bash
-hf download nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps \
-    nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
-    --local-dir models/nano-codec
-```
+Pull it independently with `nemo-speech pull nano-codec`. Pulling `magpie`
+does this automatically because the two models must run together.
 
-Run both models together:
+Run the default stack:
 
 ```bash
-nemo-speech synthesize "Hello from Magpie Multilingual." \
-    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
-    --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
-    --tokenizer-dir models/magpie-tts/extracted \
-    --output output.wav
+nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 ```
 
 ## Converting custom TTS checkpoints
@@ -102,22 +100,16 @@ nemo-speech synthesize "Hello from Magpie Multilingual." \
 The unified [`convert_model.py`](../../convert_model.py) entry point accepts
 compatible local `.nemo` archives and extracted NeMo checkpoints. It defaults
 to `--outtype f16` for MagpieTTS and NanoCodec; pass `--outtype f32` to retain
-full precision.
+full precision. The converter is a source-tree Python tool and is not included
+in native release archives; see [Model conversion](../model-conversion.md) for
+environment setup.
 
 ```bash
-pip install -r requirements.txt
 python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.f16.gguf
 ```
 
-The converter reads `.nemo` archives directly with PyTorch and does not require
-`nemo_toolkit`. The optional `scripts/tts/tokenize-magpietts.py` debugging
-helper does use NeMo's Python tokenizer implementation.
+Conversion does not require `nemo_toolkit`. The optional
+`scripts/tts/tokenize-magpietts.py` debugging helper does.
 
-## Notes
-
-For CUDA builds, the MagpieTTS and NanoCodec operations require the ggml
-patches applied by `scripts/configure.sh`; see
-[ggml patches](../development/ggml-patches.md).
-
-Once converted, point the server at them - see
+Once converted, point the server at them; see
 [TTS configuration](configuration.md).

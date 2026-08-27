@@ -58,9 +58,7 @@ class TtsTokenizerProfilesTest(unittest.TestCase):
         reordered = list(TOKENIZER_ORDERS["v2607"])
         reordered[0], reordered[1] = reordered[1], reordered[0]
         with self.assertRaisesRegex(ValueError, "unsupported Magpie tokenizer layout"):
-            tokenizer_profile(
-                {"text_tokenizers": {name: {} for name in reordered}}, 3359, 2
-            )
+            tokenizer_profile({"text_tokenizers": {name: {} for name in reordered}}, 3359, 2)
 
     def test_critical_tokenizer_config_changes_are_rejected(self) -> None:
         config = self._config("v2607")
@@ -69,9 +67,7 @@ class TtsTokenizerProfilesTest(unittest.TestCase):
             tokenizer_profile(config, 3359, 2)
 
         config = self._config("v2607")
-        config["text_tokenizers"]["japanese_phoneme"]["g2p"][
-            "ascii_letter_case"
-        ] = "upper"
+        config["text_tokenizers"]["japanese_phoneme"]["g2p"]["ascii_letter_case"] = "upper"
         with self.assertRaisesRegex(ValueError, "Japanese ascii_letter_case"):
             tokenizer_profile(config, 3359, 2)
 

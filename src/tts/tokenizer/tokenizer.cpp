@@ -48,9 +48,8 @@ struct tokenizer_profile {
             throw std::invalid_argument("unsupported tokenizer language '" + language + "'");
         }
         const auto entry = std::find_if(
-            entries.begin(), entries.end(), [&](const tokenizer_entry& value) {
-                return value.name == mapping->second;
-            });
+            entries.begin(), entries.end(),
+            [&](const tokenizer_entry& value) { return value.name == mapping->second; });
         if (entry == entries.end()) {
             throw std::runtime_error(
                 "tokenizer profile '" + id + "' maps language '" + language +
@@ -75,9 +74,8 @@ trim(std::string value) {
 std::string
 unquote(std::string value) {
     value = trim(std::move(value));
-    if (value.size() >= 2 &&
-        ((value.front() == '\'' && value.back() == '\'') ||
-         (value.front() == '"' && value.back() == '"'))) {
+    if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') ||
+                              (value.front() == '"' && value.back() == '"'))) {
         value = value.substr(1, value.size() - 2);
     }
     return value;
@@ -194,8 +192,7 @@ require_block_value(
 void
 require_common_tokenizer_values(
     const std::map<std::string, std::string>& blocks, const std::string& tokenizer,
-    const std::string& target, const std::string& apostrophe,
-    const std::string& pad_with_space) {
+    const std::string& target, const std::string& apostrophe, const std::string& pad_with_space) {
     require_block_value(blocks, tokenizer, "_target_", target);
     require_block_value(blocks, tokenizer, "punct", "true");
     require_block_value(blocks, tokenizer, "apostrophe", apostrophe);
@@ -267,8 +264,8 @@ parse_language_mapping(const std::vector<std::string>& lines) {
 tokenizer_entry
 entry(
     std::string name, tokenizer_kind kind, int offset, int size, std::string locale = {},
-    std::string grapheme_case = {}, std::string grapheme_prefix = {},
-    bool apostrophe = true, bool pad_with_space = false) {
+    std::string grapheme_case = {}, std::string grapheme_prefix = {}, bool apostrophe = true,
+    bool pad_with_space = false) {
     tokenizer_entry value;
     value.name = std::move(name);
     value.kind = kind;
@@ -303,8 +300,8 @@ attach_artifacts(
         if ((item.kind == tokenizer_kind::ipa || item.kind == tokenizer_kind::mandarin) &&
             item.phoneme_dict.empty()) {
             throw std::runtime_error(
-                "tokenizer profile '" + profile.id + "' has no phoneme_dict for '" +
-                item.name + "'");
+                "tokenizer profile '" + profile.id + "' has no phoneme_dict for '" + item.name +
+                "'");
         }
     }
 }
@@ -333,19 +330,25 @@ load_tokenizer_profile(const fs::path& root) {
     std::vector<std::string> order;
     const auto blocks = yaml_child_blocks(lines, "text_tokenizers", order);
     const std::vector<std::string> v2602_order = {
-        "english_phoneme",   "spanish_phoneme",  "german_phoneme",
-        "mandarin_phoneme",  "japanese_phoneme", "french_chartokenizer",
-        "hindi_chartokenizer", "italian_phoneme", "vietnamese_phoneme",
-        "text_ce_tokenizer",
+        "english_phoneme",    "spanish_phoneme",      "german_phoneme",      "mandarin_phoneme",
+        "japanese_phoneme",   "french_chartokenizer", "hindi_chartokenizer", "italian_phoneme",
+        "vietnamese_phoneme", "text_ce_tokenizer",
     };
     const std::vector<std::string> v2607_order = {
-        "english_phoneme",        "text_ce_tokenizer",
-        "spanish_phoneme",        "german_phoneme",
-        "mandarin_phoneme",       "japanese_phoneme",
-        "portuguese_Brazilian_phoneme", "hindi_phoneme",
-        "arabic_AE_chartokenizer", "arabic_SA_chartokenizer",
-        "arabic_MSA_chartokenizer", "french_chartokenizer",
-        "italian_chartokenizer",  "vietnamese_chartokenizer",
+        "english_phoneme",
+        "text_ce_tokenizer",
+        "spanish_phoneme",
+        "german_phoneme",
+        "mandarin_phoneme",
+        "japanese_phoneme",
+        "portuguese_Brazilian_phoneme",
+        "hindi_phoneme",
+        "arabic_AE_chartokenizer",
+        "arabic_SA_chartokenizer",
+        "arabic_MSA_chartokenizer",
+        "french_chartokenizer",
+        "italian_chartokenizer",
+        "vietnamese_chartokenizer",
         "korean_chartokenizer",
     };
 
@@ -357,8 +360,10 @@ load_tokenizer_profile(const fs::path& root) {
         profile.eos_id = 2361;
         profile.entries = {
             entry("english_phoneme", tokenizer_kind::ipa, 0, 96, "en-US", "upper", "", true, false),
-            entry("spanish_phoneme", tokenizer_kind::ipa, 96, 103, "es-ES", "upper", "", true, true),
-            entry("german_phoneme", tokenizer_kind::ipa, 199, 150, "de-DE", "mixed", "#", true, true),
+            entry(
+                "spanish_phoneme", tokenizer_kind::ipa, 96, 103, "es-ES", "upper", "", true, true),
+            entry(
+                "german_phoneme", tokenizer_kind::ipa, 199, 150, "de-DE", "mixed", "#", true, true),
             entry("mandarin_phoneme", tokenizer_kind::mandarin, 349, 109),
             entry("japanese_phoneme", tokenizer_kind::japanese, 458, 175),
             entry("french_chartokenizer", tokenizer_kind::byt5, 633, 384),
@@ -368,9 +373,9 @@ load_tokenizer_profile(const fs::path& root) {
             entry("text_ce_tokenizer", tokenizer_kind::byt5, 1976, 384),
         };
         profile.language_mapping = {
-            {"en", "english_phoneme"}, {"es", "spanish_phoneme"},
-            {"de", "german_phoneme"}, {"fr", "french_chartokenizer"},
-            {"it", "italian_phoneme"}, {"vi", "vietnamese_phoneme"},
+            {"en", "english_phoneme"},  {"es", "spanish_phoneme"},
+            {"de", "german_phoneme"},   {"fr", "french_chartokenizer"},
+            {"it", "italian_phoneme"},  {"vi", "vietnamese_phoneme"},
             {"zh", "mandarin_phoneme"}, {"hi", "hindi_chartokenizer"},
             {"ja", "japanese_phoneme"},
         };
@@ -385,12 +390,17 @@ load_tokenizer_profile(const fs::path& root) {
         profile.entries = {
             entry("english_phoneme", tokenizer_kind::ipa, 0, 96, "en-US", "upper", "", true, false),
             entry("text_ce_tokenizer", tokenizer_kind::byt5, 96, 384),
-            entry("spanish_phoneme", tokenizer_kind::ipa, 480, 103, "es-ES", "upper", "", true, true),
-            entry("german_phoneme", tokenizer_kind::ipa, 583, 150, "de-DE", "mixed", "#", true, true),
+            entry(
+                "spanish_phoneme", tokenizer_kind::ipa, 480, 103, "es-ES", "upper", "", true, true),
+            entry(
+                "german_phoneme", tokenizer_kind::ipa, 583, 150, "de-DE", "mixed", "#", true, true),
             entry("mandarin_phoneme", tokenizer_kind::mandarin, 733, 109),
             entry("japanese_phoneme", tokenizer_kind::japanese, 842, 175),
-            entry("portuguese_Brazilian_phoneme", tokenizer_kind::ipa, 1017, 111, "pt-BR", "upper", "#", true, true),
-            entry("hindi_phoneme", tokenizer_kind::ipa, 1128, 201, "hi-IN", "upper", "", true, true),
+            entry(
+                "portuguese_Brazilian_phoneme", tokenizer_kind::ipa, 1017, 111, "pt-BR", "upper",
+                "#", true, true),
+            entry(
+                "hindi_phoneme", tokenizer_kind::ipa, 1128, 201, "hi-IN", "upper", "", true, true),
             entry("arabic_AE_chartokenizer", tokenizer_kind::arabic, 1329, 164),
             entry("arabic_SA_chartokenizer", tokenizer_kind::arabic, 1493, 164),
             entry("arabic_MSA_chartokenizer", tokenizer_kind::arabic, 1657, 164),
@@ -401,25 +411,39 @@ load_tokenizer_profile(const fs::path& root) {
         };
         profile.language_mapping = parse_language_mapping(lines);
         const std::map<std::string, std::string> expected_mapping = {
-            {"en", "english_phoneme"}, {"de", "german_phoneme"},
-            {"es", "spanish_phoneme"}, {"fr", "french_chartokenizer"},
-            {"it", "italian_chartokenizer"}, {"vi", "vietnamese_chartokenizer"},
-            {"zh", "mandarin_phoneme"}, {"hi", "hindi_phoneme"},
-            {"ja", "japanese_phoneme"}, {"pt-BR", "portuguese_Brazilian_phoneme"},
-            {"ko", "korean_chartokenizer"}, {"ar-AE", "arabic_AE_chartokenizer"},
-            {"ar-SA", "arabic_SA_chartokenizer"}, {"ar-MSA", "arabic_MSA_chartokenizer"},
+            {"en", "english_phoneme"},
+            {"de", "german_phoneme"},
+            {"es", "spanish_phoneme"},
+            {"fr", "french_chartokenizer"},
+            {"it", "italian_chartokenizer"},
+            {"vi", "vietnamese_chartokenizer"},
+            {"zh", "mandarin_phoneme"},
+            {"hi", "hindi_phoneme"},
+            {"ja", "japanese_phoneme"},
+            {"pt-BR", "portuguese_Brazilian_phoneme"},
+            {"ko", "korean_chartokenizer"},
+            {"ar-AE", "arabic_AE_chartokenizer"},
+            {"ar-SA", "arabic_SA_chartokenizer"},
+            {"ar-MSA", "arabic_MSA_chartokenizer"},
         };
         if (profile.language_mapping != expected_mapping) {
             throw std::runtime_error("unsupported v2607 language_to_tokenizer_mapping");
         }
         profile.language_mapping = {
-            {"en", "english_phoneme"}, {"de", "german_phoneme"},
-            {"es", "spanish_phoneme"}, {"fr", "french_chartokenizer"},
-            {"it", "italian_chartokenizer"}, {"vi", "vietnamese_chartokenizer"},
-            {"zh", "mandarin_phoneme"}, {"hi", "hindi_phoneme"},
-            {"ja", "japanese_phoneme"}, {"pt-br", "portuguese_Brazilian_phoneme"},
-            {"ko", "korean_chartokenizer"}, {"ar-ae", "arabic_AE_chartokenizer"},
-            {"ar-sa", "arabic_SA_chartokenizer"}, {"ar-msa", "arabic_MSA_chartokenizer"},
+            {"en", "english_phoneme"},
+            {"de", "german_phoneme"},
+            {"es", "spanish_phoneme"},
+            {"fr", "french_chartokenizer"},
+            {"it", "italian_chartokenizer"},
+            {"vi", "vietnamese_chartokenizer"},
+            {"zh", "mandarin_phoneme"},
+            {"hi", "hindi_phoneme"},
+            {"ja", "japanese_phoneme"},
+            {"pt-br", "portuguese_Brazilian_phoneme"},
+            {"ko", "korean_chartokenizer"},
+            {"ar-ae", "arabic_AE_chartokenizer"},
+            {"ar-sa", "arabic_SA_chartokenizer"},
+            {"ar-msa", "arabic_MSA_chartokenizer"},
         };
         if (profile.nemo_version != "2.8.0rc0") {
             throw std::runtime_error(
@@ -428,12 +452,13 @@ load_tokenizer_profile(const fs::path& root) {
     } else {
         std::ostringstream found;
         for (size_t i = 0; i < order.size(); ++i) {
-            if (i != 0) found << ", ";
+            if (i != 0)
+                found << ", ";
             found << order[i];
         }
         throw std::runtime_error(
-            "unsupported Magpie tokenizer layout in " + config_path.string() + ": [" +
-            found.str() + "]");
+            "unsupported Magpie tokenizer layout in " + config_path.string() + ": [" + found.str() +
+            "]");
     }
 
     for (auto& item : profile.entries) {
@@ -475,8 +500,7 @@ load_tokenizer_profile(const fs::path& root) {
                     "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers."
                     "JapanesePhonemeTokenizer",
                     "false", "true");
-                require_block_value(
-                    blocks, item.name, "ascii_letter_case", item.ascii_letter_case);
+                require_block_value(blocks, item.name, "ascii_letter_case", item.ascii_letter_case);
                 break;
             case tokenizer_kind::arabic:
                 require_common_tokenizer_values(
@@ -689,11 +713,10 @@ class MagpieNativeTokenizer::Impl {
 
     std::vector<std::string> supported_language_codes() const {
         static const std::vector<std::pair<std::string, std::string>> canonical = {
-            {"en", "en-US"},   {"es", "es-ES"},     {"de", "de-DE"},
-            {"fr", "fr-FR"},  {"it", "it-IT"},     {"vi", "vi-VN"},
-            {"zh", "zh-CN"},  {"hi", "hi-IN"},     {"ja", "ja-JP"},
-            {"ar-ae", "ar-AE"}, {"ar-sa", "ar-SA"}, {"ar-msa", "ar-MSA"},
-            {"ko", "ko-KR"},  {"pt-br", "pt-BR"},
+            {"en", "en-US"}, {"es", "es-ES"},    {"de", "de-DE"},    {"fr", "fr-FR"},
+            {"it", "it-IT"}, {"vi", "vi-VN"},    {"zh", "zh-CN"},    {"hi", "hi-IN"},
+            {"ja", "ja-JP"}, {"ar-ae", "ar-AE"}, {"ar-sa", "ar-SA"}, {"ar-msa", "ar-MSA"},
+            {"ko", "ko-KR"}, {"pt-br", "pt-BR"},
         };
         std::vector<std::string> languages;
         for (const auto& [normalized, code] : canonical) {
@@ -702,9 +725,8 @@ class MagpieNativeTokenizer::Impl {
                 continue;
             }
             const auto item = std::find_if(
-                profile_.entries.begin(), profile_.entries.end(), [&](const tokenizer_entry& entry) {
-                    return entry.name == mapping->second;
-                });
+                profile_.entries.begin(), profile_.entries.end(),
+                [&](const tokenizer_entry& entry) { return entry.name == mapping->second; });
             if (item != profile_.entries.end() && supports(*item)) {
                 languages.push_back(code);
             }
@@ -771,8 +793,8 @@ class MagpieNativeTokenizer::Impl {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         if (!mandarin_cache_) {
             const auto& entry = profile_.entry_for_language("zh");
-            mandarin_cache_ = std::make_unique<mandarin_tokenizer>(
-                model_dir_, entry.offset, entry.phoneme_dict);
+            mandarin_cache_ =
+                std::make_unique<mandarin_tokenizer>(model_dir_, entry.offset, entry.phoneme_dict);
         }
         return *mandarin_cache_;
     }

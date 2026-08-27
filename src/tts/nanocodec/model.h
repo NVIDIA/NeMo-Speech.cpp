@@ -43,7 +43,7 @@ class NanoCodecModel {
     NanoCodecModel(const NanoCodecModel&) = delete;
     NanoCodecModel& operator=(const NanoCodecModel&) = delete;
 
-    bool load(const std::string& path, bool force_cpu = false);
+    bool load(const std::string& path, bool force_cpu = false, bool verbose = false);
     void reset();
     bool loaded() const;
 

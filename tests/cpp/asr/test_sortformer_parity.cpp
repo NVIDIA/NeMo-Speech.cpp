@@ -113,7 +113,9 @@ main(int argc, char** argv) {
         if (std::string(argv[i]) == "--gpu")
             use_gpu = true;
 
-    ggml_runtime::BackendManager bm({.use_gpu = use_gpu});
+    ggml_runtime::Params backend_params;
+    backend_params.use_gpu = use_gpu;
+    ggml_runtime::BackendManager bm(backend_params);
     nemo_speech::asr::SortformerModel model(bm, gguf_path);
 
     const int n_chunks = static_cast<int>(load_ref(ref_dir, "n_chunks").i[0]);

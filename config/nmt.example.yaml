@@ -4,8 +4,8 @@
 #   nemo-speech serve --config config/nmt.example.yaml
 #
 # Requires a build with -DNEMO_SPEECH_BUILD_NMT=ON. The translation model is a
-# Riva-Translate GGUF; the language pair is selected per request via the
-# source_language / target_language fields of TranslateText.
+# Riva-Translate GGUF; the language pair is selected per request with the
+# source_language and target_language fields.
 nmt:
   enabled: true                 # true | false | auto
   backend:
@@ -20,4 +20,3 @@ nmt:
   pool:
     contexts: 1                 # concurrent decode contexts; each adds one
                                 # n_ctx-sized KV cache. Raise for concurrency.
-  verbose: false                # enable verbose llama.cpp loader/runtime logs

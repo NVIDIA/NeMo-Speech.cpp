@@ -220,8 +220,8 @@ run_bench(int argc, char** argv) {
     const int max_concurrency =
         *std::max_element(options.concurrency.begin(), options.concurrency.end());
     options.config.model.path =
-        require_model_file(
-            options.model.empty() ? options.config.model.path : options.model, "ASR model")
+        resolve_model_file(
+            options.model.empty() ? options.config.model.path : options.model, "asr", "ASR model")
             .string();
     options.config.batching.enabled = max_concurrency > 1;
     options.config.batching.max_batch_size =
@@ -230,6 +230,7 @@ run_bench(int argc, char** argv) {
         std::max(options.config.batching.max_queue_depth, max_concurrency * 2);
     options.config.batching.state_arena_slots =
         std::max(options.config.batching.state_arena_slots, max_concurrency);
+    options.config.log_status = !cli_quiet() && !cli_json();
 
     nemo_speech::EngineRegistry engines;
     const auto load_start = Clock::now();

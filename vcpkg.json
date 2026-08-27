@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "nemo-speech",
+  "version-string": "1.0.0",
+  "builtin-baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
+  "dependencies": [],
+  "features": {
+    "asr": {
+      "description": "Dependencies shared by ASR and diarization",
+      "dependencies": [
+        "sentencepiece"
+      ]
+    },
+    "examples": {
+      "description": "Dependencies for all public examples",
+      "dependencies": [
+        "portaudio"
+      ]
+    },
+    "flashlight": {
+      "description": "Compression support for the Flashlight/KenLM decoder",
+      "dependencies": [
+        "bzip2",
+        "liblzma",
+        "zlib"
+      ]
+    },
+    "grpc": {
+      "description": "Dependencies for the Riva-compatible gRPC server",
+      "dependencies": [
+        "grpc",
+        "protobuf"
+      ]
+    },
+    "http-tls": {
+      "description": "TLS support for the HTTP server",
+      "dependencies": [
+        "openssl"
+      ]
+    }
+  }
+}

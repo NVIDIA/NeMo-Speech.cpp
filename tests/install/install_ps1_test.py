@@ -62,10 +62,20 @@ install(FILES LICENSE DESTINATION share/licenses/nemo-speech)
         """[CmdletBinding()]
 param(
     [string]$Backend,
+    [string]$Profile,
     [string]$BuildDir,
     [string]$Config,
+    [string]$CudaArch,
+    [string]$VcpkgRoot,
+    [string]$VcpkgTriplet,
+    [switch]$Grpc,
+    [switch]$Nmt,
+    [switch]$Flashlight,
+    [switch]$TtsJa,
+    [switch]$TtsZh,
     [switch]$AsrOnly,
-    [switch]$Http
+    [switch]$Http,
+    [switch]$HttpTls
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -117,12 +127,11 @@ def main() -> None:
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             requests[self.path] = requests.get(self.path, 0) + 1
-            if self.path == "/releases/latest":
-                self.send_response(302)
-                self.send_header("Location", "/releases/tag/v1.2.3")
-                self.end_headers()
-                return
-            body = b"latest\n" if self.path == "/releases/tag/v1.2.3" else releases.get(self.path)
+            body = (
+                b"NEMO_SPEECH_VERSION: 1.2.3\n"
+                if self.path == "/VERSION"
+                else releases.get(self.path)
+            )
             if body is None:
                 self.send_error(404)
                 return
@@ -150,6 +159,9 @@ def main() -> None:
                 f"http://127.0.0.1:{server.server_port}/releases"
             )
             environment["NEMO_SPEECH_SOURCE_URL"] = str(source)
+            environment["NEMO_SPEECH_VERSION_URL"] = (
+                f"http://127.0.0.1:{server.server_port}/VERSION"
+            )
 
             def run(*arguments: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
                 result = subprocess.run(
@@ -175,6 +187,17 @@ def main() -> None:
                 if not ok and result.returncode == 0:
                     raise RuntimeError(f"installer unexpectedly succeeded:\n{result.stdout}")
                 return result
+
+            remote_source = "https://github.com/NVIDIA/NeMo-Speech.cpp.git"
+            environment["NEMO_SPEECH_SOURCE_URL"] = remote_source
+            environment.pop("NEMO_SPEECH_SOURCE_REF", None)
+            remote_plan = run("-Source", "-Backend", "cpu", "-DryRun")
+            require(f"{remote_source}#main" in remote_plan.stdout, "remote source ref")
+            environment["NEMO_SPEECH_SOURCE_REF"] = "review-test"
+            override_plan = run("-Source", "-Backend", "cpu", "-DryRun")
+            require(f"{remote_source}#review-test" in override_plan.stdout, "source ref override")
+            environment["NEMO_SPEECH_SOURCE_URL"] = str(source)
+            environment.pop("NEMO_SPEECH_SOURCE_REF")
 
             run("-Prefix", str(prefix), "-Backend", "cpu", "-NoModifyPath")
             metadata = prefix / ".nemo-speech-install"
@@ -226,7 +249,7 @@ def main() -> None:
             require((source_prefix / "bin" / "nemo-speech.exe").is_file(), "source binary")
             require(
                 (source_prefix / ".nemo-speech-install").read_text(encoding="utf-8")
-                == f"1.2.6 windows {arch} cpu source:v1.2.6 profile:speech-server",
+                == f"1.2.6 windows {arch} cpu source:v1.2.6 profile:server",
                 "source metadata",
             )
             repeated = run(

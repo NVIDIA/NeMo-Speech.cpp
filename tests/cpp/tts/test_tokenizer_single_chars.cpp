@@ -153,7 +153,7 @@ main(int argc, char** argv) {
             v2607_ok = false;
         }
         std::vector<std::string> expected_languages = {
-            "en-US", "es-ES", "de-DE", "fr-FR", "it-IT", "vi-VN",
+            "en-US", "es-ES", "de-DE",  "fr-FR", "it-IT", "vi-VN",
 #ifdef NEMO_SPEECH_TTS_WITH_ZH
             "zh-CN",
 #endif
@@ -168,12 +168,12 @@ main(int argc, char** argv) {
         v2607_ok &= check_tokens(tokenizer, "T", "es-ES", {580, 581, 581, 511, 580, 3358});
         v2607_ok &= check_tokens(
             tokenizer, "er ist sehr gut", "de-DE",
-            {730, 615, 628, 730, 619, 629, 630, 730, 691, 716, 672, 718, 711, 730, 617, 631,
-             630, 730, 3358});
+            {730, 615, 628, 730, 619, 629, 630, 730, 691, 716, 672, 718, 711, 730, 617, 631, 630,
+             730, 3358});
         v2607_ok &= check_tokens(
             tokenizer, "नमस्ते दुनिया।", "hi-IN",
-            {1326, 1190, 1216, 1189, 1234, 1195, 1196, 1182, 1239, 1326, 1279, 1305, 1281,
-             1303, 1288, 1302, 1322, 1326, 3358});
+            {1326, 1190, 1216, 1189, 1234, 1195, 1196, 1182, 1239, 1326, 1279, 1305, 1281, 1303,
+             1288, 1302, 1322, 1326, 3358});
         v2607_ok &= check_tokens(
             tokenizer, "مرحبا", "ar-AE", {1329, 1405, 1391, 1387, 1382, 1381, 1329, 3358});
         v2607_ok &= check_tokens(

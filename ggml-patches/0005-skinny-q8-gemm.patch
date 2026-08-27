@@ -3,7 +3,7 @@ new file mode 100644
 index 00000000..60147ff1
 --- /dev/null
 +++ b/src/ggml-cuda/skinny-q8.cu
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,616 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +// Skinny-N Q8_0 GEMM for streaming ASR encoders (nemo-speech).
@@ -408,6 +408,12 @@ index 00000000..60147ff1
 +    if (planar_q8 && src0 != root) {
 +        return false;
 +    }
++
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    const bool skinny_q8_available = ampere_mma_available(cc);
++    if (!planar_q8 && !skinny_q8_available) {
++        return false;
++    }
 +    // The repack cache is keyed by src0->data and assumes the bytes are
 +    // immutable from the outside: only accept long-lived weight buffers, never
 +    // transient compute-pool tensors (whose addresses get reused).
@@ -435,7 +441,9 @@ index 00000000..60147ff1
 +        // because stock MMQ cannot interpret tensor-wide planes; skq8_gemm
 +        // tiles arbitrary N in 64-column chunks.
 +        GGML_ASSERT(tensor_ok && call_ok && "planar Q8 weight used in unsupported mul_mat shape");
-+        return total_n > MMVQ_MAX_BATCH_SIZE;
++        GGML_ASSERT((skinny_q8_available || total_n <= MMVQ_MAX_BATCH_SIZE) &&
++                    "wide planar Q8 requires an SM80+ CUDA kernel; use block Q8 on older GPUs");
++        return skinny_q8_available && total_n > MMVQ_MAX_BATCH_SIZE;
 +    }
 +
 +    const bool repacked = [&]() {

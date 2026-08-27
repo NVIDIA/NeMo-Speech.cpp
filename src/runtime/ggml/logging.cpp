@@ -13,49 +13,38 @@
 
 namespace ggml_runtime {
 
-#include <climits>
-#include <cstdarg>
-#include <cstdio>
-#include <cstring>
-
-void
-log_callback_default(ggml_log_level level, const char* text, void* user_data) {
-    (void)level;
-    (void)user_data;
-    fputs(text, stderr);
-    fflush(stderr);
-}
-
-struct LogState {
-    ggml_log_callback log_callback = log_callback_default;
-    void* log_callback_user_data = nullptr;
-};
-
-static LogState g_log_state;
-
 GGML_ATTRIBUTE_FORMAT(5, 6)
 void
 log_internal(
     ggml_log_level level, const char* file, int line, const char* func, const char* format, ...) {
     va_list args;
     va_start(args, format);
+    va_list args_copy;
+    va_copy(args_copy, args);
     char buffer[1024];
     int len = vsnprintf(buffer, 1024, format, args);
     if (len < 1024) {
         char formatted_buffer[2048];
         snprintf(
             formatted_buffer, sizeof(formatted_buffer), "%s:%d:<%s> %s", file, line, func, buffer);
-        g_log_state.log_callback(level, formatted_buffer, g_log_state.log_callback_user_data);
+        ggml_log_callback callback;
+        void* user_data;
+        ggml_log_get(&callback, &user_data);
+        callback(level, formatted_buffer, user_data);
     } else {
         char* buffer2 = new char[len + 1];
-        vsnprintf(buffer2, len + 1, format, args);
+        vsnprintf(buffer2, len + 1, format, args_copy);
         buffer2[len] = 0;
         char formatted_buffer[4096];
         snprintf(
             formatted_buffer, sizeof(formatted_buffer), "%s:%d:<%s> %s", file, line, func, buffer2);
-        g_log_state.log_callback(level, formatted_buffer, g_log_state.log_callback_user_data);
+        ggml_log_callback callback;
+        void* user_data;
+        ggml_log_get(&callback, &user_data);
+        callback(level, formatted_buffer, user_data);
         delete[] buffer2;
     }
+    va_end(args_copy);
     va_end(args);
 }
 

@@ -34,6 +34,7 @@ def expect_json_error(result: subprocess.CompletedProcess, exit_code: int, error
 
 def main() -> None:
     binary = sys.argv[1]
+    expect_live = "--expect-live" in sys.argv[2:]
     with tempfile.TemporaryDirectory(prefix="nemo-speech-cli-contract-") as temporary:
         help_result = run(binary, "--help")
         assert help_result.returncode == 0, help_result.stderr
@@ -41,9 +42,9 @@ def main() -> None:
 
         model_help = run(binary, "model", "--help")
         assert model_help.returncode == 0, model_help.stderr
-        assert "model info FILE" in model_help.stdout
-        assert "model path" not in model_help.stdout
-        assert "pull" not in model_help.stdout
+        assert "info FILE" in model_help.stdout
+        assert "list" in model_help.stdout
+        assert "pull REPO" in model_help.stdout
 
         expect_json_error(run(binary, "--json", "not-a-command"), 2, "invalid_argument")
         expect_json_error(
@@ -159,6 +160,26 @@ def main() -> None:
         transcribe_help = run(binary, "transcribe", "--help")
         if transcribe_help.returncode == 0:
             assert "--backend" in transcribe_help.stdout
+            assert ("--live" in transcribe_help.stdout) == expect_live
+            assert "session" not in transcribe_help.stderr
+            lifecycle = run(binary, "transcribe")
+            assert lifecycle.returncode == 2, lifecycle.stdout + lifecycle.stderr
+            assert "[nemo-speech] transcribe session started" in lifecycle.stderr
+            assert "[nemo-speech] transcribe session failed (exit code 2)" in lifecycle.stderr
+            quiet_lifecycle = run(binary, "--quiet", "transcribe")
+            assert "session" not in quiet_lifecycle.stderr
+            expect_json_error(run(binary, "--json", "transcribe"), 2, "invalid_argument")
+            if expect_live:
+                expect_json_error(
+                    run(binary, "--json", "transcribe", "--live", "recording.wav"),
+                    2,
+                    "invalid_argument",
+                )
+                expect_json_error(
+                    run(binary, "--json", "transcribe", "--live", "--output-dir", temporary),
+                    2,
+                    "invalid_argument",
+                )
 
         synthesize_help = run(binary, "synthesize", "--help")
         if synthesize_help.returncode == 0:
