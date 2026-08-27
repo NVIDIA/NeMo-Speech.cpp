@@ -719,10 +719,29 @@ magpietts_model_load_impl(
     h.mask_token_id = gguf_i32(model.gguf, "magpietts.mask_token_id", h.mask_token_id);
     h.frame_stacking_factor =
         gguf_i32(model.gguf, "magpietts.frame_stacking_factor", h.frame_stacking_factor);
+    if (h.audio_codebooks < 1 || h.frame_stacking_factor < 1) {
+        fprintf(
+            stderr, "invalid stacked audio layout: codebooks=%d frame_stacking_factor=%d\n",
+            h.audio_codebooks, h.frame_stacking_factor);
+        return false;
+    }
+    const int64_t stacked_audio_codebooks_64 =
+        static_cast<int64_t>(h.audio_codebooks) * h.frame_stacking_factor;
+    if (stacked_audio_codebooks_64 > std::numeric_limits<int32_t>::max()) {
+        fprintf(
+            stderr,
+            "stacked audio layout overflows int32: codebooks=%d frame_stacking_factor=%d "
+            "slots=%lld\n",
+            h.audio_codebooks, h.frame_stacking_factor,
+            static_cast<long long>(stacked_audio_codebooks_64));
+        return false;
+    }
+    const int32_t expected_stacked_codebooks =
+        static_cast<int32_t>(stacked_audio_codebooks_64);
     model.tokenizer_profile = gguf_string(model.gguf, "magpietts.tokenizer_profile");
     model.nemo_version = gguf_string(model.gguf, "magpietts.nemo_version");
     const int32_t stored_stacked_codebooks =
-        gguf_i32(model.gguf, "magpietts.stacked_audio_codebooks", h.stacked_audio_codebooks());
+        gguf_i32(model.gguf, "magpietts.stacked_audio_codebooks", expected_stacked_codebooks);
     h.n_embd = gguf_i32(model.gguf, "magpietts.embedding_dim", h.n_embd);
     h.n_ffn = gguf_i32(model.gguf, "magpietts.ffn_dim", h.n_ffn);
     h.n_ctx = gguf_i32(model.gguf, "magpietts.context_length", h.n_ctx);
@@ -801,10 +820,6 @@ magpietts_model_load_impl(
         return false;
     }
 
-    if (h.frame_stacking_factor < 1) {
-        fprintf(stderr, "invalid frame_stacking_factor=%d\n", h.frame_stacking_factor);
-        return false;
-    }
     if (model.tokenizer_profile.empty()) {
         model.tokenizer_profile = magpietts_infer_tokenizer_profile(h);
     }
@@ -816,7 +831,7 @@ magpietts_model_load_impl(
             model.tokenizer_profile.c_str(), h.text_vocab_size, h.frame_stacking_factor);
         return false;
     }
-    if (h.audio_codebooks < 1 || stored_stacked_codebooks != h.stacked_audio_codebooks()) {
+    if (stored_stacked_codebooks != expected_stacked_codebooks) {
         fprintf(
             stderr,
             "invalid stacked audio layout: codebooks=%d frame_stacking_factor=%d stored_slots=%d\n",

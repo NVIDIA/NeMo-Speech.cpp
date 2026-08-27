@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "tts/magpietts/lt.h"
 #include "tts/magpietts/model.h"
 
 namespace tts = nemo_speech::tts;
@@ -41,6 +42,29 @@ main() {
         frames[0] != std::vector<int32_t>({10, 11}) ||
         frames[1] != std::vector<int32_t>({20, 21})) {
         std::fprintf(stderr, "stacked-frame reconstruction failed\n");
+        return 1;
+    }
+
+    const std::vector<std::vector<int32_t>> forced_frames = {
+        {10, 11}, {20, 21}, {30, 31}, {40, 41}};
+    std::vector<int32_t> stacked_forced;
+    if (!tts::magpietts_stack_forced_code_frames(forced_frames, 0, h, stacked_forced) ||
+        stacked_forced != stacked) {
+        std::fprintf(stderr, "forced-code frame stacking failed\n");
+        return 1;
+    }
+    const std::vector<std::vector<int32_t>> incomplete_forced_frames = {
+        {10, 11}, {20, 21}, {30, 31}};
+    if (tts::magpietts_stack_forced_code_frames(
+            incomplete_forced_frames, 0, h, stacked_forced) ||
+        !stacked_forced.empty()) {
+        std::fprintf(stderr, "incomplete forced-code frame group was accepted\n");
+        return 1;
+    }
+    const std::vector<std::vector<int32_t>> malformed_forced_frames = {{10}, {20, 21}};
+    if (tts::magpietts_stack_forced_code_frames(
+            malformed_forced_frames, 0, h, stacked_forced)) {
+        std::fprintf(stderr, "malformed forced-code frame was accepted\n");
         return 1;
     }
 

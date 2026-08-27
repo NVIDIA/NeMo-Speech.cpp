@@ -23,6 +23,10 @@ struct LocalCodebookLogitDump {
     int frame_index = 0;
 };
 
+bool magpietts_stack_forced_code_frames(
+    const std::vector<std::vector<int32_t>>& raw_frames, size_t first_frame,
+    const magpietts_hparams& h, std::vector<int32_t>& stacked_codes);
+
 class LocalCodebookSampler {
    public:
     LocalCodebookSampler(const magpietts_model& model, int threads);

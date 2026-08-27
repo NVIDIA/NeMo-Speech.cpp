@@ -950,7 +950,8 @@ ensure_terminal_punctuation(const std::string& text, const std::string& language
         return result;
     };
 
-    static const std::array<std::string, 7> terminals = {".", "?", "!", "？", "！", "。", "।"};
+    static const std::array<std::string, 8> terminals = {
+        ".", "?", "!", "？", "！", "。", "।", "؟"};
     for (const std::string& existing : terminals) {
         if (last + 1 >= existing.size()) {
             const size_t marker_start = last + 1 - existing.size();

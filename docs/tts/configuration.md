@@ -41,18 +41,24 @@ when present. The older split layout (`classify/tokenize_and_classify.far`,
 
 The optional `riva_server` supports `RivaSpeechSynthesis.Synthesize`,
 `SynthesizeOnline`, and `GetRivaSynthesisConfig`. It takes plain text in
-`SynthesizeSpeechRequest.text`, supports native Magpie tokenizers for `en`,
-`es`, `de`, `fr`, `it`, `vi`, `zh`, `hi`, `ja`, `ar-AE`, `ar-SA`, `ar-MSA`,
-`ko`, and `pt-BR`, and returns `LINEAR_PCM`
-s16le at the NanoCodec sample rate. Japanese and Mandarin are included when
-`NEMO_SPEECH_TTS_WITH_JA` and `NEMO_SPEECH_TTS_WITH_ZH`, respectively, are
-enabled at build time; both default to `OFF`. Mandarin uses bundled Jieba and
+`SynthesizeSpeechRequest.text` and returns `LINEAR_PCM` s16le at the NanoCodec
+sample rate. The loaded Magpie tokenizer/model determines the supported
+languages. Both v2602 and v2607 support `en`, `es`, `de`, `fr`, `it`, `vi`,
+`zh`, `hi`, and `ja`. Arabic (`ar-AE`, `ar-SA`, and `ar-MSA`), Korean (`ko`),
+and Brazilian Portuguese (`pt-BR`) require a matching v2607 tokenizer and
+model; v2602 does not support or advertise those codes. Japanese and Mandarin
+also require the respective `NEMO_SPEECH_TTS_WITH_JA` and
+`NEMO_SPEECH_TTS_WITH_ZH` build options, both of which default to `OFF`. Native
+tokenizers are cached by language. Mandarin uses bundled Jieba and
 pypinyin-compatible data together with the model's pinyin-to-phoneme
 dictionary. Set `MAGPIE_MANDARIN_G2P_DIR` only to override the bundled Mandarin
 data directory.
 
-`GetRivaSynthesisConfig` advertises the compiled-in TTS languages and the
-dotted voice names accepted by synthesis requests.
+`GetRivaSynthesisConfig` advertises the TTS languages supported by the loaded
+Magpie tokenizer/model in `language_code` and exposes the per-language dotted
+voice names in `voices_by_language`. The legacy `voice_name`, `subvoices`, and
+`voices` parameters remain available for clients that assemble voice names
+themselves.
 
 TTS auto-enables when `tts.magpie-model`, `tts.codec-model`, and
 `tts.tokenizer-model-dir` are all set; force with `tts.enabled`.
