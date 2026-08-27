@@ -2029,6 +2029,8 @@ MagpieCodeGenerator::generate(
         for (int step = 0; step < max_decoder_positions; ++step) {
             const ggml_nvtx::range nvtx_step("magpietts_generate_step");
             const int64_t frame_start_us = ggml_time_us();
+            const int frames_remaining =
+                h.max_decoder_steps - step * h.frame_stacking_factor;
             if (step % 10 == 0) {
                 fprintf(stderr, "%s decoding frame %d/%d\n", label, step, max_decoder_positions);
             }
@@ -2199,8 +2201,9 @@ MagpieCodeGenerator::generate(
                     audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
                 }
             }
-            for (int lane = 0; lane < (eos_lane >= 0 ? eos_lane : h.frame_stacking_factor);
-                 ++lane) {
+            const int frames_to_emit = std::min(
+                frames_remaining, eos_lane >= 0 ? eos_lane : h.frame_stacking_factor);
+            for (int lane = 0; lane < frames_to_emit; ++lane) {
                 generated_frames.push_back(codec_frames[(size_t)lane]);
             }
             if (eos_lane >= 0) {
