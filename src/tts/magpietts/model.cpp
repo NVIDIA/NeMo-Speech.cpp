@@ -2057,8 +2057,9 @@ MagpieCodeGenerator::generate(
                             ? (params.use_kv_cache
                                    ? decoder.evalCachedPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
-                                         params.threads, cond_kv, uncond_kv, cond, uncond, nullptr,
-                                         &text_cond_device, &cond_hidden_device,
+                                         params.threads, cond_kv, uncond_kv, cond, uncond,
+                                         max_decoder_positions, nullptr, &text_cond_device,
+                                         &cond_hidden_device,
                                          &uncond_hidden_device, &cond_cross_kv,
                                          decoder_attention_arg)
                                    : decoder.evalPair(
@@ -2109,8 +2110,8 @@ MagpieCodeGenerator::generate(
                                    ? decoder.evalCachedPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                          params.threads, cond_kv, uncond_kv, cond, uncond,
-                                         &cuda_sample, &text_cond_device, nullptr, nullptr,
-                                         &cond_cross_kv, decoder_attention_arg)
+                                         max_decoder_positions, &cuda_sample, &text_cond_device,
+                                         nullptr, nullptr, &cond_cross_kv, decoder_attention_arg)
                                    : decoder.evalPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                          params.threads, cond, uncond, &cuda_sample,
@@ -2143,8 +2144,9 @@ MagpieCodeGenerator::generate(
                         params.use_kv_cache
                             ? decoder.evalCachedPair(
                                   text_cond, (int)tokens.size(), audio_codes, params.speaker,
-                                  params.threads, cond_kv, uncond_kv, cond, uncond, nullptr,
-                                  nullptr, nullptr, nullptr, &cond_cross_kv, decoder_attention_arg)
+                                  params.threads, cond_kv, uncond_kv, cond, uncond,
+                                  max_decoder_positions, nullptr, nullptr, nullptr, nullptr,
+                                  &cond_cross_kv, decoder_attention_arg)
                             : decoder.evalPair(
                                   text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                   params.threads, cond, uncond, nullptr, nullptr, nullptr, nullptr,

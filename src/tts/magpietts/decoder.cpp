@@ -616,13 +616,11 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
 class MagpieDecoder::PersistentDecoderRuntime {
    public:
     PersistentDecoderRuntime(
-        const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len)
+        const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
+        int stacked_position_budget)
         : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
-          cache_len_(
-              model.hparams.baked_context_length +
-              (model.hparams.max_decoder_steps + model.hparams.frame_stacking_factor - 1) /
-                  model.hparams.frame_stacking_factor -
-              1),
+          stacked_position_budget_(stacked_position_budget),
+          cache_len_(model.hparams.baked_context_length + stacked_position_budget - 1),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
           module_(model, cross_kv, text_len, cache_len_),
           session_(backend_manager_, &module_, nullptr) {
@@ -633,8 +631,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
         session_.setup();
     }
 
-    bool matches(const DecoderCrossKvCache* cross_kv, int text_len) const {
-        return cross_kv == cross_kv_ && text_len == text_len_;
+    bool matches(
+        const DecoderCrossKvCache* cross_kv, int text_len, int stacked_position_budget) const {
+        return cross_kv == cross_kv_ && text_len == text_len_ &&
+               stacked_position_budget == stacked_position_budget_;
     }
 
     bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_; }
@@ -772,6 +772,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     const magpietts_model& model_;
     const DecoderCrossKvCache* cross_kv_ = nullptr;
     int text_len_ = 0;
+    int stacked_position_budget_ = 0;
     int cache_len_ = 0;
     int n_tokens_ = 0;
     int valid_tokens_ = 0;
@@ -829,7 +830,8 @@ MagpieDecoder::evalCachedPair(
     const std::vector<float>& text_cond, int text_len,
     const std::vector<std::vector<int32_t>>& audio_codes, int speaker, int threads,
     DecoderKvCache& cond_kv, DecoderKvCache& uncond_kv, decoder_result& cond_result,
-    decoder_result& uncond_result, magpietts_cuda_sample_request* cuda_sample,
+    decoder_result& uncond_result, int stacked_position_budget,
+    magpietts_cuda_sample_request* cuda_sample,
     const magpietts_backend_tensor* text_cond_device, magpietts_backend_tensor* cond_hidden_out,
     magpietts_backend_tensor* uncond_hidden_out, DecoderCrossKvCache* cond_cross_kv,
     const magpietts_decoder_attention* attention) const {
@@ -840,15 +842,18 @@ MagpieDecoder::evalCachedPair(
         cond_kv.n_tokens > 0 && cond_kv.n_tokens == uncond_kv.n_tokens;
     if (persistent_candidate) {
         try {
-            if (persistent_runtime_ && !persistent_runtime_->matches(cond_cross_kv, text_len)) {
-                // Cross-cache address or shape changes require a new graph.
+            if (persistent_runtime_ &&
+                !persistent_runtime_->matches(
+                    cond_cross_kv, text_len, stacked_position_budget)) {
+                // Cross-cache address, shape, or request budget changes require a new graph.
                 persistent_runtime_.reset();
                 cond_kv.clear();
                 uncond_kv.clear();
             }
             if (cond_kv.n_tokens > 0 && !persistent_runtime_) {
                 persistent_runtime_ =
-                    std::make_unique<PersistentDecoderRuntime>(model_, *cond_cross_kv, text_len);
+                    std::make_unique<PersistentDecoderRuntime>(
+                        model_, *cond_cross_kv, text_len, stacked_position_budget);
                 persistent_runtime_->seed(cond_kv, uncond_kv);
                 fprintf(
                     stderr,
@@ -871,7 +876,9 @@ MagpieDecoder::evalCachedPair(
         }
         catch (const std::exception& e) {
             fprintf(stderr, "MagpieTTS persistent decoder failed: %s\n", e.what());
-            return false;
+            persistent_runtime_.reset();
+            cond_kv.clear();
+            uncond_kv.clear();
         }
     }
     return decoder_eval_cached_pair_impl(
