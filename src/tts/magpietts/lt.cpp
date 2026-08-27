@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -1172,6 +1173,68 @@ local_transformer_graph_bank_eval_cuda(
 }
 #endif
 
+bool
+magpietts_stack_forced_code_frames(
+    const std::vector<std::vector<int32_t>>& raw_frames, size_t first_frame,
+    const magpietts_hparams& h, std::vector<int32_t>& stacked_codes) {
+    stacked_codes.clear();
+    if (h.audio_codebooks < 1 || h.frame_stacking_factor < 1) {
+        fprintf(
+            stderr, "invalid forced-code layout: codebooks=%d frame_stacking_factor=%d\n",
+            h.audio_codebooks, h.frame_stacking_factor);
+        return false;
+    }
+
+    const int64_t stacked_count =
+        static_cast<int64_t>(h.audio_codebooks) * h.frame_stacking_factor;
+    if (stacked_count > std::numeric_limits<int32_t>::max()) {
+        fprintf(
+            stderr, "forced-code layout has too many stacked codebooks: %lld\n",
+            static_cast<long long>(stacked_count));
+        return false;
+    }
+
+    const size_t lane_count = static_cast<size_t>(h.frame_stacking_factor);
+    if (raw_frames.size() % lane_count != 0) {
+        fprintf(
+            stderr,
+            "incomplete forced-code input: %zu raw frame(s) cannot be grouped into %zu-frame "
+            "stacks\n",
+            raw_frames.size(), lane_count);
+        return false;
+    }
+    if (first_frame % lane_count != 0) {
+        fprintf(
+            stderr, "forced-code stack starts at unaligned raw frame %zu (stacking factor %zu)\n",
+            first_frame, lane_count);
+        return false;
+    }
+    if (first_frame > raw_frames.size() || raw_frames.size() - first_frame < lane_count) {
+        const size_t available =
+            first_frame < raw_frames.size() ? raw_frames.size() - first_frame : 0;
+        fprintf(
+            stderr,
+            "incomplete forced-code input at frame %zu: found %zu consecutive frame(s), "
+            "expected %zu\n",
+            first_frame, available, lane_count);
+        return false;
+    }
+
+    stacked_codes.reserve(static_cast<size_t>(stacked_count));
+    for (size_t lane = 0; lane < lane_count; ++lane) {
+        const auto& frame = raw_frames[first_frame + lane];
+        if (frame.size() != static_cast<size_t>(h.audio_codebooks)) {
+            fprintf(
+                stderr, "forced-code frame %zu has %zu codebooks, expected %d\n",
+                first_frame + lane, frame.size(), h.audio_codebooks);
+            stacked_codes.clear();
+            return false;
+        }
+        stacked_codes.insert(stacked_codes.end(), frame.begin(), frame.end());
+    }
+    return true;
+}
+
 static bool
 sample_local_codebooks_impl(
     const magpietts_model& model, const std::vector<float>& cond_hidden,
@@ -1182,13 +1245,24 @@ sample_local_codebooks_impl(
     const std::vector<int32_t>* forced_codes) {
     const ggml_nvtx::range nvtx_range("magpietts_sample_local_codebooks");
     const auto& h = model.hparams;
+    codes.clear();
+    argmax_codes.clear();
+    const int32_t stacked_codebooks = h.stacked_audio_codebooks();
+    if (stacked_codebooks < 1) {
+        fprintf(stderr, "invalid stacked codebook count: %d\n", stacked_codebooks);
+        return false;
+    }
+    if (forced_codes && forced_codes->size() != static_cast<size_t>(stacked_codebooks)) {
+        fprintf(
+            stderr, "forced-code input has %zu stacked codebooks, expected %d\n",
+            forced_codes->size(), stacked_codebooks);
+        return false;
+    }
     if (!local_graphs.beginFrame(model, use_cfg)) {
         return false;
     }
-    codes.clear();
-    argmax_codes.clear();
     std::vector<int32_t> prev;
-    for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
+    for (int c = 0; c < stacked_codebooks; ++c) {
         std::vector<float> logits;
         if (use_cfg) {
             std::vector<float> uncond;
@@ -1209,9 +1283,7 @@ sample_local_codebooks_impl(
             logits, h, temperature, top_k, rng, forbid_audio_eos);
         const int greedy = MagpieCodebookSampler::argmaxFromLogits(logits, h, forbid_audio_eos);
         dump_local_codebook_logits(logit_dump, c, sampled, greedy, logits);
-        const int emitted = forced_codes && (int)forced_codes->size() == h.stacked_audio_codebooks()
-                                ? (*forced_codes)[c]
-                                : sampled;
+        const int emitted = forced_codes ? (*forced_codes)[c] : sampled;
         codes.push_back(emitted);
         argmax_codes.push_back(greedy);
         prev.push_back(emitted);

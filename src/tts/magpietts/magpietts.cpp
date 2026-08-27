@@ -1485,13 +1485,23 @@ stream_magpie_to_audio(
                             logit_dump.step = step;
                             logit_dump.frame_index = sample_frame_index;
                         }
+                        std::vector<int32_t> stacked_forced_codes;
+                        const std::vector<int32_t>* forced_codes = nullptr;
+                        const size_t first_forced_frame =
+                            static_cast<size_t>(step) *
+                            static_cast<size_t>(h.frame_stacking_factor);
+                        if (chunk_index == 0 && first_forced_frame < forced_code_frames.size()) {
+                            if (!magpietts_stack_forced_code_frames(
+                                    forced_code_frames, first_forced_frame, h,
+                                    stacked_forced_codes)) {
+                                return cancel_worker();
+                            }
+                            forced_codes = &stacked_forced_codes;
+                        }
                         if (!local_sampler->sample(
                                 cond.hidden_last, uncond.hidden_last, params.use_cfg, h.cfg_scale,
                                 h.temperature, h.top_k, forbid_eos, rng, next_codes, argmax_codes,
-                                dump_logits ? &logit_dump : nullptr,
-                                chunk_index == 0 && step < (int)forced_code_frames.size()
-                                    ? &forced_code_frames[(size_t)step]
-                                    : nullptr)) {
+                                dump_logits ? &logit_dump : nullptr, forced_codes)) {
                             return cancel_worker();
                         }
                     } else {

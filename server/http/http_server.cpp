@@ -329,6 +329,7 @@ class TtsPreemptionCoordinator {
     uint64_t claim() {
         std::unique_lock<std::mutex> lock(mutex_);
         const uint64_t generation = ++newest_generation_;
+        ready_.notify_all();
         ready_.wait(lock, [&] { return !active_ || generation != newest_generation_; });
         if (generation != newest_generation_)
             return 0;
@@ -379,6 +380,10 @@ struct Server::Impl {
 
     Impl(EngineRegistry& engines, ServerConfig config)
         : models(engines), config(std::move(config)) {
+        if (this->config.preempt_tts && this->config.threads < 2) {
+            throw std::invalid_argument(
+                "tts.preempt requires at least two HTTP workers (http.threads >= 2)");
+        }
         const bool has_cert = !this->config.tls_certificate.empty();
         const bool has_key = !this->config.tls_private_key.empty();
         if (has_cert != has_key)
