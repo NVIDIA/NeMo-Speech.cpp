@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cuda_runtime.h>
 
-#include <cub/block/block_radix_sort.cuh>
-
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cub/block/block_radix_sort.cuh>
 
 #include "magpietts_cuda_sampling.h"
 
@@ -139,8 +138,7 @@ magpietts_sample_codebooks_kernel(
 
     const magpietts_cuda_sampling_config config = *config_ptr;
 
-    using block_sort = cub::BlockRadixSort<
-        float, MAGPIETTS_CUDA_BLOCK_SIZE, items_per_thread, int>;
+    using block_sort = cub::BlockRadixSort<float, MAGPIETTS_CUDA_BLOCK_SIZE, items_per_thread, int>;
     __shared__ typename block_sort::TempStorage sort_storage;
     __shared__ double s_sums[MAGPIETTS_CUDA_BLOCK_SIZE];
 
@@ -159,12 +157,12 @@ magpietts_sample_codebooks_kernel(
 #pragma unroll
     for (int item = 0; item < items_per_thread; ++item) {
         const int id = (int)threadIdx.x * items_per_thread + item;
-        thread_vals[item] = id < vocab_size
-                                ? sampled_logit(
-                                      logits_cond, logits_uncond, off, id, audio_codebook_size,
-                                      audio_eos_id, config.use_cfg != 0, config.cfg_scale,
-                                      config.forbid_audio_eos != 0)
-                                : -INFINITY;
+        thread_vals[item] =
+            id < vocab_size
+                ? sampled_logit(
+                      logits_cond, logits_uncond, off, id, audio_codebook_size, audio_eos_id,
+                      config.use_cfg != 0, config.cfg_scale, config.forbid_audio_eos != 0)
+                : -INFINITY;
         thread_ids[item] = id;
     }
     block_sort(sort_storage).SortDescendingBlockedToStriped(thread_vals, thread_ids);
@@ -192,8 +190,7 @@ magpietts_sample_codebooks_kernel(
         double local_sum = 0.0;
         for (int i = threadIdx.x; i < k; i += blockDim.x) {
             if (isfinite(top_vals[i])) {
-                local_sum +=
-                    exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
+                local_sum += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
             }
         }
         s_sums[threadIdx.x] = local_sum;
@@ -210,8 +207,7 @@ magpietts_sample_codebooks_kernel(
             double acc = 0.0;
             for (int i = 0; i < k; ++i) {
                 if (isfinite(top_vals[i])) {
-                    acc +=
-                        exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
+                    acc += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
                 }
                 if (target <= acc) {
                     sampled = top_ids[i];
@@ -350,7 +346,8 @@ magpietts_cuda_sampler_configure(
     sampler->h_config->seed = seed;
     sampler->h_config->use_cfg = use_cfg ? 1 : 0;
     sampler->h_config->forbid_audio_eos = forbid_audio_eos ? 1 : 0;
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
@@ -369,7 +366,8 @@ magpietts_cuda_sampler_upload_config(
         err = cudaGraphAddMemcpyNode1D(
             &node, sampler->sequence_graph, deps, dependency_count, sampler->d_config,
             sampler->h_config, sizeof(*sampler->d_config), cudaMemcpyHostToDevice);
-        if (err == cudaSuccess) sampler->sequence_tail = node;
+        if (err == cudaSuccess)
+            sampler->sequence_tail = node;
     } else {
         err = cudaMemcpyAsync(
             sampler->d_config, sampler->h_config, sizeof(*sampler->d_config),
@@ -379,7 +377,8 @@ magpietts_cuda_sampler_upload_config(
         set_error(error, error_size, "failed to upload CUDA sampler config", err);
         return false;
     }
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
@@ -405,7 +404,8 @@ magpietts_cuda_sampler_sequence_build_active(const magpietts_cuda_sampler* sampl
 
 void
 magpietts_cuda_sampler_sequence_mark_warm(magpietts_cuda_sampler* sampler) {
-    if (sampler) sampler->sequence_warm = true;
+    if (sampler)
+        sampler->sequence_warm = true;
 }
 
 bool
@@ -425,7 +425,8 @@ magpietts_cuda_sampler_sequence_begin_build(
     sampler->sequence_graph = graph;
     sampler->sequence_tail = nullptr;
     sampler->sequence_build_active = true;
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
@@ -461,14 +462,17 @@ magpietts_cuda_sampler_sequence_finish_build_and_launch(
         return false;
     }
     sampler->sequence_exec = exec;
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
 void
 magpietts_cuda_sampler_sequence_abort_build(magpietts_cuda_sampler* sampler) {
-    if (!sampler || !sampler->sequence_build_active) return;
-    if (sampler->sequence_graph) cudaGraphDestroy(sampler->sequence_graph);
+    if (!sampler || !sampler->sequence_build_active)
+        return;
+    if (sampler->sequence_graph)
+        cudaGraphDestroy(sampler->sequence_graph);
     sampler->sequence_graph = nullptr;
     sampler->sequence_tail = nullptr;
     sampler->sequence_build_active = false;
@@ -476,7 +480,8 @@ magpietts_cuda_sampler_sequence_abort_build(magpietts_cuda_sampler* sampler) {
 
 void
 magpietts_cuda_sampler_sequence_disable(magpietts_cuda_sampler* sampler) {
-    if (!sampler) return;
+    if (!sampler)
+        return;
     magpietts_cuda_sampler_sequence_abort_build(sampler);
     if (sampler->sequence_exec) {
         cudaGraphExecDestroy(sampler->sequence_exec);
@@ -502,7 +507,8 @@ magpietts_cuda_sampler_sequence_launch(
         set_error(error, error_size, "failed to launch CUDA local sequence graph", err);
         return false;
     }
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
@@ -525,7 +531,8 @@ magpietts_cuda_sampler_sequence_add_ggml_graph(
         return false;
     }
     sampler->sequence_tail = node;
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
@@ -549,7 +556,8 @@ magpietts_cuda_sampler_sequence_add_device_copy(
         return false;
     }
     sampler->sequence_tail = node;
-    if (error && error_size > 0) error[0] = '\0';
+    if (error && error_size > 0)
+        error[0] = '\0';
     return true;
 }
 
@@ -594,8 +602,8 @@ magpietts_cuda_sample_codebooks_device(
 bool
 magpietts_cuda_sample_codebooks_device_configured(
     magpietts_cuda_sampler* sampler, const float* logits_cond, const float* logits_uncond,
-    int codebooks, int vocab_size, int audio_codebook_size, int audio_eos_id,
-    int codebook_offset, int output_offset, char* error, size_t error_size) {
+    int codebooks, int vocab_size, int audio_codebook_size, int audio_eos_id, int codebook_offset,
+    int output_offset, char* error, size_t error_size) {
     if (!sampler || !logits_cond) {
         set_error(error, error_size, "invalid CUDA sampler device arguments");
         return false;
@@ -620,18 +628,16 @@ magpietts_cuda_sample_codebooks_device_configured(
         int32_t* codes = sampler->d_codes;
         int32_t* argmax = sampler->d_argmax;
         void* kernel_args[] = {
-            &logits_cond,       &logits_uncond, &codebooks,       &vocab_size,
-            &audio_codebook_size, &audio_eos_id,   &config,          &codebook_offset,
-            &output_offset,     &top_ids,       &top_vals,        &codes,
-            &argmax};
+            &logits_cond,  &logits_uncond, &codebooks,       &vocab_size,    &audio_codebook_size,
+            &audio_eos_id, &config,        &codebook_offset, &output_offset, &top_ids,
+            &top_vals,     &codes,         &argmax};
         cudaKernelNodeParams params{};
-        params.func = vocab_size <= MAGPIETTS_CUDA_SMALL_VOCAB
-                          ? reinterpret_cast<void*>(
-                                magpietts_sample_codebooks_kernel<
-                                    MAGPIETTS_CUDA_SMALL_ITEMS_PER_THREAD>)
-                          : reinterpret_cast<void*>(
-                                magpietts_sample_codebooks_kernel<
-                                    MAGPIETTS_CUDA_MAX_ITEMS_PER_THREAD>);
+        params.func =
+            vocab_size <= MAGPIETTS_CUDA_SMALL_VOCAB
+                ? reinterpret_cast<void*>(
+                      magpietts_sample_codebooks_kernel<MAGPIETTS_CUDA_SMALL_ITEMS_PER_THREAD>)
+                : reinterpret_cast<void*>(
+                      magpietts_sample_codebooks_kernel<MAGPIETTS_CUDA_MAX_ITEMS_PER_THREAD>);
         params.gridDim = dim3((unsigned int)codebooks, 1, 1);
         params.blockDim = dim3(MAGPIETTS_CUDA_BLOCK_SIZE, 1, 1);
         params.sharedMemBytes = 0;
@@ -640,14 +646,15 @@ magpietts_cuda_sample_codebooks_device_configured(
         cudaGraphNode_t node = nullptr;
         const cudaGraphNode_t* deps = sampler->sequence_tail ? &sampler->sequence_tail : nullptr;
         const size_t dependency_count = sampler->sequence_tail ? 1 : 0;
-        const cudaError_t err = cudaGraphAddKernelNode(
-            &node, sampler->sequence_graph, deps, dependency_count, &params);
+        const cudaError_t err =
+            cudaGraphAddKernelNode(&node, sampler->sequence_graph, deps, dependency_count, &params);
         if (err != cudaSuccess) {
             set_error(error, error_size, "failed to add sampler to CUDA local sequence", err);
             return false;
         }
         sampler->sequence_tail = node;
-        if (error && error_size > 0) error[0] = '\0';
+        if (error && error_size > 0)
+            error[0] = '\0';
         return true;
     }
 
@@ -655,16 +662,14 @@ magpietts_cuda_sample_codebooks_device_configured(
         magpietts_sample_codebooks_kernel<MAGPIETTS_CUDA_SMALL_ITEMS_PER_THREAD>
             <<<codebooks, MAGPIETTS_CUDA_BLOCK_SIZE, 0, sampler->stream>>>(
                 logits_cond, logits_uncond, codebooks, vocab_size, audio_codebook_size,
-                audio_eos_id, sampler->d_config, codebook_offset, output_offset,
-                sampler->d_top_ids, sampler->d_top_vals, sampler->d_codes,
-                sampler->d_argmax);
+                audio_eos_id, sampler->d_config, codebook_offset, output_offset, sampler->d_top_ids,
+                sampler->d_top_vals, sampler->d_codes, sampler->d_argmax);
     } else {
         magpietts_sample_codebooks_kernel<MAGPIETTS_CUDA_MAX_ITEMS_PER_THREAD>
             <<<codebooks, MAGPIETTS_CUDA_BLOCK_SIZE, 0, sampler->stream>>>(
                 logits_cond, logits_uncond, codebooks, vocab_size, audio_codebook_size,
-                audio_eos_id, sampler->d_config, codebook_offset, output_offset,
-                sampler->d_top_ids, sampler->d_top_vals, sampler->d_codes,
-                sampler->d_argmax);
+                audio_eos_id, sampler->d_config, codebook_offset, output_offset, sampler->d_top_ids,
+                sampler->d_top_vals, sampler->d_codes, sampler->d_argmax);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -693,8 +698,7 @@ magpietts_cuda_copy_sampled_code_to_device(
 
     if (sampler->sequence_build_active) {
         return magpietts_cuda_sampler_sequence_add_device_copy(
-            sampler, sampler->d_codes + codebook, dst_device, sizeof(int32_t), error,
-            error_size);
+            sampler, sampler->d_codes + codebook, dst_device, sizeof(int32_t), error, error_size);
     }
 
     cudaError_t err = cudaSuccess;

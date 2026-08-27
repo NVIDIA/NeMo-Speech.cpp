@@ -104,8 +104,7 @@ magpietts_infer_tokenizer_profile(const magpietts_hparams& h) {
 }
 
 inline bool
-magpietts_tokenizer_profile_matches(
-    const std::string& profile, const magpietts_hparams& h) {
+magpietts_tokenizer_profile_matches(const std::string& profile, const magpietts_hparams& h) {
     return profile == magpietts_infer_tokenizer_profile(h) && !profile.empty();
 }
 

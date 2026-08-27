@@ -502,8 +502,7 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             "magpietts.decoder.runtime.slot_ids");
         std::vector<ggml_tensor*> alignment_outputs;
 
-        for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size());
-             ++layer_index) {
+        for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size()); ++layer_index) {
             const magpietts_layer& layer = tr.layers[layer_index];
             ggml_tensor* residual = x;
             ggml_tensor* cur = layer_norm(ctx, x, layer.norm_self);
@@ -518,27 +517,26 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             ggml_tensor* q = split_heads(0);
             ggml_tensor* k = split_heads(static_cast<size_t>(tr.n_embd) * element);
             ggml_tensor* v = split_heads(static_cast<size_t>(2 * tr.n_embd) * element);
-            auto kv = session->model_tensor_container->get_tensor_by_name(
-                runtime_kv_name(layer_index));
+            auto kv =
+                session->model_tensor_container->get_tensor_by_name(runtime_kv_name(layer_index));
             ggml_tensor* heads = ggml_fused_attn_cached(
                 ctx, q, k, v, nullptr, kv.tensor, slots.tensor, cache_meta.tensor, cache_len_,
                 1.0f / std::sqrt(static_cast<float>(d_head)), true);
             ggml_tensor* merged = ggml_reshape_2d(
-                ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), tr.n_embd,
-                kMagpieCfgLanes);
+                ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), tr.n_embd, kMagpieCfgLanes);
             x = ggml_add(ctx, residual, linear(ctx, layer.self_o, merged));
 
             // Text cross-attention applies only to the conditional lane.
             if (tr.has_cross && layer.has_cross) {
                 ggml_tensor* cond = ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0);
-                ggml_tensor* uncond =
-                    ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]);
+                ggml_tensor* uncond = ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]);
                 ggml_tensor* cross_in = layer_norm(ctx, cond, layer.norm_xattn_query);
                 ggml_tensor* last_attn = nullptr;
-                const bool apply_prior = tr.apply_attention_prior &&
-                                         runtime_layer_selected(tr.apply_prior_to_layers, layer_index);
-                const bool collect = runtime_layer_selected(
-                    tr.estimate_alignment_from_layers, layer_index);
+                const bool apply_prior =
+                    tr.apply_attention_prior &&
+                    runtime_layer_selected(tr.apply_prior_to_layers, layer_index);
+                const bool collect =
+                    runtime_layer_selected(tr.estimate_alignment_from_layers, layer_index);
                 ggml_tensor* cross = cross_attention_cached(
                     ctx, tr, layer, cross_kv_, layer_index, cross_in,
                     apply_prior ? prior.tensor : nullptr, collect ? &last_attn : nullptr, true);
@@ -556,12 +554,13 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             cur = causal_conv1d(ctx, cur, layer.ff_out);
             x = ggml_add(ctx, residual, cur);
         }
-        if (tr.norm_out) x = layer_norm(ctx, x, tr.norm_out);
+        if (tr.norm_out)
+            x = layer_norm(ctx, x, tr.norm_out);
 
-        ggml_tensor* cond = ggml_cont_2d(
-            ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0), tr.n_embd, 1);
-        ggml_tensor* uncond = ggml_cont_2d(
-            ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]), tr.n_embd, 1);
+        ggml_tensor* cond =
+            ggml_cont_2d(ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0), tr.n_embd, 1);
+        ggml_tensor* uncond =
+            ggml_cont_2d(ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]), tr.n_embd, 1);
         ggml_set_name(cond, "magpietts_decoder_runtime_hidden_cond");
         ggml_set_name(uncond, "magpietts_decoder_runtime_hidden_uncond");
         ggml_runtime::TensorBag outputs;
@@ -584,9 +583,7 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
                 sum = sum ? ggml_add(ctx, sum, per_layer) : per_layer;
             }
             ggml_tensor* mean = ggml_scale(
-                ctx, sum,
-                1.0f /
-                    static_cast<float>(alignment_outputs.size() * tr.n_cross_head));
+                ctx, sum, 1.0f / static_cast<float>(alignment_outputs.size() * tr.n_cross_head));
             ggml_set_name(mean, "magpietts_decoder_runtime_alignment_mean");
             outputs.add_tensor({mean, bf_ctx.buft});
         }
@@ -648,12 +645,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
         ggml_context* ctx = new_graph_context();
         const size_t element = sizeof(float);
-        const size_t source_layer_bytes =
-            static_cast<size_t>(cond.n_ctx) * cond.n_embd * element;
+        const size_t source_layer_bytes = static_cast<size_t>(cond.n_ctx) * cond.n_embd * element;
         const size_t copy_elements = static_cast<size_t>(cond.n_tokens) * cond.n_embd;
         const size_t destination_token = static_cast<size_t>(cache_len_ - cond.n_tokens);
         for (int layer = 0; layer < cond.n_layers; ++layer) {
-            auto arena = session_.model_tensor_container->get_tensor_by_name(runtime_kv_name(layer));
+            auto arena =
+                session_.model_tensor_container->get_tensor_by_name(runtime_kv_name(layer));
             for (int plane = 0; plane < 2; ++plane) {
                 ggml_tensor* dst_base = arena.tensor;
                 ggml_tensor* cond_src_base = plane == 0 ? cond.memory_k : cond.memory_v;
@@ -663,10 +660,9 @@ class MagpieDecoder::PersistentDecoderRuntime {
                     ggml_tensor* src = ggml_view_1d(
                         ctx, const_cast<ggml_tensor*>(sources[lane]), copy_elements,
                         static_cast<size_t>(layer) * source_layer_bytes);
-                    const size_t dst_offset =
-                        static_cast<size_t>(plane) * dst_base->nb[2] +
-                        static_cast<size_t>(lane) * dst_base->nb[1] +
-                        destination_token * cond.n_embd * element;
+                    const size_t dst_offset = static_cast<size_t>(plane) * dst_base->nb[2] +
+                                              static_cast<size_t>(lane) * dst_base->nb[1] +
+                                              destination_token * cond.n_embd * element;
                     ggml_tensor* dst = ggml_view_1d(ctx, dst_base, copy_elements, dst_offset);
                     ggml_backend_tensor_copy_async(model_.backend, model_.backend, src, dst);
                 }
@@ -682,24 +678,26 @@ class MagpieDecoder::PersistentDecoderRuntime {
     bool eval(
         const std::vector<std::vector<int32_t>>& audio_codes, DecoderKvCache& cond_kv,
         DecoderKvCache& uncond_kv, decoder_result& cond_result, decoder_result& uncond_result,
-        magpietts_backend_tensor* cond_hidden_out,
-        magpietts_backend_tensor* uncond_hidden_out,
+        magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out,
         const magpietts_decoder_attention* attention) {
         const ggml_nvtx::range nvtx_range("magpietts_persistent_decoder_eval");
         const magpietts_hparams& h = model_.hparams;
         if (!cond_hidden_out || !uncond_hidden_out || !cond_hidden_out->tensor ||
-            !uncond_hidden_out->tensor || static_cast<int>(audio_codes.size()) != h.audio_codebooks ||
-            audio_codes.empty()) {
+            !uncond_hidden_out->tensor ||
+            static_cast<int>(audio_codes.size()) != h.audio_codebooks || audio_codes.empty()) {
             return false;
         }
         const size_t raw_len = audio_codes[0].size();
-        if (raw_len == 0 || raw_len % h.frame_stacking_factor != 0) return false;
+        if (raw_len == 0 || raw_len % h.frame_stacking_factor != 0)
+            return false;
         for (const auto& codes : audio_codes) {
-            if (codes.size() != raw_len) return false;
+            if (codes.size() != raw_len)
+                return false;
         }
-        const int total_len = h.baked_context_length +
-                              static_cast<int>(raw_len / h.frame_stacking_factor);
-        if (total_len != n_tokens_ + 1 || n_tokens_ >= cache_len_) return false;
+        const int total_len =
+            h.baked_context_length + static_cast<int>(raw_len / h.frame_stacking_factor);
+        if (total_len != n_tokens_ + 1 || n_tokens_ >= cache_len_)
+            return false;
 
         std::vector<int32_t> tokens(static_cast<size_t>(h.stacked_audio_codebooks()));
         const size_t frame_start = raw_len - static_cast<size_t>(h.frame_stacking_factor);
@@ -716,7 +714,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
             ring_head_, ring_head_, valid_tokens_, valid_tokens_};
         std::vector<float> log_prior(static_cast<size_t>(text_len_), 0.0f);
         if (attention && attention->prior) {
-            if (static_cast<int>(attention->prior->size()) != text_len_) return false;
+            if (static_cast<int>(attention->prior->size()) != text_len_)
+                return false;
             for (int i = 0; i < text_len_; ++i) {
                 log_prior[static_cast<size_t>(i)] =
                     std::log(std::max((*attention->prior)[static_cast<size_t>(i)], 1.0e-20f));
@@ -724,10 +723,14 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
 
         std::vector<ggml_runtime::Session::Input> inputs = {
-            {"magpietts.decoder.runtime.tokens", GGML_TYPE_I32, tokens.data(),
+            {"magpietts.decoder.runtime.tokens",
+             GGML_TYPE_I32,
+             tokens.data(),
              {h.stacked_audio_codebooks()}},
             {"magpietts.decoder.runtime.position", GGML_TYPE_I32, &position, {1}},
-            {"magpietts.decoder.runtime.cache_meta", GGML_TYPE_I32, cache_meta,
+            {"magpietts.decoder.runtime.cache_meta",
+             GGML_TYPE_I32,
+             cache_meta,
              {kMagpieCfgLanes, 2}},
             {"magpietts.decoder.runtime.prior", GGML_TYPE_F32, log_prior.data(), {text_len_}}};
 
@@ -852,15 +855,14 @@ MagpieDecoder::evalCachedPair(
                     "MagpieTTS decoder runtime: fixed-shape CUDA graph, CFG batch=2, "
                     "device K/V arena enabled\n");
             }
-            if (persistent_runtime_ &&
-                !persistent_runtime_->sequence_matches(cond_kv.n_tokens)) {
+            if (persistent_runtime_ && !persistent_runtime_->sequence_matches(cond_kv.n_tokens)) {
                 // Reuse the graph and reseed the cache suffix.
                 persistent_runtime_->seed(cond_kv, uncond_kv);
             }
-            if (persistent_runtime_ && persistent_runtime_->eval(
-                                           audio_codes, cond_kv, uncond_kv, cond_result,
-                                           uncond_result, cond_hidden_out, uncond_hidden_out,
-                                           attention)) {
+            if (persistent_runtime_ &&
+                persistent_runtime_->eval(
+                    audio_codes, cond_kv, uncond_kv, cond_result, uncond_result, cond_hidden_out,
+                    uncond_hidden_out, attention)) {
                 return true;
             }
             persistent_runtime_.reset();
