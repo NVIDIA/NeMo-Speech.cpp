@@ -76,5 +76,27 @@ main() {
         std::fprintf(stderr, "unexpected EOS lane\n");
         return 1;
     }
+
+    h.max_decoder_steps = 5;
+    int emitted_frames = 0;
+    int final_position_frames = 0;
+    const int decoder_positions =
+        (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+    for (int step = 0; step < decoder_positions; ++step) {
+        const int frames_remaining =
+            h.max_decoder_steps - step * h.frame_stacking_factor;
+        final_position_frames = tts::magpietts_frames_to_emit(
+            frames_remaining, h.frame_stacking_factor, -1);
+        emitted_frames += final_position_frames;
+    }
+    if (emitted_frames != h.max_decoder_steps || final_position_frames != 1) {
+        std::fprintf(stderr, "non-divisible decoder frame budget was exceeded\n");
+        return 1;
+    }
+    if (tts::magpietts_frames_to_emit(1, h.frame_stacking_factor, 0) != 0 ||
+        tts::magpietts_frames_to_emit(1, h.frame_stacking_factor, 1) != 1) {
+        std::fprintf(stderr, "partial final stacked frame did not preserve EOS handling\n");
+        return 1;
+    }
     return 0;
 }

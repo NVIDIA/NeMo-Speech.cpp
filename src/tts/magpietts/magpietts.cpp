@@ -1329,6 +1329,11 @@ stream_magpie_to_audio(
                 (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
             for (int step = 0; step < max_decoder_positions; ++step) {
                 const ggml_nvtx::range nvtx_step("magpietts_stream_generation_step");
+                const int frames_remaining =
+                    h.max_decoder_steps - step * h.frame_stacking_factor;
+                if (frames_remaining <= 0) {
+                    break;
+                }
                 if (codec_worker.is_failed()) {
                     codec_worker.join();
                     return false;
@@ -1366,7 +1371,8 @@ stream_magpie_to_audio(
                                        ? decoder.evalCachedPair(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond_kv, uncond_kv, cond, uncond,
-                                             nullptr, &text_cond_device, &cond_hidden_device,
+                                             max_decoder_positions, nullptr, &text_cond_device,
+                                             &cond_hidden_device,
                                              &uncond_hidden_device, &cond_cross_kv,
                                              decoder_attention_arg)
                                        : decoder.evalPair(
@@ -1419,8 +1425,8 @@ stream_magpie_to_audio(
                                        ? decoder.evalCachedPair(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond_kv, uncond_kv, cond, uncond,
-                                             &cuda_sample, &text_cond_device, nullptr, nullptr,
-                                             &cond_cross_kv, decoder_attention_arg)
+                                             max_decoder_positions, &cuda_sample, &text_cond_device,
+                                             nullptr, nullptr, &cond_cross_kv, decoder_attention_arg)
                                        : decoder.evalPair(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond, uncond, &cuda_sample,
@@ -1454,9 +1460,9 @@ stream_magpie_to_audio(
                             params.use_kv_cache
                                 ? decoder.evalCachedPair(
                                       text_cond, text_len, audio_codes, params.speaker,
-                                      params.threads, cond_kv, uncond_kv, cond, uncond, nullptr,
-                                      nullptr, nullptr, nullptr, &cond_cross_kv,
-                                      decoder_attention_arg)
+                                      params.threads, cond_kv, uncond_kv, cond, uncond,
+                                      max_decoder_positions, nullptr, nullptr, nullptr, nullptr,
+                                      &cond_cross_kv, decoder_attention_arg)
                                 : decoder.evalPair(
                                       text_cond, text_len, audio_codes, params.speaker,
                                       params.threads, cond, uncond, nullptr, nullptr, nullptr,
@@ -1562,7 +1568,7 @@ stream_magpie_to_audio(
                 }
                 const int eos_lane =
                     forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
-                const bool has_eos = eos_lane >= 0;
+                const bool has_eos = eos_lane >= 0 && eos_lane < frames_remaining;
                 bool terminate_after_frame = false;
                 if (has_eos) {
                     ggml_nvtx::mark("magpietts_stream_eos");
@@ -1598,7 +1604,8 @@ stream_magpie_to_audio(
                 }
 
                 decoder_frames_generated += h.frame_stacking_factor;
-                const int frames_to_emit = has_eos ? eos_lane : h.frame_stacking_factor;
+                const int frames_to_emit = magpietts_frames_to_emit(
+                    frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
                 if (!suppress_nonfinal_codec_output) {
                     for (int lane = 0; lane < frames_to_emit; ++lane) {
                         const auto& frame = codec_frames[(size_t)lane];

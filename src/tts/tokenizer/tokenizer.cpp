@@ -500,7 +500,9 @@ load_tokenizer_profile(const fs::path& root) {
                     "nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers."
                     "JapanesePhonemeTokenizer",
                     "false", "true");
-                require_block_value(blocks, item.name, "ascii_letter_case", item.ascii_letter_case);
+                require_block_value(
+                    blocks, item.name, "ascii_letter_case",
+                    profile.id == "v2602" ? "upper" : "lower");
                 break;
             case tokenizer_kind::arabic:
                 require_common_tokenizer_values(

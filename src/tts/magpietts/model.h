@@ -12,6 +12,7 @@
 #include "magpietts_cuda_sampling.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -142,6 +143,15 @@ magpietts_first_eos_lane(
         }
     }
     return -1;
+}
+
+inline int
+magpietts_frames_to_emit(int frames_remaining, int frame_stacking_factor, int eos_lane) {
+    if (frames_remaining <= 0 || frame_stacking_factor <= 0) {
+        return 0;
+    }
+    const int available_frames = eos_lane >= 0 ? eos_lane : frame_stacking_factor;
+    return std::min(frames_remaining, std::max(0, available_frames));
 }
 
 struct magpietts_layer {
