@@ -736,8 +736,7 @@ magpietts_model_load_impl(
             static_cast<long long>(stacked_audio_codebooks_64));
         return false;
     }
-    const int32_t expected_stacked_codebooks =
-        static_cast<int32_t>(stacked_audio_codebooks_64);
+    const int32_t expected_stacked_codebooks = static_cast<int32_t>(stacked_audio_codebooks_64);
     model.tokenizer_profile = gguf_string(model.gguf, "magpietts.tokenizer_profile");
     model.nemo_version = gguf_string(model.gguf, "magpietts.nemo_version");
     const int32_t stored_stacked_codebooks =
@@ -2030,8 +2029,7 @@ MagpieCodeGenerator::generate(
         for (int step = 0; step < max_decoder_positions; ++step) {
             const ggml_nvtx::range nvtx_step("magpietts_generate_step");
             const int64_t frame_start_us = ggml_time_us();
-            const int frames_remaining =
-                h.max_decoder_steps - step * h.frame_stacking_factor;
+            const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
             if (frames_remaining <= 0) {
                 break;
             }
@@ -2065,8 +2063,7 @@ MagpieCodeGenerator::generate(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                          params.threads, cond_kv, uncond_kv, cond, uncond,
                                          max_decoder_positions, nullptr, &text_cond_device,
-                                         &cond_hidden_device,
-                                         &uncond_hidden_device, &cond_cross_kv,
+                                         &cond_hidden_device, &uncond_hidden_device, &cond_cross_kv,
                                          decoder_attention_arg)
                                    : decoder.evalPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
@@ -2205,8 +2202,8 @@ MagpieCodeGenerator::generate(
                     audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
                 }
             }
-            const int frames_to_emit = magpietts_frames_to_emit(
-                frames_remaining, h.frame_stacking_factor, eos_lane);
+            const int frames_to_emit =
+                magpietts_frames_to_emit(frames_remaining, h.frame_stacking_factor, eos_lane);
             for (int lane = 0; lane < frames_to_emit; ++lane) {
                 generated_frames.push_back(codec_frames[(size_t)lane]);
             }
@@ -2220,8 +2217,7 @@ MagpieCodeGenerator::generate(
                 bool first_frame = false;
                 const double inter_ms =
                     metrics.record_frame(frame_done_us, first_frame, frames_to_emit);
-                const double frame_latency_ms =
-                    (double)(frame_done_us - frame_start_us) / 1000.0;
+                const double frame_latency_ms = (double)(frame_done_us - frame_start_us) / 1000.0;
                 if (step < 4 || step % 10 == 0) {
                     if (first_frame) {
                         fprintf(
