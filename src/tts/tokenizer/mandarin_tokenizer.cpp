@@ -160,10 +160,16 @@ class mandarin_tokenizer::impl {
             throw std::runtime_error(
                 "failed to find Mandarin G2P data; set MAGPIE_MANDARIN_G2P_DIR");
         }
+        const bool configured_phoneme_dict = !phoneme_dict.empty();
         const fs::path phoneme_path =
-            phoneme_dict.empty() ? find_phoneme_dict(model_dir) : model_dir / phoneme_dict;
+            configured_phoneme_dict ? model_dir / phoneme_dict : find_phoneme_dict(model_dir);
         if (!fs::is_regular_file(phoneme_path)) {
-            throw std::runtime_error("failed to find Mandarin pinyin-to-phoneme dictionary");
+            throw std::runtime_error(
+                "failed to find Mandarin pinyin-to-phoneme dictionary at '" +
+                (phoneme_path.empty() ? std::string("<not found>") : phoneme_path.string()) +
+                "' (" +
+                (configured_phoneme_dict ? "configured phoneme_dict" : "automatic discovery") +
+                ")");
         }
 
         segmenter_ = std::make_unique<cppjieba::MixSegment>(

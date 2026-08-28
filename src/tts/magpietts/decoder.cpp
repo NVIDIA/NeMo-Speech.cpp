@@ -613,6 +613,16 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
 
 }  // namespace
 
+static int
+checked_persistent_cache_len(const magpietts_model& model, int stacked_position_budget) {
+    const int64_t cache_len = static_cast<int64_t>(model.hparams.baked_context_length) +
+                              stacked_position_budget - 1;
+    if (cache_len <= 0 || cache_len >= model.hparams.n_ctx) {
+        throw std::runtime_error("invalid persistent Magpie decoder cache length");
+    }
+    return static_cast<int>(cache_len);
+}
+
 class MagpieDecoder::PersistentDecoderRuntime {
    public:
     PersistentDecoderRuntime(
@@ -620,13 +630,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
         int stacked_position_budget)
         : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
           stacked_position_budget_(stacked_position_budget),
-          cache_len_(model.hparams.baked_context_length + stacked_position_budget - 1),
+          cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
           module_(model, cross_kv, text_len, cache_len_),
           session_(backend_manager_, &module_, nullptr) {
-        if (cache_len_ <= 0 || cache_len_ >= model.hparams.n_ctx) {
-            throw std::runtime_error("invalid persistent Magpie decoder cache length");
-        }
         session_.set_run_cache_capacity(1);
         session_.setup();
     }

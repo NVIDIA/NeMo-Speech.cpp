@@ -377,7 +377,7 @@ index a531ce07..4b4a8488 100644
          GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
          return false;
      }
-@@ -3891,6 +3907,88 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3891,6 +3907,89 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -448,9 +448,10 @@ index a531ce07..4b4a8488 100644
 +                          concat->ne[3] == x_snake->ne[3] &&
 +                          alpha->type == GGML_TYPE_F32 &&
 +                          inv_b->type == GGML_TYPE_F32 &&
-+                          ggml_are_same_shape(alpha, inv_b) &&
-+                          alpha->ne[0] == 1 &&
-+                          alpha->ne[1] == x_snake->ne[1] &&
++                          ggml_is_contiguous(alpha) &&
++                          ggml_is_contiguous(inv_b) &&
++                          ggml_nelements(alpha) == x_snake->ne[1] &&
++                          ggml_nelements(inv_b) == x_snake->ne[1] &&
 +                          ggml_is_contiguous(x_snake) &&
 +                          ggml_is_contiguous(view_l) &&
 +                          ggml_is_contiguous(concat);

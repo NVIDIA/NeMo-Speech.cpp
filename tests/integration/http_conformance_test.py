@@ -51,6 +51,16 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def wait_for_log_entry(log_file, start: int, marker: bytes, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        size = os.fstat(log_file.fileno()).st_size
+        if size > start and marker in os.pread(log_file.fileno(), size - start, start):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def test_javascript_client(args: argparse.Namespace, base: str, api_key: str) -> None:
     javascript = (args.node, args.openai_js_package, args.openai_js_example)
     if not any(javascript):
@@ -131,7 +141,7 @@ def main() -> None:
         if value:
             command.extend((option, value))
     if args.tts_preempt:
-        command.append("--tts.preempt")
+        command.extend(("--tts.preempt", "--verbose"))
 
     server_log = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     process = subprocess.Popen(
@@ -422,10 +432,7 @@ def main() -> None:
             )
             require(response.status_code == 400, "invalid TTS sample rate was accepted")
             if args.tts_preempt:
-                first_started = threading.Event()
-
                 def synthesize_long_text() -> tuple[int, bytes]:
-                    first_started.set()
                     with httpx.Client(timeout=args.timeout, trust_env=False) as concurrent_client:
                         response = concurrent_client.post(
                             f"{base}/v1/audio/speech",
@@ -439,10 +446,15 @@ def main() -> None:
                 def collect_first() -> None:
                     first_result.append(synthesize_long_text())
 
+                admission_log_offset = os.fstat(server_log.fileno()).st_size
                 first = threading.Thread(target=collect_first)
                 first.start()
-                require(first_started.wait(5), "long TTS request did not start")
-                time.sleep(0.5)
+                require(
+                    wait_for_log_entry(
+                        server_log, admission_log_offset, b"riva_tts encoding", 5
+                    ),
+                    "long TTS request was not admitted",
+                )
                 with httpx.Client(timeout=args.timeout, trust_env=False) as concurrent_client:
                     latest = concurrent_client.post(
                         f"{base}/v1/audio/speech",

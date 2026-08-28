@@ -137,18 +137,25 @@ def tokenizer_profile(cfg: dict[str, Any], text_vocab: int, frame_stacking: int)
     if str(cfg.get("nemo_version", "")) != TOKENIZER_PROFILE_NEMO_VERSIONS[profile]:
         raise ValueError(f"unsupported {profile} nemo_version: {cfg.get('nemo_version')!r}")
     for name, target in TOKENIZER_TARGETS[profile].items():
-        if tokenizers[name].get("_target_") != target:
+        tokenizer = tokenizers.get(name)
+        actual_target = tokenizer.get("_target_") if isinstance(tokenizer, dict) else None
+        if actual_target != target:
             raise ValueError(
                 f"unsupported {profile} tokenizer target for {name}: "
-                f"{tokenizers[name].get('_target_')!r}"
+                f"{actual_target!r}"
             )
     expected_japanese_case = "upper" if profile == "v2602" else "lower"
-    japanese_case = tokenizers["japanese_phoneme"].get("g2p", {}).get("ascii_letter_case")
+    japanese_g2p = tokenizers["japanese_phoneme"].get("g2p")
+    japanese_case = (
+        japanese_g2p.get("ascii_letter_case") if isinstance(japanese_g2p, dict) else None
+    )
     if japanese_case != expected_japanese_case:
         raise ValueError(f"unsupported {profile} Japanese ascii_letter_case: {japanese_case!r}")
     if profile == "v2607":
         hindi = tokenizers["hindi_phoneme"]
-        if hindi.get("locale") != "hi-IN" or hindi.get("g2p", {}).get("locale") != "hi-IN":
+        hindi_g2p = hindi.get("g2p")
+        hindi_g2p_locale = hindi_g2p.get("locale") if isinstance(hindi_g2p, dict) else None
+        if hindi.get("locale") != "hi-IN" or hindi_g2p_locale != "hi-IN":
             raise ValueError("unsupported v2607 Hindi IPA locale")
         if tokenizers["portuguese_Brazilian_phoneme"].get("locale_specific_punct") is not False:
             raise ValueError("unsupported v2607 Portuguese punctuation mode")

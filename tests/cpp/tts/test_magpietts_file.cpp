@@ -283,9 +283,9 @@ main(int argc, char** argv) {
                 token_chunks.push_back(chunk.tokens);
             }
             std::fprintf(
-                stderr, "benchmark_text=\"%s\" language=%s tokenizer=%s tokens=%zu chunks=%zu\n",
-                params.text.c_str(), tokenized.language.c_str(), tokenized.tokenizer_name.c_str(),
-                params.tokens.size(), token_chunks.size());
+                stderr, "language=%s tokenizer=%s tokens=%zu chunks=%zu\n",
+                tokenized.language.c_str(), tokenized.tokenizer_name.c_str(), params.tokens.size(),
+                token_chunks.size());
         }
         catch (const std::exception& e) {
             std::fprintf(stderr, "failed to tokenize benchmark text: %s\n", e.what());

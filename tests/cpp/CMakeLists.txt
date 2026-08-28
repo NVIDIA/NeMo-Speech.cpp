@@ -82,7 +82,10 @@ if(TARGET nemo_speech_cli)
             set(nemo_speech_http_tts_conformance OFF)
             if(NEMO_SPEECH_BUILD_TTS AND DEFINED ENV{NEMO_SPEECH_TEST_TTS_MODEL} AND
                DEFINED ENV{NEMO_SPEECH_TEST_CODEC_MODEL} AND
-               DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR})
+               DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR} AND
+               NOT "$ENV{NEMO_SPEECH_TEST_TTS_MODEL}" STREQUAL "" AND
+               NOT "$ENV{NEMO_SPEECH_TEST_CODEC_MODEL}" STREQUAL "" AND
+               NOT "$ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR}" STREQUAL "")
                 set(nemo_speech_http_tts_conformance ON)
                 list(APPEND http_conformance_args
                     --tts-model $ENV{NEMO_SPEECH_TEST_TTS_MODEL}

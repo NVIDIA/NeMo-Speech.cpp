@@ -78,6 +78,8 @@ def main() -> None:
         if "--cors-origin" in serve_help.stdout:
             if has_tts_options:
                 assert "--tts.preempt" in serve_help.stdout
+            else:
+                assert "--tts.preempt" not in serve_help.stdout
             with socket.socket() as stalled_server:
                 stalled_server.bind(("127.0.0.1", 0))
                 stalled_server.listen()

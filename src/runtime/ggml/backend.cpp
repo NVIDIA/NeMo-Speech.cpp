@@ -49,57 +49,55 @@ BackendManager::init_backends() {
     GGMLF_LOG_INFO("Found %zu devices.\n", dev_count);
 
     ggml_backend_dev_t dev = nullptr;
-    if (params.use_gpu) {
-        if (borrowed_gpu_backend_ != nullptr) {
-            dev = ggml_backend_get_device(borrowed_gpu_backend_);
-            const auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
-            if (dev == nullptr || (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
-                                   dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-                throw std::runtime_error("borrowed GPU backend is not a GPU device");
-            }
-            auto* buft = ggml_backend_dev_buffer_type(dev);
-            if (buft) {
-                buft_list.emplace_back(dev, buft);
-            }
-            gpu_backend = borrowed_gpu_backend_;
-            GGMLF_LOG_INFO("Using borrowed GPU backend: %s\n", ggml_backend_name(gpu_backend));
-        } else {
-            int idx = 0;
-            for (int i = 0; i < dev_count; i++) {
-                ggml_backend_dev_t dev_cur = ggml_backend_dev_get(i);
-                GGMLF_LOG_INFO("Device %d: %s\n", i, ggml_backend_dev_name(dev_cur));
-                const auto dev_type = ggml_backend_dev_type(dev_cur);
-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
-                    dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    // Register buffer types only for the selected device.
-                    if (idx == params.gpu_device_idx) {
-                        dev = dev_cur;
-                        auto* buft = ggml_backend_dev_buffer_type(dev);
-                        if (buft) {
-                            buft_list.emplace_back(dev, buft);
-                        }
-                    }
-
-                    if (++idx > params.gpu_device_idx) {
-                        break;
+    if (borrowed_gpu_backend_ != nullptr) {
+        dev = ggml_backend_get_device(borrowed_gpu_backend_);
+        const auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (dev == nullptr || (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                               dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            throw std::runtime_error("borrowed GPU backend is not a GPU device");
+        }
+        auto* buft = ggml_backend_dev_buffer_type(dev);
+        if (buft) {
+            buft_list.emplace_back(dev, buft);
+        }
+        gpu_backend = borrowed_gpu_backend_;
+        GGMLF_LOG_INFO("Using borrowed GPU backend: %s\n", ggml_backend_name(gpu_backend));
+    } else if (params.use_gpu) {
+        int idx = 0;
+        for (int i = 0; i < dev_count; i++) {
+            ggml_backend_dev_t dev_cur = ggml_backend_dev_get(i);
+            GGMLF_LOG_INFO("Device %d: %s\n", i, ggml_backend_dev_name(dev_cur));
+            const auto dev_type = ggml_backend_dev_type(dev_cur);
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                // Register buffer types only for the selected device.
+                if (idx == params.gpu_device_idx) {
+                    dev = dev_cur;
+                    auto* buft = ggml_backend_dev_buffer_type(dev);
+                    if (buft) {
+                        buft_list.emplace_back(dev, buft);
                     }
                 }
+
+                if (++idx > params.gpu_device_idx) {
+                    break;
+                }
             }
-            if (dev == nullptr) {
-                throw std::runtime_error(
-                    "use_gpu=true but no matching GPU device found (gpu_device_idx=" +
-                    std::to_string(params.gpu_device_idx) + ")");
-            }
-            GGMLF_LOG_INFO("Using GPU backend: %s\n", ggml_backend_dev_name(dev));
-            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-            if (backend == nullptr) {
-                throw std::runtime_error(
-                    std::string("use_gpu=true but ggml_backend_dev_init failed for ") +
-                    ggml_backend_dev_name(dev));
-            }
-            gpu_backend = backend;
-            backends.emplace_back(backend);
         }
+        if (dev == nullptr) {
+            throw std::runtime_error(
+                "use_gpu=true but no matching GPU device found (gpu_device_idx=" +
+                std::to_string(params.gpu_device_idx) + ")");
+        }
+        GGMLF_LOG_INFO("Using GPU backend: %s\n", ggml_backend_dev_name(dev));
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (backend == nullptr) {
+            throw std::runtime_error(
+                std::string("use_gpu=true but ggml_backend_dev_init failed for ") +
+                ggml_backend_dev_name(dev));
+        }
+        gpu_backend = backend;
+        backends.emplace_back(backend);
     }
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

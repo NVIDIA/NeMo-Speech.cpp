@@ -429,22 +429,11 @@ load_tokenizer_profile(const fs::path& root) {
         if (profile.language_mapping != expected_mapping) {
             throw std::runtime_error("unsupported v2607 language_to_tokenizer_mapping");
         }
-        profile.language_mapping = {
-            {"en", "english_phoneme"},
-            {"de", "german_phoneme"},
-            {"es", "spanish_phoneme"},
-            {"fr", "french_chartokenizer"},
-            {"it", "italian_chartokenizer"},
-            {"vi", "vietnamese_chartokenizer"},
-            {"zh", "mandarin_phoneme"},
-            {"hi", "hindi_phoneme"},
-            {"ja", "japanese_phoneme"},
-            {"pt-br", "portuguese_Brazilian_phoneme"},
-            {"ko", "korean_chartokenizer"},
-            {"ar-ae", "arabic_AE_chartokenizer"},
-            {"ar-sa", "arabic_SA_chartokenizer"},
-            {"ar-msa", "arabic_MSA_chartokenizer"},
-        };
+        profile.language_mapping.clear();
+        for (const auto& [language, tokenizer] : expected_mapping) {
+            profile.language_mapping.emplace(
+                MagpieNativeTokenizer::normalize_language_code(language), tokenizer);
+        }
         if (profile.nemo_version != "2.8.0rc0") {
             throw std::runtime_error(
                 "unsupported v2607 nemo_version '" + profile.nemo_version + "'");

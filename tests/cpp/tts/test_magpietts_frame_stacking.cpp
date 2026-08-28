@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -98,6 +99,18 @@ main() {
     if (tts::magpietts_frames_to_emit(1, h.frame_stacking_factor, 0) != 0 ||
         tts::magpietts_frames_to_emit(1, h.frame_stacking_factor, 1) != 1) {
         std::fprintf(stderr, "partial final stacked frame did not preserve EOS handling\n");
+        return 1;
+    }
+
+    tts::magpietts_run_metrics metrics;
+    metrics.begin();
+    bool first_frame = false;
+    metrics.record_frame(metrics.start_us + 1000, first_frame, 2);
+    metrics.record_frame(metrics.start_us + 4000, first_frame, 1);
+    if (metrics.frames != 3 || metrics.timing_events != 2 ||
+        std::abs(metrics.inter_frame_avg_ms() - 3.0) > 1e-9 ||
+        std::abs(metrics.inter_frame_min_value_ms() - 3.0) > 1e-9) {
+        std::fprintf(stderr, "stacked frame metrics accounting failed\n");
         return 1;
     }
     return 0;
