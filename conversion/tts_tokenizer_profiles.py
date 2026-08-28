@@ -141,8 +141,7 @@ def tokenizer_profile(cfg: dict[str, Any], text_vocab: int, frame_stacking: int)
         actual_target = tokenizer.get("_target_") if isinstance(tokenizer, dict) else None
         if actual_target != target:
             raise ValueError(
-                f"unsupported {profile} tokenizer target for {name}: "
-                f"{actual_target!r}"
+                f"unsupported {profile} tokenizer target for {name}: " f"{actual_target!r}"
             )
     expected_japanese_case = "upper" if profile == "v2602" else "lower"
     japanese_g2p = tokenizers["japanese_phoneme"].get("g2p")

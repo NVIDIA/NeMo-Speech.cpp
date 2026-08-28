@@ -99,11 +99,9 @@ main() {
         const auto buffer_types = manager.get_buft_list();
         if (manager.gpu_backend_handle() != backend ||
             std::find(backends.begin(), backends.end(), backend) == backends.end() ||
-            std::none_of(
-                buffer_types.begin(), buffer_types.end(),
-                [backend](const auto& item) {
-                    return item.first == ggml_backend_get_device(backend);
-                })) {
+            std::none_of(buffer_types.begin(), buffer_types.end(), [backend](const auto& item) {
+                return item.first == ggml_backend_get_device(backend);
+            })) {
             std::fprintf(stderr, "FAIL: borrowed CUDA backend was not registered\n");
             ggml_backend_free(backend);
             return 1;

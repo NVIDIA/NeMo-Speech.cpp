@@ -615,8 +615,8 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
 
 static int
 checked_persistent_cache_len(const magpietts_model& model, int stacked_position_budget) {
-    const int64_t cache_len = static_cast<int64_t>(model.hparams.baked_context_length) +
-                              stacked_position_budget - 1;
+    const int64_t cache_len =
+        static_cast<int64_t>(model.hparams.baked_context_length) + stacked_position_budget - 1;
     if (cache_len <= 0 || cache_len >= model.hparams.n_ctx) {
         throw std::runtime_error("invalid persistent Magpie decoder cache length");
     }

@@ -432,6 +432,7 @@ def main() -> None:
             )
             require(response.status_code == 400, "invalid TTS sample rate was accepted")
             if args.tts_preempt:
+
                 def synthesize_long_text() -> tuple[int, bytes]:
                     with httpx.Client(timeout=args.timeout, trust_env=False) as concurrent_client:
                         response = concurrent_client.post(
@@ -450,9 +451,7 @@ def main() -> None:
                 first = threading.Thread(target=collect_first)
                 first.start()
                 require(
-                    wait_for_log_entry(
-                        server_log, admission_log_offset, b"riva_tts encoding", 5
-                    ),
+                    wait_for_log_entry(server_log, admission_log_offset, b"riva_tts encoding", 5),
                     "long TTS request was not admitted",
                 )
                 with httpx.Client(timeout=args.timeout, trust_env=False) as concurrent_client:
