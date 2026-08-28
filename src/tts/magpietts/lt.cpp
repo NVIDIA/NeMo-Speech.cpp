@@ -1185,8 +1185,7 @@ magpietts_stack_forced_code_frames(
         return false;
     }
 
-    const int64_t stacked_count =
-        static_cast<int64_t>(h.audio_codebooks) * h.frame_stacking_factor;
+    const int64_t stacked_count = static_cast<int64_t>(h.audio_codebooks) * h.frame_stacking_factor;
     if (stacked_count > std::numeric_limits<int32_t>::max()) {
         fprintf(
             stderr, "forced-code layout has too many stacked codebooks: %lld\n",

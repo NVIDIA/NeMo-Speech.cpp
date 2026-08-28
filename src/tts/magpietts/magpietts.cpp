@@ -1329,8 +1329,7 @@ stream_magpie_to_audio(
                 (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
             for (int step = 0; step < max_decoder_positions; ++step) {
                 const ggml_nvtx::range nvtx_step("magpietts_stream_generation_step");
-                const int frames_remaining =
-                    h.max_decoder_steps - step * h.frame_stacking_factor;
+                const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
                 if (frames_remaining <= 0) {
                     break;
                 }
@@ -1372,9 +1371,8 @@ stream_magpie_to_audio(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond_kv, uncond_kv, cond, uncond,
                                              max_decoder_positions, nullptr, &text_cond_device,
-                                             &cond_hidden_device,
-                                             &uncond_hidden_device, &cond_cross_kv,
-                                             decoder_attention_arg)
+                                             &cond_hidden_device, &uncond_hidden_device,
+                                             &cond_cross_kv, decoder_attention_arg)
                                        : decoder.evalPair(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond, uncond, nullptr,
@@ -1426,7 +1424,8 @@ stream_magpie_to_audio(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond_kv, uncond_kv, cond, uncond,
                                              max_decoder_positions, &cuda_sample, &text_cond_device,
-                                             nullptr, nullptr, &cond_cross_kv, decoder_attention_arg)
+                                             nullptr, nullptr, &cond_cross_kv,
+                                             decoder_attention_arg)
                                        : decoder.evalPair(
                                              text_cond, text_len, audio_codes, params.speaker,
                                              params.threads, cond, uncond, &cuda_sample,

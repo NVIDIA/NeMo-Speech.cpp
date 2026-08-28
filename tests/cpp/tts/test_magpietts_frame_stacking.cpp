@@ -56,15 +56,13 @@ main() {
     }
     const std::vector<std::vector<int32_t>> incomplete_forced_frames = {
         {10, 11}, {20, 21}, {30, 31}};
-    if (tts::magpietts_stack_forced_code_frames(
-            incomplete_forced_frames, 0, h, stacked_forced) ||
+    if (tts::magpietts_stack_forced_code_frames(incomplete_forced_frames, 0, h, stacked_forced) ||
         !stacked_forced.empty()) {
         std::fprintf(stderr, "incomplete forced-code frame group was accepted\n");
         return 1;
     }
     const std::vector<std::vector<int32_t>> malformed_forced_frames = {{10}, {20, 21}};
-    if (tts::magpietts_stack_forced_code_frames(
-            malformed_forced_frames, 0, h, stacked_forced)) {
+    if (tts::magpietts_stack_forced_code_frames(malformed_forced_frames, 0, h, stacked_forced)) {
         std::fprintf(stderr, "malformed forced-code frame was accepted\n");
         return 1;
     }
@@ -86,10 +84,9 @@ main() {
     const int decoder_positions =
         (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
     for (int step = 0; step < decoder_positions; ++step) {
-        const int frames_remaining =
-            h.max_decoder_steps - step * h.frame_stacking_factor;
-        final_position_frames = tts::magpietts_frames_to_emit(
-            frames_remaining, h.frame_stacking_factor, -1);
+        const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
+        final_position_frames =
+            tts::magpietts_frames_to_emit(frames_remaining, h.frame_stacking_factor, -1);
         emitted_frames += final_position_frames;
     }
     if (emitted_frames != h.max_decoder_steps || final_position_frames != 1) {
