@@ -322,7 +322,10 @@ GrpcTtsService::GetRivaSynthesisConfig(
                 grpc::StatusCode::NOT_FOUND, "unknown TTS model '" + req->model_name() + "'");
         }
 
-        const std::vector<std::string> language_codes = synthesizer_->supported_language_codes();
+        std::vector<std::string> language_codes = synthesizer_->supported_language_codes();
+        if (language_codes.empty()) {
+            language_codes.push_back(synthesizer_->default_language_code());
+        }
         const std::vector<std::string> speaker_names = synthesizer_->speaker_names();
         const std::vector<std::string> dotted_voices =
             dotted_voice_names(synthesizer_->model_name(), speaker_names);

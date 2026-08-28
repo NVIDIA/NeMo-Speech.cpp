@@ -44,7 +44,11 @@ check_unsupported(
         static_cast<void>(tokenizer.tokenize(text, language));
     }
     catch (const std::invalid_argument& error) {
-        return std::string(error.what()).find("unsupported language_code") != std::string::npos;
+        const std::string message = error.what();
+        return message.find("unsupported language_code '" + language + "'") != std::string::npos ||
+               message.find(
+                   "native Magpie tokenizer is not available for language_code '" + language +
+                   "'") != std::string::npos;
     }
     return false;
 }

@@ -8,6 +8,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "runtime/ggml/runtime.h"
 #include "tts/magpietts/model.h"
 
 namespace {
@@ -86,8 +87,27 @@ int
 main() {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
-        std::fprintf(stderr, "FAIL: CUDA backend unavailable\n");
-        return 1;
+        std::fprintf(stderr, "SKIP: CUDA backend unavailable\n");
+        return 0;
+    }
+
+    {
+        ggml_runtime::Params params;
+        params.use_gpu = false;
+        ggml_runtime::BackendManager manager(params, backend);
+        const auto backends = manager.get_backends();
+        const auto buffer_types = manager.get_buft_list();
+        if (manager.gpu_backend_handle() != backend ||
+            std::find(backends.begin(), backends.end(), backend) == backends.end() ||
+            std::none_of(
+                buffer_types.begin(), buffer_types.end(),
+                [backend](const auto& item) {
+                    return item.first == ggml_backend_get_device(backend);
+                })) {
+            std::fprintf(stderr, "FAIL: borrowed CUDA backend was not registered\n");
+            ggml_backend_free(backend);
+            return 1;
+        }
     }
 
     nemo_speech::tts::magpietts_model backend_model;

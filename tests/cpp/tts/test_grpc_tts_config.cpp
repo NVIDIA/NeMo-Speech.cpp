@@ -111,7 +111,10 @@ main() {
     synthesizer_config.tokenizer_model_dir = tokenizer_dir;
     synthesizer_config.default_language_code = "en-US";
     auto synthesizer = std::make_shared<tts::Synthesizer>(std::move(synthesizer_config));
-    const std::vector<std::string> supported_languages = synthesizer->supported_language_codes();
+    std::vector<std::string> configured_languages = synthesizer->supported_language_codes();
+    if (configured_languages.empty()) {
+        configured_languages.push_back(synthesizer->default_language_code());
+    }
     nemo_speech::GrpcTtsService service(std::move(synthesizer));
 
     nr_tts::RivaSynthesisConfigRequest req;
@@ -122,7 +125,7 @@ main() {
     bool ok = true;
     ok &= expect(status.ok(), "GetRivaSynthesisConfig succeeds");
     ok &= expect(
-        resp.model_config_size() == static_cast<int>(supported_languages.size()),
+        resp.model_config_size() == static_cast<int>(configured_languages.size()),
         "one TTS model config is returned per supported language");
     if (!ok) {
         return 1;
@@ -143,7 +146,7 @@ main() {
         advertised_languages.push_back(language);
     }
 
-    for (const auto& language : supported_languages) {
+    for (const auto& language : configured_languages) {
         ok &= expect(contains(advertised_languages, language), "supported language is advertised");
     }
 
@@ -160,7 +163,7 @@ main() {
 
     const std::string voices_by_language = param_or_empty(first_params, "voices_by_language");
     const std::string model_prefix = param_or_empty(first_params, "voice_name") + ".";
-    for (const auto& language : supported_languages) {
+    for (const auto& language : configured_languages) {
         const std::string marker = "\"" + language + "\":{\"voices\":[";
         const size_t start = voices_by_language.find(marker);
         ok &= expect(start != std::string::npos, "language has voices_by_language entry");

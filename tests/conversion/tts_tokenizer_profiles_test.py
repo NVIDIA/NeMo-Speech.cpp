@@ -71,6 +71,17 @@ class TtsTokenizerProfilesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Japanese ascii_letter_case"):
             tokenizer_profile(config, 3359, 2)
 
+    def test_null_g2p_mappings_are_rejected(self) -> None:
+        config = self._config("v2602")
+        config["text_tokenizers"]["japanese_phoneme"]["g2p"] = None
+        with self.assertRaisesRegex(ValueError, "Japanese ascii_letter_case"):
+            tokenizer_profile(config, 2362, 1)
+
+        config = self._config("v2607")
+        config["text_tokenizers"]["hindi_phoneme"]["g2p"] = None
+        with self.assertRaisesRegex(ValueError, "Hindi IPA locale"):
+            tokenizer_profile(config, 3359, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

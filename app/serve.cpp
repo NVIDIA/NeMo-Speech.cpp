@@ -622,7 +622,6 @@ print_serve_help(const char* program) {
         "  --read-timeout SEC      Socket read timeout (default: 30)\n"
         "  --write-timeout SEC     Socket write timeout (default: 30)\n"
         "  --access-log            Log completed HTTP requests\n"
-        "  --tts.preempt           Cancel older HTTP TTS synthesis for the newest request\n"
         "  --log-format text|json  Access-log format (--json also selects JSON)\n"
         "  --api-key KEY           Require Authorization: Bearer KEY\n"
         "  --cors-origin ORIGIN    Allow one cross-origin browser origin\n"
@@ -647,6 +646,7 @@ print_serve_help(const char* program) {
         "  --codec-model MODEL     NanoCodec path or indexed model\n"
         "  --tokenizer-dir MODEL   TTS tokenizer directory or indexed model\n"
         "  --tn-model-dir MODEL    Optional TTS text-normalization assets\n"
+        "  --tts.preempt           Cancel older HTTP TTS synthesis for the newest request\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
         "  --nmt-model MODEL       Optional translation model\n"

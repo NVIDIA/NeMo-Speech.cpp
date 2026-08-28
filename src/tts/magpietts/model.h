@@ -381,6 +381,7 @@ struct magpietts_run_metrics {
     int64_t first_frame_us = 0;
     int64_t last_frame_us = 0;
     int frames = 0;
+    int timing_events = 0;
     double inter_frame_sum_ms = 0.0;
     double inter_frame_min_ms = 0.0;
     double inter_frame_max_ms = 0.0;
@@ -391,7 +392,7 @@ struct magpietts_run_metrics {
     double e2e_rtfx = 0.0;
 
     void begin();
-    double record_frame(int64_t now_us, bool& first_frame);
+    double record_frame(int64_t now_us, bool& first_frame, int emitted_frames);
     void finish(size_t frames_generated, double codec_fps);
     double inter_frame_avg_ms() const;
     double inter_frame_min_value_ms() const;

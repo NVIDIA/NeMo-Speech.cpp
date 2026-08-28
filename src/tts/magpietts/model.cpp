@@ -1801,7 +1801,7 @@ magpietts_run_metrics::begin() {
 }
 
 double
-magpietts_run_metrics::record_frame(int64_t now_us, bool& first_frame) {
+magpietts_run_metrics::record_frame(int64_t now_us, bool& first_frame, int emitted_frames) {
     first_frame = first_frame_us == 0;
     double inter_ms = 0.0;
     if (first_frame) {
@@ -1814,7 +1814,8 @@ magpietts_run_metrics::record_frame(int64_t now_us, bool& first_frame) {
         inter_frame_max_ms = std::max(inter_frame_max_ms, inter_ms);
     }
     last_frame_us = now_us;
-    ++frames;
+    frames += emitted_frames;
+    ++timing_events;
     return inter_ms;
 }
 
@@ -1828,12 +1829,12 @@ magpietts_run_metrics::finish(size_t frames_generated, double codec_fps) {
 
 double
 magpietts_run_metrics::inter_frame_avg_ms() const {
-    return frames > 1 ? inter_frame_sum_ms / (double)(frames - 1) : 0.0;
+    return timing_events > 1 ? inter_frame_sum_ms / (double)(timing_events - 1) : 0.0;
 }
 
 double
 magpietts_run_metrics::inter_frame_min_value_ms() const {
-    return frames > 1 ? inter_frame_min_ms : 0.0;
+    return timing_events > 1 ? inter_frame_min_ms : 0.0;
 }
 
 bool
@@ -2214,15 +2215,8 @@ MagpieCodeGenerator::generate(
             if (frames_to_emit > 0) {
                 const int64_t frame_done_us = ggml_time_us();
                 bool first_frame = false;
-                double inter_ms = 0.0;
-                for (int lane = 0; lane < frames_to_emit; ++lane) {
-                    bool lane_is_first = false;
-                    const double lane_inter_ms = metrics.record_frame(frame_done_us, lane_is_first);
-                    if (lane == 0) {
-                        first_frame = lane_is_first;
-                        inter_ms = lane_inter_ms;
-                    }
-                }
+                const double inter_ms =
+                    metrics.record_frame(frame_done_us, first_frame, frames_to_emit);
                 const double frame_latency_ms = (double)(frame_done_us - frame_start_us) / 1000.0;
                 if (step < 4 || step % 10 == 0) {
                     if (first_frame) {
