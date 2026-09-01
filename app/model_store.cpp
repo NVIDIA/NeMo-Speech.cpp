@@ -285,8 +285,7 @@ void
 validate_revision(const std::string& revision, const std::string& description) {
     if (revision.size() != 40 ||
         revision.find_first_not_of("0123456789abcdef") != std::string::npos)
-        throw std::runtime_error(
-            "model index revision must be a full commit SHA: " + description);
+        throw std::runtime_error("model index revision must be a full commit SHA: " + description);
 }
 
 bool
@@ -348,8 +347,7 @@ load_index() {
             if (allowed_roles.find(artifact.role) == allowed_roles.end())
                 throw std::runtime_error("unsupported artifact role in model index");
             if (!artifact.revision.empty())
-                validate_revision(
-                    artifact.revision, model.repo + "/" + artifact.role);
+                validate_revision(artifact.revision, model.repo + "/" + artifact.role);
             if (!artifact_roles.insert(artifact.role).second)
                 throw std::runtime_error(
                     "duplicate artifact role in model index: " + model.repo + "/" + artifact.role);
@@ -1024,8 +1022,8 @@ materialize(const Model& model, const Artifact& artifact) {
             stderr,
             "[model] downloading %s@%.12s (%s, %.1f MiB)\n"
             "[model] license: %s — %s\n",
-            model.repo.c_str(), revision.c_str(), artifact.role.c_str(),
-            artifact.size / 1048576.0, model.license.c_str(), model.license_url.c_str());
+            model.repo.c_str(), revision.c_str(), artifact.role.c_str(), artifact.size / 1048576.0,
+            model.license.c_str(), model.license_url.c_str());
     }
     const fs::path partial = directory / (artifact.filename + ".partial");
     if (!valid_file(partial, artifact)) {
