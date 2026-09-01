@@ -1,0 +1,4 @@
+numpy>=1.26,<3
+soundfile>=0.12,<1
+urllib3>=2,<3
+websockets>=15,<18

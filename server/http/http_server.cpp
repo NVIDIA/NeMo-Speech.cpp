@@ -26,6 +26,9 @@
 #include "engine_registry.h"
 #include "json.h"
 #include "subtitles.h"
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+#include "s2s_realtime.h"
+#endif
 
 namespace nemo_speech::http {
 namespace {
@@ -65,7 +68,7 @@ document.getElementById('diarize').onclick=async()=>{const f=document.getElement
     R"HTML(let live={};const liveOut=document.getElementById('asr-output'),listen=document.getElementById('listen'),stopListen=document.getElementById('stop-listening');
 const stopCapture=async()=>{live.processor?.disconnect();live.source?.disconnect();live.media?.getTracks().forEach(t=>t.stop());if(live.context?.state!=='closed')await live.context.close()};
 const resetLive=()=>{listen.disabled=false;stopListen.disabled=true;busy('asr-status',0)};
-listen.onclick=async()=>{try{const media=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true},video:false}),context=new AudioContext(),source=context.createMediaStreamSource(media),processor=context.createScriptProcessor(4096,1,1),speakers=asrSpeakers.checked,scheme=location.protocol==='https:'?'wss':'ws',key=new URLSearchParams(location.search).get('api_key'),url=`${scheme}://${location.host}/v1/realtime${key?'?api_key='+encodeURIComponent(key):''}`,socket=new WebSocket(url);socket.binaryType='arraybuffer';const render=()=>{const final=(live.finals||[]).join('\n');liveOut.textContent=final+(final&&live.partial?'\n':'')+(live.partial||'')};socket.onopen=()=>socket.send(JSON.stringify({type:'session.update',session:{sample_rate:context.sampleRate,language:document.getElementById('asr-lang').value,automatic_punctuation:true,word_timestamps:speakers,speaker_diarization:speakers}}));socket.onmessage=e=>{const m=JSON.parse(e.data);if(m.type.endsWith('.delta')){live.partial=(live.partial||'')+(m.delta||'');render()}else if(m.type.endsWith('.completed')){live.finals.push(speakers?speakerTranscript(m.words,m.transcript||''):(m.transcript||''));live.partial='';render();if(m.words)timeline('asr-timeline',m.words)}else if(m.type==='input_audio_buffer.committed'){socket.close()}else if(m.type==='error'){liveOut.textContent=m.error.message;if(live.stopping)socket.close()}};socket.onclose=resetLive;processor.onaudioprocess=e=>{if(socket.readyState!==1||live.stopping)return;const f=e.inputBuffer.getChannelData(0),p=new Int16Array(f.length);for(let i=0;i<f.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(f[i]*32767)));socket.send(p.buffer)};source.connect(processor);processor.connect(context.destination);live={media,context,source,processor,socket,finals:[],partial:'',stopping:false};listen.disabled=true;stopListen.disabled=false;busy('asr-status',1,'Listening…')}catch(e){liveOut.textContent=e;resetLive()}};
+listen.onclick=async()=>{try{const media=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true},video:false}),context=new AudioContext(),source=context.createMediaStreamSource(media),processor=context.createScriptProcessor(4096,1,1),speakers=asrSpeakers.checked,scheme=location.protocol==='https:'?'wss':'ws',key=new URLSearchParams(location.search).get('api_key'),url=`${scheme}://${location.host}/v1/audio/transcriptions/realtime${key?'?api_key='+encodeURIComponent(key):''}`,socket=new WebSocket(url);socket.binaryType='arraybuffer';const render=()=>{const final=(live.finals||[]).join('\n');liveOut.textContent=final+(final&&live.partial?'\n':'')+(live.partial||'')};socket.onopen=()=>socket.send(JSON.stringify({type:'session.update',session:{sample_rate:context.sampleRate,language:document.getElementById('asr-lang').value,automatic_punctuation:true,word_timestamps:speakers,speaker_diarization:speakers}}));socket.onmessage=e=>{const m=JSON.parse(e.data);if(m.type.endsWith('.delta')){live.partial=(live.partial||'')+(m.delta||'');render()}else if(m.type.endsWith('.completed')){live.finals.push(speakers?speakerTranscript(m.words,m.transcript||''):(m.transcript||''));live.partial='';render();if(m.words)timeline('asr-timeline',m.words)}else if(m.type==='input_audio_buffer.committed'){socket.close()}else if(m.type==='error'){liveOut.textContent=m.error.message;if(live.stopping)socket.close()}};socket.onclose=resetLive;processor.onaudioprocess=e=>{if(socket.readyState!==1||live.stopping)return;const f=e.inputBuffer.getChannelData(0),p=new Int16Array(f.length);for(let i=0;i<f.length;i++)p[i]=Math.max(-32768,Math.min(32767,Math.round(f[i]*32767)));socket.send(p.buffer)};source.connect(processor);processor.connect(context.destination);live={media,context,source,processor,socket,finals:[],partial:'',stopping:false};listen.disabled=true;stopListen.disabled=false;busy('asr-status',1,'Listening…')}catch(e){liveOut.textContent=e;resetLive()}};
 stopListen.onclick=async()=>{if(live.stopping)return;live.stopping=true;stopListen.disabled=true;busy('asr-status',1,'Finalizing…');await stopCapture();if(live.socket?.readyState===1)live.socket.send(JSON.stringify({type:'input_audio_buffer.commit'}));else{live.socket?.close();resetLive()}};
 document.getElementById('speak').onclick=async()=>{busy('tts-status',1);try{const r=await apiFetch('/v1/audio/speech',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({input:document.getElementById('tts-text').value,language:document.getElementById('tts-lang').value,voice:document.getElementById('tts-voice').value,response_format:'wav'})});if(!r.ok)throw Error(await r.text());const audio=await r.blob();downloadable('download-tts','speech.wav',audio,'audio/wav');document.getElementById('tts-audio').src=downloads['download-tts']}catch(e){alert(e)}finally{busy('tts-status',0)}};
 document.getElementById('translate').onclick=async()=>{busy('nmt-status',1);try{const r=await apiFetch('/v1/translations',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({input:document.getElementById('nmt-text').value,source_language:document.getElementById('nmt-from').value,target_language:document.getElementById('nmt-to').value})});const t=await r.text();if(!r.ok)throw Error(t);const j=JSON.parse(t);document.getElementById('nmt-output').textContent=j.translations.map(x=>x.text).join('\n')}catch(e){document.getElementById('nmt-output').textContent=e}finally{busy('nmt-status',0)}};
@@ -443,10 +446,11 @@ struct Server::Impl {
                 response.set_header("X-Request-Id", std::to_string(request_id.fetch_add(1)));
                 if (this->config.api_key.empty() || request.method == "OPTIONS" ||
                     request.path == "/" || request.path == "/health" || request.path == "/ready" ||
-                    request.path == "/version")
+                    request.path == "/version" || request.path == "/v1/realtime/health")
                     return httplib::Server::HandlerResponse::Unhandled;
                 const std::string expected = "Bearer " + this->config.api_key;
                 const bool is_realtime = request.path == "/v1/realtime" ||
+                                         request.path == "/realtime" ||
                                          request.path == "/v1/audio/transcriptions/realtime";
                 const bool query_authorized =
                     is_realtime && request.has_param("api_key") &&
@@ -502,6 +506,24 @@ struct Server::Impl {
             response.status = this->models.ready() ? 200 : 503;
             response.set_content(body.dump(), "application/json");
         });
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+        server->Get(
+            "/v1/realtime/health", [this](const httplib::Request&, httplib::Response& response) {
+                Value body(Value::Object{});
+                bool ready = false;
+                try {
+                    ready = static_cast<bool>(this->models.voicechat());
+                }
+                catch (...) {
+                }
+                body["status"] = ready ? "ok" : "error";
+                body["service"] = "nemotron-voicechat-websocket-server";
+                body["mode"] = "native";
+                body["model_status"] = ready ? "ready" : "not_ready";
+                response.status = ready ? 200 : 503;
+                response.set_content(body.dump(), "application/json");
+            });
+#endif
         server->Get("/ready", [this](const httplib::Request&, httplib::Response& response) {
             Value body(Value::Object{});
             body["ready"] = this->models.ready();
@@ -579,6 +601,20 @@ struct Server::Impl {
                 item["object"] = "model";
                 item["owned_by"] = "local";
                 item["capability"] = "translation";
+                item["device"] = this->models.device_label();
+                data.emplace_back(std::move(item));
+            }
+            catch (const std::exception&) {
+            }
+#endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+            try {
+                (void)this->models.voicechat();
+                Value item(Value::Object{});
+                item["id"] = "nemotron-voicechat";
+                item["object"] = "model";
+                item["owned_by"] = "local";
+                item["capability"] = "realtime-speech-to-speech";
                 item["device"] = this->models.device_label();
                 data.emplace_back(std::move(item));
             }
@@ -965,6 +1001,15 @@ struct Server::Impl {
         server->Post("/v1/diarizations", diarize);
         server->Post("/v1/audio/diarizations", std::move(diarize));
 
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+        std::shared_ptr<s2s::VoiceChat> voicechat;
+        try {
+            voicechat = this->models.voicechat();
+        }
+        catch (const std::exception&) {
+        }
+#endif
+
 #if defined(NEMO_SPEECH_REGISTRY_ASR)
         auto realtime = [this](const httplib::Request& request, httplib::ws::WebSocket& socket) {
             if (!this->config.api_key.empty()) {
@@ -1151,8 +1196,21 @@ struct Server::Impl {
                 }
             }
         };
-        server->WebSocket("/v1/realtime", realtime);
-        server->WebSocket("/v1/audio/transcriptions/realtime", std::move(realtime));
+        server->WebSocket("/v1/audio/transcriptions/realtime", realtime);
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+        if (!voicechat)
+#endif
+            server->WebSocket("/v1/realtime", std::move(realtime));
+#endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+        if (voicechat) {
+            auto realtime_s2s =
+                [this, voicechat](const httplib::Request& request, httplib::ws::WebSocket& socket) {
+                    handle_s2s_realtime(request, socket, voicechat, this->config, request_id);
+                };
+            server->WebSocket("/v1/realtime", realtime_s2s, select_s2s_subprotocol);
+            server->WebSocket("/realtime", std::move(realtime_s2s), select_s2s_subprotocol);
+        }
 #endif
     }
 };

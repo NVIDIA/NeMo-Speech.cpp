@@ -28,6 +28,8 @@ struct ServerConfig {
     std::string api_key;
     std::string cors_origin;
     bool enable_playground = true;
+    int realtime_s2s_max_session_seconds = 300;
+    bool realtime_s2s_output_text_events = false;
 };
 
 class Server {

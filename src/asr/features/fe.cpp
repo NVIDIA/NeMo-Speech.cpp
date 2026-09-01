@@ -234,9 +234,12 @@ class MelSpectrogramExtractor::GpuBatcher {
               return owner_->compute_gpu_batch_via_session(std::move(requests));
           }) {}
 
-    BatchResult run(const float* audio, size_t n_samples, bool reflect_left, bool normalize) {
+    BatchResult run(
+        const float* audio, size_t n_samples, size_t valid_samples, bool reflect_left,
+        bool normalize) {
         BatchRequest request;
         request.audio.assign(audio, audio + n_samples);
+        request.valid_samples = valid_samples;
         request.reflect_left = reflect_left;
         request.normalize = normalize;
         return queue_.run({n_samples, reflect_left, normalize}, std::move(request));
@@ -358,6 +361,15 @@ void
 MelSpectrogramExtractor::compute(
     const float* audio, size_t n_samples, std::vector<float>& features, int& n_frames,
     bool reflect_left, bool normalize) const {
+    compute_padded(audio, n_samples, n_samples, features, n_frames, reflect_left, normalize);
+}
+
+void
+MelSpectrogramExtractor::compute_padded(
+    const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& features,
+    int& n_frames, bool reflect_left, bool normalize) const {
+    if (valid_samples > n_samples)
+        throw std::invalid_argument("valid audio length exceeds padded length");
     // `normalize` is a call-site request (streaming can explicitly suppress
     // utterance normalization); the model metadata is authoritative about
     // whether normalization exists at all.
@@ -385,11 +397,12 @@ MelSpectrogramExtractor::compute(
     // CPU-only builds fall through to the radix-2 FFT path below.
     if (n_samples > 0 && session_) {
         if (batcher_) {
-            auto result = batcher_->run(audio, n_samples, reflect_left, normalize);
+            auto result = batcher_->run(audio, n_samples, valid_samples, reflect_left, normalize);
             features = std::move(result.features);
             n_frames = result.n_frames;
         } else {
-            compute_gpu_via_session(audio, n_samples, features, n_frames, reflect_left, normalize);
+            compute_gpu_via_session(
+                audio, n_samples, valid_samples, features, n_frames, reflect_left, normalize);
         }
         return;
     }
@@ -401,9 +414,10 @@ MelSpectrogramExtractor::compute(
     // framing. Matches NeMo's order (`preemph(audio)` then `torch.stft`);
     // applying it after padding biases the reflected/zero edges. First sample
     // kept as `y[0] = x[0]`.
-    std::vector<float> pre(audio, audio + n_samples);
-    if (cfg_.preemph != 0.0f && n_samples >= 2) {
-        for (size_t i = n_samples - 1; i > 0; --i) {
+    std::vector<float> pre(n_samples, 0.0f);
+    std::copy_n(audio, valid_samples, pre.data());
+    if (cfg_.preemph != 0.0f && valid_samples >= 2) {
+        for (size_t i = valid_samples - 1; i > 0; --i) {
             pre[i] = pre[i] - cfg_.preemph * pre[i - 1];
         }
     }
@@ -466,7 +480,7 @@ MelSpectrogramExtractor::compute(
         }
     }
 
-    const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
+    const int valid = std::min(static_cast<int>(valid_samples) / hop, n_frames);
     if (cfg_.mask_invalid_frames) {
         for (int f = valid; f < n_frames; ++f) {
             std::fill_n(features.data() + static_cast<size_t>(f) * cfg_.n_mels, cfg_.n_mels, 0.0f);
@@ -578,10 +592,11 @@ read_wav_mono_16k(const std::string& path, std::vector<float>& out_samples, int&
 
 void
 MelSpectrogramExtractor::compute_gpu_via_session(
-    const float* audio, size_t n_samples, std::vector<float>& features, int& n_frames,
-    bool reflect_left, bool normalize) const {
+    const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& features,
+    int& n_frames, bool reflect_left, bool normalize) const {
     BatchRequest request;
     request.audio.assign(audio, audio + n_samples);
+    request.valid_samples = valid_samples;
     request.reflect_left = reflect_left;
     request.normalize = normalize;
     std::vector<BatchRequest> requests;
@@ -616,18 +631,19 @@ MelSpectrogramExtractor::compute_gpu_batch_via_session(std::vector<BatchRequest>
     std::vector<float> pre(input_item * requests.size(), 0.0f);
     for (size_t b = 0; b < requests.size(); ++b) {
         const auto& request = requests[b];
-        if (request.audio.size() != n_samples || request.reflect_left != reflect_left ||
-            request.normalize != normalize)
+        if (request.audio.size() != n_samples || request.valid_samples > n_samples ||
+            request.reflect_left != reflect_left || request.normalize != normalize)
             throw std::runtime_error("GPU frontend batch contains incompatible inputs");
         float* dst = pre.data() + b * input_item;
-        if (n_samples == 0)
+        if (request.valid_samples == 0)
             continue;
         dst[0] = request.audio[0];
         if (cfg_.preemph != 0.0f) {
-            for (size_t i = 1; i < n_samples; ++i)
+            for (size_t i = 1; i < request.valid_samples; ++i)
                 dst[i] = request.audio[i] - cfg_.preemph * request.audio[i - 1];
-        } else if (n_samples > 1) {
-            std::memcpy(dst + 1, request.audio.data() + 1, (n_samples - 1) * sizeof(float));
+        } else if (request.valid_samples > 1) {
+            std::memcpy(
+                dst + 1, request.audio.data() + 1, (request.valid_samples - 1) * sizeof(float));
         }
     }
 
@@ -664,7 +680,7 @@ MelSpectrogramExtractor::compute_gpu_batch_via_session(std::vector<BatchRequest>
         auto& features = results[b].features;
         results[b].n_frames = n_frames;
         features.assign(packed.begin() + b * output_item, packed.begin() + (b + 1) * output_item);
-        const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
+        const int valid = std::min(static_cast<int>(requests[b].valid_samples) / hop, n_frames);
         if (cfg_.mask_invalid_frames) {
             for (int f = valid; f < n_frames; ++f) {
                 std::fill_n(features.data() + static_cast<size_t>(f) * n_mels, n_mels, 0.0f);

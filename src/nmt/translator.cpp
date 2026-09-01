@@ -5,25 +5,22 @@
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
-#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 
-#include "ggml_log_filter.h"
 #include "langpairs.h"
 #include "llama.h"
+#include "model_logging.h"
 
 namespace nemo_speech::nmt {
 
 namespace {
 
-GgmlLogFilter llama_logs;
-
 void
 configure_llama_logging(bool verbose) {
-    llama_logs.set_verbose(verbose);
-    llama_log_set(GgmlLogFilter::callback, &llama_logs);
+    common::ensure_ggml_logging(verbose);
+    llama_log_set(common::model_log_callback, nullptr);
 }
 
 void

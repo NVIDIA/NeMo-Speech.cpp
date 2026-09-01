@@ -127,6 +127,10 @@ endif()
 
 set(GENERATED_SRCS)
 foreach(proto ${PROTO_FILES})
+    set(proto_root ${RIVA_PROTO_DIR})
+    if(proto MATCHES "^nemotron/")
+        set(proto_root ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
     get_filename_component(proto_dir ${proto} DIRECTORY)
     get_filename_component(proto_we  ${proto} NAME_WE)
     set(pb_cc   ${GEN_DIR}/${proto_dir}/${proto_we}.pb.cc)
@@ -137,12 +141,12 @@ foreach(proto ${PROTO_FILES})
     add_custom_command(
         OUTPUT ${pb_cc} ${pb_h} ${grpc_cc} ${grpc_h}
         COMMAND ${_PROTOC_CMD}
-            --proto_path=${RIVA_PROTO_DIR}
+            --proto_path=${proto_root}
             --cpp_out=${GEN_DIR}
             --grpc_out=${GEN_DIR}
             --plugin=protoc-gen-grpc=${_GRPC_PLUGIN}
-            ${RIVA_PROTO_DIR}/${proto}
-        DEPENDS ${RIVA_PROTO_DIR}/${proto}
+            ${proto_root}/${proto}
+        DEPENDS ${proto_root}/${proto}
         COMMENT "protoc ${proto}"
         VERBATIM
     )

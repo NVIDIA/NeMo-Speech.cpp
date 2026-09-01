@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Validate a source checkout, apply the pinned ggml CUDA patches when needed,
-# and configure one of the supported CMake presets.
+# Validate a source checkout, apply the pinned ggml CUDA and llama.cpp patches
+# when needed, and configure one of the supported CMake presets.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,7 +12,7 @@ Usage: scripts/configure.sh [PRESET] [CMAKE_OPTION ...]
 
 Valid presets:
   cpu-asr cpu-diar cpu-tts cpu-nmt cpu-speech cpu-server
-  cuda-asr cuda-diar cuda-tts cuda-nmt cuda-speech cuda-server cuda-full
+  cuda-asr cuda-diar cuda-tts cuda-nmt cuda-speech cuda-server cuda-s2s cuda-full
   metal-asr metal-diar metal-tts metal-nmt metal-speech metal-server
   vulkan-asr vulkan-diar vulkan-tts vulkan-nmt vulkan-speech vulkan-server
   developer
@@ -22,7 +22,8 @@ Examples:
   scripts/configure.sh cuda-server -DNEMO_SPEECH_WITH_NORM=ON
 
 The script checks required submodules and optional feature assets, applies the
-pinned ggml patch series for CUDA and Metal presets, and then runs cmake --preset PRESET.
+pinned ggml patch series for CUDA and Metal presets and the llama.cpp batching
+patch series when required, and then runs cmake --preset PRESET.
 EOF
     exit 0
 fi
@@ -36,7 +37,7 @@ fi
 
 case "$PRESET" in
     cpu-asr|cpu-diar|cpu-tts|cpu-nmt|cpu-speech|cpu-server|\
-    cuda-asr|cuda-diar|cuda-tts|cuda-nmt|cuda-speech|cuda-server|cuda-full|\
+    cuda-asr|cuda-diar|cuda-tts|cuda-nmt|cuda-speech|cuda-server|cuda-s2s|cuda-full|\
     metal-asr|metal-diar|metal-tts|metal-nmt|metal-speech|metal-server|\
     vulkan-asr|vulkan-diar|vulkan-tts|vulkan-nmt|vulkan-speech|vulkan-server|\
     developer) ;;
@@ -77,6 +78,7 @@ cmake_bool_override() { # cmake_bool_override VARIABLE DEFAULT ARGS...
 
 need_nmt=OFF
 need_asr=OFF
+need_s2s=OFF
 need_grpc=OFF
 need_http=OFF
 need_flashlight=OFF
@@ -89,10 +91,13 @@ case "$PRESET" in
     *-asr|*-speech|*-server|cuda-full|developer) need_asr=ON ;;
 esac
 case "$PRESET" in
+    cuda-s2s) need_s2s=ON ;;
+esac
+case "$PRESET" in
     cuda-full|developer) need_grpc=ON ;;
 esac
 case "$PRESET" in
-    *-server|cuda-full|developer) need_http=ON ;;
+    *-server|cuda-s2s|cuda-full|developer) need_http=ON ;;
 esac
 if [ "$PRESET" = cuda-full ]; then
     need_flashlight=ON
@@ -103,6 +108,7 @@ fi
 need_nmt="$(cmake_bool_override NEMO_SPEECH_BUILD_NMT "$need_nmt" "$@")"
 need_nmt="$(cmake_bool_override NEMO_SPEECH_WITH_NMT "$need_nmt" "$@")"
 need_asr="$(cmake_bool_override NEMO_SPEECH_BUILD_ASR "$need_asr" "$@")"
+need_s2s="$(cmake_bool_override NEMO_SPEECH_BUILD_S2S "$need_s2s" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_BUILD_GRPC "$need_grpc" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_WITH_GRPC "$need_grpc" "$@")"
 need_http="$(cmake_bool_override NEMO_SPEECH_BUILD_HTTP "$need_http" "$@")"
@@ -132,7 +138,7 @@ require_submodule() { # require_submodule PATH SENTINEL
 if [ "$need_http" = ON ]; then
     require_submodule third_party/cpp-httplib httplib.h
 fi
-if [ "$need_nmt" = ON ]; then
+if [ "$need_nmt" = ON ] || [ "$need_s2s" = ON ]; then
     require_submodule llama.cpp CMakeLists.txt
 elif [ "$need_asr" = ON ]; then
     require_submodule llama.cpp vendor/miniaudio/miniaudio.h
@@ -165,5 +171,9 @@ case "$PRESET" in
         scripts/apply-ggml-patches.sh
         ;;
 esac
+
+if [ "$need_nmt" = ON ] || [ "$need_s2s" = ON ]; then
+    scripts/apply-llama-patches.sh
+fi
 
 cmake --preset "$PRESET" "$@"

@@ -34,7 +34,7 @@ fi
 # hunk introduced by an earlier patch. Compare the complete worktree state
 # with the result of applying the full series to the pinned submodule commit.
 # Temporary indexes keep both this check and the caller's real index untouched.
-if git -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
+if git -c "safe.directory=${GGML}" -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
     tmp_dir="$(mktemp -d)"
     expected_index="${tmp_dir}/expected.index"
     current_index="${tmp_dir}/current.index"
@@ -43,9 +43,9 @@ if git -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
     }
     trap cleanup_indexes EXIT
 
-    GIT_INDEX_FILE="${expected_index}" git -C "${GGML}" read-tree HEAD
+    GIT_INDEX_FILE="${expected_index}" git -c "safe.directory=${GGML}" -C "${GGML}" read-tree HEAD
     for p in "${patch_files[@]}"; do
-        if ! GIT_INDEX_FILE="${expected_index}" git -C "${GGML}" apply --cached "${p}"; then
+        if ! GIT_INDEX_FILE="${expected_index}" git -c "safe.directory=${GGML}" -C "${GGML}" apply --cached "${p}"; then
             echo "error: $(basename "${p}") does not apply to the pinned ggml commit" >&2
             exit 1
         fi
@@ -55,24 +55,68 @@ if git -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
     patched_paths=()
     while IFS= read -r -d '' path; do
         patched_paths+=("${path}")
-    done < <(GIT_INDEX_FILE="${expected_index}" git -C "${GGML}" \
+    done < <(GIT_INDEX_FILE="${expected_index}" git -c "safe.directory=${GGML}" -C "${GGML}" \
             diff --cached --name-only -z HEAD)
-    GIT_INDEX_FILE="${current_index}" git -C "${GGML}" read-tree HEAD
+    GIT_INDEX_FILE="${current_index}" git -c "safe.directory=${GGML}" -C "${GGML}" read-tree HEAD
     current_paths=()
     for path in "${patched_paths[@]}"; do
         if [ -e "${GGML}/${path}" ] || [ -L "${GGML}/${path}" ] \
-            || git -C "${GGML}" cat-file -e "HEAD:${path}" 2>/dev/null; then
+            || git -c "safe.directory=${GGML}" -C "${GGML}" cat-file -e "HEAD:${path}" 2>/dev/null; then
             current_paths+=("${path}")
         fi
     done
     if [ "${#current_paths[@]}" -ne 0 ]; then
-        GIT_INDEX_FILE="${current_index}" git -C "${GGML}" \
+        GIT_INDEX_FILE="${current_index}" git -c "safe.directory=${GGML}" -C "${GGML}" \
             add -A -- "${current_paths[@]}"
     fi
 
-    expected_tree="$(GIT_INDEX_FILE="${expected_index}" git -C "${GGML}" write-tree)"
-    current_tree="$(GIT_INDEX_FILE="${current_index}" git -C "${GGML}" write-tree)"
+    expected_tree="$(GIT_INDEX_FILE="${expected_index}" git -c "safe.directory=${GGML}" -C "${GGML}" write-tree)"
+    current_tree="$(GIT_INDEX_FILE="${current_index}" git -c "safe.directory=${GGML}" -C "${GGML}" write-tree)"
     if [ "${current_tree}" = "${expected_tree}" ]; then
+        echo "[ggml-patch] current series already applied"
+        echo "[ggml-patch] done"
+        exit 0
+    fi
+else
+    # Docker build contexts intentionally omit the submodule's .git file. Test
+    # the complete applied series in reverse order against a temporary index;
+    # this handles later patches that refine hunks introduced by earlier ones
+    # without changing the copied source tree.
+    tmp_dir="$(mktemp -d)"
+    plain_git_dir="${tmp_dir}/plain.git"
+    plain_index="${tmp_dir}/plain.index"
+    cleanup_plain_index() {
+        rm -rf "${tmp_dir}"
+    }
+    trap cleanup_plain_index EXIT
+
+    git init --bare --quiet "${plain_git_dir}"
+    GIT_INDEX_FILE="${plain_index}" \
+        git --git-dir="${plain_git_dir}" --work-tree="${GGML}" read-tree --empty
+    mapfile -t patched_paths \
+        < <(sed -n -e 's|^--- a/||p' -e 's|^+++ b/||p' "${patch_files[@]}" | sort -u)
+    current_paths=()
+    for path in "${patched_paths[@]}"; do
+        if [ -e "${GGML}/${path}" ] || [ -L "${GGML}/${path}" ]; then
+            current_paths+=("${path}")
+        fi
+    done
+    if [ "${#current_paths[@]}" -ne 0 ]; then
+        GIT_INDEX_FILE="${plain_index}" \
+            git --git-dir="${plain_git_dir}" --work-tree="${GGML}" \
+            add -- "${current_paths[@]}"
+    fi
+
+    series_applied=ON
+    for ((i = ${#patch_files[@]} - 1; i >= 0; --i)); do
+        if ! GIT_INDEX_FILE="${plain_index}" \
+            git --git-dir="${plain_git_dir}" --work-tree="${GGML}" \
+            apply --cached --reverse "${patch_files[i]}" >/dev/null 2>&1; then
+            series_applied=OFF
+            break
+        fi
+    done
+    if [ "${series_applied}" = ON ]; then
         echo "[ggml-patch] current series already applied"
         echo "[ggml-patch] done"
         exit 0
@@ -82,17 +126,17 @@ fi
 for p in "${patch_files[@]}"; do
     name="$(basename "${p}")"
     # Already applied? (the reverse patch applies cleanly) -> skip.
-    if git -C "${GGML}" apply --reverse --check "${p}" >/dev/null 2>&1; then
+    if git -c "safe.directory=${GGML}" -C "${GGML}" apply --reverse --check "${p}" >/dev/null 2>&1; then
         echo "[ggml-patch] ${name}: already applied"
         continue
     fi
-    if ! git -C "${GGML}" apply --check "${p}" >/dev/null 2>&1; then
+    if ! git -c "safe.directory=${GGML}" -C "${GGML}" apply --check "${p}" >/dev/null 2>&1; then
         echo "[ggml-patch] ${name}: does NOT apply cleanly to current ggml" >&2
         echo "             (the tree is modified or contains a stale patch series)" >&2
         echo "             restore the pinned ggml submodule, then retry" >&2
         exit 1
     fi
-    git -C "${GGML}" apply "${p}"
+    git -c "safe.directory=${GGML}" -C "${GGML}" apply "${p}"
     echo "[ggml-patch] ${name}: applied"
 done
 
@@ -101,8 +145,11 @@ done
 # NEW file silently produces an empty diff (untracked files are invisible to
 # `git diff`). Only meaningful on a dev host where ggml is a git repo; the
 # docker build copies ggml without its .git, so skip there.
-if git -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
-    git -C "${GGML}" status --porcelain | awk '$1 == "??" { print $2 }' \
-        | while read -r f; do git -C "${GGML}" add -N "${f}"; done
+if git -c "safe.directory=${GGML}" -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
+    git -c "safe.directory=${GGML}" -C "${GGML}" status --porcelain \
+        | awk '$1 == "??" { print $2 }' \
+        | while read -r f; do
+            git -c "safe.directory=${GGML}" -C "${GGML}" add -N "${f}"
+        done
 fi
 echo "[ggml-patch] done"

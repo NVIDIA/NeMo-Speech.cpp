@@ -303,7 +303,7 @@ def main() -> None:
             sample_rate = audio.getframerate()
             pcm = audio.readframes(audio.getnframes())
         events = []
-        websocket_url = f"ws://127.0.0.1:{port}/v1/realtime?api_key={api_key}"
+        websocket_url = f"ws://127.0.0.1:{port}/v1/audio/transcriptions/realtime?api_key={api_key}"
         with connect(
             websocket_url,
             open_timeout=30,
@@ -369,7 +369,7 @@ def main() -> None:
 
         try:
             with connect(
-                f"ws://127.0.0.1:{port}/v1/realtime",
+                f"ws://127.0.0.1:{port}/v1/audio/transcriptions/realtime",
                 open_timeout=30,
                 close_timeout=10,
                 ping_interval=None,

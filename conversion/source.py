@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-import torch
 import yaml
 
 CHECKPOINT_CONFIG_NAMES = ("model_config.yaml", "config.yaml")
@@ -108,6 +107,8 @@ def read_nemo_config(source: Path) -> dict[str, Any]:
 
 
 def load_state_dict(path: Path, *, weights_only: bool = False) -> dict[str, Any]:
+    import torch
+
     value = torch.load(path, map_location="cpu", weights_only=weights_only)
     if isinstance(value, dict) and "state_dict" in value:
         value = value["state_dict"]

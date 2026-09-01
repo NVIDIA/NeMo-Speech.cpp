@@ -13,8 +13,7 @@
 #include <stdexcept>
 
 #include "audio_file.h"
-#include "ggml.h"
-#include "ggml_log_filter.h"
+#include "model_logging.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -29,7 +28,6 @@ struct CliOutputState {
 };
 
 CliOutputState output_state;
-nemo_speech::GgmlLogFilter dependency_logs;
 
 }  // namespace
 
@@ -272,8 +270,7 @@ open_url_in_browser(const std::string& url) {
 void
 configure_cli_output(bool json, bool quiet, bool verbose) {
     output_state = {json, quiet, verbose};
-    dependency_logs.set_verbose(verbose);
-    ggml_log_set(nemo_speech::GgmlLogFilter::callback, &dependency_logs);
+    nemo_speech::common::configure_ggml_logging(verbose);
 }
 
 bool

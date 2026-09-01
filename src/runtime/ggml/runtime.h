@@ -71,6 +71,10 @@ class GGUFLoader {
     ggml_type get_tensor_type(const std::string& tensor_name);
     // Returns the on-disk rank (1-4), or 0 when the tensor is absent.
     int get_tensor_n_dims(const std::string& tensor_name) const;
+    // Returns the on-disk extents in GGML order, or an empty vector when the
+    // tensor is absent. Modules whose geometry is data-defined (rather than
+    // fully described by metadata keys) use this when declaring weights.
+    std::vector<int64_t> get_tensor_ne(const std::string& tensor_name) const;
     bool has_tensor(const std::string& tensor_name) const;
 
     // Metadata accessors (return `def` if key missing).
@@ -90,6 +94,7 @@ class GGUFLoader {
     std::map<std::string, std::tuple<ggml_type, uint64_t>> m_tensor_infos;
     // Per-tensor on-disk dimensionality.
     std::map<std::string, int> m_tensor_n_dims;
+    std::map<std::string, std::vector<int64_t>> m_tensor_ne;
     std::vector<char> m_tensor_buffer;
 };
 

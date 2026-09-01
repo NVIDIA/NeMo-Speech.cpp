@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .source import list_hugging_face_files, read_nemo_config, resolve_nemo_source
 
-ARCHITECTURES = ("asr", "diarization", "pnc", "vad", "tts", "codec", "nmt")
+ARCHITECTURES = ("asr", "diarization", "pnc", "vad", "tts", "codec", "nmt", "s2s")
 
 
 @dataclass
@@ -29,6 +29,11 @@ class ConversionRequest:
     local_transformer_outtype: str | None = None
     silero_version: str = "6.2.0"
     from_whisper_ggml: Path | None = None
+    llama_cpp: Path | None = None
+    llama_quantize: Path | None = None
+    auto_build_quantizer: bool = True
+    force: bool = False
+    dry_run: bool = False
 
 
 def _architecture_from_config(config: dict) -> str:
@@ -51,6 +56,11 @@ def _architecture_from_config(config: dict) -> str:
 def _resolve_nemo_for_detection(request: ConversionRequest) -> Path | None:
     local = Path(request.source).expanduser()
     if local.exists():
+        if local.is_dir():
+            from . import s2s
+
+            if s2s.is_s2s_source(local):
+                return None
         if local.is_dir() and not any(local.rglob("model_config.yaml")):
             return None
         if local.is_file() and local.suffix.lower() != ".nemo":
@@ -62,6 +72,10 @@ def _resolve_nemo_for_detection(request: ConversionRequest) -> Path | None:
     files = list_hugging_face_files(request.source, request.revision)
     if any(name.endswith(".nemo") for name in files):
         return resolve_nemo_source(request.source, request.cache_dir, request.revision)
+    from . import s2s
+
+    if s2s.is_s2s_file_list(files):
+        return None
     if "config.json" in files or any(name.endswith(".safetensors") for name in files):
         return None
     raise RuntimeError(f"no supported checkpoint found in {request.source}")
@@ -73,6 +87,9 @@ def detect_architecture(request: ConversionRequest) -> tuple[str, Path | None]:
             raise ValueError(f"unknown architecture: {request.architecture}")
         if request.architecture in ("vad", "nmt"):
             return request.architecture, None
+        if request.architecture == "s2s":
+            local = Path(request.source).expanduser()
+            return request.architecture, local.resolve() if local.exists() else None
         return (
             request.architecture,
             resolve_nemo_source(request.source, request.cache_dir, request.revision),
@@ -80,8 +97,25 @@ def detect_architecture(request: ConversionRequest) -> tuple[str, Path | None]:
 
     if request.source.lower() in ("silero", "silero-vad", "vad"):
         return "vad", None
+    local = Path(request.source).expanduser()
+    if local.is_dir():
+        from . import s2s
+
+        if s2s.is_s2s_source(local):
+            return "s2s", local.resolve()
     checkpoint = _resolve_nemo_for_detection(request)
     if checkpoint is None:
+        if local.is_dir():
+            from . import s2s
+
+            if s2s.is_s2s_source(local):
+                return "s2s", local.resolve()
+        elif not local.exists():
+            files = list_hugging_face_files(request.source, request.revision)
+            from . import s2s
+
+            if s2s.is_s2s_file_list(files):
+                return "s2s", None
         return "nmt", None
     return _architecture_from_config(read_nemo_config(checkpoint)), checkpoint
 
@@ -95,10 +129,15 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
         "tts": "f16",
         "codec": "f16",
         "nmt": "f16",
+        "s2s": "q4_k_m",
     }
     value = defaults[architecture] if outtype == "auto" else outtype.lower()
     if value == "fp16":
         value = "f16"
+    if architecture == "s2s":
+        from .s2s import normalize_profile
+
+        value = normalize_profile(value)
     supported = {
         "asr": {"f16", "bf16", "q8_0", "q4_k", "q5_k", "q6_k", "nvfp4", "mxfp4"},
         "diarization": {
@@ -117,6 +156,7 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
         "tts": {"f16", "f32"},
         "codec": {"f16", "f32"},
         "nmt": {"f32", "f16", "bf16", "q8_0", "auto"},
+        "s2s": {"bf16", "q4_k_m", "nvfp4"},
     }
     if value not in supported[architecture]:
         choices = ", ".join(sorted(supported[architecture]))
@@ -125,7 +165,11 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
 
 
 def _convert_nmt(request: ConversionRequest, outtype: str) -> None:
-    script = Path(__file__).resolve().parent.parent / "llama.cpp" / "convert_hf_to_gguf.py"
+    repository = Path(__file__).resolve().parent.parent
+    from .s2s_components.voicechat_source import ensure_llama_checkout
+
+    llama_cpp = ensure_llama_checkout(request.llama_cpp or repository / "llama.cpp", repository)
+    script = llama_cpp / "convert_hf_to_gguf.py"
     source = Path(request.source).expanduser()
     if not source.exists():
         from huggingface_hub import snapshot_download
@@ -200,6 +244,22 @@ def convert_model(request: ConversionRequest) -> str:
 
         assert checkpoint is not None
         codec.convert(checkpoint, request.outfile, outtype, request.metadata_json)
-    else:
+    elif architecture == "nmt":
         _convert_nmt(request, outtype)
+    else:
+        from . import s2s
+
+        s2s.convert(
+            request.source,
+            request.outfile,
+            cache_dir=request.cache_dir,
+            outtype=outtype,
+            revision=request.revision,
+            llama_cpp=request.llama_cpp,
+            quantizer=request.llama_quantize,
+            auto_build_quantizer=request.auto_build_quantizer,
+            force=request.force,
+            dry_run=request.dry_run,
+            metadata_json=request.metadata_json,
+        )
     return architecture

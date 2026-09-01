@@ -66,7 +66,8 @@ optional_model(
         .string();
 }
 
-#if defined(NEMO_SPEECH_CLI_ASR) || defined(NEMO_SPEECH_CLI_NMT) || defined(NEMO_SPEECH_CLI_TTS)
+#if defined(NEMO_SPEECH_CLI_ASR) || defined(NEMO_SPEECH_CLI_NMT) || \
+    defined(NEMO_SPEECH_CLI_TTS) || defined(NEMO_SPEECH_CLI_S2S)
 int
 parse_enablement(const std::string& key, const std::string& value) {
     std::string normalized = value;
@@ -105,6 +106,11 @@ validate_compiled_feature_options(int argc, char** argv) {
             option == "--tn-model-dir" || option.rfind("--tts.", 0) == 0)
             add(option, "NEMO_SPEECH_BUILD_TTS=ON");
 #endif
+#if !defined(NEMO_SPEECH_CLI_S2S)
+        if (option == "--s2s-model-dir" || option == "--s2s-max-streams" ||
+            option.rfind("--s2s.", 0) == 0)
+            add(option, "NEMO_SPEECH_BUILD_S2S=ON");
+#endif
     }
     if (!issues.empty()) {
         std::ostringstream message;
@@ -124,6 +130,7 @@ run_server(int argc, char** argv) {
     bool device_set = false;
     bool no_warmup = false;
     bool open_browser = false;
+    bool http_threads_set = false;
 #if defined(NEMO_SPEECH_CLI_ASR)
     nemo_speech::asr::RecognizerConfig asr_config;
     asr_config.backend.gpu = default_gpu_index();
@@ -146,6 +153,13 @@ run_server(int argc, char** argv) {
     std::string tts_model, codec_model, tokenizer_model, tn_model;
     int tts_enabled = -1;
 #endif
+#if defined(NEMO_SPEECH_CLI_S2S)
+    std::string voicechat_model_dir;
+    int voicechat_enabled = -1;
+    int voicechat_gpu = default_gpu_index();
+    int voicechat_max_streams = 32;
+    bool voicechat_verbose = false;
+#endif
     nemo_speech::common::ParameterParser parser;
     parser.Register(
         "http.enabled",
@@ -165,6 +179,7 @@ run_server(int argc, char** argv) {
         "http.threads",
         [&](const std::string& value) {
             server_config.threads = parse_int(value, "http.threads", 1, 1024);
+            http_threads_set = true;
         },
         "Bounded HTTP worker count");
     parser.Register(
@@ -232,6 +247,37 @@ run_server(int argc, char** argv) {
         "tts.preempt", &server_config.preempt_tts,
         "Cancel older HTTP TTS synthesis when a newer request arrives");
 #endif
+#if defined(NEMO_SPEECH_CLI_S2S)
+    parser.Register(
+        "s2s.enabled",
+        [&](const std::string& value) {
+            voicechat_enabled = parse_enablement("s2s.enabled", value);
+        },
+        "Enable VoiceChat: auto, true, or false");
+    parser.Register(
+        "s2s.model_dir", &voicechat_model_dir, "Converted VoiceChat model-version directory");
+    parser.Register(
+        "s2s.gpu",
+        [&](const std::string& value) { voicechat_gpu = parse_int(value, "s2s.gpu", -1, 1024); },
+        "VoiceChat backend index; -1 selects CPU");
+    parser.Register(
+        "s2s.max_streams",
+        [&](const std::string& value) {
+            voicechat_max_streams = parse_int(value, "s2s.max_streams", 1, 1024);
+        },
+        "Maximum resident VoiceChat conversations");
+    parser.Register("s2s.verbose", &voicechat_verbose, "Enable verbose GGML/llama.cpp logging");
+    parser.Register(
+        "s2s.max_session_seconds",
+        [&](const std::string& value) {
+            server_config.realtime_s2s_max_session_seconds =
+                parse_int(value, "s2s.max_session_seconds", 1, 86400);
+        },
+        "Maximum input-audio duration per realtime session");
+    parser.Register(
+        "s2s.output_text_events", &server_config.realtime_s2s_output_text_events,
+        "Emit legacy response.output_text events");
+#endif
     auto value = [&](int& index, const std::string& option) {
         if (++index >= argc)
             throw std::invalid_argument(option + " requires a value");
@@ -253,6 +299,7 @@ run_server(int argc, char** argv) {
             server_config.port = parse_int(value(i, arg), arg, 1, 65535);
         else if (arg == "--threads") {
             server_config.threads = parse_int(value(i, arg), arg, 1, 1024);
+            http_threads_set = true;
         } else if (arg == "--max-upload-mb")
             server_config.max_upload_bytes =
                 static_cast<size_t>(parse_int(value(i, arg), arg, 1, 16384)) * 1024 * 1024;
@@ -319,6 +366,12 @@ run_server(int argc, char** argv) {
             tokenizer_model = value(i, arg);
         else if (arg == "--tn-model-dir")
             tn_model = value(i, arg);
+#endif
+#if defined(NEMO_SPEECH_CLI_S2S)
+        else if (arg == "--s2s-model-dir")
+            voicechat_model_dir = value(i, arg);
+        else if (arg == "--s2s-max-streams")
+            voicechat_max_streams = parse_int(value(i, arg), arg, 1, 1024);
 #endif
         else if (!arg.empty() && arg.front() == '-') {
             bool consumed = false;
@@ -448,6 +501,27 @@ run_server(int argc, char** argv) {
         });
     }
 #endif
+#if defined(NEMO_SPEECH_CLI_S2S)
+    const bool voicechat_requested = voicechat_enabled > 0 || !voicechat_model_dir.empty();
+    const auto voicechat_path =
+        voicechat_enabled == 0 ? std::string() : resolve("VoiceChat model", [&] {
+            return optional_model(
+                voicechat_model_dir, "", "VoiceChat model directory", voicechat_requested, true);
+        });
+    if (!voicechat_path.empty()) {
+        if (device_set)
+            voicechat_gpu = gpu;
+        if (!http_threads_set)
+            server_config.threads = std::max(server_config.threads, voicechat_max_streams + 2);
+        else if (server_config.threads < voicechat_max_streams) {
+            std::fprintf(
+                stderr,
+                "warning: HTTP worker count (%d) is below s2s.max_streams (%d); "
+                "concurrent WebSocket sessions will be limited by HTTP workers\n",
+                server_config.threads, voicechat_max_streams);
+        }
+    }
+#endif
     if (!server_config.tls_certificate.empty()) {
         if (!std::filesystem::is_regular_file(server_config.tls_certificate))
             validation_errors.push_back(
@@ -475,6 +549,14 @@ run_server(int argc, char** argv) {
 #endif
     nemo_speech::EngineRegistry engines(registry_config);
     engines.set_device_label(device_set ? device_name : "auto");
+#if defined(NEMO_SPEECH_CLI_S2S)
+    if (!voicechat_path.empty()) {
+        auto config = nemo_speech::s2s::voicechat_config_from_model_dir(
+            voicechat_path, voicechat_gpu, voicechat_max_streams);
+        config.verbose = cli_verbose() || voicechat_verbose;
+        engines.load_voicechat(std::move(config));
+    }
+#endif
 #if defined(NEMO_SPEECH_CLI_ASR)
     if (!asr_path.empty())
         engines.load_asr(std::move(asr_config));
@@ -526,7 +608,7 @@ run_server(int argc, char** argv) {
     if (!engines.ready())
         throw std::runtime_error(
             "no models were loaded; pass --asr-model, --diar-model, --tts-model, --nmt-model, "
-            "or --config");
+            "--s2s-model-dir, or --config");
     if (!no_warmup) {
         nemo_speech::WarmupOptions warmup;
 #if defined(NEMO_SPEECH_CLI_TTS)
@@ -630,7 +712,11 @@ print_serve_help(const char* program) {
         "  --no-ui                 Disable the browser playground\n"
         "  --open                  Open the playground in the default browser\n"
         "  --http.* VALUE          Override any HTTP listener setting\n"
-        "                          Realtime ASR: WebSocket /v1/realtime\n\n"
+        "                          Realtime ASR: /v1/audio/transcriptions/realtime\n"
+#if defined(NEMO_SPEECH_CLI_S2S)
+        "                          Realtime VoiceChat: /v1/realtime and /realtime\n"
+#endif
+        "\n"
         "Models:\n"
 #if defined(NEMO_SPEECH_CLI_ASR)
         "  --asr-model MODEL       ASR GGUF path or indexed model\n"
@@ -651,6 +737,10 @@ print_serve_help(const char* program) {
 #if defined(NEMO_SPEECH_CLI_NMT)
         "  --nmt-model MODEL       Optional translation model\n"
 #endif
+#if defined(NEMO_SPEECH_CLI_S2S)
+        "  --s2s-model-dir DIR     Converted VoiceChat model-version directory\n"
+        "  --s2s-max-streams N     Maximum resident VoiceChat conversations\n"
+#endif
         "  --device, --backend DEVICE\n"
         "                          auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
         "  --config FILE           Apply YAML configuration\n"
@@ -662,6 +752,9 @@ print_serve_help(const char* program) {
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
         "  --nmt.* VALUE           Override NMT engine configuration\n"
+#endif
+#if defined(NEMO_SPEECH_CLI_S2S)
+        "  --s2s.* VALUE           Override VoiceChat configuration\n"
 #endif
         "  --no-warmup             Skip engine warmup\n",
         program);

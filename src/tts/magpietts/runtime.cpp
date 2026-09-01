@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "magpietts.h"
+#include "model_logging.h"
 #include "token_utils.h"
 
 namespace nemo_speech::tts {
@@ -103,6 +104,7 @@ class MagpieTtsRuntime::Impl {
    public:
     explicit Impl(MagpieRuntimeConfig config) : config_(std::move(config)) {
         validate_config(config_);
+        nemo_speech::common::ensure_ggml_logging(config_.verbose);
         ggml_time_init();
 
         stream_ = std::make_unique<MagpieStreamingRuntime>();

@@ -7,17 +7,21 @@ pinned llama.cpp converter.
 
 Hugging Face: [nvidia/Riva-Translate-4B-Instruct-v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2)
 
-Unlike the NeMo model converters, NMT conversion requires the pinned llama.cpp
-submodule and its additional Python dependencies. Conversion is run from a
-source checkout; the Python tools are not included in native release archives.
-See [Model conversion](../model-conversion.md) for the base environment setup.
+## Convert
+
+Conversion is run from a source checkout; the Python tools are not included in
+native release archives. Install the root conversion requirements and use the
+unified converter. See [Model conversion](../model-conversion.md) for the base
+environment setup.
 
 ```bash
-git submodule update --init llama.cpp
-python3 -m pip install -r llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+python3 -m pip install -r requirements.txt
 python3 convert_model.py nvidia/Riva-Translate-4B-Instruct-v2 \
     --outfile riva-translate-4b-instruct-v2.q8_0.gguf --outtype q8_0
 ```
+
+The converter initializes the pinned llama.cpp source automatically. A local
+Hugging Face checkpoint directory can be passed instead of the repository ID.
 
 ## Notes
 

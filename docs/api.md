@@ -30,11 +30,12 @@ OpenAI Realtime API.
 | `GET /health`, `GET /ready` | compact health status (`{"status": "ok", ...}`) / detailed readiness (`{"ready": true, ...}`) |
 | `GET /version` | build version |
 | `GET /v1/models` | loaded models and capabilities |
+| `GET /v1/realtime/health` | VoiceChat WebSocket readiness |
 
 ## POST /v1/audio/transcriptions
 
-Speech-to-text (OpenAI-compatible multipart subset). Alias:
-`/v1/audio/transcriptions/realtime` upgrades to the WebSocket protocol below.
+Speech-to-text (OpenAI-compatible multipart subset). Realtime transcription
+uses the `/v1/audio/transcriptions/realtime` WebSocket described below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -61,7 +62,7 @@ Response (`json`): `{"text": "..."}`. `verbose_json` adds `task`, `language`,
 when diarization is on). SRT and WebVTT responses use the same readable,
 punctuation-aware cue grouping as the file CLI.
 
-## WebSocket /v1/realtime
+## WebSocket /v1/audio/transcriptions/realtime
 
 Live PCM16 transcription using a project-specific event protocol. The server
 sends `session.created` on connect. Optionally send one `session.update` JSON
@@ -90,6 +91,59 @@ Server events: `session.created`, `session.updated`,
 `conversation.item.input_audio_transcription.delta` (partials), `.completed`
 (finals, with `words` when requested), `input_audio_buffer.committed`,
 `input_audio_buffer.cleared`, and `error`.
+
+For backward compatibility, `/v1/realtime` serves this transcription protocol
+when VoiceChat is not loaded. Use the explicit audio-namespaced path for new
+transcription clients.
+
+## VoiceChat WebSocket /v1/realtime and /realtime
+
+When a VoiceChat model is loaded, both paths expose the full-duplex Riva
+VoiceChat session protocol used by the reference client and compatible realtime
+integrations. The server sends `session.created` on connection. Send
+`session.update` before audio begins; session configuration is immutable after
+the first audio frame.
+
+`session.audio.input.format` accepts `"pcm16"` or an object such as
+`{"type":"audio/pcm","rate":24000}`. Input must be mono little-endian
+PCM16 at 16-48 kHz. `session.audio.output.format` must select PCM16 at 24 kHz.
+Audio may be sent as binary frames or as base64 in
+`input_audio_buffer.append`. Output is base64 PCM16 in 80 ms
+`response.output_audio.delta` packets.
+
+| `session` field | Type | Default | Description |
+|---|---|---|---|
+| `audio.input.format` | string or object | PCM16 at 24 kHz | client input encoding and rate |
+| `audio.output.format` | string or object | PCM16 at 24 kHz | output encoding; only 24 kHz PCM16 is supported |
+| `instructions` | string | server VoiceChat prompt | system instructions, including conversational policy |
+| `tools` | array or JSON string | `[]` | OpenAI-format tool definitions; `ack_messages` is supported |
+
+Response events include `response.created`,
+`response.output_audio.delta`, `response.output_audio.done`,
+`response.output_audio_transcript.delta`,
+`response.output_audio_transcript.done`, and `response.done`. User turns emit
+`input_audio_buffer.speech_started`, transcription delta/completed events, and
+`input_audio_buffer.speech_stopped`. Every event includes an `event_id`.
+
+Tool requests arrive as `response.function_call_arguments.done`, with
+`call_id`, `name`, and JSON-encoded `arguments`. Return the result on the same
+socket:
+
+```json
+{
+  "type": "conversation.item.create",
+  "item": {
+    "type": "function_call_output",
+    "call_id": "call_123",
+    "output": "{\"status\":\"ok\"}"
+  }
+}
+```
+
+Send `session.close` to finish cleanly. The server drains residual input,
+emits response completion events, then sends `session.end` with received,
+sent, dropped, inference, and audio-duration counters. See the
+[VoiceChat client guide](s2s/clients.md) for the complete event flow.
 
 ## POST /v1/audio/speech
 
