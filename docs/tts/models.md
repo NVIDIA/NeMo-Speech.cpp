@@ -17,10 +17,15 @@ options are omitted.
 Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidia/magpie_tts_multilingual_357m)
 
 ```bash
-# Download the v2602 GGUF and the original archive containing its tokenizer.
+# Download the v2602 GGUF and its matching tokenizer archive from their
+# immutable revisions.
 hf download nvidia/magpie_tts_multilingual_357m \
     --include magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --revision 452ef560f972c38d5fc16476259aac9456453547 \
+    --local-dir models/magpie-tts
+hf download nvidia/magpie_tts_multilingual_357m \
     --include magpie_tts_multilingual_357m.nemo \
+    --revision 34d7e40da85cabc97f92198889b65cea27bc7fd1 \
     --local-dir models/magpie-tts
 
 # Extract the tokenizer assets loaded by the runtime.

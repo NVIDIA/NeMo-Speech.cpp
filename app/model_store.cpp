@@ -57,6 +57,7 @@ struct Artifact {
     std::string role;
     std::string type;
     std::string filename;
+    std::string revision;
     std::string directory;
     std::string sha256;
     uint64_t size = 0;
@@ -280,6 +281,14 @@ validate_repo(const std::string& repo) {
     validate_component(repo.substr(slash + 1), "repository name");
 }
 
+void
+validate_revision(const std::string& revision, const std::string& description) {
+    if (revision.size() != 40 ||
+        revision.find_first_not_of("0123456789abcdef") != std::string::npos)
+        throw std::runtime_error(
+            "model index revision must be a full commit SHA: " + description);
+}
+
 bool
 looks_like_repo(const std::string& reference) {
     try {
@@ -314,10 +323,7 @@ load_index() {
                 model.aliases.push_back(alias.string());
             }
         }
-        if (model.revision.size() != 40 ||
-            model.revision.find_first_not_of("0123456789abcdef") != std::string::npos)
-            throw std::runtime_error(
-                "model index revision must be a full commit SHA: " + model.repo);
+        validate_revision(model.revision, model.repo);
         if (const Value* companions = model_value.find("companions")) {
             for (const auto& companion : companions->array()) {
                 validate_repo(companion.string());
@@ -330,6 +336,7 @@ load_index() {
             artifact.role = artifact_value.at("role").string();
             artifact.type = artifact_value.at("type").string();
             artifact.filename = artifact_value.at("filename").string();
+            artifact.revision = artifact_value.string_or("revision");
             artifact.directory = artifact_value.string_or("directory");
             artifact.sha256 = artifact_value.at("sha256").string();
             artifact.size = integer(artifact_value, "size");
@@ -340,6 +347,9 @@ load_index() {
                 "asr", "diarization", "tts", "codec", "tokenizer"};
             if (allowed_roles.find(artifact.role) == allowed_roles.end())
                 throw std::runtime_error("unsupported artifact role in model index");
+            if (!artifact.revision.empty())
+                validate_revision(
+                    artifact.revision, model.repo + "/" + artifact.role);
             if (!artifact_roles.insert(artifact.role).second)
                 throw std::runtime_error(
                     "duplicate artifact role in model index: " + model.repo + "/" + artifact.role);
@@ -591,9 +601,14 @@ base_url() {
 }
 
 std::string
+artifact_revision(const Model& model, const Artifact& artifact) {
+    return artifact.revision.empty() ? model.revision : artifact.revision;
+}
+
+std::string
 download_url(const Model& model, const Artifact& artifact) {
-    return base_url() + "/" + model.repo + "/resolve/" + model.revision + "/" + artifact.filename +
-           "?download=true";
+    return base_url() + "/" + model.repo + "/resolve/" + artifact_revision(model, artifact) + "/" +
+           artifact.filename + "?download=true";
 }
 
 int
@@ -1004,11 +1019,12 @@ materialize(const Model& model, const Artifact& artifact) {
     }
 
     if (!cli_quiet() && !cli_json()) {
+        const std::string revision = artifact_revision(model, artifact);
         std::fprintf(
             stderr,
             "[model] downloading %s@%.12s (%s, %.1f MiB)\n"
             "[model] license: %s — %s\n",
-            model.repo.c_str(), model.revision.c_str(), artifact.role.c_str(),
+            model.repo.c_str(), revision.c_str(), artifact.role.c_str(),
             artifact.size / 1048576.0, model.license.c_str(), model.license_url.c_str());
     }
     const fs::path partial = directory / (artifact.filename + ".partial");
