@@ -305,7 +305,33 @@ def main() -> None:
                 run(binary, bad_environment, "--json", "pull", "tiny-asr"), 1
             )
             assert "SHA-256 verification" in invalid["message"]
+            assert f"revision {'0' * 40}" in invalid["message"]
+            assert f"expected size {len(PAYLOAD)}" in invalid["message"]
+            assert f"actual size {len(PAYLOAD)}" in invalid["message"]
+            assert f"expected SHA-256 {'0' * 64}" in invalid["message"]
+            assert f"actual SHA-256 {hashlib.sha256(PAYLOAD).hexdigest()}" in invalid["message"]
             assert not list(bad_cache.rglob("tiny.gguf"))
+
+            write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
+            oversized_payload = PAYLOAD + b"x"
+            ArtifactHandler.payloads["tiny.gguf"] = oversized_payload
+            oversized_cache = root / "oversized-cache"
+            oversized_environment = {
+                **environment,
+                "NEMO_SPEECH_MODEL_DIR": str(oversized_cache),
+            }
+            oversized = expect_json_error(
+                run(binary, oversized_environment, "--json", "pull", "tiny-asr"), 1
+            )
+            assert f"expected size {len(PAYLOAD)}" in oversized["message"]
+            assert f"actual size {len(oversized_payload)}" in oversized["message"]
+            assert f"expected SHA-256 {hashlib.sha256(PAYLOAD).hexdigest()}" in oversized["message"]
+            assert (
+                f"actual SHA-256 {hashlib.sha256(oversized_payload).hexdigest()}"
+                in oversized["message"]
+            )
+            assert not list(oversized_cache.rglob("tiny.gguf"))
+            ArtifactHandler.payloads["tiny.gguf"] = PAYLOAD
 
             invalid_revision_index = json.loads(index.read_text(encoding="utf-8"))
             invalid_revision_index["models"][1]["artifacts"][1]["revision"] = "invalid"

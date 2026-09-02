@@ -1041,11 +1041,26 @@ materialize(const Model& model, const Artifact& artifact) {
     if (!cli_quiet() && !cli_json())
         std::fprintf(stderr, "[model] verifying size and SHA-256...\n");
     if (!valid_file(partial, artifact)) {
+        std::string actual_size = "unavailable";
+        std::string actual_sha256 = "unavailable";
+        std::error_code diagnostic_error;
+        if (fs::is_regular_file(partial, diagnostic_error) && !diagnostic_error) {
+            const uintmax_t size = fs::file_size(partial, diagnostic_error);
+            if (!diagnostic_error)
+                actual_size = std::to_string(size);
+            try {
+                actual_sha256 = sha256_file(partial);
+            }
+            catch (const std::exception&) {
+            }
+        }
         std::error_code error;
         fs::remove(partial, error);
         throw std::runtime_error(
             "downloaded artifact failed size or SHA-256 verification: " + model.repo + "/" +
-            artifact.filename);
+            artifact.filename + " (revision " + artifact_revision(model, artifact) +
+            ", expected size " + std::to_string(artifact.size) + ", actual size " + actual_size +
+            ", expected SHA-256 " + artifact.sha256 + ", actual SHA-256 " + actual_sha256 + ")");
     }
 
     std::error_code error;
