@@ -83,11 +83,12 @@ jobs:
         run: git submodule update --init --depth 1 ggml llama.cpp
 
       - name: Install dependencies
-        run: brew install ninja sentencepiece
+        run: brew install bash ninja sentencepiece
 
       - name: Configure
-        # The default `bash` shell on the macOS runner is Homebrew bash 5, which
-        # the configure scripts require.
+        # The runner's default shell is Apple's bash 3.2; configure.sh and
+        # apply-ggml-patches.sh need bash 4+, so run them under Homebrew bash.
+        shell: /opt/homebrew/bin/bash -e {0}
         run: |
           scripts/configure.sh metal-speech \
             -DNEMO_SPEECH_BUILD_NMT=OFF \

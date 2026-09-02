@@ -58,6 +58,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare container environment
+        # The container runs as root but the checkout is owned by the runner
+        # user, and checkout's safe.directory exception is removed after its
+        # own steps. ${{ github.workspace }} resolves to the host path inside a
+        # container job, so derive the model directory from $GITHUB_WORKSPACE.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "NEMO_SPEECH_MODEL_DIR=$GITHUB_WORKSPACE/.ci-models" >> "$GITHUB_ENV"
+
       - name: Initialize submodules
         run: git submodule update --init --depth 1 ggml llama.cpp
 
