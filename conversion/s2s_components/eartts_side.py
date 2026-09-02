@@ -187,6 +187,7 @@ def _load_legacy_inputs(bundle_dir: Path) -> tuple[dict, dict, dict]:
 def _load_public_inputs(source: Path, tokenizer_json: Path) -> tuple[dict, dict, dict]:
     checkpoint = source / "model.safetensors"
     prefix = "tts_model.tts_model."
+    cfg = build_eartts_config(source, tokenizer_json)
     total_emb: dict[str, torch.Tensor] = {}
     sampler: dict[str, torch.Tensor] = {}
     with safe_open(str(checkpoint), framework="pt", device="cpu") as tensors:
@@ -198,21 +199,28 @@ def _load_public_inputs(source: Path, tokenizer_json: Path) -> tuple[dict, dict,
                 raise KeyError(f"VoiceChat checkpoint is missing {name}")
             return tensors.get_tensor(name)
 
-        for relative in (
-            "audio_prompt_projection_W",
+        relatives = [
             "bos_emb",
             "null_emb",
             "embed_code.weight",
             "embed_subword.embed_tokens.weight",
             "embed_subword.proj_embedding.weight",
-            "gated_fusion_audio_text.audio_proj.bias",
-            "gated_fusion_audio_text.audio_proj.weight",
-            "gated_fusion_audio_text.final_norm.weight",
-            "gated_fusion_audio_text.gate",
-            "gated_fusion_audio_text.residual_scale",
-            "gated_fusion_audio_text.text_proj.bias",
-            "gated_fusion_audio_text.text_proj.weight",
-        ):
+        ]
+        if cfg.get("use_audio_prompt_frozen_projection", False):
+            relatives.append("audio_prompt_projection_W")
+        if cfg.get("use_gated_fusion_for_text_audio", False):
+            relatives.extend(
+                [
+                    "gated_fusion_audio_text.audio_proj.bias",
+                    "gated_fusion_audio_text.audio_proj.weight",
+                    "gated_fusion_audio_text.final_norm.weight",
+                    "gated_fusion_audio_text.gate",
+                    "gated_fusion_audio_text.residual_scale",
+                    "gated_fusion_audio_text.text_proj.bias",
+                    "gated_fusion_audio_text.text_proj.weight",
+                ]
+            )
+        for relative in relatives:
             total_emb[relative] = read(relative)
 
         for source_prefix in ("embed_subword.backbone.",):
@@ -240,7 +248,6 @@ def _load_public_inputs(source: Path, tokenizer_json: Path) -> tuple[dict, dict,
     char_ids, char_mask, _ = build_character_tables(tokenizer_json)
     total_emb["embed_subword.embed_subwords.weight"] = torch.from_numpy(char_ids)
     total_emb["embed_subword.embed_subwords_mask.weight"] = torch.from_numpy(char_mask)
-    cfg = build_eartts_config(source, tokenizer_json)
     return cfg, total_emb, sampler
 
 

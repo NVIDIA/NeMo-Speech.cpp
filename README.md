@@ -1,16 +1,19 @@
-# NeMo-Speech.cpp
+<div align="center">
 
-A lightweight native C++ runtime for running the NVIDIA Nemotron Speech model
-family locally, with broad hardware support. It supports multilingual speech
-recognition, speaker diarization, translation, speech synthesis, and realtime
-full-duplex VoiceChat.
+<h1>NeMo-Speech.cpp</h1>
 
-NeMo-Speech.cpp is NVIDIA's official local speech inference solution, with
-day-0 support for our latest speech models. It builds on models and tooling
-from [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech), with native
-inference powered by [ggml](https://github.com/ggml-org/ggml) and llama.cpp.
+<p><strong>A lightweight native C++ runtime for the NVIDIA Nemotron Speech model family, with broad hardware support.</strong></p>
 
-## Models and applications
+[Models](#-models-and-applications) &nbsp;|&nbsp; [Installation](#-installation) &nbsp;|&nbsp; [Quick Start](#-quick-start) &nbsp;|&nbsp; [Documentation](#-documentation) &nbsp;|&nbsp; [API Reference](docs/api.md)
+
+</div>
+
+> **NeMo-Speech.cpp is NVIDIA's official solution for local speech inference**,
+> providing day-0 support for the latest models from
+> [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech), with native
+> inference powered by [ggml](https://github.com/ggml-org/ggml).
+
+## 🧩 Models and applications
 
 | Application | Supported models |
 |---|---|
@@ -18,23 +21,10 @@ inference powered by [ggml](https://github.com/ggml-org/ggml) and llama.cpp.
 | Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2), standalone or combined with ASR |
 | Text and speech translation | [Riva Translate 4B Instruct v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2), with composed ASR-to-NMT-to-TTS speech translation |
 | Speech synthesis | [MagpieTTS Multilingual 357M](https://huggingface.co/nvidia/magpie_tts_multilingual_357m) with [NeMo NanoCodec](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) |
-| Full-duplex voice conversation | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
+| Full-duplex voicechat | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
 | Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
 
-## Contents
-
-- [Models and applications](#models-and-applications)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Command line](#command-line)
-- [Local server and playground](#local-server-and-playground)
-- [Native SDK](#native-sdk)
-- [Build from source](#build-from-source)
-- [Documentation](#documentation)
-- [License](#license)
-- [Contributing](#contributing)
-
-## Installation
+## 📦 Installation
 
 Install the `nemo-speech` CLI for the detected platform and backend:
 
@@ -62,7 +52,7 @@ toolchain required by the selected backend, if any. See
 [Installation](docs/install.md) for platform-specific prerequisites and
 options.
 
-## Quick start
+## 🚀 Quick start
 
 Transcribe a local WAV file. On first use, the CLI downloads the pinned default
 Nemotron 3.5 GGUF from Hugging Face and verifies its size and SHA-256:
@@ -89,7 +79,7 @@ available backend and handles common mono or stereo PCM WAV sample rates
 automatically. See the [CLI model guide](docs/cli.md#models-and-cache) and
 [model conversion](docs/model-conversion.md) for custom checkpoints.
 
-## Command line
+## ⌨️ Command line
 
 The CLI is the primary interface. Run `nemo-speech --help` to see the
 capabilities included in your build. The [CLI guide](docs/cli.md) covers model
@@ -98,7 +88,7 @@ translation, synthesis, structured output, and benchmarking. The
 [VoiceChat guide](docs/s2s/README.md) covers building and serving the realtime
 pipeline.
 
-## Local server and playground
+## 🌐 Local server and playground
 
 Start the same runtime as a local HTTP service and open the playground:
 
@@ -115,7 +105,7 @@ separately built `riva_server` binary provides the ASR, TTS, and translation
 gRPC interfaces. See the [server guide](docs/server.md) when you are ready to
 integrate either frontend.
 
-## Native SDK
+## 🧰 Native SDK
 
 Release archives include stable C headers, shared libraries, and an exported
 CMake package. An installed application can link only the capability it uses:
@@ -129,7 +119,7 @@ See [native SDK integration](docs/sdk.md) for in-process C/C++ usage, or
 [client integration](docs/clients.md) for OpenAI SDK, curl, and Riva-compatible
 gRPC usage.
 
-## Build from source
+## 🛠️ Build from source
 
 Requires CMake 3.26 or newer, Ninja, C and C++17 compilers, SentencePiece
 development files, and the toolchain required by the selected backend, if any.
@@ -146,7 +136,7 @@ ggml patch series for CUDA builds. CPU, Metal, Vulkan, server, component,
 Windows, and container instructions are in
 [Build from source](docs/build.md).
 
-## Documentation
+## 📚 Documentation
 
 | Start here | What it covers |
 |---|---|
@@ -162,7 +152,7 @@ Windows, and container instructions are in
 | [Build from source](docs/build.md) | Presets, optional components, dependencies, containers, and artifacts |
 | [All documentation](docs/README.md) | ASR, TTS, NMT, configuration, and developer references |
 
-## License
+## ⚖️ License
 
 NVIDIA-authored code is released under the
 [Apache License 2.0](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/LICENSE),
@@ -172,7 +162,7 @@ components retain their respective terms; see
 [Third-Party Notices](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/THIRD_PARTY_NOTICES.md).
 Release archives also include these files under `share/licenses/nemo-speech/`.
 
-## Contributing
+## 🤝 Contributing
 
 External contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
 the contribution terms and Developer Certificate of Origin sign-off process.

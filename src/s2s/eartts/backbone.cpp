@@ -144,6 +144,8 @@ EarTTSBackbone::initialize_prompt_template(
 
 void
 EarTTSBackbone::decode_chunked(int slot, const float* embs, int n_tokens) {
+    if (n_tokens <= 0)
+        throw std::invalid_argument("EarTTSBackbone: n_tokens must be positive");
     llama_pos pos = slot_pos_[slot];
     for (int start = 0; start < n_tokens; start += kMaxBatchTokens) {
         const int n = std::min(kMaxBatchTokens, n_tokens - start);

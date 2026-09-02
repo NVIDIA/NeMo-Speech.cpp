@@ -463,6 +463,8 @@ void
 EarTTSSampler::run_maskgit(
     const float* h_cond, const float* h_uncond, float guidance_scale, const float* ext_gumbel,
     const float* ext_gauss, int BT, int32_t* out_codes) {
+    if (BT <= 0)
+        throw std::invalid_argument("eartts: batch size must be positive");
     const int H = cfg_.hidden;
     const int L = cfg_.latent;
     const int N = cfg_.mog_num_predictions;

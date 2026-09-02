@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -98,9 +99,10 @@ class S2SStream {
 
    private:
     friend class S2SPipeline;
-    explicit S2SStream(int64_t id) : seq_id(id) {}
+    explicit S2SStream(int64_t id) : seq_id(id), rng(std::random_device{}()) {}
 
     int64_t seq_id;
+    std::mt19937_64 rng;
     std::vector<float> audio_buffer;         // grows; only last window used
     std::vector<int64_t> text_tokens;        // [max_steps]
     std::vector<int64_t> function_tokens;    // [max_steps]
@@ -236,7 +238,7 @@ class S2SPipeline {
     int sample_text_token(const float* logits, S2SStream& st) const;
     std::string sanitize_function_text(const std::string& raw) const;
     std::string format_tool_response(const std::string& raw) const;
-    std::string select_tool_ack(const S2SStream& st, const std::string& sanitized) const;
+    std::string select_tool_ack(S2SStream& st, const std::string& sanitized) const;
     void reset_fn_call_state(S2SStream& st);
 
     S2SPipelineConfig cfg_;

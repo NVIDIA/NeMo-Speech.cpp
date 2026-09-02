@@ -8,9 +8,8 @@
 // function-head matmul is NOT done here — the caller runs it via LLMHeads on
 // the returned hidden state.
 //
-// Threading contract: single-threaded. One shared llama_batch is reused
-// across prefill()/step() calls; concurrent calls from multiple threads are
-// not supported.
+// prefill(), step(), step_batch(), and cleanup() are internally serialized;
+// step_batch() owns the shared llama context lock.
 #pragma once
 
 #include <cstdint>

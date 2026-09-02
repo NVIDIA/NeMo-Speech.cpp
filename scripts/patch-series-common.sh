@@ -4,7 +4,7 @@
 
 # Return success when a source tree without .git contains the complete patch
 # series. The reverse applications operate only on a temporary index.
-patch_series_applied_without_git() {
+patch_series_applied_without_git() (
     local source_tree="$1"
     local patch_dir="$2"
     local log_prefix="$3"
@@ -49,4 +49,4 @@ patch_series_applied_without_git() {
         return 0
     fi
     return 1
-}
+)

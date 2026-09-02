@@ -920,7 +920,7 @@ S2SPipeline::sample_text_token(const float* logits, S2SStream& st) const {
     }
     double sub = 0;
     for (int i = 0; i < keep; i++) sub += p[i];
-    double r = static_cast<double>(rand()) / RAND_MAX * sub;
+    double r = std::uniform_real_distribution<double>(0.0, sub)(st.rng);
     for (int i = 0; i < keep; i++) {
         r -= p[i];
         if (r <= 0)
@@ -1337,7 +1337,7 @@ S2SPipeline::format_tool_response(const std::string& raw) const {
 }
 
 std::string
-S2SPipeline::select_tool_ack(const S2SStream& st, const std::string& sanitized) const {
+S2SPipeline::select_tool_ack(S2SStream& st, const std::string& sanitized) const {
     const Json calls = Json::parse(sanitized, nullptr, false);
     if (!calls.is_array() || calls.empty() || !calls[0].is_object() || !calls[0].contains("name") ||
         !calls[0]["name"].is_string())
@@ -1346,7 +1346,8 @@ S2SPipeline::select_tool_ack(const S2SStream& st, const std::string& sanitized) 
     for (const auto& item : st.tool_ack_messages) {
         if (item.first != name || item.second.empty())
             continue;
-        return item.second[static_cast<size_t>(std::rand()) % item.second.size()];
+        return item
+            .second[std::uniform_int_distribution<size_t>(0, item.second.size() - 1)(st.rng)];
     }
     return "";
 }
@@ -1370,7 +1371,8 @@ S2SPipeline::parse_function_tokens(
     // Timeouts advance once per response frame.
     if (st.fn_state == S2SStream::FnState::WaitingForRequest ||
         st.fn_state == S2SStream::FnState::WaitingForResponse) {
-        if (++st.fn_frames_in_state >= cfg_.fn_call_timeout_frames) {
+        st.fn_frames_in_state += cfg_.steps_per_call;
+        if (st.fn_frames_in_state >= cfg_.fn_call_timeout_frames) {
             reset_fn_call_state(st);
             return;
         }
@@ -1569,12 +1571,17 @@ S2SPipeline::decode_outputs(S2SStream& st, S2SChunkResult& out) {
 void
 S2SPipeline::warmup() {
     auto st = create_stream(/*seq_id=*/0);
-    prefill_system_prompt(*st, "You are a helpful voice assistant.");
-    const int chunk = cfg_.steps_per_call * cfg_.samples_per_chunk;
-    std::vector<float> zeros(chunk, 0.0f);
-    // Enough chunks for the audio window to cross every bucket boundary.
-    const int n_chunks = cfg_.max_chunks_for_inference / cfg_.steps_per_call + 5;
-    for (int i = 0; i < n_chunks; i++) process_chunk(*st, zeros.data(), chunk, "");
+    try {
+        prefill_system_prompt(*st, "You are a helpful voice assistant.");
+        const int chunk = cfg_.steps_per_call * cfg_.samples_per_chunk;
+        std::vector<float> zeros(chunk, 0.0f);
+        const int n_chunks = cfg_.max_chunks_for_inference / cfg_.steps_per_call + 5;
+        for (int i = 0; i < n_chunks; i++) process_chunk(*st, zeros.data(), chunk, "");
+    }
+    catch (...) {
+        end_stream(*st);
+        throw;
+    }
     end_stream(*st);
 }
 

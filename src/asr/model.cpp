@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <future>
-#include <iostream>
 #include <map>
 #include <optional>
 #include <shared_mutex>
@@ -1689,8 +1688,9 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
             throw std::runtime_error("S2S projection metadata does not match proj.weight");
         s2s_projection_ =
             std::make_unique<S2SProjectionTail>(rnnt_cfg_.d_model, s2s_projection_dim_);
-        std::cerr << "[asr_model] S2S projection enabled: " << rnnt_cfg_.d_model << " -> "
-                  << s2s_projection_dim_ << "\n";
+        GGMLF_LOG_INFO(
+            "[asr_model] S2S projection enabled: %d -> %d\n", rnnt_cfg_.d_model,
+            s2s_projection_dim_);
     }
     rnnt_decoder_stages_ = std::make_unique<RnntDecoderStages>(
         rnnt_predictor_.get(), rnnt_joint_.get(), decoder_arena_slots_);

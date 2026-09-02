@@ -220,7 +220,15 @@ async def run_session(args: argparse.Namespace, rate: int, pcm: bytes, tools: li
                     await asyncio.sleep(0.08)
             await socket.send(json.dumps({"type": "session.close"}))
 
-        stats, _ = await asyncio.gather(receive_events(), send_audio())
+        receiver = asyncio.create_task(receive_events())
+        sender = asyncio.create_task(send_audio())
+        try:
+            stats = await receiver
+            await sender
+        except BaseException:
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+            raise
 
     event_types = {event.get("type") for event in events}
     required_events = {

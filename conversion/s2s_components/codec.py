@@ -148,42 +148,6 @@ def _remap_block(prefix: str, blk_idx: int, sub: str) -> str:
     return f"{prefix}.blk{blk_idx}.{short}.{suffix}"
 
 
-def remap_key(pt_key: str) -> str:
-    if pt_key.startswith("encoder.layers."):
-        rest = pt_key[len("encoder.layers.") :]
-        idx_s, _, sub = rest.partition(".")
-        idx = int(idx_s)
-        spec = ENC_LAYOUT[idx]
-        if spec[0] == "blk":
-            return _remap_block("enc", spec[1], sub)
-        # Non-block layers carry a single ``weight`` (sometimes ``bias`` too).
-        return f"enc.{spec[0]}.{sub}" if spec[0] == "ds" else f"enc.{spec[0]}.{sub}"
-
-    if pt_key.startswith("decoder.layers."):
-        rest = pt_key[len("decoder.layers.") :]
-        idx_s, _, sub = rest.partition(".")
-        idx = int(idx_s)
-        spec = DEC_LAYOUT[idx]
-        if spec[0] == "blk":
-            return _remap_block("dec", spec[1], sub)
-        return f"dec.{spec[0]}.{sub}" if spec[0] == "us" else f"dec.{spec[0]}.{sub}"
-
-    if pt_key.startswith("prvq.mus_list."):
-        idx_s, _, _ = pt_key[len("prvq.mus_list.") :].partition(".")
-        return f"rvq.cb{int(idx_s)}.mus"
-
-    if pt_key.startswith("prvq._variance_list."):
-        rest = pt_key[len("prvq._variance_list.") :]
-        idx_s, _, sub = rest.partition(".")  # 'variance'
-        return f"rvq.cb{int(idx_s)}.variance"
-
-    raise KeyError(f"unrecognized codec tensor key: {pt_key}")
-
-
-# Multi-element layer indices: encoder.ds.{0,1} need disambiguation back from
-# our names (enc.ds.0 vs enc.ds.1). The remap_key above leaves "ds" with no
-# index baked in -- fix that for downsample/upsample/bottleneck names that
-# come from a single PyTorch layer.
 def remap_key_v2(pt_key: str) -> str:
     if pt_key.startswith("encoder.layers."):
         rest = pt_key[len("encoder.layers.") :]

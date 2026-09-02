@@ -64,8 +64,11 @@ class S2SCodec {
     std::unordered_map<int64_t, StreamState> streams_;
     std::mutex streams_mutex_;
 
-    // Per-n_frames envelope reciprocal (host), keyed by n_frames.
-    std::unordered_map<int, std::vector<float>> envelope_cache_;
+    struct EnvelopeEntry {
+        std::vector<float> reciprocal;
+        int out_trim = 0;
+    };
+    std::unordered_map<int, EnvelopeEntry> envelope_cache_;
     std::vector<float> compute_envelope_recip(int n_frames, int* out_trim) const;
 };
 

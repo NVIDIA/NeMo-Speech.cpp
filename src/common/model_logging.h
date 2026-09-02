@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 
 #include "ggml.h"
 
@@ -13,6 +14,7 @@ namespace detail {
 
 inline std::atomic<bool> model_logging_configured{false};
 inline std::atomic<bool> model_logging_verbose{false};
+inline std::mutex model_logging_mutex;
 inline thread_local bool continue_model_log = false;
 
 }  // namespace detail
@@ -35,6 +37,7 @@ model_log_callback(ggml_log_level level, const char* text, void*) {
 // Explicit process-level configuration used by executable frontends.
 inline void
 configure_ggml_logging(bool verbose) {
+    std::lock_guard<std::mutex> lock(detail::model_logging_mutex);
     detail::model_logging_verbose.store(verbose, std::memory_order_relaxed);
     detail::continue_model_log = false;
     detail::model_logging_configured.store(true, std::memory_order_release);
@@ -46,14 +49,12 @@ configure_ggml_logging(bool verbose) {
 // once any loaded model requests it.
 inline void
 ensure_ggml_logging(bool verbose = false) {
-    if (verbose) {
-        configure_ggml_logging(true);
-        return;
-    }
+    std::lock_guard<std::mutex> lock(detail::model_logging_mutex);
+    if (verbose)
+        detail::model_logging_verbose.store(true, std::memory_order_relaxed);
     bool expected = false;
     if (detail::model_logging_configured.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        detail::model_logging_verbose.store(false, std::memory_order_relaxed);
         ggml_log_set(model_log_callback, nullptr);
     }
 }

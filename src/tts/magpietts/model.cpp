@@ -708,7 +708,7 @@ magpietts_model_load_impl(
     bool verbose) {
     const ggml_nvtx::range nvtx_range("magpietts_model_load");
     model.reset();
-    nemo_speech::common::ensure_ggml_logging();
+    nemo_speech::common::ensure_ggml_logging(verbose);
 
     gguf_init_params params = {
         /*.no_alloc =*/true,

@@ -124,9 +124,9 @@ def _remap(name: str) -> str | None:
 # Encoder geometry inference from the perception tensors.
 # ----------------------------------------------------------------------------
 def _infer_encoder_geometry(
-    perception_keys: list[str], shape_of: dict[str, tuple[int, ...]]
+    perception_keys: list[str], shape_of: dict[str, tuple[int, ...]], att_context_size: list[int]
 ) -> dict:
-    """Read encoder geometry off the tensor shapes — no external config needed."""
+    """Read encoder geometry from tensor shapes."""
     layer_idxs = sorted(
         {int(k.split(".")[2]) for k in perception_keys if k.startswith("encoder.layers.")}
     )
@@ -216,14 +216,8 @@ def _infer_encoder_geometry(
         "cache_supported": False,
         "train_left_ctx": 0,
         "train_right_ctx": 0,
-        # The S2S perception model was trained with `att_context_size=[70, 0]`
-        # — strictly causal self-attention. nemotron-edge's offline encoder
-        # respects these limits when `asr.encoder.offline_{left,right}_ctx`
-        # are emitted (sentinel -1 = unlimited; absent key = unlimited).
-        # Bundle config.json: model.stt.model.perception.encoder.att_context_size
-        # = [70, 0].
-        "offline_left_ctx": 70,
-        "offline_right_ctx": 0,
+        "offline_left_ctx": att_context_size[0],
+        "offline_right_ctx": att_context_size[1],
     }
 
 
@@ -314,7 +308,26 @@ def convert(bundle_dir: Path, out_path: Path, weight_type: str) -> None:
     # Apply the same remap to rnnt shape dict so downstream geometry detection works on the renamed keys.
     rnnt_shapes = {_remap(k): v for k, v in rnnt_shapes_raw.items() if _remap(k) is not None}
 
-    enc = _infer_encoder_geometry(list(perception_shapes), perception_shapes)
+    att_context_size = [70, 0]
+    config_path = bundle_dir / "config.json"
+    if config_path.is_file():
+        bundle_config = json.loads(config_path.read_text(encoding="utf-8"))
+        encoder_config = (
+            bundle_config.get("model", {})
+            .get("stt", {})
+            .get("model", {})
+            .get("perception", {})
+            .get("encoder", {})
+        )
+        if "att_context_size" in encoder_config:
+            att_context_size = encoder_config["att_context_size"]
+            if (
+                not isinstance(att_context_size, list)
+                or len(att_context_size) != 2
+                or not all(isinstance(value, int) for value in att_context_size)
+            ):
+                raise ValueError("perception encoder att_context_size must contain two values")
+    enc = _infer_encoder_geometry(list(perception_shapes), perception_shapes, att_context_size)
     rnnt = _infer_rnnt_geometry(rnnt_shapes)
     proj_shape = perception_shapes["proj.weight"]
     proj_out_dim, proj_in_dim = proj_shape
@@ -449,7 +462,7 @@ def convert(bundle_dir: Path, out_path: Path, weight_type: str) -> None:
 
     print(f"[convert-s2s] emitted {emitted} tensors, skipped {len(skipped)}")
     print(
-        f"[convert-s2s] dtype tally: "
+        "[convert-s2s] dtype tally: "
         + ", ".join(f"{k}={v}" for k, v in sorted(dtype_counts.items()))
     )
     if skipped:

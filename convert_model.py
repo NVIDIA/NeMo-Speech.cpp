@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llama-cpp",
         type=Path,
-        help="llama.cpp checkout used for S2S backbone conversion (default: ./llama.cpp)",
+        help="llama.cpp checkout used for S2S and NMT conversion (default: ./llama.cpp)",
     )
     parser.add_argument(
         "--llama-quantize",
@@ -116,7 +116,8 @@ def main() -> int:
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         print(f"convert_model.py: error: {error}", file=sys.stderr)
         return 1
-    print(f"converted {architecture} model to {args.outfile}")
+    if not args.dry_run:
+        print(f"converted {architecture} model to {args.outfile}")
     return 0
 
 

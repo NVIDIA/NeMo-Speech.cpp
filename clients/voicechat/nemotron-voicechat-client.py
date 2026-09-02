@@ -146,6 +146,8 @@ def _validate_tools(tools):
         prefix = f"tools[{i}]"
         if not isinstance(tool, dict):
             raise ValueError(f"{prefix}: each tool must be an object")
+        if isinstance(tool.get("function"), dict):
+            tool = tool["function"]
         if not isinstance(tool.get("name"), str) or not tool["name"]:
             raise ValueError(f'{prefix}: "name" must be a non-empty string')
         if "description" in tool and not isinstance(tool["description"], str):
@@ -499,7 +501,7 @@ class NemotronVoicechatClient:
                     self.input_audio_buffer.append(audio_float32)
 
                 # Convert float32 to int16 PCM
-                audio_int16 = (audio_float32 * 32768.0).astype(np.int16)
+                audio_int16 = np.clip(audio_float32 * 32768.0, -32768, 32767).astype(np.int16)
                 encoded_data = audio_int16.tobytes()
 
                 # Log first chunk
@@ -573,7 +575,9 @@ class NemotronVoicechatClient:
                                     self.received_audio_buffer.append(pcm_float32)
 
                                     # Convert float32 [-1.0, 1.0] to int16 for playback
-                                    pcm_int16 = (pcm_float32 * 32768.0).astype(np.int16)
+                                    pcm_int16 = np.clip(
+                                        pcm_float32 * 32768.0, -32768, 32767
+                                    ).astype(np.int16)
                                     pcm_bytes = pcm_int16.tobytes()
 
                                     # Queue for playback only if enabled
@@ -972,7 +976,7 @@ class NemotronVoicechatClient:
         combined_audio = np.concatenate(self.received_audio_buffer)
 
         # Convert to int16 PCM
-        audio_int16 = (combined_audio * 32768.0).astype(np.int16)
+        audio_int16 = np.clip(combined_audio * 32768.0, -32768, 32767).astype(np.int16)
 
         # Save to WAV file (16-bit PCM mono)
         sf.write(filename, audio_int16, OUTPUT_SAMPLE_RATE, subtype='PCM_16')
@@ -992,7 +996,7 @@ class NemotronVoicechatClient:
         combined_audio = np.concatenate(self.input_audio_buffer)
 
         # Convert to int16 PCM
-        audio_int16 = (combined_audio * 32768.0).astype(np.int16)
+        audio_int16 = np.clip(combined_audio * 32768.0, -32768, 32767).astype(np.int16)
 
         # Save to WAV file (16-bit PCM mono)
         sf.write(filename, audio_int16, INPUT_SAMPLE_RATE, subtype='PCM_16')

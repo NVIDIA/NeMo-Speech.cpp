@@ -7,10 +7,9 @@
 // (outside this class) produces both embeddings per step, both ride one
 // llama_decode, and the sampler mixes the two returned hidden states.
 //
-// Position budget: each slot gets n_ctx / n_seq_max = 4500 positions; the
-// prompt prefill (~37 frames) leaves roughly a 4463-step budget per stream.
-// No overflow handling — llama_decode fails when a slot's KV range is
-// exhausted.
+// The KV pool reserves 2 * (max_streams + 1) slots of 4500 positions each;
+// max_streams=32 reserves 66 slots. Prompt prefill leaves about 4463 steps.
+// llama_decode fails when a slot's range is exhausted.
 //
 // Threading contract: single-threaded. One shared llama_batch is reused
 // across prefill_pair()/step_pair() calls.

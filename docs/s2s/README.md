@@ -33,12 +33,10 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install \
   -r requirements.txt \
-  -r clients/voicechat/requirements.txt \
-  pyaudio
+  -r clients/voicechat/requirements.txt
 ```
 
-PyAudio is only needed for microphone capture and playback. You can omit it
-when using WAV-file input with `--no-playback`.
+PyAudio is only needed for microphone capture and playback.
 
 ## 2. Convert the model
 

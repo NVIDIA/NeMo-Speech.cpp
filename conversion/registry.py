@@ -53,14 +53,11 @@ def _architecture_from_config(config: dict) -> str:
     )
 
 
-def _resolve_nemo_for_detection(request: ConversionRequest) -> Path | None:
+def _resolve_nemo_for_detection(
+    request: ConversionRequest, files: list[str] | None = None
+) -> Path | None:
     local = Path(request.source).expanduser()
     if local.exists():
-        if local.is_dir():
-            from . import s2s
-
-            if s2s.is_s2s_source(local):
-                return None
         if local.is_dir() and not any(local.rglob("model_config.yaml")):
             return None
         if local.is_file() and local.suffix.lower() != ".nemo":
@@ -69,13 +66,10 @@ def _resolve_nemo_for_detection(request: ConversionRequest) -> Path | None:
 
     if request.source.lower() in ("silero", "silero-vad", "vad"):
         return None
-    files = list_hugging_face_files(request.source, request.revision)
+    if files is None:
+        files = list_hugging_face_files(request.source, request.revision)
     if any(name.endswith(".nemo") for name in files):
         return resolve_nemo_source(request.source, request.cache_dir, request.revision)
-    from . import s2s
-
-    if s2s.is_s2s_file_list(files):
-        return None
     if "config.json" in files or any(name.endswith(".safetensors") for name in files):
         return None
     raise RuntimeError(f"no supported checkpoint found in {request.source}")
@@ -98,24 +92,18 @@ def detect_architecture(request: ConversionRequest) -> tuple[str, Path | None]:
     if request.source.lower() in ("silero", "silero-vad", "vad"):
         return "vad", None
     local = Path(request.source).expanduser()
-    if local.is_dir():
-        from . import s2s
+    from . import s2s
 
+    if local.is_dir():
         if s2s.is_s2s_source(local):
             return "s2s", local.resolve()
-    checkpoint = _resolve_nemo_for_detection(request)
+    files = None
+    if not local.exists():
+        files = list_hugging_face_files(request.source, request.revision)
+        if s2s.is_s2s_file_list(files):
+            return "s2s", None
+    checkpoint = _resolve_nemo_for_detection(request, files)
     if checkpoint is None:
-        if local.is_dir():
-            from . import s2s
-
-            if s2s.is_s2s_source(local):
-                return "s2s", local.resolve()
-        elif not local.exists():
-            files = list_hugging_face_files(request.source, request.revision)
-            from . import s2s
-
-            if s2s.is_s2s_file_list(files):
-                return "s2s", None
         return "nmt", None
     return _architecture_from_config(read_nemo_config(checkpoint)), checkpoint
 

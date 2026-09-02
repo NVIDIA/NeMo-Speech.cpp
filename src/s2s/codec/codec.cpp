@@ -112,13 +112,12 @@ S2SCodec::decode_wav(
     int out_trim = 0;
     auto env_it = envelope_cache_.find(n_frames);
     if (env_it == envelope_cache_.end()) {
-        env_it =
-            envelope_cache_.emplace(n_frames, compute_envelope_recip(n_frames, &out_trim)).first;
-    } else {
-        // Recompute trim length only.
-        compute_envelope_recip(n_frames, &out_trim);
+        EnvelopeEntry entry;
+        entry.reciprocal = compute_envelope_recip(n_frames, &entry.out_trim);
+        env_it = envelope_cache_.emplace(n_frames, std::move(entry)).first;
     }
-    const std::vector<float>& env = env_it->second;
+    out_trim = env_it->second.out_trim;
+    const std::vector<float>& env = env_it->second.reciprocal;
 
     StreamState* st = &get_or_create_stream(stream_id);
 

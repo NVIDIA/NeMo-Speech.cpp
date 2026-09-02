@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "llama_common.h"
 
@@ -115,6 +116,10 @@ LLMBackbone::step_batch(
     float* out_hidden) {
     if (batch <= 0 || batch > kMaxBatchTokens)
         throw std::invalid_argument("LLMBackbone: invalid step batch size");
+    std::unordered_set<int64_t> seen_ids;
+    for (int i = 0; i < batch; ++i)
+        if (!seen_ids.insert(ext_seq_ids[i]).second)
+            throw std::invalid_argument("LLMBackbone: duplicate sequence id in step batch");
     std::lock_guard<std::mutex> lock(mu_);
     batch_.n_tokens = batch;
     std::vector<int> slots(static_cast<size_t>(batch));
