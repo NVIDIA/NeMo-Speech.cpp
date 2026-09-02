@@ -163,6 +163,16 @@ magpietts_backend_is_cuda(ggml_backend_t backend) {
 #endif
 }
 
+bool
+magpietts_fused_cached_attention_available(ggml_backend_t backend) {
+#if defined(NEMO_SPEECH_GGML_PATCHED)
+    return magpietts_backend_is_cuda(backend);
+#else
+    (void)backend;
+    return false;
+#endif
+}
+
 static constexpr size_t MAGPIETTS_PINNED_STAGING_MIN_BYTES = 4 * 1024;
 
 MagpiePinnedHostScratch::~MagpiePinnedHostScratch() {

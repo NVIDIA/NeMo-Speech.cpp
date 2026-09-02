@@ -45,6 +45,9 @@ target_link_libraries(nemo_speech_tts PUBLIC
 # Stable C ABI (nemo_speech_tts_*) and the in-tree C++ API share one implementation
 # library. Aliases preserve existing target names without producing extra DSOs.
 target_compile_definitions(nemo_speech_tts PRIVATE NEMO_SPEECH_TTS_BUILD)
+if(NEMO_SPEECH_GGML_PATCHED)
+    target_compile_definitions(nemo_speech_tts PRIVATE NEMO_SPEECH_GGML_PATCHED=1)
+endif()
 set_target_properties(nemo_speech_tts PROPERTIES SOVERSION 1)
 if(UNIX AND NOT APPLE)
     target_link_options(nemo_speech_tts PRIVATE

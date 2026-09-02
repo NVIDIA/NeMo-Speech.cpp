@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -565,7 +566,7 @@ bool
 LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair) {
     const auto& h = model.hparams;
     if (pair) {
-        if (magpietts_backend_is_cuda(model.backend)) {
+        if (magpietts_fused_cached_attention_available(model.backend)) {
             return pair_cuda_attention_cache.init(model, 2);
         }
         if (!cond_cache.init(
@@ -604,9 +605,20 @@ local_self_attention_cuda_cached_pair(
     ggml_tensor* q = split_heads(0);
     ggml_tensor* k = split_heads(static_cast<size_t>(n_embd) * element);
     ggml_tensor* v = split_heads(static_cast<size_t>(2 * n_embd) * element);
+#if defined(NEMO_SPEECH_GGML_PATCHED)
     ggml_tensor* heads = ggml_fused_attn_cached(
         ctx, q, k, v, nullptr, cache.layers[static_cast<size_t>(layer_index)], cache.slot_ids,
         cache_state, cache.n_ctx, 1.0f / std::sqrt(static_cast<float>(d_head)), true);
+#else
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)cache;
+    (void)layer_index;
+    (void)cache_state;
+    ggml_tensor* heads = nullptr;
+    throw std::runtime_error("Magpie cached local attention requires patched ggml");
+#endif
     ggml_tensor* merged =
         ggml_reshape_2d(ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), n_embd, kCfgLanes);
     return linear(ctx, layer.self_o, merged);
@@ -773,7 +785,8 @@ local_transformer_graph_init(
     graph.codebook_idx = codebook_idx;
     graph.seq_len = 1;
     graph.pair = pair;
-    const bool cuda_cached_attention = pair && magpietts_backend_is_cuda(model.backend);
+    const bool cuda_cached_attention =
+        pair && magpietts_fused_cached_attention_available(model.backend);
 
     if (cuda_cached_attention) {
         graph.cache_state =

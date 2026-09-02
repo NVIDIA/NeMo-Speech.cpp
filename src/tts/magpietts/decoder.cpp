@@ -519,9 +519,18 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             ggml_tensor* v = split_heads(static_cast<size_t>(2 * tr.n_embd) * element);
             auto kv =
                 session->model_tensor_container->get_tensor_by_name(runtime_kv_name(layer_index));
+#if defined(NEMO_SPEECH_GGML_PATCHED)
             ggml_tensor* heads = ggml_fused_attn_cached(
                 ctx, q, k, v, nullptr, kv.tensor, slots.tensor, cache_meta.tensor, cache_len_,
                 1.0f / std::sqrt(static_cast<float>(d_head)), true);
+#else
+            (void)q;
+            (void)k;
+            (void)v;
+            (void)kv;
+            ggml_tensor* heads = nullptr;
+            throw std::runtime_error("Magpie persistent decoder requires patched ggml");
+#endif
             ggml_tensor* merged = ggml_reshape_2d(
                 ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), tr.n_embd, kMagpieCfgLanes);
             x = ggml_add(ctx, residual, linear(ctx, layer.self_o, merged));
@@ -844,8 +853,9 @@ MagpieDecoder::evalCachedPair(
     const bool persistent_candidate =
         cuda_sample == nullptr && cond_hidden_out != nullptr && uncond_hidden_out != nullptr &&
         cond_cross_kv != nullptr && cond_cross_kv->validFor(model_, text_len) &&
-        model_.hparams.dec_kernel == 1 && magpietts_backend_is_cuda(model_.backend) &&
-        cond_kv.n_tokens > 0 && cond_kv.n_tokens == uncond_kv.n_tokens;
+        model_.hparams.dec_kernel == 1 &&
+        magpietts_fused_cached_attention_available(model_.backend) && cond_kv.n_tokens > 0 &&
+        cond_kv.n_tokens == uncond_kv.n_tokens;
     if (persistent_candidate) {
         try {
             if (persistent_runtime_ &&
