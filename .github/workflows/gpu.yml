@@ -143,11 +143,16 @@ jobs:
           $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
           if ($vulkan) { Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan" }
 
-      - name: Cache vcpkg binaries
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore vcpkg binaries
+        # actions/cache only saves in its post step when the job succeeds, so
+        # a failing test run threw away 30 minutes of dependency builds.
+        # Split restore/save and save on any outcome once the build ran.
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~\AppData\Local\vcpkg\archives
-          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
+          restore-keys: vcpkg-windows-x64-
 
       - name: Configure and build
         # build.ps1 re-reads PATH and VULKAN_SDK from the registry, so tools
@@ -156,6 +161,13 @@ jobs:
         run: |
           scripts\windows\build.ps1 -Backend vulkan -Profile core -Tests `
             -BuildDir "${{ github.workspace }}\build\windows-vulkan"
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Unit tests
         shell: pwsh
