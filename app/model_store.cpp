@@ -899,20 +899,31 @@ write_verification_marker(const fs::path& path, const Artifact& artifact, const 
 
 bool
 valid_file(const fs::path& path, const Artifact& artifact, bool cache_hit = false) {
-    FileState before{};
-    if (!file_state(path, artifact.size, before))
-        return false;
-    if (cache_hit && verification_marker_matches(path, artifact, before))
-        return true;
-    if (sha256_file(path) != artifact.sha256)
-        return false;
-    FileState after{};
-    if (!file_state(path, artifact.size, after) || before.size != after.size ||
-        before.modified != after.modified)
-        return false;
-    if (cache_hit)
-        write_verification_marker(path, artifact, after);
-    return true;
+    constexpr int max_attempts = 4;
+    // Shared caches can expose a finishing writer or delayed filesystem metadata here.
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        FileState before{};
+        if (!file_state(path, artifact.size, before))
+            return false;
+        if (cache_hit && verification_marker_matches(path, artifact, before))
+            return true;
+
+        const std::string actual_sha256 = sha256_file(path);
+        FileState after{};
+        const bool stable = file_state(path, artifact.size, after) && before.size == after.size &&
+                            before.modified == after.modified;
+        if (stable) {
+            if (actual_sha256 != artifact.sha256)
+                return false;
+            if (cache_hit)
+                write_verification_marker(path, artifact, after);
+            return true;
+        }
+
+        if (attempt + 1 < max_attempts)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
 }
 
 bool

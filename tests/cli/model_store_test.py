@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import urllib.parse
 
 PAYLOAD = b"NeMo-Speech.cpp model-store fixture\n"
@@ -97,7 +98,12 @@ def file_artifact(role: str, filename: str, payload: bytes, sha256: str | None =
     }
 
 
-def write_index(path: pathlib.Path, asr_sha256: str, tokenizer_tar: bytes) -> None:
+def write_index(
+    path: pathlib.Path,
+    asr_sha256: str,
+    tokenizer_tar: bytes,
+    asr_payload: bytes = PAYLOAD,
+) -> None:
     path.write_text(
         json.dumps(
             {
@@ -115,7 +121,7 @@ def write_index(path: pathlib.Path, asr_sha256: str, tokenizer_tar: bytes) -> No
                         "revision": "0" * 40,
                         "license": "Test only",
                         "license_url": "https://example.invalid/license",
-                        "artifacts": [file_artifact("asr", "tiny.gguf", PAYLOAD, asr_sha256)],
+                        "artifacts": [file_artifact("asr", "tiny.gguf", asr_payload, asr_sha256)],
                     },
                     {
                         "repo": "acme/tiny-tts",
@@ -322,6 +328,47 @@ def main() -> None:
             )
             assert not revision_partial.exists()
             assert not pathlib.Path(f"{revision_partial}.revision").exists()
+            write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
+
+            unstable_payload = b"x" * (16 * 1024 * 1024)
+            write_index(
+                index,
+                hashlib.sha256(unstable_payload).hexdigest(),
+                tokenizer_tar,
+                unstable_payload,
+            )
+            unstable_cache = root / "unstable-cache"
+            unstable_partial = (
+                unstable_cache / "acme" / "tiny-asr" / ("0" * 40) / "tiny.gguf.partial"
+            )
+            unstable_partial.parent.mkdir(parents=True)
+            unstable_partial.write_bytes(unstable_payload)
+            pathlib.Path(f"{unstable_partial}.revision").write_text(
+                f"{'0' * 40}\n", encoding="utf-8"
+            )
+            unstable_environment = {
+                **environment,
+                "NEMO_SPEECH_MODEL_DIR": str(unstable_cache),
+            }
+            requests_before_unstable_pull = ArtifactHandler.requests
+
+            def change_partial_mtime() -> None:
+                deadline = time.monotonic() + 0.2
+                while time.monotonic() < deadline:
+                    try:
+                        os.utime(unstable_partial, None)
+                    except FileNotFoundError:
+                        return
+                    time.sleep(0.001)
+
+            mtime_thread = threading.Thread(target=change_partial_mtime)
+            mtime_thread.start()
+            unstable_pull = run(binary, unstable_environment, "--json", "pull", "tiny-asr")
+            mtime_thread.join(timeout=5)
+            assert unstable_pull.returncode == 0, unstable_pull.stderr
+            unstable_artifact = json.loads(unstable_pull.stdout)["artifacts"][0]
+            assert pathlib.Path(unstable_artifact["path"]).read_bytes() == unstable_payload
+            assert ArtifactHandler.requests == requests_before_unstable_pull
             write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
 
             unknown = expect_json_error(
