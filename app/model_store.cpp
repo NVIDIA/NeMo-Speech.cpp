@@ -789,6 +789,63 @@ verification_marker_path(const fs::path& path) {
     return marker;
 }
 
+fs::path
+partial_revision_path(const fs::path& path) {
+    fs::path marker = path;
+    marker += ".revision";
+    return marker;
+}
+
+bool
+partial_revision_matches(const fs::path& path, const std::string& revision) {
+    const fs::path marker = partial_revision_path(path);
+    std::error_code error;
+    if (!fs::is_regular_file(marker, error) || error || fs::file_size(marker, error) > 64 || error)
+        return false;
+    std::ifstream input(marker, std::ios::binary);
+    std::string stored_revision;
+    if (!std::getline(input, stored_revision))
+        return false;
+    std::string extra;
+    return !std::getline(input, extra) && stored_revision == revision;
+}
+
+void
+write_partial_revision(const fs::path& path, const std::string& revision) {
+    const fs::path marker = partial_revision_path(path);
+    fs::path temporary = marker;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output << revision << '\n';
+        if (!output) {
+            std::error_code error;
+            fs::remove(temporary, error);
+            throw std::runtime_error("cannot write partial-download revision marker");
+        }
+    }
+    std::error_code error;
+    fs::remove(marker, error);
+    error.clear();
+    fs::rename(temporary, marker, error);
+    if (error) {
+        fs::remove(temporary, error);
+        throw std::runtime_error("cannot install partial-download revision marker");
+    }
+}
+
+void
+discard_partial_download(const fs::path& path) {
+    std::error_code error;
+    fs::remove(path, error);
+    if (error)
+        throw std::runtime_error("cannot discard stale partial download: " + error.message());
+    fs::remove(partial_revision_path(path), error);
+    if (error)
+        throw std::runtime_error(
+            "cannot discard stale partial-download revision marker: " + error.message());
+}
+
 std::string
 file_time_string(fs::file_time_type value) {
     const auto nanoseconds =
@@ -994,6 +1051,7 @@ extract_tar_prefix(const fs::path& archive, const fs::path& destination, const A
 PulledModelArtifact
 materialize(const Model& model, const Artifact& artifact) {
     const fs::path directory = model_directory(model);
+    const std::string revision = artifact_revision(model, artifact);
     fs::create_directories(directory);
     const fs::path destination =
         artifact.type == "file" ? directory / artifact.filename : directory / artifact.directory;
@@ -1017,7 +1075,6 @@ materialize(const Model& model, const Artifact& artifact) {
     }
 
     if (!cli_quiet() && !cli_json()) {
-        const std::string revision = artifact_revision(model, artifact);
         std::fprintf(
             stderr,
             "[model] downloading %s@%.12s (%s, %.1f MiB)\n"
@@ -1026,16 +1083,23 @@ materialize(const Model& model, const Artifact& artifact) {
             model.license.c_str(), model.license_url.c_str());
     }
     const fs::path partial = directory / (artifact.filename + ".partial");
+    std::error_code partial_error;
+    if (fs::exists(partial, partial_error) && !partial_error) {
+        if (!partial_revision_matches(partial, revision))
+            discard_partial_download(partial);
+    } else {
+        fs::remove(partial_revision_path(partial), partial_error);
+    }
     if (!valid_file(partial, artifact)) {
         if (artifact.type == "tar-prefix") {
-            std::error_code error;
-            fs::remove(partial, error);
+            discard_partial_download(partial);
         } else {
             std::error_code error;
             if (fs::is_regular_file(partial, error) &&
                 fs::file_size(partial, error) > artifact.size)
-                fs::remove(partial, error);
+                discard_partial_download(partial);
         }
+        write_partial_revision(partial, revision);
         download(model, artifact, partial);
     }
     if (!cli_quiet() && !cli_json())
@@ -1056,6 +1120,7 @@ materialize(const Model& model, const Artifact& artifact) {
         }
         std::error_code error;
         fs::remove(partial, error);
+        fs::remove(partial_revision_path(partial), error);
         throw std::runtime_error(
             "downloaded artifact failed size or SHA-256 verification: " + model.repo + "/" +
             artifact.filename + " (revision " + artifact_revision(model, artifact) +
@@ -1070,6 +1135,7 @@ materialize(const Model& model, const Artifact& artifact) {
         fs::rename(partial, destination, error);
         if (error)
             throw std::runtime_error("cannot install model artifact: " + error.message());
+        fs::remove(partial_revision_path(partial), error);
         FileState state{};
         if (file_state(destination, artifact.size, state))
             write_verification_marker(destination, artifact, state);
@@ -1085,6 +1151,7 @@ materialize(const Model& model, const Artifact& artifact) {
             throw std::runtime_error("cannot install tokenizer artifact: " + error.message());
         }
         fs::remove(partial, error);
+        fs::remove(partial_revision_path(partial), error);
     }
     if (!cli_quiet() && !cli_json())
         std::fprintf(stderr, "[model] ready: %s\n", path_utf8(destination).c_str());

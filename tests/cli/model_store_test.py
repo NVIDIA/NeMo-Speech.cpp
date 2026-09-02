@@ -22,6 +22,8 @@ TOKENIZER_PAYLOAD = b"tokenizer configuration\n"
 TTS_REVISION = "1" * 40
 TOKENIZER_REVISION = "3" * 40
 CODEC_REVISION = "2" * 40
+ASR_ARTIFACT_REVISION = "4" * 40
+STALE_ASR_ARTIFACT_REVISION = "5" * 40
 
 
 class ArtifactHandler(http.server.BaseHTTPRequestHandler):
@@ -293,6 +295,35 @@ def main() -> None:
             assert destination.read_bytes() == PAYLOAD
             assert marker.read_text(encoding="utf-8").splitlines() != marker_lines
 
+            revision_index = json.loads(index.read_text(encoding="utf-8"))
+            assert revision_index["models"][0]["revision"] == "0" * 40
+            revision_index["models"][0]["artifacts"][0]["revision"] = ASR_ARTIFACT_REVISION
+            index.write_text(json.dumps(revision_index), encoding="utf-8")
+            revision_cache = root / "revision-cache"
+            revision_partial = (
+                revision_cache / "acme" / "tiny-asr" / ("0" * 40) / "tiny.gguf.partial"
+            )
+            revision_partial.parent.mkdir(parents=True)
+            revision_partial.write_bytes(b"x" * 5)
+            pathlib.Path(f"{revision_partial}.revision").write_text(
+                f"{STALE_ASR_ARTIFACT_REVISION}\n", encoding="utf-8"
+            )
+            revision_environment = {
+                **environment,
+                "NEMO_SPEECH_MODEL_DIR": str(revision_cache),
+            }
+            revision_pull = run(binary, revision_environment, "--json", "pull", "tiny-asr")
+            assert revision_pull.returncode == 0, revision_pull.stderr
+            revision_artifact = json.loads(revision_pull.stdout)["artifacts"][0]
+            assert pathlib.Path(revision_artifact["path"]).read_bytes() == PAYLOAD
+            assert (
+                f"/acme/tiny-asr/resolve/{ASR_ARTIFACT_REVISION}/tiny.gguf"
+                in ArtifactHandler.request_paths
+            )
+            assert not revision_partial.exists()
+            assert not pathlib.Path(f"{revision_partial}.revision").exists()
+            write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
+
             unknown = expect_json_error(
                 run(binary, environment, "--json", "pull", "unknown/repository"), 3
             )
@@ -311,6 +342,8 @@ def main() -> None:
             assert f"expected SHA-256 {'0' * 64}" in invalid["message"]
             assert f"actual SHA-256 {hashlib.sha256(PAYLOAD).hexdigest()}" in invalid["message"]
             assert not list(bad_cache.rglob("tiny.gguf"))
+            assert not list(bad_cache.rglob("tiny.gguf.partial"))
+            assert not list(bad_cache.rglob("tiny.gguf.partial.revision"))
 
             write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
             oversized_payload = PAYLOAD + b"x"
@@ -331,6 +364,8 @@ def main() -> None:
                 in oversized["message"]
             )
             assert not list(oversized_cache.rglob("tiny.gguf"))
+            assert not list(oversized_cache.rglob("tiny.gguf.partial"))
+            assert not list(oversized_cache.rglob("tiny.gguf.partial.revision"))
             ArtifactHandler.payloads["tiny.gguf"] = PAYLOAD
 
             invalid_revision_index = json.loads(index.read_text(encoding="utf-8"))
