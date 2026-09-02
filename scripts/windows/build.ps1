@@ -50,6 +50,10 @@
 .PARAMETER TtsZh
     Build the optional Mandarin TTS tokenizer (cppjieba and limonp).
 
+.PARAMETER Tests
+    Also build the first-party test executables (NEMO_SPEECH_BUILD_TESTS) so
+    ctest can run against the build tree. Implied by -Profile developer.
+
 .PARAMETER AsrOnly
     Build only the CLI, ASR, and diarization. Useful for a minimal ASR build.
 
@@ -90,6 +94,7 @@ param(
     [switch]$Flashlight,
     [switch]$TtsJa,
     [switch]$TtsZh,
+    [switch]$Tests,
     [switch]$AsrOnly,
     [switch]$Http,
     [switch]$HttpTls,
@@ -161,6 +166,7 @@ $BuildTtsJa = $BuildTtsJa -or $TtsJa.IsPresent
 $BuildTtsZh = $BuildTtsZh -or $TtsZh.IsPresent
 $BuildHttp = $BuildHttp -or $Http.IsPresent -or $HttpTls.IsPresent
 $BuildHttpTls = $HttpTls.IsPresent
+$BuildTests = $BuildTests -or $Tests.IsPresent
 if ($BuildGrpc -and (-not $BuildAsr -or -not $BuildTts)) {
     throw 'The gRPC server currently requires both ASR and TTS. Use -Profile server, full, or developer.'
 }
