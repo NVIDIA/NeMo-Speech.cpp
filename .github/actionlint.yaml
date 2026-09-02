@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# NVIDIA self-hosted runner labels used by .github/workflows/gpu.yml. Without
+# this list actionlint rejects non-GitHub-hosted labels.
+self-hosted-runner:
+  labels:
+    - linux-amd64-gpu-l4-latest-1
+    - windows-amd64-gpu-l4-latest-1

@@ -2,7 +2,7 @@ name: Build and Test
 
 # Builds ASR, diarization, and TTS on the GitHub-hosted runners, runs the
 # model-free ctest suite, then a CLI smoke test with real models. CUDA and
-# Vulkan need GPU runners and are wired separately.
+# Vulkan run on NVIDIA's self-hosted GPU runners in gpu.yml.
 
 on:
   pull_request:
