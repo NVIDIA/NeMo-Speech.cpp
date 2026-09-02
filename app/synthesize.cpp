@@ -20,6 +20,7 @@
 #include "json.h"
 #include "model_utils.h"
 #include "parameter_parser.h"
+#include "tts_device_policy.h"
 
 namespace {
 
@@ -207,19 +208,10 @@ command_synthesize(int argc, char** argv) {
             cuda_device = cuda_device || device_name == "auto" || device_name == "gpu" ||
                           device_name.rfind("gpu:", 0) == 0;
 #endif
-            if (gpu < 0) {
-                parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.magpie_cpu = true;
-                parsed.runtime.codec_cpu = true;
-            } else if (cuda_device) {
-                parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cuda;
-                parsed.runtime.codec_cpu = false;
-            } else {
-                parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.codec_cpu = false;
-            }
+            const auto tts_device = gpu < 0       ? TtsCliDevice::Cpu
+                                    : cuda_device ? TtsCliDevice::Cuda
+                                                  : TtsCliDevice::Accelerator;
+            apply_tts_device_policy(parsed.runtime, tts_device);
         }
         parsed.runtime.verbose = cli_verbose();
 
