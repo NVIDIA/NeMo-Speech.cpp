@@ -105,10 +105,11 @@ def build_character_tables(tokenizer_json: Path) -> tuple[np.ndarray, np.ndarray
         for token, token_id in vocab.items()
     }
     mappings = {token_id: chars for token_id, chars in mappings.items() if chars}
-    mappings[len(vocab)] = (len(char_vocab),)
+    sentinel_id = max(int(token_id) for token_id in vocab.values()) + 1
+    mappings[sentinel_id] = (len(char_vocab),)
     max_char_len = max(map(len, mappings.values()))
 
-    ids = np.zeros((len(vocab) + 1, max_char_len), dtype=np.float32)
+    ids = np.zeros((sentinel_id + 1, max_char_len), dtype=np.float32)
     mask = np.zeros_like(ids)
     for token_id, chars in mappings.items():
         ids[token_id, : len(chars)] = chars
@@ -165,7 +166,7 @@ def build_eartts_config(source: Path, tokenizer_json: Path) -> dict[str, Any]:
         "guidance_scale": model.get("inference_guidance_scale", 0.5),
         "emb_backbone_config": char,
         "emb_backbone_type": tts["cas_config"]["backbone_type"],
-        "emb_vocab_size": len(vocab) + 1,
+        "emb_vocab_size": int(char_ids.shape[0]),
         "emb_char_vocab_size": char_vocab_size,
         "max_char_len": char_ids.shape[1],
         "pretrained_tokenizer_name": tts["cas_config"].get("pretrained_tokenizer_name", ""),

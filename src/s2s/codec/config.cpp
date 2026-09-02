@@ -29,7 +29,9 @@ CodecConfig::from_gguf(const gr::GGUFLoader& loader) {
     c.codebook_size = static_cast<int>(loader.get_u32("eartts_codec.codebook_size"));
     c.stage_channels = loader.get_i32_array("eartts_codec.stage_channels");
     c.rates = loader.get_i32_array("eartts_codec.rates");
-    if (c.n_quantizers == 0 || c.latent_dim == 0 || c.rates.empty())
+    if (c.n_quantizers == 0 || c.latent_dim == 0 || c.n_fft == 0 || c.hop_length == 0 ||
+        c.conv_next_kernel == 0 || c.num_blocks_per_stage == 0 || c.stage_channels.empty() ||
+        c.rates.empty())
         throw std::runtime_error("codec gguf missing eartts_codec.* metadata");
     return c;
 }

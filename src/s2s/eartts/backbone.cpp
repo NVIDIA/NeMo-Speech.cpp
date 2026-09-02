@@ -36,7 +36,7 @@ EarTTSBackbone::EarTTSBackbone(const std::string& gguf_path, int max_streams) {
 
     llama_context_params cp = llama_context_default_params();
     // n_ctx is the TOTAL KV pool shared by all sequences: 4500 positions each.
-    cp.n_ctx = 4500 * (uint32_t)n_seq_max_;
+    cp.n_ctx = kPositionsPerSequence * (uint32_t)n_seq_max_;
     cp.n_seq_max = (uint32_t)n_seq_max_;
     cp.n_batch = kMaxBatchTokens;
     cp.n_ubatch = kMaxBatchTokens;
@@ -63,6 +63,13 @@ EarTTSBackbone::~EarTTSBackbone() {
         llama_free(ctx_);
     if (model_)
         llama_model_free(model_);
+}
+
+int
+EarTTSBackbone::step_capacity() const {
+    if (!prompt_template_ready_)
+        throw std::runtime_error("EarTTSBackbone: prompt template is not initialized");
+    return kPositionsPerSequence - slot_pos_[template_cond_slot_];
 }
 
 std::pair<int, int>

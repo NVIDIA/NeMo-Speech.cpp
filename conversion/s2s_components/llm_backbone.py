@@ -41,7 +41,11 @@ import tempfile
 from pathlib import Path
 
 import torch
-from voicechat_source import is_hf_voicechat_source, quantize_backbone
+
+if __package__:
+    from .voicechat_source import is_hf_voicechat_source, quantize_backbone
+else:
+    from voicechat_source import is_hf_voicechat_source, quantize_backbone
 
 logger = logging.getLogger("convert_nemotronh_voicechat_to_gguf")
 

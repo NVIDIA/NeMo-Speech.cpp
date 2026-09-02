@@ -275,6 +275,13 @@ run_server(int argc, char** argv) {
         },
         "Maximum input-audio duration per realtime session");
     parser.Register(
+        "s2s.max_pending_function_responses",
+        [&](const std::string& value) {
+            server_config.realtime_s2s_max_pending_function_responses = static_cast<size_t>(
+                parse_int(value, "s2s.max_pending_function_responses", 1, 4096));
+        },
+        "Maximum queued function responses per realtime session");
+    parser.Register(
         "s2s.output_text_events", &server_config.realtime_s2s_output_text_events,
         "Emit legacy response.output_text events");
 #endif

@@ -160,11 +160,8 @@ float_to_pcm16(float sample) {
     if (!std::isfinite(sample))
         return 0;
     constexpr double scale = 32768.0;
-    const int64_t truncated = static_cast<int64_t>(std::trunc(sample * scale));
-    const uint16_t bits = static_cast<uint16_t>(static_cast<uint64_t>(truncated) & 0xffffu);
-    const int32_t value =
-        bits < 0x8000u ? static_cast<int32_t>(bits) : static_cast<int32_t>(bits) - 0x10000;
-    return static_cast<int16_t>(value);
+    const double scaled = std::clamp(sample * scale, -32768.0, 32767.0);
+    return static_cast<int16_t>(std::trunc(scaled));
 }
 
 std::vector<uint8_t>
@@ -440,12 +437,18 @@ class RealtimeSession {
             emit_error("Instructions too long (max 32000 characters)", "instructions_too_long");
             return;
         }
+        const bool prompt_changed = prompt != build_prompt(instructions_, tools_);
         if (requested_input_rate != input_rate_) {
             input_rate_ = requested_input_rate;
             input_resampler_ = audio::AudioResampler(input_rate_, voicechat_->input_sample_rate());
         }
         tools_ = std::move(requested_tools);
         instructions_ = std::move(requested_instructions);
+        if (prompt_changed && stream_) {
+            voicechat_->end_stream(*stream_);
+            stream_.reset();
+            prompt_applied_ = false;
+        }
         if (!prompt_applied_) {
             ensure_stream();
         }
@@ -759,6 +762,10 @@ class RealtimeSession {
             return;
         if (!has_configured_tools(tools_)) {
             emit_error("Tools are not set for this session", "tools_not_set");
+            return;
+        }
+        if (function_responses_.size() >= config_.realtime_s2s_max_pending_function_responses) {
+            emit_error("Too many pending function responses", "function_response_limit_exceeded");
             return;
         }
         const Value* output = item->find("output");

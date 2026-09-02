@@ -46,7 +46,11 @@ import gguf
 import numpy as np
 import torch
 from safetensors import safe_open
-from voicechat_source import load_llm_channel_weights
+
+if __package__:
+    from .voicechat_source import load_llm_channel_weights
+else:
+    from voicechat_source import load_llm_channel_weights
 
 ARCH = "s2s_llm_aux"
 KEY_HIDDEN = f"{ARCH}.hidden_size"

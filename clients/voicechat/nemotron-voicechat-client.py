@@ -1187,7 +1187,9 @@ class NemotronVoicechatClient:
         # Save function call log
         try:
             function_filename = (
-                self.function_text_output if self.function_text_output else f"function_calls.jsonl"
+                self.function_text_output
+                if self.function_text_output
+                else self._output_path("function_calls.jsonl")
             )
             self.save_function_call_log(function_filename)
         except Exception as e:

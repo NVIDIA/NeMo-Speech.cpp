@@ -40,17 +40,22 @@ The resulting image uses `nemo-speech` as its entry point.
 ## Run the realtime server
 
 Mount the converted model directory read-only and publish the realtime API on
-host port 9000:
+the host's loopback interface only:
 
 ```bash
 docker run --rm --gpus all --name nemo-voicechat \
-  -p 9000:9000 \
+  -p 127.0.0.1:9000:9000 \
   -v "$PWD/models/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF:/models/voicechat:ro" \
   nemo-speech-voicechat \
   serve --host 0.0.0.0 --port 9000 \
   --s2s-model-dir /models/voicechat \
   --s2s-max-streams 1
 ```
+
+Although the server listens on all interfaces inside the container, this port
+mapping makes it reachable only from the Docker host. For remote access, place
+it behind a TLS reverse proxy that authenticates clients; do not expose this
+cleartext, unauthenticated command on a public or shared network.
 
 Increase `--s2s-max-streams` only after sizing the deployment for its intended
 concurrency. Model files remain on the host and can be replaced without

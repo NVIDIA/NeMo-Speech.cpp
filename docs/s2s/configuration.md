@@ -45,11 +45,16 @@ These settings apply to `nemo-speech serve`:
 | Key | Default | Description |
 |---|---:|---|
 | `s2s.max_session_seconds` | `300` | Maximum cumulative input-audio duration per session |
+| `s2s.max_pending_function_responses` | `64` | Maximum queued tool responses per session |
 | `s2s.output_text_events` | `false` | Also emit legacy `response.output_text.*` events |
 
 The listener's `http.api-key`, upload limit, read timeout, write timeout, and
-TLS settings apply to VoiceChat sockets. WebSocket clients may supply the API
-key as a bearer token or as the `api_key` query parameter.
+TLS settings apply to VoiceChat sockets. Never put the configured, long-lived
+API key in a URL or the `api_key` query parameter, where logs and browser
+history can expose it. Header-capable clients should send
+`Authorization: Bearer <key>`. Browser clients should obtain a short-lived,
+scope-limited token from a trusted backend instead of receiving the configured
+server key.
 
 ## Runtime environment variables
 

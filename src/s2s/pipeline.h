@@ -42,7 +42,7 @@ struct S2SPipelineConfig {
     int steps_per_call = 2;             // MODEL_STEPS_PER_CALL
     int samples_per_chunk = 1280;       // 80 ms @ 16 kHz
     int max_chunks_for_inference = 70;  // 5.6 s perception window
-    int max_steps = 5000;               // token buffer length
+    int max_steps = 5000;               // upper bound; clamped to EarTTS position capacity
     float user_channel_weight = 1.0f;
     float text_channel_weight = 1.0f;
     float function_channel_weight = 2.0f;

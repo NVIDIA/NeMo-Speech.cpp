@@ -42,7 +42,11 @@ from typing import Any, Dict
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from voicechat_source import build_eartts_config, is_hf_voicechat_source, quantize_backbone
+
+if __package__:
+    from .voicechat_source import build_eartts_config, is_hf_voicechat_source, quantize_backbone
+else:
+    from voicechat_source import build_eartts_config, is_hf_voicechat_source, quantize_backbone
 
 logger = logging.getLogger("convert_eartts_backbone_to_gguf")
 
@@ -112,7 +116,7 @@ def _load_eartts_config(eartts_dir: Path, tokenizer_json: Path | None) -> Dict[s
     return json.loads(cfg_path.read_text(encoding="utf-8"))
 
 
-def _extract_backbone_weights(eartts_dir: Path) -> Dict[str, torch.Tensor]:
+def _extract_backbone_weights(eartts_dir: Path, hidden_size: int) -> Dict[str, torch.Tensor]:
     """Filter the EarTTS safetensors tree to backbone-only tensors.
 
     Supports both single-file and sharded checkpoints.  The returned dict has
@@ -153,8 +157,7 @@ def _extract_backbone_weights(eartts_dir: Path) -> Dict[str, torch.Tensor]:
         new_key = "model." + k[len(source_prefix) :]
         stripped[new_key] = v
     if "model.embed_tokens.weight" not in stripped:
-        hidden = int(next(iter(stripped.values())).shape[-1])
-        stripped["model.embed_tokens.weight"] = torch.zeros((1, hidden), dtype=torch.float32)
+        stripped["model.embed_tokens.weight"] = torch.zeros((1, hidden_size), dtype=torch.float32)
     return stripped
 
 
@@ -163,7 +166,7 @@ def _build_hf_gemma3_dir(
 ) -> Dict[str, Any]:
     """Materialize a Gemma3-shaped HF directory inside ``work_dir``."""
     eartts_cfg = _load_eartts_config(eartts_dir, tokenizer_json)
-    weights = _extract_backbone_weights(eartts_dir)
+    weights = _extract_backbone_weights(eartts_dir, int(eartts_cfg["hidden_size"]))
 
     save_file(weights, str(work_dir / "model.safetensors"))
 

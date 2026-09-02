@@ -170,7 +170,7 @@ index d974948c..3b4185c0 100644
  static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                            const ggml_tensor * ffn_gate,
                                            const ggml_tensor * glu,
-@@ -4411,6 +4513,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4411,6 +4513,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -205,7 +205,9 @@ index d974948c..3b4185c0 100644
 +            input->ne[2] * input->ne[3] > 1 && cols <= 65535 &&
 +            !ggml_is_transposed(weight) && !ggml_is_transposed(input) &&
 +            !ggml_backend_buft_is_cuda_split(weight->buffer->buft);
-+        if (eligible) {
++        const int output_index = i + 3;
++        if (eligible && ggml_cuda_check_fusion_memory_ranges(
++                cgraph, i, 4, &output_index, 1)) {
 +            ggml_cuda_mul_mat_bf16_row_bias_round_to_f32(
 +                *cuda_ctx, weight, input, row_bias, bias_node, rounded_node);
 +            return 3;
@@ -215,7 +217,7 @@ index d974948c..3b4185c0 100644
      // Shared BF16 projection + broadcast F32 row bias + SiLU + BF16 cast.
      // Feed-forward linear2 consumes the rounded BF16 activation directly, so
      // avoid materializing the intermediate F32 biased activation entirely.
-@@ -4474,6 +4614,58 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4474,6 +4616,58 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  

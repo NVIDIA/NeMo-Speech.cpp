@@ -35,6 +35,9 @@ class EarTTSBackbone {
 
     int n_embd() const { return n_embd_; }  // 1152 for Gemma3 EarTTS
 
+    // Number of single-frame decode steps left after the immutable prompt.
+    int step_capacity() const;
+
     // Decode the immutable voice prompt once into two reserved template
     // sequences. Every allocate_pair() clones this exact KV state.
     void initialize_prompt_template(
@@ -91,6 +94,7 @@ class EarTTSBackbone {
     void fetch_last_hidden(float* out) const;
 
     static constexpr int kMaxBatchTokens = 512;
+    static constexpr int kPositionsPerSequence = 4500;
 
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;

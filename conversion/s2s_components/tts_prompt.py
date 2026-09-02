@@ -17,7 +17,7 @@ from safetensors import safe_open
 
 
 def _load_legacy(path: Path) -> tuple[np.ndarray, ...]:
-    prompt = torch.load(path, map_location="cpu", weights_only=False)
+    prompt = torch.load(path, map_location="cpu", weights_only=True)
     code = prompt["code"][0].to(torch.int32).numpy()
     subword_ids = prompt["subword_ids"][0].to(torch.int32).numpy()
     subword_mask = prompt["subword_mask"][0].to(torch.float32).numpy()

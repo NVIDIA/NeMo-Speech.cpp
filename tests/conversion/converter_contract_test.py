@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import yaml
 from gguf import GGMLQuantizationType
+from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -35,8 +36,10 @@ from conversion.s2s import (
     component_formats,
     output_bundle_dir,
 )
+from conversion.s2s_components.eartts_backbone import _extract_backbone_weights
 from conversion.s2s_components.perception import _preserve_subsampling_precision
 from conversion.s2s_components.voicechat_source import (
+    build_character_tables,
     default_quantizer_path,
     ensure_llama_checkout,
     ensure_quantizer,
@@ -165,6 +168,32 @@ class ConverterContractTest(unittest.TestCase):
                 load_llm_channel_weights(source),
                 {"user": 0.75, "text": 1.25, "function": 2.5},
             )
+
+    def test_s2s_character_tables_support_sparse_token_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tokenizer = Path(temporary) / "tokenizer.json"
+            tokenizer.write_text(
+                json.dumps({"model": {"vocab": {"a": 0, "bc": 3}}}),
+                encoding="utf-8",
+            )
+
+            ids, mask, _ = build_character_tables(tokenizer)
+
+            self.assertEqual(ids.shape[0], 5)
+            self.assertEqual(mask.shape, ids.shape)
+            self.assertEqual(mask[4, 0], 1.0)
+
+    def test_eartts_dummy_embedding_uses_configured_hidden_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            save_file(
+                {"model.backbone.layers.0.weight": torch.zeros((2, 7))},
+                str(source / "model.safetensors"),
+            )
+
+            weights = _extract_backbone_weights(source, hidden_size=11)
+
+            self.assertEqual(tuple(weights["model.embed_tokens.weight"].shape), (1, 11))
 
     def test_s2s_quantization_preserves_bf16_perception_stem(self) -> None:
         values = np.array([1.00390625, -0.998046875], dtype=np.float32)

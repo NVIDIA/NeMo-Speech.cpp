@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -628,6 +629,12 @@ S2SPipeline::S2SPipeline(gr::BackendManager& bm, const S2SPipelineConfig& cfg)
         std::vector<float> h_cond(H), h_uncond(H);
         tts_->initialize_prompt_template(
             cond.data(), uncond.data(), T, h_cond.data(), h_uncond.data());
+        cfg_.max_steps = std::min(cfg_.max_steps, tts_->step_capacity());
+        if (cfg_.max_steps <= 0)
+            throw std::runtime_error("S2SPipeline: EarTTS prompt exhausts the position budget");
+        if (tts_sampler_->config().num_quantizers != codec_->config().n_quantizers)
+            throw std::runtime_error(
+                "S2SPipeline: TTS sampler and codec disagree on num_quantizers");
         tts_initial_codes_.resize(tts_sampler_->config().num_quantizers);
         tts_sampler_->sample(
             h_cond.data(), h_uncond.data(), cfg_.guidance_scale, tts_seed_for_step(0), 1,
@@ -656,47 +663,17 @@ S2SPipeline::S2SPipeline(gr::BackendManager& bm, const S2SPipelineConfig& cfg)
     // perception GGUF carries no vocab strings, so the transcript pieces
     // come from the bundle's rnnt_tokenizer/vocab.json.
     if (!cfg.rnnt_vocab_json.empty()) {
-        FILE* f = std::fopen(cfg.rnnt_vocab_json.c_str(), "rb");
-        if (f) {
-            std::fseek(f, 0, SEEK_END);
-            const long n = std::ftell(f);
-            std::fseek(f, 0, SEEK_SET);
-            std::string j(n, '\0');
-            if (std::fread(j.data(), 1, n, f) != static_cast<size_t>(n))
-                j.clear();
-            std::fclose(f);
-            // Parse: ["piece", "piece", ...] with \uXXXX escapes.
-            size_t i = 0;
-            while ((i = j.find('"', i)) != std::string::npos) {
-                std::string piece;
-                i++;
-                while (i < j.size() && j[i] != '"') {
-                    if (j[i] == '\\' && i + 1 < j.size()) {
-                        if (j[i + 1] == 'u' && i + 5 < j.size()) {
-                            const unsigned cp = std::stoul(j.substr(i + 2, 4), nullptr, 16);
-                            // UTF-8 encode (BMP only — sufficient for SP pieces).
-                            if (cp < 0x80)
-                                piece.push_back(static_cast<char>(cp));
-                            else if (cp < 0x800) {
-                                piece.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-                                piece.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                            } else {
-                                piece.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-                                piece.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-                                piece.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                            }
-                            i += 6;
-                        } else {
-                            piece.push_back(j[i + 1]);
-                            i += 2;
-                        }
-                    } else {
-                        piece.push_back(j[i++]);
-                    }
-                }
-                i++;
-                rnnt_vocab_.push_back(std::move(piece));
-            }
+        std::ifstream input(cfg.rnnt_vocab_json, std::ios::binary);
+        if (!input)
+            throw std::runtime_error("S2SPipeline: cannot open " + cfg.rnnt_vocab_json);
+        const Json pieces = Json::parse(input, nullptr, false);
+        if (!pieces.is_array())
+            throw std::runtime_error("S2SPipeline: rnnt vocab is not a JSON array");
+        rnnt_vocab_.reserve(pieces.size());
+        for (const auto& piece : pieces) {
+            if (!piece.is_string())
+                throw std::runtime_error("S2SPipeline: rnnt vocab entry is not a string");
+            rnnt_vocab_.push_back(piece.get<std::string>());
         }
     }
 

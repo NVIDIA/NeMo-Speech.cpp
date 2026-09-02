@@ -16,6 +16,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GGML="${ROOT}/ggml"
 PATCHES="${ROOT}/ggml-patches"
+source "${ROOT}/scripts/patch-series-common.sh"
 
 if [ ! -d "${GGML}/src" ]; then
     echo "error: ggml submodule not initialized at ${GGML}" >&2
@@ -82,42 +83,7 @@ else
     # the complete applied series in reverse order against a temporary index;
     # this handles later patches that refine hunks introduced by earlier ones
     # without changing the copied source tree.
-    tmp_dir="$(mktemp -d)"
-    plain_git_dir="${tmp_dir}/plain.git"
-    plain_index="${tmp_dir}/plain.index"
-    cleanup_plain_index() {
-        rm -rf "${tmp_dir}"
-    }
-    trap cleanup_plain_index EXIT
-
-    git init --bare --quiet "${plain_git_dir}"
-    GIT_INDEX_FILE="${plain_index}" \
-        git --git-dir="${plain_git_dir}" --work-tree="${GGML}" read-tree --empty
-    mapfile -t patched_paths \
-        < <(sed -n -e 's|^--- a/||p' -e 's|^+++ b/||p' "${patch_files[@]}" | sort -u)
-    current_paths=()
-    for path in "${patched_paths[@]}"; do
-        if [ -e "${GGML}/${path}" ] || [ -L "${GGML}/${path}" ]; then
-            current_paths+=("${path}")
-        fi
-    done
-    if [ "${#current_paths[@]}" -ne 0 ]; then
-        GIT_INDEX_FILE="${plain_index}" \
-            git --git-dir="${plain_git_dir}" --work-tree="${GGML}" \
-            add -- "${current_paths[@]}"
-    fi
-
-    series_applied=ON
-    for ((i = ${#patch_files[@]} - 1; i >= 0; --i)); do
-        if ! GIT_INDEX_FILE="${plain_index}" \
-            git --git-dir="${plain_git_dir}" --work-tree="${GGML}" \
-            apply --cached --reverse "${patch_files[i]}" >/dev/null 2>&1; then
-            series_applied=OFF
-            break
-        fi
-    done
-    if [ "${series_applied}" = ON ]; then
-        echo "[ggml-patch] current series already applied"
+    if patch_series_applied_without_git "${GGML}" "${PATCHES}" "[ggml-patch]"; then
         echo "[ggml-patch] done"
         exit 0
     fi
