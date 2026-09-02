@@ -24,6 +24,10 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def log(message: str) -> None:
+    print(f"[install-test] {message}", flush=True)
+
+
 def archive(version: str, arch: str, binary: Path) -> tuple[str, bytes, str]:
     name = f"nemo-speech-{version}-windows-{arch}-cpu.zip"
     with tempfile.TemporaryDirectory(prefix="nemo-speech-windows-archive-") as temporary:
@@ -191,6 +195,7 @@ def main() -> None:
             remote_source = "https://github.com/NVIDIA/NeMo-Speech.cpp.git"
             environment["NEMO_SPEECH_SOURCE_URL"] = remote_source
             environment.pop("NEMO_SPEECH_SOURCE_REF", None)
+            log("dry-run plans")
             remote_plan = run("-Source", "-Backend", "cpu", "-DryRun")
             require(f"{remote_source}#main" in remote_plan.stdout, "remote source ref")
             environment["NEMO_SPEECH_SOURCE_REF"] = "review-test"
@@ -199,6 +204,7 @@ def main() -> None:
             environment["NEMO_SPEECH_SOURCE_URL"] = str(source)
             environment.pop("NEMO_SPEECH_SOURCE_REF")
 
+            log("binary install")
             run("-Prefix", str(prefix), "-Backend", "cpu", "-NoModifyPath")
             metadata = prefix / ".nemo-speech-install"
             require(
@@ -236,6 +242,7 @@ def main() -> None:
             require(metadata.read_text(encoding="utf-8").startswith("1.2.4 "), "rollback")
 
             source_prefix = root / "source-install"
+            log("source fallback build")
             fallback = run(
                 "-Prefix",
                 str(source_prefix),
@@ -263,6 +270,7 @@ def main() -> None:
             )
             require("Already installed from source" in repeated.stdout, "source idempotence")
 
+            log("published binary replaces source install")
             name, contents, checksum = archive("1.2.6", arch, binary)
             releases[f"/releases/download/v1.2.6/{name}"] = contents
             releases[f"/releases/download/v1.2.6/{name}.sha256"] = f"{checksum}  {name}\n".encode()

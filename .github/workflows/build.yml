@@ -83,7 +83,9 @@ jobs:
         run: git submodule update --init --depth 1 ggml llama.cpp
 
       - name: Install dependencies
-        run: brew install bash ninja sentencepiece
+        # Homebrew's sentencepiece header includes abseil, which the formula
+        # does not pull in as a build-time dependency for consumers.
+        run: brew install bash ninja sentencepiece abseil
 
       - name: Configure
         # The runner's default shell is Apple's bash 3.2; configure.sh and

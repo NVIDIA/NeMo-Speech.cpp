@@ -57,18 +57,25 @@ def main() -> None:
             "-B",
             str(consumer),
             f"-DCMAKE_PREFIX_PATH={prefix}",
+            "-DCMAKE_BUILD_TYPE=Release",
         ]
         configure_command.extend(
             f"-DEXPECT_NEMO_SPEECH_{component}={'ON' if enabled else 'OFF'}"
             for component, enabled in expected.items()
         )
         run(*configure_command)
+        # The consumer uses CMake's default generator, which can be multi-config
+        # (Visual Studio) even when the SDK build tree is single-config Ninja.
+        consumer_multi_config = bool(
+            cache_value(consumer / "CMakeCache.txt", "CMAKE_CONFIGURATION_TYPES")
+        )
+        consumer_config = "Release" if consumer_multi_config else ""
         build_command = [cmake, "--build", str(consumer)]
-        if config:
-            build_command.extend(("--config", config))
+        if consumer_config:
+            build_command.extend(("--config", consumer_config))
         run(*build_command)
 
-        consumer_binary = consumer / (config if config else "") / f"installed_consumer{suffix}"
+        consumer_binary = consumer / consumer_config / f"installed_consumer{suffix}"
         consumer_environment = os.environ.copy()
         if os.name == "nt":
             consumer_environment["PATH"] = (

@@ -135,6 +135,13 @@ jobs:
             (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
           if (-not $hasVc) { $packages += 'visualstudio2022-workload-vctools' }
           choco install -y --no-progress @packages
+          # Later steps run in fresh shells with the job's original PATH, so
+          # publish the updated machine/user PATH and VULKAN_SDK to them.
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          "$machine;$user" -split ';' | Where-Object { $_ } | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+          $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+          if ($vulkan) { Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan" }
 
       - name: Cache vcpkg binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

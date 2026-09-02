@@ -70,6 +70,7 @@ def run(binary: str, environment: dict[str, str], *arguments: str) -> subprocess
         env=environment,
         check=False,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

@@ -1807,6 +1807,8 @@ void
 magpietts_run_metrics::begin() {
     *this = {};
     inter_frame_min_ms = std::numeric_limits<double>::max();
+    // On Windows ggml_time_us divides by a frequency set in ggml_time_init.
+    ggml_time_init();
     start_us = ggml_time_us();
 }
 
