@@ -53,13 +53,21 @@ def source_repository(root: Path, version: str, binary: Path) -> Path:
     scripts = repository / "scripts" / "windows"
     scripts.mkdir(parents=True)
     shutil.copy2(binary, repository / "nemo-speech.exe")
+    # The CLI links its libraries as DLLs; without them the installed binary
+    # fails its version check with STATUS_DLL_NOT_FOUND.
+    libraries = sorted(path.name for path in binary.parent.glob("*.dll"))
+    for name in libraries:
+        shutil.copy2(binary.parent / name, repository / name)
+    install_libraries = (
+        f"install(FILES {' '.join(libraries)} DESTINATION bin)\n" if libraries else ""
+    )
     (repository / "LICENSE").write_text("test license\n", encoding="utf-8")
     (repository / "CMakeLists.txt").write_text(
-        """cmake_minimum_required(VERSION 3.26)
-project(installer_source_fixture NONE)
-install(PROGRAMS nemo-speech.exe DESTINATION bin)
-install(FILES LICENSE DESTINATION share/licenses/nemo-speech)
-""",
+        "cmake_minimum_required(VERSION 3.26)\n"
+        "project(installer_source_fixture NONE)\n"
+        "install(PROGRAMS nemo-speech.exe DESTINATION bin)\n"
+        + install_libraries
+        + "install(FILES LICENSE DESTINATION share/licenses/nemo-speech)\n",
         encoding="utf-8",
     )
     (scripts / "build.ps1").write_text(
@@ -168,24 +176,32 @@ def main() -> None:
             )
 
             def run(*arguments: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
-                result = subprocess.run(
-                    [
-                        powershell,
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(installer),
-                        *arguments,
-                    ],
-                    env=environment,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=False,
-                )
+                command = [
+                    powershell,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    *arguments,
+                ]
+                try:
+                    result = subprocess.run(
+                        command,
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                        timeout=300,
+                    )
+                except subprocess.TimeoutExpired as timeout:
+                    raise RuntimeError(
+                        f"installer timed out after {timeout.timeout:.0f}s; output so far:\n"
+                        f"{timeout.output or ''}"
+                    ) from None
                 if ok and result.returncode != 0:
                     raise RuntimeError(f"installer failed ({result.returncode}):\n{result.stdout}")
                 if not ok and result.returncode == 0:

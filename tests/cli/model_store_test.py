@@ -313,7 +313,7 @@ def main() -> None:
             revision_partial.parent.mkdir(parents=True)
             revision_partial.write_bytes(b"x" * 5)
             pathlib.Path(f"{revision_partial}.revision").write_text(
-                f"{STALE_ASR_ARTIFACT_REVISION}\n", encoding="utf-8"
+                f"{STALE_ASR_ARTIFACT_REVISION}\n", encoding="utf-8", newline="\n"
             )
             revision_environment = {
                 **environment,
@@ -345,7 +345,7 @@ def main() -> None:
             unstable_partial.parent.mkdir(parents=True)
             unstable_partial.write_bytes(unstable_payload)
             pathlib.Path(f"{unstable_partial}.revision").write_text(
-                f"{'0' * 40}\n", encoding="utf-8"
+                f"{'0' * 40}\n", encoding="utf-8", newline="\n"
             )
             unstable_environment = {
                 **environment,

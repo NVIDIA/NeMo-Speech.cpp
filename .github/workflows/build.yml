@@ -124,6 +124,7 @@ jobs:
 
       - name: Metal backend probe (non-blocking)
         continue-on-error: true
+        timeout-minutes: 10
         run: |
           lldb --batch -o run -k "bt 30" -k quit -- \
             build/metal-speech/bin/nemo-speech --verbose transcribe \

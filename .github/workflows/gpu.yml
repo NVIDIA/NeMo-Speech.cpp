@@ -32,7 +32,7 @@ jobs:
     container:
       # Same toolchain image as docker/Dockerfile. Self-hosted Linux GPU jobs
       # must run in a container; these options are the standard NVIDIA setup.
-      image: nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+      image: nvcr.io/nvidia/cuda@sha256:1e8ac7a54c184a1af8ef2167f28fa98281892a835c981ebcddb1fad04bdd452d # 13.0.0-devel-ubuntu24.04
       options: -u root --security-opt seccomp=unconfined --shm-size 16g
       env:
         NVIDIA_VISIBLE_DEVICES: ${{ env.NVIDIA_VISIBLE_DEVICES }}
@@ -41,7 +41,7 @@ jobs:
         run: nvidia-smi
 
       - name: Setup proxy cache
-        uses: nv-gha-runners/setup-proxy-cache@main
+        uses: nv-gha-runners/setup-proxy-cache@eadc57871cde0c92a223d0f486ab669a2360f978 # main 2026-08-31
         with:
           enable-apt: true
 
