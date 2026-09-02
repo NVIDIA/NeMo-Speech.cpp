@@ -54,7 +54,8 @@ invalid or mismatched checksum always fails rather than falling back to source.
 The source fallback requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
 SentencePiece development files, and any toolkit required by the selected
 backend. On Ubuntu/Debian install `libsentencepiece-dev`; on Fedora install
-`sentencepiece-devel`; on macOS install `sentencepiece` with Homebrew.
+`sentencepiece-devel`; on macOS install `sentencepiece` and `abseil` with
+Homebrew.
 
 Source installs use `main` by default. To install a fork or the current
 checkout, set `NEMO_SPEECH_SOURCE_URL` to its URL or path (`$PWD` on Linux or

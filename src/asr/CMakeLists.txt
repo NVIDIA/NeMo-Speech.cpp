@@ -102,6 +102,22 @@ else()
         find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h REQUIRED)
         target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_LIB})
         target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
+        # SentencePiece >= 0.2 exposes absl::Status in its public header, so our
+        # objects reference abseil directly. System packages (Homebrew) do not
+        # propagate that link dependency; add it only when the header needs it.
+        file(STRINGS "${SENTENCEPIECE_INCLUDE_DIR}/sentencepiece_processor.h"
+            _NEMO_SPEECH_SENTENCEPIECE_ABSL REGEX "#include [<\"]absl/")
+        if(_NEMO_SPEECH_SENTENCEPIECE_ABSL)
+            find_package(absl CONFIG QUIET)
+            if(absl_FOUND)
+                target_link_libraries(nemo_speech_asr PRIVATE absl::status absl::strings)
+            else()
+                message(WARNING
+                    "sentencepiece_processor.h includes abseil but no abseil CMake package "
+                    "was found; linking nemo_speech_asr may fail")
+            endif()
+        endif()
+        unset(_NEMO_SPEECH_SENTENCEPIECE_ABSL)
     endif()
 endif()
 set(_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR
