@@ -127,19 +127,24 @@ if(EXISTS "${_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR}/LICENSE")
     install(DIRECTORY "${_NEMO_SPEECH_SENTENCEPIECE_LICENSE_DIR}/"
         DESTINATION "${NEMO_SPEECH_LICENSE_INSTALL_DIR}/third_party/sentencepiece")
 endif()
-# SentencePiece (vcpkg) uses absl::flat_hash_map + protobuf internally, but its
-# config target doesn't propagate those link deps. On Windows/vcpkg, add them
-# explicitly; elsewhere SentencePiece links its own deps (apt's -dev package).
-if(WIN32)
-    find_package(absl CONFIG QUIET)
-    if(absl_FOUND)
-        target_link_libraries(nemo_speech_asr PRIVATE
-            absl::flat_hash_map absl::flat_hash_set absl::strings absl::str_format absl::hash)
-    endif()
-    find_package(protobuf CONFIG QUIET)
-    if(TARGET protobuf::libprotobuf)
-        target_link_libraries(nemo_speech_asr PRIVATE protobuf::libprotobuf)
-    endif()
+# SentencePiece uses absl::Status (and, via vcpkg, absl::flat_hash_map +
+# protobuf) internally, but the imported target doesn't always propagate
+# those link deps. This was previously assumed Windows/vcpkg-only ("elsewhere
+# SentencePiece links its own deps"), but the same gap reproduces on macOS
+# against Homebrew's sentencepiece formula: its installed
+# sentencepiece_processor.h pulls in absl::Status, and libsentencepiece.dylib
+# doesn't re-export those symbols, so nemo_speech_asr fails to link with
+# undefined absl::Status symbols unless Abseil is linked explicitly here too.
+# Linking an already-found Abseil/Protobuf is harmless on platforms that
+# don't strictly need it, so don't special-case by platform at all.
+find_package(absl CONFIG QUIET)
+if(absl_FOUND)
+    target_link_libraries(nemo_speech_asr PRIVATE
+        absl::flat_hash_map absl::flat_hash_set absl::strings absl::str_format absl::hash absl::status)
+endif()
+find_package(protobuf CONFIG QUIET)
+if(TARGET protobuf::libprotobuf)
+    target_link_libraries(nemo_speech_asr PRIVATE protobuf::libprotobuf)
 endif()
 
 if(NEMO_SPEECH_WITH_FLASHLIGHT)
