@@ -10,9 +10,9 @@ platform without a suitable release artifact.
 - CMake 3.26 or newer and Ninja;
 - a C compiler and a C++17-capable compiler compatible with the selected
   backend and, when applicable, its toolkit;
-- SentencePiece development files for ASR and diarization (SentencePiece 0.2.1
-  and newer also need the Abseil development package, since its public header
-  uses `absl::Status`); and
+- SentencePiece development files for ASR and diarization; when its
+  `sentencepiece_processor.h` includes Abseil headers (upstream since 0.2.1, as
+  in Homebrew's package), the Abseil development package as well; and
 - any toolkit required by the selected backend.
 
 CUDA 12 and 13 are supported. Outside the Windows build driver, gRPC builds

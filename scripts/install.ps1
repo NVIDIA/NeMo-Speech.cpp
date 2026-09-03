@@ -172,7 +172,7 @@ if ($Version -eq "latest") {
             if ($BinaryOnly) { throw "Could not resolve the latest release. $($_.Exception.Message)" }
             $binaryCandidate = $false
             $Version = "source"
-            Write-Host "Latest release is unavailable ($($_.Exception.Message)); falling back to the main source branch."
+            Write-Host "Latest release is unavailable ($($_.Exception.Message)); falling back to a source build."
         }
     }
 }

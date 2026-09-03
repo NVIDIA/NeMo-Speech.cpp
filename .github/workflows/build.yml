@@ -154,7 +154,7 @@ jobs:
       - name: Restore vcpkg binaries
         # actions/cache only saves in its post step when the job succeeds, so
         # a failing test run threw away 30 minutes of dependency builds.
-        # Split restore/save and save on any outcome once the build ran.
+        # Split restore/save and save right after a successful build.
         id: vcpkg-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -163,13 +163,16 @@ jobs:
           restore-keys: vcpkg-windows-x64-
 
       - name: Configure and build
+        id: build
         shell: pwsh
         run: |
           scripts\windows\build.ps1 -Backend cpu -Profile core -Tests `
             -BuildDir "${{ github.workspace }}\build\windows-cpu"
 
       - name: Save vcpkg binaries
-        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        # Keys are immutable, so only save a fully built dependency set. Test
+        # failures later in the job do not prevent the save.
+        if: steps.build.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~\AppData\Local\vcpkg\archives

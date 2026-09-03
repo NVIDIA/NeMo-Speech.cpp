@@ -426,16 +426,19 @@ def main() -> None:
             assert "acme/tiny-tts/tokenizer" in invalid_revision["message"]
             write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
 
-            missing_environment = {
-                **environment,
-                "PATH": str(root / "empty-path"),
-                "NEMO_SPEECH_MODEL_DIR": str(root / "missing-curl-cache"),
-            }
-            missing = expect_json_error(
-                run(binary, missing_environment, "--json", "pull", "tiny-asr"), 1
-            )
-            assert "curl executable" in missing["message"]
-            assert "Local model paths" in missing["message"]
+            if os.name != "nt":
+                # On Windows the CLI resolves curl.exe with SearchPathW, which
+                # searches System32 before PATH, so an empty PATH cannot hide it.
+                missing_environment = {
+                    **environment,
+                    "PATH": str(root / "empty-path"),
+                    "NEMO_SPEECH_MODEL_DIR": str(root / "missing-curl-cache"),
+                }
+                missing = expect_json_error(
+                    run(binary, missing_environment, "--json", "pull", "tiny-asr"), 1
+                )
+                assert "curl executable" in missing["message"]
+                assert "Local model paths" in missing["message"]
 
             unsafe_environment = {
                 **environment,

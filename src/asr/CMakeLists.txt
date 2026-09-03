@@ -102,9 +102,10 @@ else()
         find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h REQUIRED)
         target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_LIB})
         target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
-        # SentencePiece >= 0.2.1 exposes absl::Status in its public header, so our
-        # objects reference abseil directly. System packages (Homebrew) do not
-        # propagate that link dependency; add it only when the header needs it.
+        # When sentencepiece_processor.h includes abseil (upstream since 0.2.1),
+        # our objects reference absl::Status directly. System packages (Homebrew)
+        # do not propagate that link dependency; add it only when the header
+        # needs it.
         file(STRINGS "${SENTENCEPIECE_INCLUDE_DIR}/sentencepiece_processor.h"
             _NEMO_SPEECH_SENTENCEPIECE_ABSL REGEX "#include [<\"](third_party/)?absl/")
         if(_NEMO_SPEECH_SENTENCEPIECE_ABSL)

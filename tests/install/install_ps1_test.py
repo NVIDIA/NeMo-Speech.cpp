@@ -148,6 +148,16 @@ def main() -> None:
                 self.send_error(404)
                 return
             self.send_response(200)
+            # Without a text Content-Type, PowerShell 7 exposes .Content as
+            # byte[] and the installer's VERSION regex cannot match.
+            self.send_header(
+                "Content-Type",
+                (
+                    "text/plain; charset=utf-8"
+                    if self.path == "/VERSION"
+                    else "application/octet-stream"
+                ),
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -187,21 +197,27 @@ def main() -> None:
                     str(installer),
                     *arguments,
                 ]
-                try:
-                    result = subprocess.run(
-                        command,
-                        env=environment,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        check=False,
-                        timeout=300,
-                    )
-                except subprocess.TimeoutExpired as timeout:
-                    raise RuntimeError(
-                        f"installer timed out after {timeout.timeout:.0f}s; output so far:\n"
-                        f"{timeout.output or ''}"
-                    ) from None
+                with subprocess.Popen(
+                    command,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                ) as process:
+                    try:
+                        output, _ = process.communicate(timeout=300)
+                    except subprocess.TimeoutExpired:
+                        # Popen.kill() stops only pwsh; take its children with it.
+                        subprocess.run(
+                            ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                            check=False,
+                            capture_output=True,
+                        )
+                        output, _ = process.communicate()
+                        raise RuntimeError(
+                            f"installer timed out after 300s; output so far:\n{output}"
+                        ) from None
+                result = subprocess.CompletedProcess(command, process.returncode, output, None)
                 if ok and result.returncode != 0:
                     raise RuntimeError(f"installer failed ({result.returncode}):\n{result.stdout}")
                 if not ok and result.returncode == 0:
