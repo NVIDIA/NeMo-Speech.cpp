@@ -1,8 +1,14 @@
 name: Build and Test
 
 # Builds ASR, diarization, and TTS on the GitHub-hosted runners, runs the
-# model-free ctest suite, then a CLI smoke test with real models. CUDA and
-# Vulkan run on NVIDIA's self-hosted GPU runners in gpu.yml.
+# model-free ctest suite, then a CLI smoke test with real models.
+#
+# Coverage per job:
+#   Linux CPU    - build, ctest, CPU inference
+#   macOS Metal  - Metal backend COMPILE AND LINK only; inference runs on CPU.
+#                  The hosted macOS VM's paravirtual GPU cannot run ggml Metal.
+#   Windows CPU  - build, ctest, CPU inference
+# CUDA and Vulkan run on NVIDIA's self-hosted GPU runners in gpu.yml.
 
 on:
   pull_request:
@@ -69,7 +75,7 @@ jobs:
             --audio test_files/asr/wav/test/jfk.wav
 
   macos-metal:
-    name: macOS Metal
+    name: macOS Metal (build + CPU smoke)
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: macos-15
     timeout-minutes: 90

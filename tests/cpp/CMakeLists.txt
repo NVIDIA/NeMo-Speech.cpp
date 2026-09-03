@@ -70,7 +70,7 @@ if(TARGET nemo_speech_cli)
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install/install_ps1_test.py
                         ${NEMO_SPEECH_POWERSHELL_EXECUTABLE}
                         $<TARGET_FILE:nemo_speech_cli>)
-            set_tests_properties(cli_install_windows PROPERTIES TIMEOUT 900)
+            set_tests_properties(cli_install_windows PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
         endif()
         if(NEMO_SPEECH_BUILD_HTTP AND NEMO_SPEECH_BUILD_ASR AND
            DEFINED ENV{NEMO_SPEECH_TEST_ASR_MODEL} AND

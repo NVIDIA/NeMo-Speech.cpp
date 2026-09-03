@@ -1,10 +1,16 @@
 name: GPU Build and Test
 
-# GPU coverage on NVIDIA's self-hosted runners (nv-gpu-general, L4). Linux
-# builds the patched-ggml CUDA path, Windows builds the Vulkan path; both run
-# ctest and the model smoke test. copy-pr-bot mirrors vetted PRs to
-# pull-request/N branches, which is what triggers these jobs; pull_request
-# events never reach self-hosted runners.
+# GPU coverage on NVIDIA's self-hosted runners (nv-gpu-general, L4).
+#
+# Coverage per job:
+#   Linux CUDA     - patched-ggml CUDA build, ctest, GPU inference. This is the
+#                    only job that runs inference on a GPU.
+#   Windows Vulkan - Vulkan backend COMPILE AND LINK only; inference runs on
+#                    CPU because the Vulkan build enumerates no GPU device on
+#                    this runner. A non-blocking probe reports if that changes.
+#
+# copy-pr-bot mirrors vetted PRs to pull-request/N branches, which is what
+# triggers these jobs; pull_request events never reach self-hosted runners.
 
 on:
   push:
@@ -99,7 +105,7 @@ jobs:
             --audio test_files/asr/wav/test/jfk.wav
 
   windows-vulkan:
-    name: Windows Vulkan (L4)
+    name: Windows Vulkan (L4, build + CPU smoke)
     if: github.repository == 'NVIDIA/NeMo-Speech.cpp'
     runs-on: windows-amd64-gpu-l4-latest-1
     timeout-minutes: 120
@@ -143,6 +149,15 @@ jobs:
           $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
           if ($vulkan) { Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan" }
 
+      - name: Display GPU information
+        # nvidia-smi shows the driver mode (TCC has no graphics stack and
+        # therefore no Vulkan); vulkaninfo shows what the loader enumerates.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          nvidia-smi
+          & "$env:VULKAN_SDK\Bin\vulkaninfoSDK.exe" --summary
+
       - name: Restore vcpkg binaries
         # actions/cache only saves in its post step when the job succeeds, so
         # a failing test run threw away 30 minutes of dependency builds.
@@ -183,9 +198,22 @@ jobs:
           key: models-${{ hashFiles('models/index.json') }}
 
       - name: Model smoke test
+        # The Vulkan-built CLI enumerates no GPU device on this runner (see
+        # the GPU information step for the driver mode). Build and link the
+        # Vulkan backend here, run inference on CPU, and probe Vulkan
+        # non-blockingly below.
         shell: pwsh
         run: |
           python tests\ci\model_smoke.py `
             --binary build\windows-vulkan\bin\nemo-speech.exe `
-            --backend vulkan `
+            --backend cpu `
             --audio test_files\asr\wav\test\jfk.wav
+
+      - name: Vulkan backend probe (non-blocking)
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          build\windows-vulkan\bin\nemo-speech.exe --json doctor
+          build\windows-vulkan\bin\nemo-speech.exe --verbose transcribe `
+            test_files\asr\wav\test\jfk.wav --backend vulkan
