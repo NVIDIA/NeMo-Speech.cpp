@@ -874,8 +874,7 @@ local_transformer_graph_init(
                 codebook_idx);
             graph.logits_cond = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_cond, model.lt_out_b[codebook_idx]);
-            graph.logits_cond =
-                as_f32_contig(graph.ctx, graph.logits_cond);
+            graph.logits_cond = as_f32_contig(graph.ctx, graph.logits_cond);
             ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits");
             ggml_set_output(graph.logits_cond);
             ggml_build_forward_expand(graph.gf, graph.logits_cond);

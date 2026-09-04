@@ -13,10 +13,12 @@ class DecoderCrossKvCache;
 // that computes nothing, and ggml_cast to the type a tensor already has is the
 // same copy. Both show up per decode step, per layer, per column. A reshape of
 // a contiguous tensor is the identical view for free.
-inline ggml_tensor* as_contig(ggml_context* ctx, ggml_tensor* t) {
+inline ggml_tensor*
+as_contig(ggml_context* ctx, ggml_tensor* t) {
     return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
 }
-inline ggml_tensor* as_contig_2d(ggml_context* ctx, ggml_tensor* t, int64_t ne0, int64_t ne1) {
+inline ggml_tensor*
+as_contig_2d(ggml_context* ctx, ggml_tensor* t, int64_t ne0, int64_t ne1) {
     return ggml_is_contiguous(t) ? ggml_reshape_2d(ctx, t, ne0, ne1)
                                  : ggml_cont_2d(ctx, t, ne0, ne1);
 }
@@ -27,7 +29,8 @@ as_contig_3d(ggml_context* ctx, ggml_tensor* t, int64_t ne0, int64_t ne1, int64_
 }
 // The graph's read-back tensors want F32 and contiguous; when they already are,
 // asking for it again costs a copy of the whole tensor every step.
-inline ggml_tensor* as_f32_contig(ggml_context* ctx, ggml_tensor* t) {
+inline ggml_tensor*
+as_f32_contig(ggml_context* ctx, ggml_tensor* t) {
     if (t->type != GGML_TYPE_F32) {
         t = ggml_cast(ctx, t, GGML_TYPE_F32);
     }
