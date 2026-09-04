@@ -1,0 +1,148 @@
+diff --git a/src/ggml-cpu/vec.cpp b/src/ggml-cpu/vec.cpp
+index d0e40013..72c0cde0 100644
+--- a/src/ggml-cpu/vec.cpp
++++ b/src/ggml-cpu/vec.cpp
+@@ -80,7 +80,7 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
+             svbool_t pg = svwhilelt_b32(np2, n);
+             ax1 = svld1_f32(pg, x + np2);
+             ay1 = svld1_f32(pg, y + np2);
+-            sum1 = svmad_f32_m(pg, ax1, ay1, sum1);
++            sum1 = svmla_f32_m(pg, sum1, ax1, ay1);
+         }
+         // reduce sum1,sum2 to sum1
+         GGML_F32_VEC_REDUCE(sumf, sum1, sum2, sum3, sum4, sum5, sum6, sum7, sum8);
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7c28e344..b1828604 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -291,6 +291,15 @@ if (NOT GGML_BACKEND_DL)
+     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+     set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+ 
++    #
++    # test-vec-dot-f32
++
++    set(TEST_TARGET test-vec-dot-f32)
++    add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
++    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
++    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
++    set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
++
+     #
+     # test-conv1d
+ 
+diff --git a/tests/test-vec-dot-f32.cpp b/tests/test-vec-dot-f32.cpp
+new file mode 100644
+index 00000000..5765ab6e
+--- /dev/null
++++ b/tests/test-vec-dot-f32.cpp
+@@ -0,0 +1,109 @@
++// Exactness of the F32 dot product across SIMD tail boundaries.
++//
++// ggml_vec_dot_f32 is the CPU backend's reference implementation, which makes it
++// invisible to test-backend-ops: that harness checks every other backend against
++// the CPU, so a bug in the CPU path is the yardstick rather than the thing being
++// measured. This test checks the CPU against arithmetic instead.
++//
++// The interesting lengths are the ones a vectorised loop cannot cover with whole
++// vectors. Implementations handle the remainder with a predicated or scalar tail,
++// and a tail that merges into the wrong operand can discard lanes of the
++// accumulator -- silently, and only for lengths that are not a multiple of the
++// vector width.
++//
++// Both patterns below are exactly representable in binary32 at these sizes, so
++// the comparison is exact equality and not a tolerance.
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++static float dot_through_ggml(const std::vector<float> & a, const std::vector<float> & b) {
++    const int64_t n = (int64_t) a.size();
++
++    struct ggml_init_params params = {
++        /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead() +
++                          2 * (size_t) n * sizeof(float) + (size_t) 1024 * 1024,
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    struct ggml_tensor * ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
++    struct ggml_tensor * tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
++    memcpy(ta->data, a.data(), (size_t) n * sizeof(float));
++    memcpy(tb->data, b.data(), (size_t) n * sizeof(float));
++
++    struct ggml_tensor  * out = ggml_mul_mat(ctx, ta, tb);
++    struct ggml_cgraph  * gf  = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, out);
++    ggml_graph_compute_with_ctx(ctx, gf, 1);
++
++    const float got = ((float *) out->data)[0];
++    ggml_free(ctx);
++    return got;
++}
++
++int main(void) {
++    int failures = 0;
++    int checked  = 0;
++
++    // Lengths that straddle every plausible vector width and unroll step: 1..300
++    // covers 128-, 256-, 512- and 1024-bit vectors with every possible remainder,
++    // and the larger sizes re-check once the unrolled body dominates the tail.
++    std::vector<int64_t> lengths;
++    for (int64_t n = 1; n <= 300; ++n) {
++        lengths.push_back(n);
++    }
++    for (int64_t n : {511, 512, 513, 1023, 1024, 1025, 4095, 4096, 4097}) {
++        lengths.push_back(n);
++    }
++
++    for (int64_t n : lengths) {
++        // Pattern 1: ones against ones. The result is the length itself, so a
++        // dropped lane shows up as a shortfall of exactly the lanes lost.
++        {
++            std::vector<float> a((size_t) n, 1.0f), b((size_t) n, 1.0f);
++            const float want = (float) n;
++            const float got  = dot_through_ggml(a, b);
++            ++checked;
++            if (got != want) {
++                if (failures < 12) {
++                    printf("  n=%-5lld ones      got %12.1f  want %12.1f  (%+.1f%%)\n",
++                           (long long) n, got, want, 100.0 * (got - want) / want);
++                }
++                ++failures;
++            }
++        }
++        // Pattern 2: a ramp against ones. Position-dependent, so a tail that
++        // reads or merges the wrong lane moves the result even when the number
++        // of terms happens to come out right.
++        {
++            std::vector<float> a((size_t) n), b((size_t) n, 1.0f);
++            for (int64_t i = 0; i < n; ++i) {
++                a[(size_t) i] = (float) (i + 1);
++            }
++            const float want = (float) (n * (n + 1) / 2);
++            const float got  = dot_through_ggml(a, b);
++            ++checked;
++            if (got != want) {
++                if (failures < 12) {
++                    printf("  n=%-5lld ramp      got %12.1f  want %12.1f  (%+.1f%%)\n",
++                           (long long) n, got, want, 100.0 * (got - want) / want);
++                }
++                ++failures;
++            }
++        }
++    }
++
++    printf("ggml_vec_dot_f32 exactness (%d cases): %s\n", checked,
++           failures == 0 ? "\033[32mPASSED\033[0m" : "\033[31mFAILED\033[0m");
++    if (failures) {
++        printf("  %d of %d cases wrong\n", failures, checked);
++    }
++    return failures == 0 ? 0 : 1;
++}
