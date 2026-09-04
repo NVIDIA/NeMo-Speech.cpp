@@ -31,8 +31,8 @@
 // valid.
 
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -212,8 +212,9 @@ main() {
         return 1;
     }
     std::fprintf(
-        stderr, "OK: half_snake correct (max diff %.3g) with the output shifted %zu bytes "
-                "into its input\n",
+        stderr,
+        "OK: half_snake correct (max diff %.3g) with the output shifted %zu bytes "
+        "into its input\n",
         worst, kOverlapShift);
     return 0;
 }
