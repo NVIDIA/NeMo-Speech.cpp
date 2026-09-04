@@ -9,13 +9,20 @@ git submodule update --init ggml
 scripts/apply-ggml-patches.sh        # applies patches in filename order
 ```
 
-Patched CUDA builds expect the patches before CMake configuration; CPU, Metal,
-Vulkan, and stock-CUDA builds do not. `apply-ggml-patches.sh` uses `git apply`,
-skips patches that are already applied, and applies new patches in filename
-order. Later patches may build on files changed by earlier patches; 0006 carries
-the dispatch wiring for the ops/kernels introduced by 0001/0003/0005. Docker
-builds and `scripts/configure.sh` apply the series automatically; apply it
-explicitly before a raw CUDA CMake configuration.
+Patched CUDA and Metal builds expect the patches before CMake configuration.
+CPU, Vulkan, and stock-CUDA builds do not. `apply-ggml-patches.sh` uses `git
+apply`, skips patches that are already applied, and applies new patches in
+filename order. Later patches may build on files changed by earlier patches;
+0006 carries the dispatch wiring for the ops/kernels introduced by
+0001/0003/0005. Docker builds and `scripts/configure.sh` apply the series
+automatically; apply it explicitly before a raw CUDA or Metal CMake
+configuration.
+
+Metal requires only 0018, the one patch that touches the Metal backend. The
+`metal-*` presets apply the whole series because `apply-ggml-patches.sh`
+requires all of them or it fails. Once the submodule moves past upstream ggml
+`33c9ea5`, drop 0018 as described below and remove `metal-*` from the `case` in
+`scripts/configure.sh`.
 
 ## Building against patched vs stock ggml
 
@@ -116,6 +123,11 @@ stock comparison therefore requires both a pristine ggml checkout and
 
 - **0017-cuda-stream-interop.patch** - exposes borrowed access to the active
   CUDA stream and stable graph templates for external graph composition.
+
+- **0018-metal-tensor-api-dynamic-k.patch** - backports upstream ggml `33c9ea5`
+  (llama/27450), which stops the Metal tensor-API matmul reading `src1` out of
+  bounds when `K % 32 != 0`. Drop it once the submodule passes that commit,
+  keeping the `K = 1296` test case.
 
 ## Regenerating after editing ggml
 

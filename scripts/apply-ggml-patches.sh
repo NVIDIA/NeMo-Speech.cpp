@@ -51,8 +51,11 @@ if git -C "${GGML}" rev-parse --git-dir >/dev/null 2>&1; then
         fi
     done
 
-    mapfile -d '' patched_paths \
-        < <(GIT_INDEX_FILE="${expected_index}" git -C "${GGML}" \
+    # note: not mapfile -d '' - that is bash 4+, and macOS ships bash 3.2
+    patched_paths=()
+    while IFS= read -r -d '' path; do
+        patched_paths+=("${path}")
+    done < <(GIT_INDEX_FILE="${expected_index}" git -C "${GGML}" \
             diff --cached --name-only -z HEAD)
     GIT_INDEX_FILE="${current_index}" git -C "${GGML}" read-tree HEAD
     current_paths=()

@@ -22,7 +22,7 @@ Examples:
   scripts/configure.sh cuda-server -DNEMO_SPEECH_WITH_NORM=ON
 
 The script checks required submodules and optional feature assets, applies the
-pinned ggml patch series for CUDA presets, and then runs cmake --preset PRESET.
+pinned ggml patch series for CUDA and Metal presets, and then runs cmake --preset PRESET.
 EOF
     exit 0
 fi
@@ -65,7 +65,8 @@ cmake_bool_override() { # cmake_bool_override VARIABLE DEFAULT ARGS...
         key="${key%%:*}"
         [ "$key" = "$variable" ] || continue
         setting="${definition#*=}"
-        setting="${setting^^}"
+        # note: not ${setting^^} - that is bash 4+, and macOS ships bash 3.2
+        setting="$(printf '%s' "${setting}" | tr '[:lower:]' '[:upper:]')"
         case "$setting" in
             ON|TRUE|YES|1) value=ON ;;
             OFF|FALSE|NO|0) value=OFF ;;
@@ -160,7 +161,7 @@ if [ "${#missing[@]}" -ne 0 ]; then
 fi
 
 case "$PRESET" in
-    cuda-*)
+    cuda-*|metal-*)
         scripts/apply-ggml-patches.sh
         ;;
 esac

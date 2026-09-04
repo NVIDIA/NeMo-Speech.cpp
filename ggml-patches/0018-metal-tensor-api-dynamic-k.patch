@@ -1,0 +1,60 @@
+diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
+index f6ffb2b..55ad5ea 100644
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -9412,9 +9412,12 @@ kernel void kernel_mul_mm(
+     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
+ 
+     // Configure matmul operation
++    // note: K is dynamic_extent (clamped to the valid range in PHASE 2), since a static
++    //       N_MM_NK_TOTAL K tile would read src1 out of bounds when K % N_MM_NK_TOTAL != 0
++    // ref: https://github.com/ggml-org/llama.cpp/pull/27064
+     mpp::tensor_ops::matmul2d<
+         mpp::tensor_ops::matmul2d_descriptor(
+-            NRB, NRA, N_MM_NK_TOTAL, false, true, true,
++            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
+             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+ 
+@@ -9466,10 +9469,14 @@ kernel void kernel_mul_mm(
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+         // === PHASE 2: Tensor matmul ===
+-        auto mA = tA.slice(0, 0);
+-        auto mB = tB.slice(loop_k, rb);
++        // Clamp the K extent of both operand tensors to the remaining valid K range so
++        // the dynamic-K op never reads past the K extent of src1 (or the staged A tile).
++        const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
+ 
+-        mm.run(mB, mA, cT);
++        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
++        auto tBv = tensor(ptrB + loop_k + rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
++
++        mm.run(tBv, tAv, cT);
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f54ab41..85e0e92 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8401,6 +8401,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
+ 
++    // K not a multiple of 32 - exercises the partial-K tile of the Metal tensor API
++    // mat-mat kernel, which previously read past the K extent of src1 (ggml 33c9ea5)
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,   65, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,   80, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 32,   80, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 32,   80, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,  588, {1, 1}, {1, 1})); // 14*14*3, e.g. conv_2d im2col
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 64, 32,   80, {4, 1}, {1, 1}));
++    // NanoCodec residual input convolution: K = 1296 (1296 % 32 == 16), plus an aligned control
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  8, 432, 1296, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 32, 432, 1296, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 32, 432, 1280, {1, 1}, {1, 1}));
++
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
+     for (ggml_type type_a : all_types) {
