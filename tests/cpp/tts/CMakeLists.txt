@@ -31,13 +31,20 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_test(NAME magpietts_cached_attention COMMAND test_magpietts_cached_attention)
 endif()
 
-add_executable(test_magpietts_asr test_magpietts_asr.cpp)
-target_link_libraries(test_magpietts_asr PRIVATE
-    tests_cpp_wer
-    nemo_speech_tts_magpietts
-    nemo_speech_tts_tokenizer
-    nemo_speech_asr
-)
+# Synthesizes with MagpieTTS and transcribes the result, so it needs both
+# pipelines. With NEMO_SPEECH_BUILD_ASR=OFF the nemo_speech_asr link name
+# resolves to nothing -- CMake takes an unknown target for a raw library and
+# says so only at link time -- so recognizer.h never reaches the include path
+# and the whole directory fails to compile.
+if(TARGET nemo_speech_asr)
+    add_executable(test_magpietts_asr test_magpietts_asr.cpp)
+    target_link_libraries(test_magpietts_asr PRIVATE
+        tests_cpp_wer
+        nemo_speech_tts_magpietts
+        nemo_speech_tts_tokenizer
+        nemo_speech_asr
+    )
+endif()
 
 # C ABI tests. tts_c_smoke is compiled as C (proves include/nemo_speech/tts.h
 # is valid C) and links the unified TTS library; tts_c_dlopen loads it at runtime.
