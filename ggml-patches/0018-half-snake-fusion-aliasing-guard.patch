@@ -1,0 +1,32 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4162,6 +4162,28 @@
+         return 0;
+     }
+ 
++    // The graph allocator planned these buffers for the *unfused* sequence, in which the
++    // parent activation dies at the leaky_relu and its memory may be recycled for the
++    // concat output -- the unfused concat reads the materialised add/leaky_relu, not the
++    // parent. The fused kernel still reads the parent while writing the concat, so an
++    // output overlapping an input at a different offset races. Fuse only when the output
++    // misses both inputs entirely, or aliases them exactly (each thread then reads and
++    // writes one and the same address).
++    const char * dst_beg = (const char *) concat->data;
++    const char * dst_end = dst_beg + ggml_nbytes(concat);
++    const char * snk_beg = (const char *) x_snake->data;
++    const char * snk_end = snk_beg + ggml_nbytes(x_snake);
++    const char * lrl_beg = (const char *) view_l->data;
++    const char * lrl_end = lrl_beg + ggml_nbytes(view_l);
++
++    const bool disjoint = (snk_end <= dst_beg || dst_end <= snk_beg) &&
++                          (lrl_end <= dst_beg || dst_end <= lrl_beg);
++    const bool exact_inplace = dst_beg == snk_beg && lrl_beg == snk_end && dst_end == lrl_end;
++
++    if (!disjoint && !exact_inplace) {
++        return 0;
++    }
++
+     ggml_cuda_op_half_snake_fused(*cuda_ctx, x_snake, view_l, alpha, inv_b, lrelu, concat);
+     return 7;
+ }
