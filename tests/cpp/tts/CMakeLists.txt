@@ -12,6 +12,19 @@ add_executable(test_magpietts_frame_stacking test_magpietts_frame_stacking.cpp)
 target_link_libraries(test_magpietts_frame_stacking PRIVATE nemo_speech_tts_magpietts)
 add_test(NAME magpietts_frame_stacking COMMAND test_magpietts_frame_stacking)
 
+# Needs a real graph and a real allocator, so it links ggml directly rather than
+# testing the kernel in isolation -- the bug it guards is invisible to a
+# kernel-level test. Skips itself (exit 77) without a GPU backend.
+if(GGML_CUDA)
+    add_executable(test_nanocodec_half_snake_fusion test_nanocodec_half_snake_fusion.cpp)
+    target_link_libraries(test_nanocodec_half_snake_fusion PRIVATE ggml)
+    add_test(
+        NAME nanocodec_half_snake_fusion
+        COMMAND test_nanocodec_half_snake_fusion)
+    set_tests_properties(nanocodec_half_snake_fusion PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_magpietts_cached_attention test_magpietts_cached_attention.cpp)
     target_link_libraries(test_magpietts_cached_attention PRIVATE nemo_speech_tts_magpietts)
