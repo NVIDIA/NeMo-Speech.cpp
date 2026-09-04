@@ -1061,7 +1061,7 @@ decoder_eval_impl(
     ggml_tensor* dec_out = transformer_forward(
         ctx, model.decoder, dec_in, pos, cond, attn_prior,
         collect_alignment ? &alignment_outputs : nullptr);
-    dec_out = ggml_cont(ctx, ggml_cast(ctx, dec_out, GGML_TYPE_F32));
+    dec_out = as_f32_contig(ctx, dec_out);
     ggml_set_name(dec_out, "magpietts_decoder_out");
     ggml_set_output(dec_out);
 
@@ -1069,7 +1069,7 @@ decoder_eval_impl(
     ggml_tensor* logits = nullptr;
     if (compute_logits) {
         logits = linear(ctx, model.final_proj_w, dec_out, model.final_proj_b);
-        logits = ggml_cont(ctx, ggml_cast(ctx, logits, GGML_TYPE_F32));
+        logits = as_f32_contig(ctx, logits);
         ggml_set_name(logits, "magpietts_decoder_logits");
         ggml_set_output(logits);
     }
@@ -1215,7 +1215,7 @@ decoder_eval_pair_impl(
     ggml_tensor* dec_out_cond = transformer_forward(
         ctx, model.decoder, dec_in_cond, pos, text, attn_prior,
         collect_alignment ? &alignment_outputs : nullptr);
-    dec_out_cond = ggml_cont(ctx, ggml_cast(ctx, dec_out_cond, GGML_TYPE_F32));
+    dec_out_cond = as_f32_contig(ctx, dec_out_cond);
     ggml_set_name(dec_out_cond, "magpietts_decoder_out_cond");
     ggml_set_output(dec_out_cond);
 
@@ -1224,21 +1224,21 @@ decoder_eval_pair_impl(
     ggml_tensor* logits_cond = nullptr;
     if (compute_logits) {
         logits_cond = linear(ctx, model.final_proj_w, dec_out_cond, model.final_proj_b);
-        logits_cond = ggml_cont(ctx, ggml_cast(ctx, logits_cond, GGML_TYPE_F32));
+        logits_cond = as_f32_contig(ctx, logits_cond);
         ggml_set_name(logits_cond, "magpietts_decoder_logits_cond");
         ggml_set_output(logits_cond);
     }
 
     ggml_tensor* dec_out_uncond =
         transformer_forward(ctx, model.decoder, dec_in_uncond, pos, nullptr);
-    dec_out_uncond = ggml_cont(ctx, ggml_cast(ctx, dec_out_uncond, GGML_TYPE_F32));
+    dec_out_uncond = as_f32_contig(ctx, dec_out_uncond);
     ggml_set_name(dec_out_uncond, "magpietts_decoder_out_uncond");
     ggml_set_output(dec_out_uncond);
 
     ggml_tensor* logits_uncond = nullptr;
     if (compute_logits) {
         logits_uncond = linear(ctx, model.final_proj_w, dec_out_uncond, model.final_proj_b);
-        logits_uncond = ggml_cont(ctx, ggml_cast(ctx, logits_uncond, GGML_TYPE_F32));
+        logits_uncond = as_f32_contig(ctx, logits_uncond);
         ggml_set_name(logits_uncond, "magpietts_decoder_logits_uncond");
         ggml_set_output(logits_uncond);
     }
@@ -1454,7 +1454,7 @@ decoder_eval_cached_impl(
     ggml_tensor* dec_out = transformer_forward_cached(
         ctx, gf, model.decoder, dec_in, pos, cond, kv_state, conditional ? cross_kv : nullptr,
         n_past, attn_prior, collect_alignment ? &alignment_outputs : nullptr);
-    dec_out = ggml_cont(ctx, ggml_cast(ctx, dec_out, GGML_TYPE_F32));
+    dec_out = as_f32_contig(ctx, dec_out);
     ggml_set_name(dec_out, "magpietts_decoder_out_cached");
     ggml_set_output(dec_out);
 
@@ -1462,7 +1462,7 @@ decoder_eval_cached_impl(
     ggml_tensor* logits = nullptr;
     if (compute_logits) {
         logits = linear(ctx, model.final_proj_w, dec_out, model.final_proj_b);
-        logits = ggml_cont(ctx, ggml_cast(ctx, logits, GGML_TYPE_F32));
+        logits = as_f32_contig(ctx, logits);
         ggml_set_name(logits, "magpietts_decoder_logits_cached");
         ggml_set_output(logits);
         ggml_build_forward_expand(gf, logits);
@@ -1677,7 +1677,7 @@ decoder_eval_cached_pair_impl(
     ggml_tensor* dec_out_cond = transformer_forward_cached(
         ctx, gf, model.decoder, dec_in_cond, pos, text, cond_kv, cond_cross_kv, n_past, attn_prior,
         collect_alignment ? &alignment_outputs : nullptr);
-    dec_out_cond = ggml_cont(ctx, ggml_cast(ctx, dec_out_cond, GGML_TYPE_F32));
+    dec_out_cond = as_f32_contig(ctx, dec_out_cond);
     ggml_set_name(dec_out_cond, "magpietts_decoder_out_cond_cached");
     ggml_set_output(dec_out_cond);
 
@@ -1686,21 +1686,21 @@ decoder_eval_cached_pair_impl(
     ggml_tensor* logits_cond = nullptr;
     if (compute_logits) {
         logits_cond = linear(ctx, model.final_proj_w, dec_out_cond, model.final_proj_b);
-        logits_cond = ggml_cont(ctx, ggml_cast(ctx, logits_cond, GGML_TYPE_F32));
+        logits_cond = as_f32_contig(ctx, logits_cond);
         ggml_set_name(logits_cond, "magpietts_decoder_logits_cond_cached");
         ggml_set_output(logits_cond);
     }
 
     ggml_tensor* dec_out_uncond = transformer_forward_cached(
         ctx, gf, model.decoder, dec_in_uncond, pos, nullptr, uncond_kv, nullptr, n_past);
-    dec_out_uncond = ggml_cont(ctx, ggml_cast(ctx, dec_out_uncond, GGML_TYPE_F32));
+    dec_out_uncond = as_f32_contig(ctx, dec_out_uncond);
     ggml_set_name(dec_out_uncond, "magpietts_decoder_out_uncond_cached");
     ggml_set_output(dec_out_uncond);
 
     ggml_tensor* logits_uncond = nullptr;
     if (compute_logits) {
         logits_uncond = linear(ctx, model.final_proj_w, dec_out_uncond, model.final_proj_b);
-        logits_uncond = ggml_cont(ctx, ggml_cast(ctx, logits_uncond, GGML_TYPE_F32));
+        logits_uncond = as_f32_contig(ctx, logits_uncond);
         ggml_set_name(logits_uncond, "magpietts_decoder_logits_uncond_cached");
         ggml_set_output(logits_uncond);
     }
