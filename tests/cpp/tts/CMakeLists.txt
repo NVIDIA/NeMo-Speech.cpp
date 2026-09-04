@@ -18,13 +18,15 @@ if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_test(NAME magpietts_cached_attention COMMAND test_magpietts_cached_attention)
 endif()
 
-add_executable(test_magpietts_asr test_magpietts_asr.cpp)
-target_link_libraries(test_magpietts_asr PRIVATE
-    tests_cpp_wer
-    nemo_speech_tts_magpietts
-    nemo_speech_tts_tokenizer
-    nemo_speech_asr
-)
+if(NEMO_SPEECH_BUILD_ASR)
+    add_executable(test_magpietts_asr test_magpietts_asr.cpp)
+    target_link_libraries(test_magpietts_asr PRIVATE
+        tests_cpp_wer
+        nemo_speech_tts_magpietts
+        nemo_speech_tts_tokenizer
+        nemo_speech_asr
+    )
+endif()
 
 # C ABI tests. tts_c_smoke is compiled as C (proves include/nemo_speech/tts.h
 # is valid C) and links the unified TTS library; tts_c_dlopen loads it at runtime.
