@@ -10,7 +10,72 @@
 
 #include "runtime.h"
 
+#if defined(GGML_USE_CUDA)
+#include <ggml-cuda.h>
+#endif
+
 namespace ggml_runtime {
+
+namespace {
+
+void
+set_process_environment(const char* name, const char* value) {
+#if defined(_WIN32)
+    if (_putenv_s(name, value) != 0)
+        throw std::runtime_error(std::string("failed to set environment variable ") + name);
+#else
+    if (setenv(name, value, 1) != 0)
+        throw std::runtime_error(std::string("failed to set environment variable ") + name);
+#endif
+}
+
+std::string
+compute_capability_name(int cc) {
+    if (cc <= 0)
+        return "unknown";
+    return std::to_string(cc / 100) + "." + std::to_string((cc % 100) / 10);
+}
+
+void
+configure_skinny_q8(ggml_backend_dev_t device, int gpu_index) {
+#if defined(GGML_USE_CUDA)
+    const char* mode = std::getenv("NEMO_SPEECH_SKINNY_Q8_MODE");
+    if (mode == nullptr)
+        return;  // No CLI control: preserve the original GGML environment behavior.
+
+    const int cc = ggml_backend_cuda_get_device_compute_capability(gpu_index);
+    const char* description = ggml_backend_dev_description(device);
+    const std::string gpu = description ? description : "unknown GPU";
+    const std::string cc_name = compute_capability_name(cc);
+    if (std::strcmp(mode, "off") == 0) {
+        set_process_environment("GGML_SKINNY_Q8", "0");
+        GGMLF_LOG_INFO("[cuda] skinny-q8=off source=cli\n");
+    } else if (std::strcmp(mode, "on") == 0) {
+        if (cc <= 0 || cc < 800) {
+            throw std::runtime_error(
+                "Skinny Q8 is not compatible with the selected GPU.\nGPU: " + gpu +
+                "\nCompute Capability: " + cc_name +
+                "\nCurrent kernel requirement: SM 8.0 or higher\nUse: --skinny-q8 off");
+        }
+        set_process_environment("GGML_SKINNY_Q8", "1");
+        GGMLF_LOG_INFO("[cuda] skinny-q8=on source=cli compute-capability=%s\n", cc_name.c_str());
+    } else {  // auto
+        if (cc <= 0 || cc < 800) {
+            set_process_environment("GGML_SKINNY_Q8", "0");
+            GGMLF_LOG_INFO(
+                "[cuda] skinny-q8=off source=auto reason=compute-capability-%s\n", cc_name.c_str());
+        } else {
+            GGMLF_LOG_INFO(
+                "[cuda] skinny-q8=on source=auto compute-capability=%s\n", cc_name.c_str());
+        }
+    }
+#else
+    (void)device;
+    (void)gpu_index;
+#endif
+}
+
+}  // namespace
 
 BackendManager::BackendManager(Params params) {
     this->params = params;
@@ -90,6 +155,9 @@ BackendManager::init_backends() {
                 std::to_string(params.gpu_device_idx) + ")");
         }
         GGMLF_LOG_INFO("Using GPU backend: %s\n", ggml_backend_dev_name(dev));
+        configure_skinny_q8(dev, params.gpu_device_idx);
+        if (std::getenv("NEMO_SPEECH_SUPPRESS_CUDA_GRAPH_LOG") != nullptr)
+            GGMLF_LOG_INFO("[cuda] cuda-graph-architecture-log=suppressed\n");
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
         if (backend == nullptr) {
             throw std::runtime_error(
