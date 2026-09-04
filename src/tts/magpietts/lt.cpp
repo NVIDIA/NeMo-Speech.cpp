@@ -628,7 +628,7 @@ static ggml_tensor*
 local_transformer_forward_cached_fixed_pos(
     ggml_context* ctx, ggml_cgraph* gf, const magpietts_transformer& tr, ggml_tensor* x,
     ggml_tensor* pos_emb, DecoderKvCache& cache, int n_past) {
-    pos_emb = ggml_cont(ctx, ggml_cast(ctx, pos_emb, GGML_TYPE_F32));
+    pos_emb = as_f32_contig(ctx, pos_emb);
     x = ggml_add(ctx, x, pos_emb);
 
     for (int il = 0; il < (int)tr.layers.size(); ++il) {
@@ -729,7 +729,7 @@ local_transformer_forward_cached_pair_fixed_pos(
     ggml_tensor* pos_emb, DecoderKvCache& cond_cache, DecoderKvCache& uncond_cache,
     LocalTransformerCudaAttentionCache* cuda_attention_cache, ggml_tensor* cache_state,
     int n_past) {
-    pos_emb = ggml_cont(ctx, ggml_cast(ctx, pos_emb, GGML_TYPE_F32));
+    pos_emb = as_f32_contig(ctx, pos_emb);
     x = ggml_add(ctx, x, pos_emb);
     for (int il = 0; il < static_cast<int>(tr.layers.size()); ++il) {
         const magpietts_layer& layer = tr.layers[static_cast<size_t>(il)];
@@ -853,7 +853,7 @@ local_transformer_graph_init(
                 graph.cache_state, codebook_idx);
             ggml_tensor* logits_pair = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_pair, model.lt_out_b[codebook_idx]);
-            logits_pair = ggml_cont(graph.ctx, ggml_cast(graph.ctx, logits_pair, GGML_TYPE_F32));
+            logits_pair = as_f32_contig(graph.ctx, logits_pair);
             graph.logits_cond =
                 ggml_view_2d(graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1], 0);
             graph.logits_uncond = ggml_view_2d(
@@ -875,7 +875,7 @@ local_transformer_graph_init(
             graph.logits_cond = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_cond, model.lt_out_b[codebook_idx]);
             graph.logits_cond =
-                ggml_cont(graph.ctx, ggml_cast(graph.ctx, graph.logits_cond, GGML_TYPE_F32));
+                as_f32_contig(graph.ctx, graph.logits_cond);
             ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits");
             ggml_set_output(graph.logits_cond);
             ggml_build_forward_expand(graph.gf, graph.logits_cond);

@@ -1072,17 +1072,17 @@ self_attention(
     ggml_tensor* vcur = ggml_view_2d(
         ctx, qkv, n_embd, n_tok, qkv->nb[1], (size_t)ggml_element_size(qkv) * n_embd * 2);
 
-    ggml_tensor* q = ggml_permute(ctx, ggml_cont_3d(ctx, qcur, d_head, n_head, n_tok), 0, 2, 1, 3);
-    ggml_tensor* k = ggml_permute(ctx, ggml_cont_3d(ctx, kcur, d_head, n_head, n_tok), 0, 2, 1, 3);
+    ggml_tensor* q = ggml_permute(ctx, as_contig_3d(ctx, qcur, d_head, n_head, n_tok), 0, 2, 1, 3);
+    ggml_tensor* k = ggml_permute(ctx, as_contig_3d(ctx, kcur, d_head, n_head, n_tok), 0, 2, 1, 3);
     ggml_tensor* kq = ggml_mul_mat(ctx, k, q);
     kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
     ggml_tensor* kq_soft = causal_soft_max(ctx, tr, kq, 0);
     ggml_tensor* v_trans = ggml_cont_3d(
-        ctx, ggml_permute(ctx, ggml_cont_3d(ctx, vcur, d_head, n_head, n_tok), 1, 2, 0, 3), n_tok,
+        ctx, ggml_permute(ctx, as_contig_3d(ctx, vcur, d_head, n_head, n_tok), 1, 2, 0, 3), n_tok,
         d_head, n_head);
     ggml_tensor* kqv = ggml_mul_mat(ctx, v_trans, kq_soft);
     ggml_tensor* merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-    ggml_tensor* out = ggml_cont_2d(ctx, merged, n_embd, n_tok);
+    ggml_tensor* out = as_contig_2d(ctx, merged, n_embd, n_tok);
     return linear(ctx, layer.self_o, out);
 }
 
@@ -1117,7 +1117,7 @@ self_attention_cached(
     ggml_set_name(v_copy, "magpietts_decoder_kv_copy_v");
     ggml_build_forward_expand(gf, v_copy);
 
-    ggml_tensor* q = ggml_permute(ctx, ggml_cont_3d(ctx, qcur, d_head, n_head, n_tok), 0, 2, 1, 3);
+    ggml_tensor* q = ggml_permute(ctx, as_contig_3d(ctx, qcur, d_head, n_head, n_tok), 0, 2, 1, 3);
     ggml_tensor* k = ggml_permute(
         ctx,
         ggml_reshape_3d(
@@ -1139,7 +1139,7 @@ self_attention_cached(
         n_total, d_head, n_head);
     ggml_tensor* kqv = ggml_mul_mat(ctx, v_trans, kq_soft);
     ggml_tensor* merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-    ggml_tensor* out = ggml_cont_2d(ctx, merged, n_embd, n_tok);
+    ggml_tensor* out = as_contig_2d(ctx, merged, n_embd, n_tok);
     return linear(ctx, layer.self_o, out);
 }
 
@@ -1159,8 +1159,8 @@ cross_attention(
     ggml_tensor* vcur = ggml_view_2d(
         ctx, kv, d_head * n_head, n_kv, kv->nb[1], (size_t)ggml_element_size(kv) * d_head * n_head);
 
-    ggml_tensor* qh = ggml_permute(ctx, ggml_cont_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
-    ggml_tensor* kh = ggml_permute(ctx, ggml_cont_3d(ctx, kcur, d_head, n_head, n_kv), 0, 2, 1, 3);
+    ggml_tensor* qh = ggml_permute(ctx, as_contig_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
+    ggml_tensor* kh = ggml_permute(ctx, as_contig_3d(ctx, kcur, d_head, n_head, n_kv), 0, 2, 1, 3);
     ggml_tensor* kq = ggml_mul_mat(ctx, kh, qh);
     kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
     ggml_tensor* kq_soft = ggml_soft_max(ctx, kq);
@@ -1176,11 +1176,11 @@ cross_attention(
         *last_attn = ggml_cont_2d(ctx, last, n_kv, n_head);
     }
     ggml_tensor* v_trans = ggml_cont_3d(
-        ctx, ggml_permute(ctx, ggml_cont_3d(ctx, vcur, d_head, n_head, n_kv), 1, 2, 0, 3), n_kv,
+        ctx, ggml_permute(ctx, as_contig_3d(ctx, vcur, d_head, n_head, n_kv), 1, 2, 0, 3), n_kv,
         d_head, n_head);
     ggml_tensor* kqv = ggml_mul_mat(ctx, v_trans, kq_soft);
     ggml_tensor* merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-    ggml_tensor* out = ggml_cont_2d(ctx, merged, d_head * n_head, n_q);
+    ggml_tensor* out = as_contig_2d(ctx, merged, d_head * n_head, n_q);
     return linear(ctx, layer.cross_o, out);
 }
 
@@ -1199,7 +1199,7 @@ cross_attention_cached(
     const size_t layer_offset =
         (size_t)layer_index * n_kv * cross_dim * ggml_element_size(cross_kv.memory_k);
 
-    ggml_tensor* qh = ggml_permute(ctx, ggml_cont_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
+    ggml_tensor* qh = ggml_permute(ctx, as_contig_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
     ggml_tensor* kh = ggml_permute(
         ctx,
         ggml_reshape_3d(
@@ -1236,7 +1236,7 @@ cross_attention_cached(
         n_kv, d_head, n_head);
     ggml_tensor* kqv = ggml_mul_mat(ctx, v_trans, kq_soft);
     ggml_tensor* merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-    ggml_tensor* out = ggml_cont_2d(ctx, merged, cross_dim, n_q);
+    ggml_tensor* out = as_contig_2d(ctx, merged, cross_dim, n_q);
     return linear(ctx, layer.cross_o, out);
 }
 
