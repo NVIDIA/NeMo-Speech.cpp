@@ -82,9 +82,10 @@ main() {
     check(prof.mask("oh darn the heck") == "oh d*** the h***", "whole-word masking");
     // UTF-8 masking keeps the first codepoint and emits one '*' per remaining codepoint.
     check(
-        prof.mask("\xE0\xA4\xAF\xE0\xA4\xB9 "              // यह
-                  "\xE0\xA4\xA8\xE0\xA4\xA6\xE0\xA5\x80 "  // नदी
-                  "\xE0\xA4\xB9\xE0\xA5\x88") ==           // है
+        prof.mask(
+            "\xE0\xA4\xAF\xE0\xA4\xB9 "              // यह
+            "\xE0\xA4\xA8\xE0\xA4\xA6\xE0\xA5\x80 "  // नदी
+            "\xE0\xA4\xB9\xE0\xA5\x88") ==           // है
             "\xE0\xA4\xAF\xE0\xA4\xB9 \xE0\xA4\xA8** \xE0\xA4\xB9\xE0\xA5\x88",
         "UTF-8 (Devanagari) word masked per codepoint, valid UTF-8");
     check(prof.mask("darn, it") == "d***, it", "trailing punctuation preserved");

@@ -57,9 +57,9 @@ static void
 test_policy() {
     // Threshold 800 ms (riva default). The runner feeds (now_ms, last_speech_ms).
     {
-        VadEndpointer ep(VadEndpointerCfg{
-            /*enable=*/true, /*vad_based=*/true,
-            /*stop_history_eou_ms=*/800.0f});
+        VadEndpointer ep(
+            VadEndpointerCfg{/*enable=*/true, /*vad_based=*/true,
+                             /*stop_history_eou_ms=*/800.0f});
         // Speech up to 1000 ms, then silence. Poll every 100 ms.
         bool fired_before = false, fired_at = false, fired_after = false;
         for (double now = 1000.0; now < 1800.0; now += 100.0)  // 0..800 ms silence

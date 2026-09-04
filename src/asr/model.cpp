@@ -299,10 +299,12 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
                 auto c = s->model_tensor_container->get_tensor_by_name(
                     rnnt_c_state_name(active_bank, i));
                 auto bf = tc->get_ctx_of_buffer_type(h.buft);
-                pred_in.add_tensor(ggml_runtime::ggml_bf_tensor(
-                    ggml_get_rows(bf.ctx, h.tensor, slot_ids.tensor), h.buft));
-                pred_in.add_tensor(ggml_runtime::ggml_bf_tensor(
-                    ggml_get_rows(bf.ctx, c.tensor, slot_ids.tensor), c.buft));
+                pred_in.add_tensor(
+                    ggml_runtime::ggml_bf_tensor(
+                        ggml_get_rows(bf.ctx, h.tensor, slot_ids.tensor), h.buft));
+                pred_in.add_tensor(
+                    ggml_runtime::ggml_bf_tensor(
+                        ggml_get_rows(bf.ctx, c.tensor, slot_ids.tensor), c.buft));
             }
             auto pred_out = pred_->build_graph(s, pred_in, tc);
             auto pred_proj =
@@ -312,27 +314,31 @@ class RnntModel::RnntDecoderStages : public ggml_runtime::Module {
             ggml_runtime::TensorBag state_out;
             auto pred_state =
                 s->model_tensor_container->get_tensor_by_name(kRnntPredProjectionState);
-            state_out.add_tensor(ggml_runtime::ggml_bf_tensor(
-                ggml_set_rows(
-                    bf.ctx, pred_state.tensor, ggml_cont(bf.ctx, pred_proj.tensor),
-                    slot_ids.tensor),
-                pred_proj.buft));
+            state_out.add_tensor(
+                ggml_runtime::ggml_bf_tensor(
+                    ggml_set_rows(
+                        bf.ctx, pred_state.tensor, ggml_cont(bf.ctx, pred_proj.tensor),
+                        slot_ids.tensor),
+                    pred_proj.buft));
             for (int i = 0; i < cfg.pred_num_layers; i++) {
                 auto h_dst = s->model_tensor_container->get_tensor_by_name(
                     rnnt_h_state_name(candidate_bank, i));
                 auto c_dst = s->model_tensor_container->get_tensor_by_name(
                     rnnt_c_state_name(candidate_bank, i));
-                state_out.add_tensor(ggml_runtime::ggml_bf_tensor(
-                    ggml_set_rows(
-                        bf.ctx, h_dst.tensor,
-                        ggml_cont(bf.ctx, pred_out.get_tensor(1 + 2 * i).tensor), slot_ids.tensor),
-                    pred_out.get_tensor(1 + 2 * i).buft));
-                state_out.add_tensor(ggml_runtime::ggml_bf_tensor(
-                    ggml_set_rows(
-                        bf.ctx, c_dst.tensor,
-                        ggml_cont(bf.ctx, pred_out.get_tensor(1 + 2 * i + 1).tensor),
-                        slot_ids.tensor),
-                    pred_out.get_tensor(1 + 2 * i + 1).buft));
+                state_out.add_tensor(
+                    ggml_runtime::ggml_bf_tensor(
+                        ggml_set_rows(
+                            bf.ctx, h_dst.tensor,
+                            ggml_cont(bf.ctx, pred_out.get_tensor(1 + 2 * i).tensor),
+                            slot_ids.tensor),
+                        pred_out.get_tensor(1 + 2 * i).buft));
+                state_out.add_tensor(
+                    ggml_runtime::ggml_bf_tensor(
+                        ggml_set_rows(
+                            bf.ctx, c_dst.tensor,
+                            ggml_cont(bf.ctx, pred_out.get_tensor(1 + 2 * i + 1).tensor),
+                            slot_ids.tensor),
+                        pred_out.get_tensor(1 + 2 * i + 1).buft));
             }
             if (!fused_tdt && !fused_rnnt)
                 return state_out;

@@ -15,7 +15,7 @@ repos:
         always_run: true
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v6.0.0
     hooks:
       - id: check-added-large-files
         args: ['--maxkb=512']
@@ -31,22 +31,22 @@ repos:
         exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v18.1.8
+    rev: v23.1.0
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
         # ggml + vendored riva protos are upstream code — don't reformat.
         exclude: '^(ggml/|ggml-patches/|proto/riva-common/|build/|build-.*/).*'
 
-  - repo: https://github.com/psf/black
-    rev: 24.10.0
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.5.1
     hooks:
       - id: black
         args: ['--skip-string-normalization', '--line-length=100']
         exclude: '^(ggml/|proto/riva-common/|build/).*'
 
   - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
+    rev: 9.0.1
     hooks:
       - id: isort
         name: isort (python)
@@ -58,7 +58,7 @@ repos:
           - '--skip=build'
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.10.0.1
+    rev: v0.11.0.1-1
     hooks:
       - id: shellcheck
         args: ['--severity=warning']
