@@ -1,0 +1,128 @@
+diff --git a/src/ggml-cuda/im2col.cu b/src/ggml-cuda/im2col.cu
+--- a/src/ggml-cuda/im2col.cu
++++ b/src/ggml-cuda/im2col.cu
+@@ -43,6 +43,78 @@
+     GGML_UNUSED(KH);
+ }
+ 
++// The generic kernel above indexes threads along IC*KH*KW, which coalesces the store but
++// scatters the load: consecutive threads read addresses IC_IH_IW apart, so a warp issues
++// several short transactions instead of one. For the 1D case that costs most of the
++// achievable bandwidth (measured ~220 GB/s against ~900 GB/s for comparable kernels).
++//
++// Both directions can be coalesced at once by staging a tile through shared memory: load
++// along the input's contiguous axis (OW), store along the destination's (IC*KW). The
++// shared tile is padded to an odd word stride so the transposed access is conflict-free.
++#define IM2COL_1D_TILE_OW 64
++#define IM2COL_1D_TILE_I  32
++
++template <typename T>
++static __global__ void im2col_1d_tiled_kernel(
++        const float * __restrict__ x, T * __restrict__ dst,
++        const int64_t IC_KW, const int64_t IW, const int64_t OW, const int64_t KW,
++        const int64_t IC_IH_IW, const int64_t IH_IW,
++        const int s0, const int p0, const int d0) {
++
++    __shared__ float tile[IM2COL_1D_TILE_I][IM2COL_1D_TILE_OW + 1];
++    // The channel and kernel tap depend only on the row of the tile, so resolve them once
++    // per row rather than once per element: the division is otherwise the dominant cost.
++    __shared__ int64_t s_base[IM2COL_1D_TILE_I];
++    __shared__ int     s_off[IM2COL_1D_TILE_I];
++
++    const int64_t ow0 = (int64_t) blockIdx.x * IM2COL_1D_TILE_OW;
++    const int64_t i0  = (int64_t) blockIdx.y * IM2COL_1D_TILE_I;
++    const int64_t in  = blockIdx.z;
++
++    if (threadIdx.x < IM2COL_1D_TILE_I) {
++        const int64_t i = i0 + threadIdx.x;
++        int64_t base = 0;
++        int off = 0;
++        if (i < IC_KW) {
++            const int64_t iic = i / KW;
++            const int64_t ikw = i - iic * KW;
++            base = iic * IC_IH_IW + in * IH_IW;
++            off  = (int) (ikw * d0 - p0);
++        }
++        s_base[threadIdx.x] = base;
++        s_off[threadIdx.x]  = off;
++    }
++    __syncthreads();
++
++    // load: consecutive threads walk OW, which is contiguous in the source
++    for (int idx = threadIdx.x; idx < IM2COL_1D_TILE_I * IM2COL_1D_TILE_OW; idx += blockDim.x) {
++        const int il = idx / IM2COL_1D_TILE_OW;
++        const int ol = idx - il * IM2COL_1D_TILE_OW;
++        const int64_t i  = i0  + il;
++        const int64_t ow = ow0 + ol;
++        float v = 0.0f;
++        if (i < IC_KW && ow < OW) {
++            const int64_t iiw = ow * s0 + s_off[il];
++            if (iiw >= 0 && iiw < IW) {
++                v = x[s_base[il] + iiw];
++            }
++        }
++        tile[il][ol] = v;
++    }
++    __syncthreads();
++
++    // store: consecutive threads walk IC*KW, which is contiguous in the destination
++    for (int idx = threadIdx.x; idx < IM2COL_1D_TILE_I * IM2COL_1D_TILE_OW; idx += blockDim.x) {
++        const int ol = idx / IM2COL_1D_TILE_I;
++        const int il = idx - ol * IM2COL_1D_TILE_I;
++        const int64_t i  = i0  + il;
++        const int64_t ow = ow0 + ol;
++        if (i < IC_KW && ow < OW) {
++            dst[(in * OW + ow) * IC_KW + i] = tile[il][ol];
++        }
++    }
++}
++
+ // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
+ template <typename T>
+ static void im2col_cuda(const float * x, T* dst,
+@@ -50,6 +122,18 @@
+     int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
+     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
+     const int64_t IC_KH_KW = IC * KH * KW;
++
++    // 1D convolutions take the tiled path; everything else keeps the generic kernel.
++    if (KH == 1 && IH == 1 && OH == 1 && N <= 65535) {
++        dim3 blocks(
++            (OW       + IM2COL_1D_TILE_OW - 1) / IM2COL_1D_TILE_OW,
++            (IC_KH_KW + IM2COL_1D_TILE_I  - 1) / IM2COL_1D_TILE_I,
++            N);
++        im2col_1d_tiled_kernel<T><<<blocks, 256, 0, stream>>>(
++            x, dst, IC_KH_KW, IW, OW, KW, IC_IH_IW, IH_IW, s0, p0, d0);
++        return;
++    }
++
+     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
+     const int64_t N_OH = N * OH;
+     const int64_t KH_KW = KW*KH;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f54ab41c..62977e67 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7749,6 +7749,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // im2col 1D, wide enough that a tiled implementation has to cover a full tile
++    // interior as well as its edges. The cases above are either 1-batch with unit
++    // stride and dilation, or too short (OW=18) to fill a tile at all, so a bug in
++    // the interior of a blocked kernel survives them.
++    //   OW=148, IC*KW=170: partial tile on both axes, batched, non-unit s0/p0/d0
++    test_cases.emplace_back(new test_im2col(
++        GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {300, 34, 3, 1}, {5, 34, 8, 1},
++        2, 0, 2, 0, 2, 0, false));
++    test_cases.emplace_back(new test_im2col(
++        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {300, 34, 3, 1}, {5, 34, 8, 1},
++        2, 0, 2, 0, 2, 0, false));
++    //   OW=255, IC*KW=192: OW one short of a 64-multiple, IC*KW an exact multiple
++    test_cases.emplace_back(new test_im2col(
++        GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {257, 64, 2, 1}, {3, 64, 8, 1},
++        1, 0, 0, 0, 1, 0, false));
++
+     // im2col 2D
+     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
+     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32));
