@@ -238,6 +238,7 @@ GGUFLoader::GGUFLoader(const std::string& path) {
         for (struct ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr;
              t = ggml_get_next_tensor(ctx, t)) {
             m_tensor_n_dims[t->name] = ggml_n_dims(t);
+            m_tensor_ne[t->name] = std::vector<int64_t>(t->ne, t->ne + ggml_n_dims(t));
         }
         ggml_free(ctx);
     }
@@ -319,6 +320,12 @@ int
 GGUFLoader::get_tensor_n_dims(const std::string& tensor_name) const {
     auto it = m_tensor_n_dims.find(tensor_name);
     return it == m_tensor_n_dims.end() ? 0 : it->second;
+}
+
+std::vector<int64_t>
+GGUFLoader::get_tensor_ne(const std::string& tensor_name) const {
+    auto it = m_tensor_ne.find(tensor_name);
+    return it == m_tensor_ne.end() ? std::vector<int64_t>{} : it->second;
 }
 
 bool

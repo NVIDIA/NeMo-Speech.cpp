@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <future>
-#include <iostream>
 #include <map>
 #include <optional>
 #include <shared_mutex>
@@ -18,6 +17,7 @@
 #include <thread>
 
 #include "cache_aware_encoder.h"  // CacheAwareEncoder (cache-aware streaming subsystem)
+#include "nn.h"
 #include "nvtx_utils.h"
 #include "rnnt_modules.h"  // RnntPredictorModule / RnntJointModule / PromptFusionModule
 #include "runtime.h"
@@ -135,18 +135,41 @@ class RnntModel::RnntEncoderTail : public ggml_runtime::Module {
     PromptFusionModule* prompt_;
 };
 
+// Optional voicechat projection attached to S2S perception GGUFs. Keeping it
+// as a tail of the native offline encoder lets compatible streams share the
+// full FastConformer batch and produces both downstream views in one graph.
+class RnntModel::S2SProjectionTail : public ggml_runtime::Module {
+   public:
+    S2SProjectionTail(int in_dim, int out_dim)
+        : projection_("proj", in_dim, out_dim, /*use_bias=*/true) {}
+
+    void define_tensors(ggml_runtime::Session* s) override { projection_.define_tensors(s); }
+    ggml_runtime::TensorBag build_graph(
+        ggml_runtime::Session* s, ggml_runtime::TensorBag input,
+        ggml_runtime::TensorContainer* tc) override {
+        return projection_.build_graph(s, input, tc);
+    }
+    void set_data(ggml_runtime::Session* s) override { projection_.set_data(s); }
+
+   private:
+    ggml_runtime::Linear projection_;
+};
+
 // Full-utterance encoder root: non-cache-aware FastConformer followed by the
 // same prompt fusion + joint encoder projection used by streaming. It is kept
 // in a separate lazy Session because cache-aware and offline graphs have
 // different persistent-state and attention semantics.
 class RnntModel::OfflineEncoderRoot : public ggml_runtime::Module {
    public:
-    OfflineEncoderRoot(FastConformerEncoder* encoder, RnntEncoderTail* tail)
-        : encoder_(encoder), tail_(tail) {}
+    OfflineEncoderRoot(
+        FastConformerEncoder* encoder, RnntEncoderTail* tail, S2SProjectionTail* s2s_projection)
+        : encoder_(encoder), tail_(tail), s2s_projection_(s2s_projection) {}
 
     void define_tensors(ggml_runtime::Session* s) override {
         encoder_->define_tensors(s);
         tail_->define_tensors(s);
+        if (s2s_projection_)
+            s2s_projection_->define_tensors(s);
     }
     ggml_runtime::TensorBag build_graph(
         ggml_runtime::Session* s, ggml_runtime::TensorBag input,
@@ -156,16 +179,24 @@ class RnntModel::OfflineEncoderRoot : public ggml_runtime::Module {
         tail_input.add_tensor(enc.get_tensor(0));
         if (input.tensor_count() > 1)
             tail_input.add_tensor(input.get_tensor(1));
-        return tail_->build_graph(s, tail_input, tc);
+        auto output = tail_->build_graph(s, tail_input, tc);
+        if (s2s_projection_) {
+            auto projected = s2s_projection_->build_graph(s, enc, tc);
+            output.add_tensor(projected.get_tensor(0));
+        }
+        return output;
     }
     void set_data(ggml_runtime::Session* s) override {
         encoder_->set_data(s);
         tail_->set_data(s);
+        if (s2s_projection_)
+            s2s_projection_->set_data(s);
     }
 
    private:
     FastConformerEncoder* encoder_;
     RnntEncoderTail* tail_;
+    S2SProjectionTail* s2s_projection_;
 };
 
 class RnntModel::OfflineEncoderBatcher {
@@ -176,6 +207,7 @@ class RnntModel::OfflineEncoderBatcher {
     };
     struct Result {
         std::vector<float> enc;
+        std::vector<float> s2s;
         int T = 0;
     };
 
@@ -184,6 +216,7 @@ class RnntModel::OfflineEncoderBatcher {
               const int B = static_cast<int>(requests.size());
               const int F = model_->enc_cfg_.feat_in;
               const int J = model_->rnnt_cfg_.joint_dim;
+              const int S = model_->s2s_projection_dim_;
               const int Tout = model_->enc_cfg_.subsample_time_length(frames);
               const size_t feature_item = static_cast<size_t>(F) * frames;
               std::vector<float> packed(feature_item * B);
@@ -214,23 +247,33 @@ class RnntModel::OfflineEncoderBatcher {
               }
 
               std::vector<float> output(static_cast<size_t>(J) * Tout * B);
-              std::vector<ggml_runtime::Session::Output> outputs(1);
-              outputs[0].index = 0;
-              outputs[0].host_buffer = output.data();
-              outputs[0].nbytes = output.size() * sizeof(float);
+              std::vector<float> s2s_output(static_cast<size_t>(S) * Tout * B);
+              std::vector<ggml_runtime::Session::Output> outputs = {
+                  {0, "", output.data(), output.size() * sizeof(float)}};
+              if (S > 0)
+                  outputs.push_back({1, "", s2s_output.data(), s2s_output.size() * sizeof(float)});
               model_->offline_encoder_session_->run(inputs, outputs);
               const int out_j = static_cast<int>(outputs[0].out_shape[0]);
               const int out_t = static_cast<int>(outputs[0].out_shape[1]);
               const int out_b = static_cast<int>(outputs[0].out_shape[2]);
               if (out_j != J || out_b != B)
                   throw std::runtime_error("offline transducer graph lost its batch dimension");
+              if (S > 0 && (static_cast<int>(outputs[1].out_shape[0]) != S ||
+                            static_cast<int>(outputs[1].out_shape[1]) != out_t ||
+                            static_cast<int>(outputs[1].out_shape[2]) != B))
+                  throw std::runtime_error("offline S2S projection lost its batch dimension");
               const size_t output_item = static_cast<size_t>(J) * out_t;
+              const size_t s2s_item = static_cast<size_t>(S) * out_t;
               std::vector<Result> results(static_cast<size_t>(B));
               for (int b = 0; b < B; ++b) {
                   results[b].T = out_t;
                   results[b].enc.assign(
                       output.begin() + static_cast<size_t>(b) * output_item,
                       output.begin() + static_cast<size_t>(b + 1) * output_item);
+                  if (S > 0)
+                      results[b].s2s.assign(
+                          s2s_output.begin() + static_cast<size_t>(b) * s2s_item,
+                          s2s_output.begin() + static_cast<size_t>(b + 1) * s2s_item);
               }
               return results;
           }) {}
@@ -1232,6 +1275,7 @@ load_fe_cfg(const ggml_runtime::GGUFLoader& loader, const std::string& A) {
     fe.n_fft = loader.get_u32(A + ".preprocessor.n_fft", fe.n_fft);
     fe.n_mels = loader.get_u32(A + ".preprocessor.features", fe.n_mels);
     fe.preemph = loader.get_f32(A + ".preprocessor.preemph", fe.preemph);
+    fe.log_zero_guard = loader.get_f32(A + ".preprocessor.log_zero_guard_value", fe.log_zero_guard);
     fe.normalize_per_feature =
         loader.get_str(A + ".preprocessor.normalize", "per_feature") == "per_feature";
     fe.stft_center_window =
@@ -1286,8 +1330,11 @@ void
 AsrModel::apply_model_mel_basis(MelSpectrogramExtractor& extractor) {
     // Prefer the serialized Slaney-normalized filterbank used during training.
     // Older GGUFs fall back to the generated unit-peak filterbank.
-    const std::string fb_name = "preprocessor.fb";
-    if (loader_->has_tensor(fb_name)) {
+    const std::string fb_name =
+        loader_->has_tensor("preprocessor.fb")
+            ? "preprocessor.fb"
+            : (loader_->has_tensor(ns_ + ".preprocessor.fb") ? ns_ + ".preprocessor.fb" : "");
+    if (!fb_name.empty()) {
         const int n_mels = fe_cfg_.n_mels;
         const int n_bins = fe_cfg_.n_fft / 2 + 1;
         const size_t want = static_cast<size_t>(n_mels) * n_bins * sizeof(float);
@@ -1626,6 +1673,25 @@ RnntModel::RnntModel(ggml_runtime::BackendManager& bm, Common&& c, const Batchin
     rnnt_joint_ = std::make_unique<RnntJointModule>("rnnt_joint", rnnt_cfg_);
     decoder_arena_slots_ = std::max(1, batching.state_arena_slots);
     rnnt_encoder_tail_ = std::make_unique<RnntEncoderTail>(rnnt_joint_.get(), prompt_fusion_.get());
+    if (loader()->has_tensor("proj.weight") || loader()->has_tensor("proj.bias")) {
+        if (!loader()->has_tensor("proj.weight") || !loader()->has_tensor("proj.bias"))
+            throw std::runtime_error("S2S perception requires both proj.weight and proj.bias");
+        const auto shape = loader()->get_tensor_ne("proj.weight");
+        if (shape.size() != 2 || shape[0] != rnnt_cfg_.d_model)
+            throw std::runtime_error("S2S proj.weight has incompatible encoder geometry");
+        s2s_projection_dim_ = static_cast<int>(shape[1]);
+        const int metadata_in =
+            static_cast<int>(loader()->get_u32("s2s.perception.proj.in_dim", rnnt_cfg_.d_model));
+        const int metadata_out =
+            static_cast<int>(loader()->get_u32("s2s.perception.proj.out_dim", s2s_projection_dim_));
+        if (metadata_in != rnnt_cfg_.d_model || metadata_out != s2s_projection_dim_)
+            throw std::runtime_error("S2S projection metadata does not match proj.weight");
+        s2s_projection_ =
+            std::make_unique<S2SProjectionTail>(rnnt_cfg_.d_model, s2s_projection_dim_);
+        GGMLF_LOG_INFO(
+            "[asr_model] S2S projection enabled: %d -> %d\n", rnnt_cfg_.d_model,
+            s2s_projection_dim_);
+    }
     rnnt_decoder_stages_ = std::make_unique<RnntDecoderStages>(
         rnnt_predictor_.get(), rnnt_joint_.get(), decoder_arena_slots_);
     decoder_session_ = std::make_unique<ggml_runtime::Session>(
@@ -1680,8 +1746,8 @@ RnntModel::ensure_offline_path() {
             offline_cfg.offline_right_ctx = offline_cfg.cache_right_ctx;
     }
     offline_encoder_ = std::make_unique<FastConformerEncoder>("encoder", offline_cfg);
-    offline_encoder_root_ =
-        std::make_unique<OfflineEncoderRoot>(offline_encoder_.get(), rnnt_encoder_tail_.get());
+    offline_encoder_root_ = std::make_unique<OfflineEncoderRoot>(
+        offline_encoder_.get(), rnnt_encoder_tail_.get(), s2s_projection_.get());
     offline_encoder_session_ = std::make_unique<ggml_runtime::Session>(
         backend_manager(), offline_encoder_root_.get(), loader());
     offline_encoder_session_->set_weight_load_hook(planar_q8_weight_load_hook());
@@ -1725,6 +1791,25 @@ RnntModel::infer_offline_from_mel(
     ensure_offline_path();
     auto result = offline_encoder_batcher_->run(feats, n_frames, prompt_index);
     enc_out = std::move(result.enc);
+    T_enc = result.T;
+}
+
+void
+RnntModel::infer_s2s_from_mel(
+    const float* feats, int n_frames, std::vector<float>& s2s_out, std::vector<float>& rnnt_out,
+    int& T_enc) {
+    if (!has_s2s_projection())
+        throw std::runtime_error("RNNT model has no S2S perception projection");
+    if (n_frames <= 0) {
+        s2s_out.clear();
+        rnnt_out.clear();
+        T_enc = 0;
+        return;
+    }
+    ensure_offline_path();
+    auto result = offline_encoder_batcher_->run(feats, n_frames, /*prompt_index=*/-1);
+    s2s_out = std::move(result.s2s);
+    rnnt_out = std::move(result.enc);
     T_enc = result.T;
 }
 

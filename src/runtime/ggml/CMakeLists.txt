@@ -23,6 +23,9 @@ target_include_directories(nemo_speech_runtime_ggml PUBLIC
     ${CMAKE_SOURCE_DIR}/ggml/include
     ${CMAKE_SOURCE_DIR}/ggml/src
 )
+target_include_directories(nemo_speech_runtime_ggml PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/common
+)
 
 target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
 

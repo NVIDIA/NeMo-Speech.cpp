@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import sys
 import tarfile
@@ -13,7 +14,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+import torch
 import yaml
+from gguf import GGMLQuantizationType
+from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -23,6 +28,23 @@ from conversion.registry import (
     _convert_nmt,
     _normalized_outtype,
     detect_architecture,
+)
+from conversion.s2s import (
+    COMPONENT_FORMATS,
+    RUNTIME_ARTIFACTS,
+    build_conversion_plan,
+    component_formats,
+    output_bundle_dir,
+)
+from conversion.s2s_components.eartts_backbone import _extract_backbone_weights
+from conversion.s2s_components.perception import _preserve_subsampling_precision
+from conversion.s2s_components.voicechat_source import (
+    build_character_tables,
+    default_quantizer_path,
+    ensure_llama_checkout,
+    ensure_quantizer,
+    find_quantizer,
+    load_llm_channel_weights,
 )
 from conversion.source import extract_archive
 
@@ -36,6 +58,33 @@ class ConverterContractTest(unittest.TestCase):
             member.size = len(payload)
             archive.addfile(member, io.BytesIO(payload))
         return checkpoint
+
+    def _s2s_repository(self, root: Path) -> Path:
+        version = root / "nemotron-voicechat" / "1"
+        for relative in (
+            "config.json",
+            "perception.safetensors",
+            "rnnt-asr.safetensors",
+            "embeddings.safetensors",
+            "codec.safetensors",
+            "rnnt_tokenizer/vocab.json",
+            "eartts_vllm/config.json",
+            "eartts_vllm/model.safetensors",
+            "eartts_vllm/tts_model_init_inputs.pt",
+            "nano-v2-vllm/config.json",
+            "nano-v2-vllm/model.safetensors",
+        ):
+            path = version / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        return version
+
+    def _hf_s2s_repository(self, root: Path) -> Path:
+        for relative in ("config.json", "model.safetensors", "rnnt_tokenizer/vocab.json"):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        return root
 
     def test_architecture_detection(self) -> None:
         configs = {
@@ -67,6 +116,21 @@ class ConverterContractTest(unittest.TestCase):
             self.assertEqual(actual, "nmt")
             self.assertIsNone(resolved)
 
+            s2s_version = self._s2s_repository(root / "voicechat-source")
+            s2s_root = s2s_version.parents[1]
+            actual, resolved = detect_architecture(
+                ConversionRequest(source=str(s2s_root), outfile=root / "voicechat-gguf")
+            )
+            self.assertEqual(actual, "s2s")
+            self.assertEqual(resolved, s2s_root.resolve())
+
+            hf_s2s = self._hf_s2s_repository(root / "NVIDIA-NemotronLabs-VoiceChat-11B")
+            actual, resolved = detect_architecture(
+                ConversionRequest(source=str(hf_s2s), outfile=root / "voicechat-hf-gguf")
+            )
+            self.assertEqual(actual, "s2s")
+            self.assertEqual(resolved, hf_s2s.resolve())
+
             actual, resolved = detect_architecture(
                 ConversionRequest(source="silero", outfile=root / "vad.gguf")
             )
@@ -77,8 +141,259 @@ class ConverterContractTest(unittest.TestCase):
         self.assertEqual(_normalized_outtype("asr", "auto"), "q8_0")
         self.assertEqual(_normalized_outtype("diarization", "auto"), "f32")
         self.assertEqual(_normalized_outtype("tts", "fp16"), "f16")
+        self.assertEqual(_normalized_outtype("s2s", "auto"), "q4_k_m")
+        self.assertEqual(_normalized_outtype("s2s", "q4"), "q4_k_m")
+        self.assertEqual(_normalized_outtype("s2s", "nvfp4"), "nvfp4")
         with self.assertRaises(ValueError):
             _normalized_outtype("vad", "q8_0")
+        with self.assertRaises(ValueError):
+            _normalized_outtype("s2s", "q8_0")
+
+    def test_s2s_channel_weights_come_from_source_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            config = {
+                "model": {
+                    "stt": {
+                        "model": {
+                            "duplex_user_channel_weight": 0.75,
+                            "duplex_text_channel_weight": 1.25,
+                            "duplex_function_channel_weight": 2.5,
+                        }
+                    }
+                }
+            }
+            (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertEqual(
+                load_llm_channel_weights(source),
+                {"user": 0.75, "text": 1.25, "function": 2.5},
+            )
+
+    def test_s2s_character_tables_support_sparse_token_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tokenizer = Path(temporary) / "tokenizer.json"
+            tokenizer.write_text(
+                json.dumps({"model": {"vocab": {"a": 0, "bc": 3}}}),
+                encoding="utf-8",
+            )
+
+            ids, mask, _ = build_character_tables(tokenizer)
+
+            self.assertEqual(ids.shape[0], 5)
+            self.assertEqual(mask.shape, ids.shape)
+            self.assertEqual(mask[4, 0], 1.0)
+
+    def test_eartts_dummy_embedding_uses_configured_hidden_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            save_file(
+                {"model.backbone.layers.0.weight": torch.zeros((2, 7))},
+                str(source / "model.safetensors"),
+            )
+
+            weights = _extract_backbone_weights(source, hidden_size=11)
+
+            self.assertEqual(tuple(weights["model.embed_tokens.weight"].shape), (1, 11))
+
+    def test_s2s_quantization_preserves_bf16_perception_stem(self) -> None:
+        values = np.array([1.00390625, -0.998046875], dtype=np.float32)
+        expected = torch.from_numpy(values).to(torch.bfloat16).float().numpy()
+
+        weight, weight_type = _preserve_subsampling_precision(
+            "encoder.pre_encode.conv.0.weight",
+            values,
+            GGMLQuantizationType.Q8_0,
+        )
+        bias, bias_type = _preserve_subsampling_precision(
+            "encoder.pre_encode.conv.0.bias",
+            values,
+            GGMLQuantizationType.Q8_0,
+        )
+        non_stem, non_stem_type = _preserve_subsampling_precision(
+            "encoder.layers.0.self_attn.linear_q.weight",
+            values,
+            GGMLQuantizationType.Q8_0,
+        )
+
+        np.testing.assert_array_equal(weight, expected)
+        np.testing.assert_array_equal(bias, expected)
+        self.assertEqual(weight_type, GGMLQuantizationType.BF16)
+        self.assertEqual(bias_type, GGMLQuantizationType.F32)
+        self.assertIs(non_stem, values)
+        self.assertEqual(non_stem_type, GGMLQuantizationType.Q8_0)
+
+    def test_s2s_bundle_plan_matches_runtime_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._s2s_repository(root / "source")
+            llama_cpp = root / "llama.cpp"
+            (llama_cpp / "convert_hf_to_gguf.py").parent.mkdir(parents=True)
+            (llama_cpp / "convert_hf_to_gguf.py").touch()
+            destination = root / "artifacts" / "nemotron-voicechat" / "1"
+            plan = build_conversion_plan(source, destination, llama_cpp)
+
+            self.assertEqual(len(plan), 7)
+            self.assertEqual(
+                {step.output.relative_to(destination).as_posix() for step in plan},
+                set(RUNTIME_ARTIFACTS) - {"rnnt_tokenizer/vocab.json"},
+            )
+            commands = {step.name: step.command for step in plan}
+            self.assertEqual(commands["perception"][-1], "q8_0")
+            self.assertEqual(commands["eartts_side"][-1], COMPONENT_FORMATS["eartts_side"])
+            self.assertEqual(commands["codec"][-1], COMPONENT_FORMATS["codec"])
+
+    def test_hf_s2s_plan_quantizes_backbones_and_uses_flat_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._hf_s2s_repository(root / "source")
+            base_model = root / "base-model"
+            base_model.mkdir()
+            (base_model / "tokenizer.json").touch()
+            llama_cpp = root / "llama.cpp"
+            (llama_cpp / "convert_hf_to_gguf.py").parent.mkdir(parents=True)
+            (llama_cpp / "convert_hf_to_gguf.py").touch()
+            quantizer = root / "llama-quantize"
+            destination = root / "artifacts"
+
+            plan = build_conversion_plan(
+                source,
+                destination,
+                llama_cpp,
+                profile="nvfp4",
+                base_model_dir=base_model,
+                quantizer=quantizer,
+            )
+            commands = {step.name: step.command for step in plan}
+            self.assertEqual(output_bundle_dir(source, source, destination), destination.resolve())
+            self.assertEqual(component_formats("nvfp4")["perception"], "q8_0")
+            self.assertEqual(component_formats("nvfp4")["llm_backbone"], "nvfp4")
+            self.assertEqual(component_formats("nvfp4")["eartts_backbone"], "q4_k_m")
+            self.assertIn("--base-model-dir", commands["llm_backbone"])
+            self.assertEqual(
+                commands["llm_backbone"][-4:],
+                ("--quantize", "nvfp4", "--quantizer", str(quantizer)),
+            )
+            self.assertEqual(
+                commands["eartts_backbone"][-4:],
+                ("--quantize", "q4_k_m", "--quantizer", str(quantizer)),
+            )
+            self.assertIn("--tokenizer-json", commands["eartts_side"])
+
+    def test_explicit_s2s_quantizer_path_is_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fallback = root / "llama.cpp" / "build" / "bin" / "llama-quantize"
+            fallback.parent.mkdir(parents=True)
+            fallback.touch(mode=0o755)
+
+            with self.assertRaisesRegex(FileNotFoundError, "is not executable"):
+                find_quantizer(root / "llama.cpp", root / "missing-llama-quantize")
+
+    def test_s2s_nvfp4_quantizer_requires_nvfp4_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            llama_cpp = root / "llama.cpp"
+            quantizer = llama_cpp / "build" / "bin" / "llama-quantize"
+            quantizer.parent.mkdir(parents=True)
+            quantizer.touch(mode=0o755)
+
+            unsupported = subprocess.CompletedProcess(
+                [str(quantizer), "--help"], 0, stdout="Q4_K_M", stderr=""
+            )
+            with mock.patch(
+                "conversion.s2s_components.voicechat_source.shutil.which",
+                return_value=None,
+            ), mock.patch(
+                "conversion.s2s_components.voicechat_source.subprocess.run",
+                return_value=unsupported,
+            ):
+                with self.assertRaisesRegex(FileNotFoundError, "NVFP4 support"):
+                    find_quantizer(llama_cpp, profile="nvfp4")
+                with self.assertRaisesRegex(RuntimeError, "does not advertise NVFP4"):
+                    find_quantizer(llama_cpp, quantizer, profile="nvfp4")
+
+            supported = subprocess.CompletedProcess(
+                [str(quantizer), "--help"], 0, stdout="NVFP4", stderr=""
+            )
+            with mock.patch(
+                "conversion.s2s_components.voicechat_source.subprocess.run",
+                return_value=supported,
+            ):
+                self.assertEqual(
+                    find_quantizer(llama_cpp, quantizer, profile="nvfp4"),
+                    quantizer,
+                )
+
+    def test_pinned_llama_checkout_is_initialized_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            llama_cpp = root / "llama.cpp"
+            converter = llama_cpp / "convert_hf_to_gguf.py"
+
+            def fake_run(command, **kwargs):
+                self.assertEqual(
+                    command,
+                    ["/usr/bin/git", "submodule", "update", "--init", "llama.cpp"],
+                )
+                self.assertEqual(kwargs["cwd"], root)
+                converter.parent.mkdir(parents=True)
+                converter.touch()
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch(
+                "conversion.s2s_components.voicechat_source.shutil.which",
+                return_value="/usr/bin/git",
+            ), mock.patch(
+                "conversion.s2s_components.voicechat_source.subprocess.run",
+                side_effect=fake_run,
+            ):
+                actual = ensure_llama_checkout(llama_cpp, root)
+
+            self.assertEqual(actual, llama_cpp)
+
+    def test_s2s_quantizer_is_built_automatically_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            llama_cpp = root / "llama.cpp"
+            llama_cpp.mkdir()
+            (llama_cpp / "CMakeLists.txt").touch()
+            (llama_cpp / "convert_hf_to_gguf.py").touch()
+            patch_script = root / "scripts" / "apply-llama-patches.sh"
+            patch_script.parent.mkdir()
+            patch_script.touch()
+            built = default_quantizer_path(llama_cpp)
+
+            def fake_run(command, **_kwargs):
+                if "--build" in command:
+                    built.parent.mkdir(parents=True)
+                    built.touch(mode=0o755)
+                if command == [str(built), "--help"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="NVFP4", stderr="")
+                return subprocess.CompletedProcess(command, 0)
+
+            def fake_which(name):
+                return f"/usr/bin/{name}" if name in {"cmake", "ninja"} else None
+
+            with mock.patch(
+                "conversion.s2s_components.voicechat_source.shutil.which",
+                side_effect=fake_which,
+            ), mock.patch(
+                "conversion.s2s_components.voicechat_source.subprocess.run",
+                side_effect=fake_run,
+            ) as run:
+                actual = ensure_quantizer(llama_cpp, profile="nvfp4", repo_root=root)
+
+            self.assertEqual(actual, built)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands[0], ["bash", str(patch_script)])
+            self.assertIn("-DLLAMA_BUILD_TOOLS=ON", commands[1])
+            self.assertEqual(commands[2][-3:], ["--target", "llama-quantize", "--parallel"])
+
+    def test_s2s_quantizer_auto_build_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            llama_cpp = Path(temporary) / "llama.cpp"
+            with self.assertRaisesRegex(FileNotFoundError, "automatic build is disabled"):
+                ensure_quantizer(llama_cpp, auto_build=False)
 
     def test_archive_traversal_and_links_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -111,6 +426,10 @@ class ConverterContractTest(unittest.TestCase):
         self.assertIn("--architecture", result.stdout)
         self.assertIn("--outfile", result.stdout)
         self.assertIn("--local-transformer-outtype", result.stdout)
+        self.assertIn("--llama-cpp", result.stdout)
+        self.assertIn("--llama-quantize", result.stdout)
+        self.assertIn("--no-build-quantizer", result.stdout)
+        self.assertIn("s2s", result.stdout)
 
     def test_nmt_adapter_honors_hugging_face_revision_and_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -125,15 +444,25 @@ class ConverterContractTest(unittest.TestCase):
             )
             snapshot = root / "snapshot"
             snapshot.mkdir()
+            llama_cpp = root / "llama.cpp"
+            llama_cpp.mkdir()
+            (llama_cpp / "convert_hf_to_gguf.py").touch()
             with mock.patch(
                 "huggingface_hub.snapshot_download", return_value=str(snapshot)
-            ) as download, mock.patch("conversion.registry.subprocess.run") as run:
+            ) as download, mock.patch(
+                "conversion.s2s_components.voicechat_source.ensure_llama_checkout",
+                return_value=llama_cpp,
+            ) as checkout, mock.patch(
+                "conversion.registry.subprocess.run"
+            ) as run:
                 _convert_nmt(request, "f16")
 
+            checkout.assert_called_once_with(ROOT / "llama.cpp", ROOT)
             download.assert_called_once_with(
                 repo_id="org/model", revision="release", cache_dir=str(root / "cache")
             )
             command = run.call_args.args[0]
+            self.assertEqual(Path(command[1]), llama_cpp / "convert_hf_to_gguf.py")
             self.assertEqual(Path(command[2]), snapshot)
             self.assertEqual(command[-2:], ["--outtype", "f16"])
             self.assertTrue(run.call_args.kwargs["check"])

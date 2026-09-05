@@ -19,6 +19,7 @@
 #include "encoder.h"
 #include "graph.h"
 #include "lt.h"
+#include "model_logging.h"
 #include "nvtx_utils.h"
 #if defined(GGML_USE_METAL)
 #include "ggml-metal.h"
@@ -707,6 +708,7 @@ magpietts_model_load_impl(
     bool verbose) {
     const ggml_nvtx::range nvtx_range("magpietts_model_load");
     model.reset();
+    nemo_speech::common::ensure_ggml_logging(verbose);
 
     gguf_init_params params = {
         /*.no_alloc =*/true,

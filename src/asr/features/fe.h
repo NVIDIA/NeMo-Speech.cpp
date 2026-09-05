@@ -85,6 +85,12 @@ class MelSpectrogramExtractor {
         const float* audio, size_t n_samples, std::vector<float>& features, int& n_frames,
         bool reflect_left = true, bool normalize = true) const;
 
+    // Compute a fixed-shape padded buffer while restricting pre-emphasis,
+    // normalization, and the valid-frame mask to the real input prefix.
+    void compute_padded(
+        const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& features,
+        int& n_frames, bool reflect_left = true, bool normalize = true) const;
+
     // Override the generated filterbank with the model's training-time basis.
     // `fb` is row-major (n_mels, n_fft / 2 + 1).
     void set_mel_basis(const float* fb, int n_mels, int n_bins);
@@ -102,6 +108,7 @@ class MelSpectrogramExtractor {
    private:
     struct BatchRequest {
         std::vector<float> audio;
+        size_t valid_samples = 0;
         bool reflect_left = true;
         bool normalize = true;
     };
@@ -123,8 +130,8 @@ class MelSpectrogramExtractor {
     // inner=n_mels (frame-major). `normalize=true` runs the host-side
     // per-feature z-score after download.
     void compute_gpu_via_session(
-        const float* audio, size_t n_samples, std::vector<float>& out, int& n_frames,
-        bool reflect_left, bool normalize) const;
+        const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& out,
+        int& n_frames, bool reflect_left, bool normalize) const;
     std::vector<BatchResult> compute_gpu_batch_via_session(
         std::vector<BatchRequest>&& requests) const;
 

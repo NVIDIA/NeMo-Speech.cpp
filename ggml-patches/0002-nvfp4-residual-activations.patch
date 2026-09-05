@@ -1,0 +1,400 @@
+diff --git a/src/ggml-cuda/mmq.cu b/src/ggml-cuda/mmq.cu
+index e1add5e0..9c98e3c3 100644
+--- a/src/ggml-cuda/mmq.cu
++++ b/src/ggml-cuda/mmq.cu
+@@ -127,7 +127,9 @@ void ggml_cuda_mul_mat_q(
+     if (!ids) {
+         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
++        const bool use_nvfp4_residual = use_native_fp4 && src0->type == GGML_TYPE_NVFP4;
++        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1 * (use_nvfp4_residual ? 2 : 1));
++        char * src1_residual = use_nvfp4_residual ? src1_q8_1.get() + nbytes_src1_q8_1 : nullptr;
+ 
+         {
+             const int64_t s11 = src1->nb[1] / ts_src1;
+@@ -135,7 +137,7 @@ void ggml_cuda_mul_mat_q(
+             const int64_t s13 = src1->nb[3] / ts_src1;
+             if (use_native_fp4) {
+                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
+-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
++                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_residual, src0->type, ne10, s11, s12, s13, ne10_padded,
+                                         ne11, ne12, ne13, stream);
+ 
+             } else {
+@@ -152,7 +154,7 @@ void ggml_cuda_mul_mat_q(
+         const int64_t s13 = ne12*s12;
+ 
+         const mmq_args args = {
+-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
++            src0_d, src0->type, (const int *) src1_q8_1.ptr, (const int *) src1_residual, nullptr, nullptr, dst_d,
+             ne00, ne01, ne1, s01, ne11, s1,
+             ne02, ne12, s02, s12, s2,
+             ne03, ne13, s03, s13, s3,
+@@ -185,7 +187,9 @@ void ggml_cuda_mul_mat_q(
+ 
+     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
++    const bool use_nvfp4_residual = use_native_fp4 && src0->type == GGML_TYPE_NVFP4;
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1 * (use_nvfp4_residual ? 2 : 1));
++    char * src1_residual = use_nvfp4_residual ? src1_q8_1.get() + nbytes_src1_q8_1 : nullptr;
+ 
+     const int64_t ne11_flat = ne12*n_expert_used;
+     const int64_t ne12_flat = 1;
+@@ -197,7 +201,7 @@ void ggml_cuda_mul_mat_q(
+         const int64_t s13 = src1->nb[3] / ts_src1;
+ 
+         if (use_native_fp4) {
+-            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
++            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_residual, src0->type, ne10, s11, s12, s13,
+                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+         } else {
+             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+@@ -213,7 +217,7 @@ void ggml_cuda_mul_mat_q(
+ 
+     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+     const mmq_args args = {
+-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
++        src0_d, src0->type, (const int *) src1_q8_1.get(), (const int *) src1_residual, ids_dst.get(), expert_bounds.get(), dst_d,
+         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+         ne02, ne02, s02, s12, s2,
+         ne03, ne13, s03, s13, s3,
+@@ -253,7 +257,7 @@ void ggml_cuda_op_mul_mat_q(
+                             || GGML_CUDA_CC_IS_CDNA(cc))
+                             && src1_ncols == ne11;
+     const mmq_args args = {
+-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
++        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, nullptr, dst_dd_i,
+         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
+         1, 1, 0, 0, 0,
+         1, 1, 0, 0, 0,
+diff --git a/src/ggml-cuda/mmq.cuh b/src/ggml-cuda/mmq.cuh
+index edf546d8..1881b7f3 100644
+--- a/src/ggml-cuda/mmq.cuh
++++ b/src/ggml-cuda/mmq.cuh
+@@ -3446,6 +3446,7 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
+ template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
++        const int * __restrict__ y_residual,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+         const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+@@ -3500,6 +3501,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+         __syncthreads();
+ 
++#if defined(BLACKWELL_MMA_AVAILABLE)
++        if constexpr (type == GGML_TYPE_NVFP4) {
++            if (y_residual) {
++                const int * by0 = y_residual + ncols_y * (kb0 * qk / ne_block) * sz;
++#pragma unroll
++                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    const int l = l0 + threadIdx.y * warp_size + threadIdx.x;
++                    tile_y[l] = by0[l];
++                }
++                __syncthreads();
++                vec_dot(tile_x, tile_y, sum, 0);
++                __syncthreads();
++            }
++        }
++#endif
++
+         {
+             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+ #pragma unroll
+@@ -3515,6 +3532,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+ 
+         __syncthreads();
++
++#if defined(BLACKWELL_MMA_AVAILABLE)
++        if constexpr (type == GGML_TYPE_NVFP4) {
++            if (y_residual) {
++                const int * by0 = y_residual + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
++#pragma unroll
++                for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    const int l = l0 + threadIdx.y * warp_size + threadIdx.x;
++                    tile_y[l] = by0[l];
++                }
++                __syncthreads();
++                vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
++                __syncthreads();
++            }
++        }
++#endif
+     }
+ 
+     if (fixup) {
+@@ -3540,7 +3573,8 @@ template <ggml_type type, int mmq_x, bool need_check>
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+ #endif // defined(GGML_USE_HIP)
+ static __global__ void mul_mat_q(
+-        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
++        const char * __restrict__ x, const int * __restrict__ y, const int * __restrict__ y_residual,
++        const int32_t * __restrict__ ids_dst,
+         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+@@ -3629,7 +3663,8 @@ static __global__ void mul_mat_q(
+ 
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
++            (x, offset_x, y + offset_y, y_residual ? y_residual + offset_y : nullptr,
++             ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+         return;
+     }
+@@ -3709,7 +3744,8 @@ static __global__ void mul_mat_q(
+ 
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
++            (x, offset_x, y + offset_y, y_residual ? y_residual + offset_y : nullptr,
++             ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ 
+         kbc += blocks_per_ne00.z;
+@@ -3778,7 +3814,8 @@ static __global__ void mul_mat_q(
+ 
+     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
++        (x, offset_x, y + offset_y, y_residual ? y_residual + offset_y : nullptr,
++         ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ }
+ 
+@@ -3922,7 +3959,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
+ }
+ 
+ struct mmq_args {
+-    const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
++    const char * x; ggml_type type_x; const int * y; const int * y_residual;
++    const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
+     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
+     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+@@ -3976,7 +4014,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+         if (args.nrows_x % mmq_y == 0) {
+             constexpr bool need_check = false;
+             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
++                (args.x, args.y, args.y_residual, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+@@ -3984,7 +4022,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+         } else {
+             constexpr bool need_check = true;
+             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
++                (args.x, args.y, args.y_residual, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+@@ -4016,7 +4054,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     if (args.nrows_x % mmq_y == 0) {
+         constexpr bool need_check = false;
+         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
++            (args.x, args.y, args.y_residual, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+@@ -4034,7 +4072,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     } else {
+         constexpr bool need_check = true;
+         mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
++            (args.x, args.y, args.y_residual, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+diff --git a/src/ggml-cuda/quantize.cu b/src/ggml-cuda/quantize.cu
+index 52f66471..2a878c73 100644
+--- a/src/ggml-cuda/quantize.cu
++++ b/src/ggml-cuda/quantize.cu
+@@ -72,7 +72,8 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
+ 
+ 
+ static __global__ void quantize_mmq_nvfp4(
+-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
++        const float * __restrict__ x, const int32_t * __restrict__ ids,
++        void * __restrict__ vy, void * __restrict__ vy_residual,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t ne0, const int64_t ne1, const int64_t ne2) {
+ #if defined(BLACKWELL_MMA_AVAILABLE)
+@@ -95,6 +96,7 @@ static __global__ void quantize_mmq_nvfp4(
+     const int64_t ib = blockIdx.z * ((int64_t) blocks_per_col * ne1) + k_block * ne1 + blockIdx.x;
+     block_fp4_mmq * y = (block_fp4_mmq *) vy;
+     block_fp4_mmq * yb = y + ib;
++    block_fp4_mmq * yrb = (block_fp4_mmq *) vy_residual + ib;
+ 
+     const int sub = (i0_base % QK_K) / QK_NVFP4_SUB;
+ 
+@@ -113,57 +115,62 @@ static __global__ void quantize_mmq_nvfp4(
+         }
+     }
+ 
+-    static constexpr int test_offsets[5] = { 0, -1, 1, -2, 2};
+-    const int first_fp8_code = (int) ggml_cuda_fp32_to_ue4m3(amax_raw / 6.0f);
+-
+-    float best_err = FLT_MAX;
+-    uint8_t fp8_code = 0;
+-    float subblock_scale = 0.0f;
+-
+-#pragma unroll // Check +/- 2 to find best code to reduce NVFP4 activation loss. Negligible overhead on Blackwell.
+-    for (int i = 0; i < 5; i++) {
+-        const int test_code = first_fp8_code + test_offsets[i];
+-        if (test_code < 0 || test_code > 0x7e) {
+-            continue;
+-        }
+-        const uint8_t code = (uint8_t) test_code;
+-        const float test_scale = ggml_cuda_ue4m3_to_fp32(code);
+-        const float test_inv_scale = test_scale > 0.0f ? 0.5f / test_scale : 0.0f;
+-        float cur_err = 0.0f;
+-#pragma unroll
+-        for (int k = 0; k < QK_NVFP4_SUB; ++k) {
+-            const float v = vals_raw[k];
+-            const uint8_t q = ggml_cuda_float_to_fp4_e2m1(v, test_inv_scale);
+-            const float err_diff = fabsf(v) - fabsf(kvalues_mxfp4[q & 0x7]) * test_scale;
+-            cur_err = fmaf(err_diff, err_diff, cur_err);
+-        }
+-
+-        if (cur_err < best_err) {
+-            best_err = cur_err;
+-            fp8_code = test_code;
+-            subblock_scale = test_scale;
+-        }
+-    }
+-
++    const uint8_t fp8_code = ggml_cuda_fp32_to_ue4m3(amax_raw / 6.0f);
++    const float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
+     const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+     uint32_t q0 = 0;
+     uint32_t q1 = 0;
+-#pragma unroll // this is faster than the previous __nv_fp4x4_e2m1
++    float residual[QK_NVFP4_SUB];
++    float residual_amax = 0.0f;
++#pragma unroll
+     for (int k = 0; k < QK_NVFP4_SUB / 4; ++k) {
+-        q0 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k +  0], inv_scale) << (8 * k);
+-        q0 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k +  8], inv_scale) << (8 * k + 4);
+-        q1 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k +  4], inv_scale) << (8 * k);
+-        q1 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals_raw[k + 12], inv_scale) << (8 * k + 4);
++        const int i0 = k + 0;
++        const int i1 = k + 8;
++        const int i2 = k + 4;
++        const int i3 = k + 12;
++        const uint8_t p0 = ggml_cuda_float_to_fp4_e2m1(vals_raw[i0], inv_scale);
++        const uint8_t p1 = ggml_cuda_float_to_fp4_e2m1(vals_raw[i1], inv_scale);
++        const uint8_t p2 = ggml_cuda_float_to_fp4_e2m1(vals_raw[i2], inv_scale);
++        const uint8_t p3 = ggml_cuda_float_to_fp4_e2m1(vals_raw[i3], inv_scale);
++        q0 |= (uint32_t) p0 << (8 * k);
++        q0 |= (uint32_t) p1 << (8 * k + 4);
++        q1 |= (uint32_t) p2 << (8 * k);
++        q1 |= (uint32_t) p3 << (8 * k + 4);
++        residual[i0] = vals_raw[i0] - (float) kvalues_mxfp4[p0] * subblock_scale;
++        residual[i1] = vals_raw[i1] - (float) kvalues_mxfp4[p1] * subblock_scale;
++        residual[i2] = vals_raw[i2] - (float) kvalues_mxfp4[p2] * subblock_scale;
++        residual[i3] = vals_raw[i3] - (float) kvalues_mxfp4[p3] * subblock_scale;
++        residual_amax = fmaxf(residual_amax, fabsf(residual[i0]));
++        residual_amax = fmaxf(residual_amax, fabsf(residual[i1]));
++        residual_amax = fmaxf(residual_amax, fabsf(residual[i2]));
++        residual_amax = fmaxf(residual_amax, fabsf(residual[i3]));
+     }
+ 
+     uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
+     yqs[2 * sub + 0] = q0;
+     yqs[2 * sub + 1] = q1;
+     reinterpret_cast<uint8_t *>(yb->d4)[sub] = fp8_code;
++
++    const uint8_t residual_code = ggml_cuda_fp32_to_ue4m3(residual_amax / 6.0f);
++    const float residual_scale = ggml_cuda_ue4m3_to_fp32(residual_code);
++    const float residual_inv_scale = residual_scale > 0.0f ? 0.5f / residual_scale : 0.0f;
++    uint32_t rq0 = 0;
++    uint32_t rq1 = 0;
++#pragma unroll
++    for (int k = 0; k < QK_NVFP4_SUB / 4; ++k) {
++        rq0 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(residual[k +  0], residual_inv_scale) << (8 * k);
++        rq0 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(residual[k +  8], residual_inv_scale) << (8 * k + 4);
++        rq1 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(residual[k +  4], residual_inv_scale) << (8 * k);
++        rq1 |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(residual[k + 12], residual_inv_scale) << (8 * k + 4);
++    }
++
++    uint32_t * yrqs = reinterpret_cast<uint32_t *>(yrb->qs);
++    yrqs[2 * sub + 0] = rq0;
++    yrqs[2 * sub + 1] = rq1;
++    reinterpret_cast<uint8_t *>(yrb->d4)[sub] = residual_code;
+ #else
+     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
+ #endif // defined(BLACKWELL_MMA_AVAILABLE)
+-
+ }
+ 
+ // quantize values in the format mxfp4 is stored which is interleaved nibbles
+@@ -413,7 +420,7 @@ void quantize_mmq_q8_1_cuda(
+ }
+ 
+ void quantize_mmq_fp4_cuda(
+-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
++        const float * x, const int32_t * ids, void * vy, void * vy_residual, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+     GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
+@@ -421,13 +428,16 @@ void quantize_mmq_fp4_cuda(
+ 
+     if (type_src0 == GGML_TYPE_NVFP4) {
+         GGML_ASSERT(ne00 % QK_NVFP4 == 0);
++        GGML_ASSERT(vy_residual != nullptr);
+         constexpr int nvfp4_block_size = 128;
+-        const int64_t block_num_y = (ne0 + QK_NVFP4_SUB * nvfp4_block_size - 1) / (QK_NVFP4_SUB * nvfp4_block_size);
++        const int64_t block_num_y =
++            (ne0 + QK_NVFP4_SUB * nvfp4_block_size - 1) / (QK_NVFP4_SUB * nvfp4_block_size);
+         const dim3 block_size(nvfp4_block_size, 1, 1);
+         const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
+         quantize_mmq_nvfp4<<<num_blocks, block_size, 0, stream>>>(
+-            x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
++            x, ids, vy, vy_residual, ne00, s01, s02, s03, ne0, ne1, ne2);
+     } else {
++        GGML_ASSERT(vy_residual == nullptr);
+         GGML_ASSERT(ne0 % (2 * QK_MXFP4) == 0);
+ 
+         constexpr int nwarps = 8;
+diff --git a/src/ggml-cuda/quantize.cuh b/src/ggml-cuda/quantize.cuh
+index 768a3ae6..84c708ba 100644
+--- a/src/ggml-cuda/quantize.cuh
++++ b/src/ggml-cuda/quantize.cuh
+@@ -29,6 +29,7 @@ void quantize_mmq_q8_1_cuda(
+ void quantize_mmq_fp4_cuda(const float *   x,
+                              const int32_t * ids,
+                              void *          vy,
++                             void *          vy_residual,
+                              ggml_type       type_src0,
+                              int64_t         ne00,
+                              int64_t         s01,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f54ab41c..e325787f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3977,7 +3977,7 @@ struct test_mul_mat : public test_case {
+ 
+     double max_nmse_err(ggml_backend_t backend) override {
+         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
++        if (type_a == GGML_TYPE_MXFP4 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+             return 2e-2;
+         }
+         return max_nmse_err();
+@@ -4166,7 +4166,7 @@ struct test_mul_mat_id : public test_case {
+ 
+     double max_nmse_err(ggml_backend_t backend) override {
+         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
++        if (type_a == GGML_TYPE_MXFP4 && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+             return 2e-2;
+         }
+         return max_nmse_err();

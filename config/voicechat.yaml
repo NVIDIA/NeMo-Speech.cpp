@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# VoiceChat configuration for the realtime WebSocket server.
+# Paths are resolved relative to the directory from which the server is run.
+s2s:
+  enabled: auto
+  model_dir: models/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF
+  max_streams: 32
+  verbose: false

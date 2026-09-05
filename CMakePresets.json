@@ -230,6 +230,21 @@
       }
     },
     {
+      "name": "cuda-s2s",
+      "inherits": "cuda-asr",
+      "displayName": "CUDA VoiceChat realtime WebSocket server",
+      "cacheVariables": {
+        "NEMO_SPEECH_BUILD_DIAR": "OFF",
+        "NEMO_SPEECH_BUILD_TTS": "OFF",
+        "NEMO_SPEECH_BUILD_NMT": "OFF",
+        "NEMO_SPEECH_BUILD_S2S": "ON",
+        "NEMO_SPEECH_BUILD_HTTP": "ON",
+        "NEMO_SPEECH_BUILD_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_GRPC": "OFF",
+        "NEMO_SPEECH_WITH_NMT": "OFF"
+      }
+    },
+    {
       "name": "metal-server",
       "inherits": "metal-asr",
       "displayName": "Metal speech CLI, HTTP server, and playground",
@@ -307,6 +322,7 @@
     { "name": "vulkan-speech", "configurePreset": "vulkan-speech" },
     { "name": "cpu-server", "configurePreset": "cpu-server" },
     { "name": "cuda-server", "configurePreset": "cuda-server" },
+    { "name": "cuda-s2s", "configurePreset": "cuda-s2s" },
     { "name": "metal-server", "configurePreset": "metal-server" },
     { "name": "vulkan-server", "configurePreset": "vulkan-server" },
     { "name": "cuda-full", "configurePreset": "cuda-full" },

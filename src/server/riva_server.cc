@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // nemo-speech Riva gRPC server.
-// Hosts ASR, TTS, or both on one port depending on configured model paths.
+// Hosts ASR, TTS, and NMT on one port depending on configured model paths.
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 
@@ -21,11 +21,14 @@
 #include <utility>
 
 #include "grpc_asr.h"
-#include "grpc_tts.h"
+#include "model_logging.h"
 #include "parameter_parser.h"
 #include "recognizer.h"
+#if defined(NEMO_SPEECH_BUILD_TTS)
+#include "grpc_tts.h"
 #include "tts/magpietts/config.h"
 #include "tts/synthesizer.h"
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
 #include "grpc_nmt.h"
 #include "speech_translator.h"
@@ -66,6 +69,7 @@ struct AsrServerConfig {
     }
 };
 
+#if defined(NEMO_SPEECH_BUILD_TTS)
 struct TtsServerConfig {
     ServiceEnablement enabled = ServiceEnablement::Auto;
     nemo_speech::tts::MagpieTtsServerConfig server;
@@ -78,6 +82,7 @@ struct TtsServerConfig {
         server.Register(parser);
     }
 };
+#endif
 
 #if defined(NEMO_SPEECH_BUILD_NMT)
 struct NmtServerConfig {
@@ -95,21 +100,28 @@ struct NmtServerConfig {
 #endif
 
 struct RivaServerConfig {
+    bool verbose = false;
     AsrServerConfig asr;
+#if defined(NEMO_SPEECH_BUILD_TTS)
     TtsServerConfig tts;
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     NmtServerConfig nmt;
 #endif
 
     void Register(nemo_speech::common::ParameterParser& parser) {
+        parser.Register("verbose", &verbose, "Enable verbose GGML/llama.cpp logging");
         parser.Register("asr", asr);
+#if defined(NEMO_SPEECH_BUILD_TTS)
         parser.Register("tts", tts);
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
         parser.Register("nmt", nmt);
 #endif
     }
 };
 
+#if defined(NEMO_SPEECH_BUILD_TTS)
 void
 configure_cuda_graph_cache_defaults() {
     if (std::getenv("GGML_CUDA_GRAPH_EVICT_AFTER_MS") != nullptr) {
@@ -122,17 +134,20 @@ configure_cuda_graph_cache_defaults() {
     std::cerr << "[riva_server] defaulting GGML_CUDA_GRAPH_EVICT_AFTER_MS=0"
               << " to keep CUDA graphs resident across TTS requests\n";
 }
+#endif
 
 bool
 asr_configured(const AsrServerConfig& cfg) {
     return !cfg.recognizer.model.path.empty();
 }
 
+#if defined(NEMO_SPEECH_BUILD_TTS)
 bool
 tts_configured(const TtsServerConfig& cfg) {
     return !cfg.server.runtime.magpie_model.empty() && !cfg.server.runtime.codec_model.empty() &&
            !cfg.server.tokenizer_model_dir.empty();
 }
+#endif
 
 #if defined(NEMO_SPEECH_BUILD_NMT)
 bool
@@ -166,7 +181,7 @@ print_usage(const char* prog) {
               << "  --bind HOST:PORT   listen address (default 0.0.0.0:50051)\n"
               << "  --config FILE      YAML config file (applied before env and CLI)\n\n"
               << "Services are enabled automatically when their required model config is present.\n"
-              << "Use --asr.enabled true|false or --tts.enabled true|false to override.\n\n"
+              << "Use each service's .enabled key to override automatic model detection.\n\n"
               << "Config keys (precedence: defaults < --config YAML < env < CLI):\n"
               << parser.Help() << "  Env: NEMO_SPEECH_<KEY> (dotted key uppercased, '.'->'_').\n";
 }
@@ -281,20 +296,30 @@ main(int argc, char** argv) {
         return 1;
     }
 
+    nemo_speech::common::configure_ggml_logging(cfg.verbose);
+#if defined(NEMO_SPEECH_BUILD_TTS)
+    cfg.tts.server.runtime.verbose = cfg.tts.server.runtime.verbose || cfg.verbose;
+#endif
+#if defined(NEMO_SPEECH_BUILD_NMT)
+    cfg.nmt.translator.verbose = cfg.nmt.translator.verbose || cfg.verbose;
+#endif
+
     const bool asr_has_config = asr_configured(cfg.asr);
-    const bool tts_has_config = tts_configured(cfg.tts);
     const bool enable_asr = enabled(cfg.asr.enabled, asr_has_config);
+#if defined(NEMO_SPEECH_BUILD_TTS)
+    const bool tts_has_config = tts_configured(cfg.tts);
     const bool enable_tts = enabled(cfg.tts.enabled, tts_has_config);
+#else
+    const bool enable_tts = false;
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     const bool nmt_has_config = nmt_configured(cfg.nmt);
     const bool enable_nmt = enabled(cfg.nmt.enabled, nmt_has_config);
 #else
     const bool enable_nmt = false;
 #endif
-
     if (!enable_asr && !enable_tts && !enable_nmt) {
-        std::cerr << "No service enabled. Configure ASR model path, TTS model paths, NMT model "
-                     "path, or set --asr.enabled/--tts.enabled/--nmt.enabled explicitly.\n";
+        std::cerr << "No service enabled. Configure an ASR, TTS, or NMT model.\n";
         print_usage(argv[0]);
         return 1;
     }
@@ -302,11 +327,13 @@ main(int argc, char** argv) {
         std::cerr << "ASR is enabled but asr.model.path is missing\n";
         return 1;
     }
+#if defined(NEMO_SPEECH_BUILD_TTS)
     if (enable_tts && !tts_has_config) {
         std::cerr << "TTS is enabled but --tts.magpie-model, --tts.codec-model, and "
                      "--tts.tokenizer-model-dir are required\n";
         return 1;
     }
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     if (enable_nmt && !nmt_has_config) {
         std::cerr << "NMT is enabled but nmt.model.path is missing\n";
@@ -345,14 +372,17 @@ main(int argc, char** argv) {
 
     // Core capabilities outlive the protocol adapters.
     std::shared_ptr<nemo_speech::asr::Recognizer> recognizer;
+#if defined(NEMO_SPEECH_BUILD_TTS)
     std::shared_ptr<nemo_speech::tts::Synthesizer> synthesizer;
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     std::shared_ptr<nemo_speech::nmt::Translator> translator;
     std::shared_ptr<nemo_speech::speech::SpeechTranslator> speech_translator;
 #endif
-
     std::unique_ptr<nemo_speech::GrpcAsrService> asr_service;
+#if defined(NEMO_SPEECH_BUILD_TTS)
     std::unique_ptr<nemo_speech::GrpcTtsService> tts_service;
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     std::unique_ptr<nemo_speech::GrpcNmtService> nmt_service;
 #endif
@@ -373,6 +403,7 @@ main(int argc, char** argv) {
         std::cerr << "[riva_server] ASR warmup complete\n";
     }
 
+#if defined(NEMO_SPEECH_BUILD_TTS)
     if (enable_tts) {
         configure_cuda_graph_cache_defaults();
         std::cerr << "[riva_server] loading MagpieTTS model: "
@@ -401,6 +432,7 @@ main(int argc, char** argv) {
             return 1;
         }
     }
+#endif
 
 #if defined(NEMO_SPEECH_BUILD_NMT)
     if (enable_nmt) {
@@ -423,20 +455,20 @@ main(int argc, char** argv) {
         std::cerr << "[riva_server] NMT loaded; " << cascade << "\n";
     }
 #endif
-
     // Construct protocol adapters from the initialized core capabilities.
     if (recognizer)
         asr_service = std::make_unique<nemo_speech::GrpcAsrService>(recognizer);
+#if defined(NEMO_SPEECH_BUILD_TTS)
     if (synthesizer) {
         tts_service =
             std::make_unique<nemo_speech::GrpcTtsService>(synthesizer, cfg.tts.server.benchmark);
     }
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     if (translator) {
         nmt_service = std::make_unique<nemo_speech::GrpcNmtService>(translator, speech_translator);
     }
 #endif
-
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
     int bound_port = 0;
@@ -444,9 +476,11 @@ main(int argc, char** argv) {
     if (asr_service) {
         builder.RegisterService(asr_service.get());
     }
+#if defined(NEMO_SPEECH_BUILD_TTS)
     if (tts_service) {
         builder.RegisterService(tts_service.get());
     }
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     if (nmt_service) {
         builder.RegisterService(nmt_service.get());
@@ -471,8 +505,10 @@ main(int argc, char** argv) {
     };
     if (asr_service)
         add_service("ASR");
+#if defined(NEMO_SPEECH_BUILD_TTS)
     if (tts_service)
         add_service("TTS");
+#endif
 #if defined(NEMO_SPEECH_BUILD_NMT)
     if (nmt_service)
         add_service("NMT");

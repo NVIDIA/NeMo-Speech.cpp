@@ -1,8 +1,17 @@
-# NeMo-Speech.cpp
+<div align="center">
 
-A lightweight native C++ runtime for running the NVIDIA Nemotron Speech model family locally, with broad hardware support. It supports multilingual speech recognition, speaker diarization, translation, and speech synthesis in real-time and batch modes.
+<h1>NeMo-Speech.cpp</h1>
 
-NeMo-Speech.cpp is NVIDIA's official local speech inference solution, with day-0 support for our latest speech models. It builds on models from [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech), with native inference powered by [ggml](https://github.com/ggml-org/ggml).
+<p><strong>A lightweight native C++ runtime for the NVIDIA Nemotron Speech model family, with broad hardware support.</strong></p>
+
+[Models](#models-and-applications) &nbsp;|&nbsp; [Installation](#installation) &nbsp;|&nbsp; [Quick Start](#quick-start) &nbsp;|&nbsp; [Documentation](#documentation) &nbsp;|&nbsp; [API Reference](docs/api.md)
+
+</div>
+
+> **NeMo-Speech.cpp is NVIDIA's official solution for local speech inference**,
+> providing day-0 support for the latest models from
+> [NVIDIA NeMo Speech](https://github.com/NVIDIA-NeMo/Speech), with native
+> inference powered by [ggml](https://github.com/ggml-org/ggml).
 
 ## Models and applications
 
@@ -12,20 +21,8 @@ NeMo-Speech.cpp is NVIDIA's official local speech inference solution, with day-0
 | Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2), standalone or combined with ASR |
 | Text and speech translation | [Riva Translate 4B Instruct v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2), with composed ASR-to-NMT-to-TTS speech translation |
 | Speech synthesis | [MagpieTTS Multilingual 357M](https://huggingface.co/nvidia/magpie_tts_multilingual_357m) with [NeMo NanoCodec](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) |
+| Full-duplex voicechat | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
 | Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
-
-## Contents
-
-- [Models and applications](#models-and-applications)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Command line](#command-line)
-- [Local server and playground](#local-server-and-playground)
-- [Native SDK](#native-sdk)
-- [Build from source](#build-from-source)
-- [Documentation](#documentation)
-- [License](#license)
-- [Contributing](#contributing)
 
 ## Installation
 
@@ -35,8 +32,9 @@ On Linux or macOS, run:
 
 ```bash
 curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"  # current shell; future shells are updated
 ```
+
+Open a new shell after installation so the updated user `PATH` takes effect.
 
 On Windows, run from PowerShell:
 
@@ -86,7 +84,9 @@ automatically. See the [CLI model guide](docs/cli.md#models-and-cache) and
 The CLI is the primary interface. Run `nemo-speech --help` to see the
 capabilities included in your build. The [CLI guide](docs/cli.md) covers model
 selection, GPU controls, directory transcription, subtitles, diarization,
-translation, synthesis, structured output, and benchmarking when you need them.
+translation, synthesis, structured output, and benchmarking. The
+[VoiceChat guide](docs/s2s/README.md) covers building and serving the realtime
+pipeline.
 
 ## Local server and playground
 
@@ -100,9 +100,10 @@ nemo-speech serve \
 
 The server binds to <http://127.0.0.1:8080> by default. Its transcription and
 speech routes expose documented OpenAI-compatible subsets, alongside realtime
-WebSocket transcription. A separately built `riva_server` binary provides the
-Riva-compatible gRPC interface. See the [server guide](docs/server.md) when you
-are ready to integrate either interface.
+WebSocket transcription and realtime VoiceChat when its model is loaded. A
+separately built `riva_server` binary provides the ASR, TTS, and translation
+gRPC interfaces. See the [server guide](docs/server.md) when you are ready to
+integrate either frontend.
 
 ## Native SDK
 
@@ -142,6 +143,7 @@ Windows, and container instructions are in
 | [Installation](docs/install.md) | Native releases, Windows, upgrades, and manual verification |
 | [CLI guide](docs/cli.md) | Transcription, subtitles, directories, diarization, NMT, TTS, and tooling |
 | [Model conversion](docs/model-conversion.md) | Convert NeMo and Hugging Face checkpoints to runtime GGUF files |
+| [Speech-to-speech VoiceChat](docs/s2s/README.md) | Convert, serve, and exercise the streaming S2S pipeline |
 | [Servers](docs/server.md) | HTTP playground/realtime serving and the separate Riva-compatible gRPC server |
 | [HTTP API reference](docs/api.md) | Every endpoint's request fields, responses, and the realtime protocol |
 | [Native SDK](docs/sdk.md) | CMake components, C ABI lifetimes, threading, and examples |

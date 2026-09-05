@@ -25,12 +25,16 @@
 #if defined(NEMO_SPEECH_REGISTRY_SPEECH)
 #include "speech_translator.h"
 #endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+#include "s2s/voicechat.h"
+#endif
 
 namespace nemo_speech {
 
 struct WarmupOptions {
     bool asr = true;
     bool tts = true;
+    bool s2s = true;
     std::string tts_text = "Hello";
     int tts_steps = 1;
 };
@@ -69,6 +73,10 @@ class EngineRegistry {
 #if defined(NEMO_SPEECH_REGISTRY_SPEECH)
     std::shared_ptr<speech::SpeechTranslator> speech_translation() const;
 #endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+    std::shared_ptr<s2s::VoiceChat> load_voicechat(s2s::VoiceChatConfig config);
+    std::shared_ptr<s2s::VoiceChat> voicechat() const;
+#endif
 
     void warmup(const WarmupOptions& options = {});
     void set_device_label(std::string label);
@@ -96,6 +104,9 @@ class EngineRegistry {
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_SPEECH)
     std::shared_ptr<speech::SpeechTranslator> speech_;
+#endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+    std::shared_ptr<s2s::VoiceChat> voicechat_;
 #endif
 };
 

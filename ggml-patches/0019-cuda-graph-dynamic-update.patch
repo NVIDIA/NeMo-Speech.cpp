@@ -1,0 +1,59 @@
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 610fdf37..474eb5c7 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1210,5 +1210,6 @@ struct ggml_cuda_graph {
+     std::vector<cudaGraphNode_t> nodes;
+     bool disable_due_to_gpu_arch = false;
++    bool warmup_started = false;
+     bool warmup_complete = false;
+     uint64_t uid = 0;
+     int64_t last_used_time = 0;
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index e8f6c10f..fd97f206 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -5044,25 +5044,25 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
+ 
+-            if (!graph->warmup_complete) {
+-                // Warmup: need at least 2 calls with no property change on the 2nd call
+-                if (!properties_changed) {
+-                    graph->warmup_complete = true;
+-                    ggml_cuda_graph_log_event(__func__, "warmup complete", cgraph, graph_key);
+-                    use_cuda_graph = true;
+-                    cuda_graph_update_required = true;
+-                }
+-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
++            if (!graph->warmup_started) {
++                // Execute one call directly so lazy kernel/library setup happens
++                // outside stream capture.  Cache/state addresses are expected to
++                // change between streaming calls, so stability is not a valid
++                // prerequisite for completing warmup.
++                graph->warmup_started = true;
++            } else if (!graph->warmup_complete) {
++                graph->warmup_complete = true;
++                ggml_cuda_graph_log_event(__func__, "warmup complete", cgraph, graph_key);
++                use_cuda_graph = true;
++                cuda_graph_update_required = true;
+             } else {
+-                // Post-warmup: normal CUDA graph operation
+-                if (properties_changed) {
+-                    // Properties changed - reset warmup, execute directly until stable again
+-                    graph->warmup_complete = false;
+-                    ggml_cuda_graph_log_event(__func__, "warmup reset", cgraph, graph_key);
+-                } else {
+-                    use_cuda_graph = true;
+-                    cuda_graph_update_required = graph->instance == nullptr;
+-                }
++                // CUDA graph topology is stable even when tensor/cache pointers
++                // rotate. Re-capture the current parameters and update the
++                // executable instead of invalidating it and falling back to
++                // repeated direct launches. cudaGraphExecUpdate() below safely
++                // re-instantiates if CUDA reports a topology incompatibility.
++                use_cuda_graph = true;
++                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+             }
+         }
+     }

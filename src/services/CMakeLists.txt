@@ -7,14 +7,16 @@ target_link_libraries(nemo_speech_grpc_asr PUBLIC
     riva_proto
 )
 
-add_library(nemo_speech_grpc_tts STATIC grpc_tts.cc)
-target_include_directories(nemo_speech_grpc_tts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(nemo_speech_grpc_tts PUBLIC
-    nemo_speech_tts_magpietts
-    nemo_speech_tts_preproc
-    nemo_speech_tts_tokenizer
-    riva_proto
-)
+if(NEMO_SPEECH_BUILD_TTS)
+    add_library(nemo_speech_grpc_tts STATIC grpc_tts.cc)
+    target_include_directories(nemo_speech_grpc_tts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(nemo_speech_grpc_tts PUBLIC
+        nemo_speech_tts_magpietts
+        nemo_speech_tts_preproc
+        nemo_speech_tts_tokenizer
+        riva_proto
+    )
+endif()
 
 if(NEMO_SPEECH_BUILD_NMT)
     add_library(nemo_speech_grpc_nmt STATIC grpc_nmt.cc)

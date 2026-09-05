@@ -37,6 +37,8 @@ ARG ENABLE_TESTS=OFF
 # NMT translation (RivaTranslation) via llama.cpp. OFF by default: it pulls in
 # the llama.cpp submodule and libllama. Set ON to build it.
 ARG ENABLE_NMT=OFF
+# Full-duplex VoiceChat via llama.cpp. Set ON to build realtime server support.
+ARG ENABLE_S2S=OFF
 # Apply the project ggml patches and build the ASR against them. Set OFF to
 # build the ASR against STANDARD upstream ggml (stock ops only, no patches):
 # skips apply-ggml-patches.sh and sets -DNEMO_SPEECH_GGML_PATCHED=OFF.
@@ -63,6 +65,7 @@ ARG ENABLE_TTS_JA
 ARG ENABLE_TTS_ZH
 ARG ENABLE_TESTS
 ARG ENABLE_NMT
+ARG ENABLE_S2S
 ARG ENABLE_GGML_PATCHES
 ARG JOBS
 ARG CUDA_ARCH
@@ -92,6 +95,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         protobuf-compiler-grpc \
         libabsl-dev \
         libre2-dev \
+        libsentencepiece-dev \
         autoconf \
         automake \
         libtool \
@@ -115,12 +119,13 @@ COPY THIRD_PARTY_NOTICES.md /work/
 COPY README.md CONTRIBUTING.md /work/
 COPY docs /work/docs
 COPY config /work/config
-COPY models /work/models
-# Core submodules: ggml (every backend) and llama.cpp (NMT decoder; built only
-# when ENABLE_NMT=ON, copied unconditionally so the layer cache is stable).
+COPY models/index.json /work/models/index.json
+# Core submodules: ggml (every backend) and llama.cpp (NMT and VoiceChat;
+# copied unconditionally so the layer cache is stable).
 COPY ggml /work/ggml
 COPY llama.cpp /work/llama.cpp
 COPY ggml-patches /work/ggml-patches
+COPY llama-patches /work/llama-patches
 COPY proto /work/proto
 COPY include /work/include
 COPY src /work/src
@@ -147,9 +152,9 @@ RUN if [ "${ENABLE_NORM}" = "ON" ]; then \
         && rm -rf /work/.deps/itn-build; \
     fi
 
-# Keep SentencePiece's bundled protobuf implementation local to the ASR shared
-# library; exporting it from libsentencepiece.so interposes Sparrowhawk's
-# incompatible protobuf runtime when Flashlight and ITN are enabled together.
+# Flashlight builds use a private static SentencePiece archive so its bundled
+# protobuf implementation cannot interpose Sparrowhawk's incompatible runtime.
+# Other builds use the system library installed above.
 RUN if [ "${ENABLE_FLASHLIGHT}" = "ON" ]; then \
         PREFIX=/usr/local JOBS="${JOBS:-$(nproc)}" \
         bash /work/scripts/build_sentencepiece_static.sh \
@@ -162,6 +167,12 @@ RUN if [ "${ENABLE_FLASHLIGHT}" = "ON" ]; then \
 # detected and skipped. Skipped entirely when ENABLE_GGML_PATCHES=OFF — the ASR
 # then builds against standard upstream ggml (see NEMO_SPEECH_GGML_PATCHED).
 RUN if [ "${ENABLE_GGML_PATCHES}" = "ON" ]; then bash /work/scripts/apply-ggml-patches.sh; fi
+
+# NMT and VoiceChat rely on the project's llama.cpp compatibility and
+# quantization patches. The patch script is idempotent for prepatched trees.
+RUN if [ "${ENABLE_NMT}" = "ON" ] || [ "${ENABLE_S2S}" = "ON" ]; then \
+        bash /work/scripts/apply-llama-patches.sh; \
+    fi
 
 # NCCL disabled: single-GPU inference does not use multi-GPU collectives,
 # and the linked libnccl is otherwise dead runtime weight.
@@ -184,6 +195,7 @@ RUN cmake -G Ninja -S /work -B /work/build \
         -DNEMO_SPEECH_TTS_WITH_JA=${ENABLE_TTS_JA} \
         -DNEMO_SPEECH_TTS_WITH_ZH=${ENABLE_TTS_ZH} \
         -DNEMO_SPEECH_BUILD_NMT=${ENABLE_NMT} \
+        -DNEMO_SPEECH_BUILD_S2S=${ENABLE_S2S} \
         -DNEMO_SPEECH_BUILD_TESTS=${ENABLE_TESTS} \
         -DNEMO_SPEECH_BUILD_TOOLS=${ENABLE_TESTS} \
     && cmake --build /work/build ${JOBS:+-- -j${JOBS}}
@@ -219,8 +231,10 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
     && license_dir=/out/share/licenses/nemo-speech/third_party \
     && install -Dm0644 /work/ggml/LICENSE "$license_dir/ggml/LICENSE" \
     && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/llama.cpp/LICENSE" \
-    && install -Dm0644 /work/proto/riva-common/LICENSE \
-        "$license_dir/riva-common/LICENSE" \
+    && if [ "${ENABLE_GRPC}" = "ON" ]; then \
+           install -Dm0644 /work/proto/riva-common/LICENSE \
+               "$license_dir/riva-common/LICENSE"; \
+       fi \
     && install -Dm0644 /work/third_party/flashlight-text/LICENSE \
         "$license_dir/flashlight-text/LICENSE" \
     && install -Dm0644 /work/third_party/kenlm/LICENSE \

@@ -7,8 +7,14 @@
 .gitmodules
 .cache
 .claude
-build
-build-*
+build/**
+build-*/**
+**/build/**
+**/build-*/**
+# Keep the tracked model index required by CMake, but never send local model
+# weights through the Docker build context.
+models/*
+!models/index.json
 core.*
 **/__pycache__
 **/*.pyc

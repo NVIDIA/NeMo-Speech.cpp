@@ -8,11 +8,13 @@
 #include <cstdlib>
 #include <mutex>
 
+#include "model_logging.h"
 #include "runtime.h"
 
 namespace ggml_runtime {
 
 BackendManager::BackendManager(Params params) {
+    nemo_speech::common::ensure_ggml_logging();
     this->params = params;
     init_backends();
 }

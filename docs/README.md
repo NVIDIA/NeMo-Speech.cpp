@@ -10,6 +10,7 @@ Start with:
 - [Command-line workflows](cli.md)
 - [Configuration examples](../config/README.md)
 - [Model conversion](model-conversion.md)
+- [Speech-to-speech VoiceChat](s2s/README.md)
 - [HTTP/realtime and optional gRPC server](server.md)
 - [HTTP API reference](api.md)
 - [Client integration](clients.md)
@@ -37,6 +38,14 @@ Start with:
 - [Models and conversion](nmt/models.md) - obtain and convert Riva-Translate
   models for the llama.cpp runtime.
 - [Configuration](nmt/configuration.md) - `nmt.*` key reference and serving.
+
+## S2S
+
+- [Overview](s2s/README.md) - build and serve the streaming VoiceChat pipeline.
+- [Models and conversion](s2s/models.md) - convert complete model repositories.
+- [Docker deployment](s2s/docker.md) - build and run the VoiceChat server image.
+- [Configuration](s2s/configuration.md) - `s2s.*` settings and runtime tuning.
+- [Client integration](s2s/clients.md) - streaming, tool responses, and concurrency.
 
 ## Developer guide
 

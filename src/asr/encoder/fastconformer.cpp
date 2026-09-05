@@ -177,9 +177,22 @@ SubSampling::build_graph(
     auto reshape_tensor = ggml_reshape_4d(
         buft_ctx.ctx, cont_tensor, cont_tensor->ne[0] * cont_tensor->ne[1], cont_tensor->ne[2],
         cont_tensor->ne[3], 1);
+    const bool bf16_projection =
+        session->params.use_gpu &&
+        session->gguf_loader->get_tensor_type(name_ + ".out.weight") == GGML_TYPE_BF16;
+    if (bf16_projection) {
+        reshape_tensor = ggml_cast(buft_ctx.ctx, reshape_tensor, GGML_TYPE_BF16);
+    }
     ggml_runtime::TensorBag output_tensors;
     output_tensors.add_tensor(ggml_runtime::ggml_bf_tensor(reshape_tensor, buft_ctx.buft));
-    return out_->build_graph(session, output_tensors, session_tensor_container);
+    auto projected = out_->build_graph(session, output_tensors, session_tensor_container);
+    if (bf16_projection) {
+        auto value = projected.get_tensor(0);
+        auto rounded = ggml_cast(
+            buft_ctx.ctx, ggml_cast(buft_ctx.ctx, value.tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
+        projected.set_first_tensor(ggml_runtime::ggml_bf_tensor(rounded, value.buft));
+    }
+    return projected;
 }
 
 void

@@ -148,6 +148,24 @@ EngineRegistry::speech_translation() const {
 }
 #endif
 
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+std::shared_ptr<s2s::VoiceChat>
+EngineRegistry::load_voicechat(s2s::VoiceChatConfig config) {
+    auto voicechat = std::make_shared<s2s::VoiceChat>(std::move(config));
+    std::lock_guard<std::mutex> lock(mutex_);
+    voicechat_ = voicechat;
+    return voicechat;
+}
+
+std::shared_ptr<s2s::VoiceChat>
+EngineRegistry::voicechat() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!voicechat_)
+        throw std::runtime_error("VoiceChat is not loaded");
+    return voicechat_;
+}
+#endif
+
 void
 EngineRegistry::rebuild_compositions_locked() {
 #if defined(NEMO_SPEECH_REGISTRY_SPEECH)
@@ -164,7 +182,8 @@ EngineRegistry::rebuild_compositions_locked() {
 
 void
 EngineRegistry::warmup(const WarmupOptions& options) {
-#if !defined(NEMO_SPEECH_REGISTRY_ASR) && !defined(NEMO_SPEECH_REGISTRY_TTS)
+#if !defined(NEMO_SPEECH_REGISTRY_ASR) && !defined(NEMO_SPEECH_REGISTRY_TTS) && \
+    !defined(NEMO_SPEECH_REGISTRY_S2S)
     (void)options;
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_ASR)
@@ -184,6 +203,15 @@ EngineRegistry::warmup(const WarmupOptions& options) {
     }
     if (synthesizer && options.tts)
         synthesizer->warmup(options.tts_text, options.tts_steps);
+#endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+    std::shared_ptr<s2s::VoiceChat> voicechat;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        voicechat = voicechat_;
+    }
+    if (voicechat && options.s2s)
+        voicechat->warmup();
 #endif
 }
 
@@ -225,6 +253,10 @@ EngineRegistry::capabilities() const {
         if (speech_->can_synthesize())
             result.emplace_back("speech-to-speech");
     }
+#endif
+#if defined(NEMO_SPEECH_REGISTRY_S2S)
+    if (voicechat_)
+        result.emplace_back("realtime-speech-to-speech");
 #endif
     return result;
 }

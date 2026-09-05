@@ -18,10 +18,10 @@ filename order. Later patches may build on files changed by earlier patches;
 automatically; apply it explicitly before a raw CUDA or Metal CMake
 configuration.
 
-Metal requires only 0018, the one patch that touches the Metal backend. The
-`metal-*` presets apply the whole series because `apply-ggml-patches.sh`
-requires all of them or it fails. Once the submodule moves past upstream ggml
-`33c9ea5`, drop 0018 as described below and remove `metal-*` from the `case` in
+Metal requires only `0018-metal-tensor-api-dynamic-k.patch`. The `metal-*`
+presets apply the whole series because `apply-ggml-patches.sh` requires all of
+them or it fails. Once the submodule moves past upstream ggml `33c9ea5`, drop
+0018 as described below and remove `metal-*` from the `case` in
 `scripts/configure.sh`.
 
 ## Building against patched vs stock ggml
@@ -65,8 +65,13 @@ stock comparison therefore requires both a pristine ggml checkout and
   CUDA, including stride-aware inputs, F16 K/V/P storage, head-merged output,
   and the `NEMO_SPEECH_FUSED_RELPOS_ATTN` encoder path.
 
-- **0002-nvfp4-warp-quantizer.patch** - adds warp-cooperative NVFP4 activation
-  quantization with configurable scale search and an optional self-check.
+- **0002-nvfp4-residual-activations.patch** - keeps the native NVFP4 weight
+  path while reducing activation-quantization error. Each activation
+  sub-block is quantized once to FP4, its reconstruction residual is quantized
+  to a second FP4 block, and both contributions are accumulated by the same
+  MMQ tile. The correction is restricted to NVFP4; MXFP4 and non-native paths
+  retain their upstream behavior. Backend correctness tests use the standard
+  quantized-matmul tolerance rather than the previous relaxed NVFP4 threshold.
 
 - **0003-norm-mul-add-fusion.patch** - fuses affine LayerNorm with row-vector
   scale and optional bias.
@@ -128,6 +133,15 @@ stock comparison therefore requires both a pristine ggml checkout and
   (llama/27450), which stops the Metal tensor-API matmul reading `src1` out of
   bounds when `K % 32 != 0`. Drop it once the submodule passes that commit,
   keeping the `K = 1296` test case.
+
+- **0019-cuda-graph-dynamic-update.patch** - refreshes CUDA graph node
+  parameters when a cached graph is replayed so dynamic pointers and launch
+  geometry do not retain values from an earlier execution.
+
+- **0020-bf16-convolution.patch** - adds BF16 im2col and direct depthwise
+  convolution support, then fuses bias, BF16 output rounding, and optional
+  ReLU epilogues. This preserves the VoiceChat perception stem's native BF16
+  behavior without adding standalone conversion kernels.
 
 ## Regenerating after editing ggml
 

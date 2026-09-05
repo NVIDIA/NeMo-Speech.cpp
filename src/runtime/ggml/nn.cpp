@@ -14,6 +14,12 @@
 
 namespace ggml_runtime {
 
+static ggml_tensor*
+round_bf16_output(ggml_context* ctx, ggml_tensor* tensor) {
+    // Portable BF16 rounding; CUDA fuses the preceding bias with these casts.
+    return ggml_cast(ctx, ggml_cast(ctx, tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
+}
+
 ggml_tensor*
 cached_q8_input(
     Session* session, TensorContainer* session_tensor_container, const ggml_bf_tensor& weight,
@@ -163,9 +169,13 @@ Conv1D::set_data(Session* session) {
 
 void
 Conv2D::define_tensors(Session* session) {
-    // Metal depthwise convolution requires F16 weights.
+    ggml_type weight_type = session->gguf_loader->get_tensor_type(weight_name);
+    if (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_BF16 &&
+        weight_type != GGML_TYPE_F32) {
+        throw std::runtime_error("Conv2D requires F16, BF16, or F32 weights: " + weight_name);
+    }
     this->weight = session->model_tensor_container->create_tensor_4d(
-        weight_name, GGML_TYPE_F16, kernel_size, kernel_size, in_channels, out_channels);
+        weight_name, weight_type, kernel_size, kernel_size, in_channels, out_channels);
 
     this->bias = session->model_tensor_container->create_tensor_4d(
         bias_name, GGML_TYPE_F32, 1, 1, out_channels, 1);
@@ -184,6 +194,9 @@ Conv2D::build_graph(
 
     ggml_tensor* output_tensor =
         ggml_add(bf_ctx.ctx, ggml_cont(bf_ctx.ctx, conv2d_ret), bias_tensor.tensor);
+    if (weight_tensor.tensor->type == GGML_TYPE_BF16) {
+        output_tensor = round_bf16_output(bf_ctx.ctx, output_tensor);
+    }
     auto output_tensor_bag = TensorBag();
     output_tensor_bag.add_tensor(ggml_bf_tensor(output_tensor, bf_ctx.buft));
     return output_tensor_bag;
@@ -216,8 +229,13 @@ ReLU::set_data(Session* session) {}
 
 void
 Conv2DDW::define_tensors(Session* session) {
+    ggml_type weight_type = session->gguf_loader->get_tensor_type(weight_name);
+    if (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_BF16 &&
+        weight_type != GGML_TYPE_F32) {
+        throw std::runtime_error("Conv2DDW requires F16, BF16, or F32 weights: " + weight_name);
+    }
     this->weight = session->model_tensor_container->create_tensor_4d(
-        weight_name, GGML_TYPE_F16, kernel_size, kernel_size, 1, out_channels);
+        weight_name, weight_type, kernel_size, kernel_size, 1, out_channels);
 
     this->bias = session->model_tensor_container->create_tensor_4d(
         bias_name, GGML_TYPE_F32, 1, 1, out_channels, 1);
@@ -230,7 +248,6 @@ Conv2DDW::build_graph(
     ggml_bf_tensor weight_tensor = session->model_tensor_container->get_tensor_by_name(weight_name);
     ggml_bf_tensor bias_tensor = session->model_tensor_container->get_tensor_by_name(bias_name);
     ggml_bf_context bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight_tensor.buft);
-
     ggml_tensor* conv2d_ret = nullptr;
     bool direct_dw = false;
 #ifdef NEMO_SPEECH_DIRECT_DW_CONV
@@ -254,6 +271,9 @@ Conv2DDW::build_graph(
 
     ggml_tensor* output_tensor =
         ggml_add(bf_ctx.ctx, ggml_cont(bf_ctx.ctx, conv2d_ret), bias_tensor.tensor);
+    if (weight_tensor.tensor->type == GGML_TYPE_BF16) {
+        output_tensor = round_bf16_output(bf_ctx.ctx, output_tensor);
+    }
     auto output_tensor_bag = TensorBag();
     output_tensor_bag.add_tensor(ggml_bf_tensor(output_tensor, bf_ctx.buft));
     return output_tensor_bag;

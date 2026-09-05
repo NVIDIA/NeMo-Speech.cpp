@@ -1,0 +1,4 @@
+numpy>=1.26,<3
+pyaudio>=0.2.13,<1
+soundfile>=0.12,<1
+websockets>=15,<18

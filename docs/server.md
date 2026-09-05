@@ -1,16 +1,22 @@
 # HTTP, realtime, and Riva-compatible gRPC serving
 
-The project provides two server executables over the same core C++ engines:
+The project provides two server executables over the same core C++ runtime
+components:
 
 - `nemo-speech serve` hosts HTTP, realtime WebSocket, and the browser
   playground. It loads each configured model once.
 - `riva_server` hosts the Riva-compatible gRPC services.
 
+Full-duplex VoiceChat is available only through the realtime WebSocket API
+hosted by `nemo-speech serve`. The server loads the model once per process,
+while every client connection owns independent conversation state.
+
 They are separate processes and do not share loaded models. The `*-server`
 presets include HTTP support for ASR, diarization, NMT, and TTS without gRPC.
-`cuda-full` adds gRPC, text normalization, and optional TTS language frontends;
-`developer` also adds examples, tests, and tools. Individual features can be
-selected explicitly (presets: [build guide](build.md)).
+`cuda-s2s` builds the VoiceChat realtime server. `cuda-full` adds gRPC, text
+normalization, and optional TTS language frontends; `developer` also adds
+examples, tests, and tools. Individual features can be selected explicitly
+(presets: [build guide](build.md)).
 
 ```bash
 nemo-speech serve \
@@ -28,6 +34,12 @@ nemo-speech serve --diar-model sortformer
 
 # Start the separate Riva-compatible gRPC server.
 riva_server --asr.model.path models/asr.q8_0.gguf --bind 0.0.0.0:50051
+```
+
+Serve a converted VoiceChat model over the realtime WebSocket API:
+
+```bash
+nemo-speech serve --config config/voicechat.yaml
 ```
 
 ## Engine and listener configuration
@@ -51,6 +63,7 @@ Nested YAML maps mirror the dotted keys. Start from a checked-in example:
 | [`config/tts.example.yaml`](../config/tts.example.yaml) | TTS-only server |
 | [`config/nmt.example.yaml`](../config/nmt.example.yaml) | NMT-only server |
 | [`config/server.example.yaml`](../config/server.example.yaml) | combined ASR, diarization, NMT, and TTS server |
+| [`config/voicechat.yaml`](../config/voicechat.yaml) | VoiceChat realtime WebSocket server |
 
 ```bash
 nemo-speech serve --config config/asr.example.yaml
@@ -101,7 +114,8 @@ that binary.
 
 The complete engine key references are in [ASR configuration](asr/configuration.md),
 [TTS configuration](tts/configuration.md), and
-[NMT configuration](nmt/configuration.md).
+[NMT configuration](nmt/configuration.md). VoiceChat settings are in the
+[S2S configuration reference](s2s/configuration.md).
 
 The default loopback binding is intentional. For remote access, set
 `--host 0.0.0.0`, TLS (`--tls-cert` + `--tls-key`), and an API key explicitly.
@@ -153,26 +167,38 @@ Full request/response field reference: **[HTTP API reference](api.md)**.
 - `POST /v1/audio/translations` - speech translation (ASR -> NMT)
 - `POST /v1/audio/speech/translations` - speech-to-speech translation (extension)
 - `POST /v1/audio/diarizations` - speaker segments (`/v1/diarizations` alias)
-- WebSocket `/v1/realtime` - live PCM16 transcription
+- WebSocket `/v1/audio/transcriptions/realtime` - live PCM16 transcription
+- WebSocket `/v1/realtime`, `/realtime` - full-duplex VoiceChat when loaded
+- `GET /v1/realtime/health` - VoiceChat readiness
 
 OpenAI SDK compatibility is limited to model listing and the documented
 transcription and speech subsets. The translation and diarization routes are
-project extensions, and the realtime socket is not the OpenAI Realtime API.
+project extensions.
 
-The realtime socket accepts binary little-endian PCM16 frames; an optional
-`session.update` JSON event before the first frame sets session options. See
-the [API reference](api.md#websocket-v1realtime) for session fields and the
-event protocol.
+The transcription socket accepts binary little-endian PCM16 frames; an
+optional `session.update` JSON event before the first frame sets session
+options. See the
+[API reference](api.md#websocket-v1audiotranscriptionsrealtime) for its event
+protocol.
+
+VoiceChat accepts PCM16 input from 16-48 kHz and returns 24 kHz PCM16 in 80 ms
+packets. Its routes support the Riva VoiceChat and OpenAI Realtime event
+shapes, including streamed transcripts, response lifecycle events, tool calls,
+and graceful `session.close`. See the
+[VoiceChat API reference](api.md#voicechat-websocket-v1realtime-and-realtime)
+and [client guide](s2s/clients.md).
 
 The bundled playground uses this protocol directly for microphone input and
 has no Node.js, Python, CDN, analytics, or external runtime assets. It reports
 server readiness, selected device, loaded model capabilities, accepts dropped
 WAV files, and disables panels whose required model is not loaded.
 
-`/v1/audio/transcriptions/realtime` is an alias for clients that prefer the
-audio namespace. Browser clients may authenticate the socket with the
-`api_key` query parameter; other requests should use the bearer header. The
-query credential is not accepted on non-realtime routes.
+When VoiceChat is absent, `/v1/realtime` remains a backward-compatible alias
+for realtime transcription. New transcription clients should use
+`/v1/audio/transcriptions/realtime` so their route remains unambiguous.
+Browser clients may authenticate realtime sockets with the `api_key` query
+parameter; other requests should use the bearer header. The query credential
+is not accepted on non-realtime routes.
 
 ## Limits and lifecycle
 
@@ -180,10 +206,13 @@ Uploads are capped at 512 MiB by default (`--max-upload-mb`); the same limit
 applies to cumulative audio on a realtime WebSocket stream. Socket reads and
 writes time out after 30 seconds by default (`--read-timeout` and
 `--write-timeout`); inference work runs on a bounded worker pool (`--threads`).
-`--threads` does not change the NMT context pool (`nmt.pool.contexts`).
-SIGINT/SIGTERM stops HTTP admission and releases loaded models. `--no-warmup`
-is available for diagnostics but is not recommended when startup readiness
-matters.
+VoiceChat sessions accept 300 seconds of input audio by default; configure the
+limit with `s2s.max_session_seconds`. Unless `http.threads` is set explicitly,
+the server reserves enough workers for `s2s.max_streams` plus listener work.
+The NMT context pool remains an engine setting (`nmt.pool.contexts`) and is not
+silently expanded to match HTTP workers. SIGINT/SIGTERM stops HTTP admission and
+releases its loaded models. `--no-warmup` is available for HTTP diagnostics but
+is not recommended when startup readiness matters.
 
 The separate `riva_server` accepts messages up to gRPC's signed 32-bit limit and
 drains active RPCs for up to 10 seconds on SIGINT/SIGTERM. It currently uses

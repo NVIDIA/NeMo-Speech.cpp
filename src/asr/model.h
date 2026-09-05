@@ -223,6 +223,15 @@ class RnntModel final : public AsrModel, public RnntEngine {
     void infer_offline_from_mel(
         const float* feats, int n_frames, std::vector<float>& enc_out, int& T_enc,
         int prompt_index = -1);
+    // S2S models carry an additional encoder projection (`proj.*`) alongside
+    // the RNNT joint encoder projection. Run both tails from one shared,
+    // dynamically batched FastConformer graph so perception is never encoded
+    // twice and no raw encoder activation is staged through host memory.
+    bool has_s2s_projection() const { return s2s_projection_dim_ > 0; }
+    int s2s_projection_dim() const { return s2s_projection_dim_; }
+    void infer_s2s_from_mel(
+        const float* feats, int n_frames, std::vector<float>& s2s_out, std::vector<float>& rnnt_out,
+        int& T_enc);
     BatchMetrics offline_encoder_batch_metrics() const;
     BatchMetrics offline_frontend_batch_metrics() const;
     bool offline_frontend_uses_gpu() const;
@@ -265,6 +274,7 @@ class RnntModel final : public AsrModel, public RnntEngine {
     class RnntDecoderState;
     class OfflineEncoderRoot;
     class OfflineEncoderBatcher;
+    class S2SProjectionTail;
     RnntConfig rnnt_cfg_;
     std::unique_ptr<RnntPredictorModule> rnnt_predictor_;
     std::unique_ptr<RnntJointModule> rnnt_joint_;
@@ -311,6 +321,8 @@ class RnntModel final : public AsrModel, public RnntEngine {
     // frontend and one offline encoder Session.
     std::unique_ptr<MelSpectrogramExtractor> offline_fe_;
     std::unique_ptr<FastConformerEncoder> offline_encoder_;
+    std::unique_ptr<S2SProjectionTail> s2s_projection_;
+    int s2s_projection_dim_ = 0;
     std::unique_ptr<OfflineEncoderRoot> offline_encoder_root_;
     std::unique_ptr<ggml_runtime::Session> offline_encoder_session_;
     std::unique_ptr<OfflineEncoderBatcher> offline_encoder_batcher_;

@@ -74,22 +74,23 @@ Initialize the submodules needed by the selected components:
 ```bash
 git submodule update --init ggml
 git submodule update --init third_party/cpp-httplib  # HTTP server only
-git submodule update --init llama.cpp                # ASR live capture or NMT
+git submodule update --init llama.cpp                # ASR live capture, NMT, or VoiceChat
 git submodule update --init proto/riva-common        # gRPC only
 git submodule update --init third_party/flashlight-text third_party/kenlm  # Flashlight only
 git submodule update --init third_party/open_jtalk   # Japanese TTS only
 git submodule update --init --recursive third_party/cppjieba  # Mandarin TTS only
 ```
 
-`scripts/configure.sh` checks required submodules before CMake runs. CUDA
-presets also apply the pinned patches from `ggml-patches/` in order. Mandarin
-TTS also requires the Git LFS files under `src/tts/tokenizer/mandarin_data/`;
-the helper reports any files that are still LFS pointers. Materialize them with
+Always configure through `scripts/configure.sh`. It checks the required
+submodules and applies the patches needed by the selected preset. CUDA presets
+apply the pinned patches from `ggml-patches/` in order. Mandarin TTS also
+requires the Git LFS files under `src/tts/tokenizer/mandarin_data/`; the helper
+reports any files that are still LFS pointers. Materialize them with
 `git lfs pull --include='src/tts/tokenizer/mandarin_data/*'`.
 
 ## Configure and build
 
-Use a supported preset:
+Pass the same preset to the configure and build commands:
 
 ```bash
 scripts/configure.sh cuda-asr
@@ -98,13 +99,14 @@ cmake --build --preset cuda-asr
 
 Presets follow `<backend>-<component>` for the `cpu`, `cuda`, `metal`, and
 `vulkan` backends and the `asr`, `diar`, `tts`, `nmt`, `speech`, and `server`
-component sets. Run `cmake --list-presets` for the exhaustive list. A few useful
-landmarks are:
+component sets. VoiceChat also provides a focused `cuda-s2s` preset. Run
+`cmake --list-presets` for the exhaustive list. A few useful landmarks are:
 
 | Preset | Components |
 |---|---|
 | `cpu-asr` | CPU ASR and diarization |
 | `cuda-speech` | CUDA ASR, diarization, NMT, and TTS |
+| `cuda-s2s` | CUDA VoiceChat pipeline and realtime WebSocket server |
 | `metal-nmt` | Metal-enabled NMT build |
 | `vulkan-diar` | Vulkan standalone diarization build |
 | `<backend>-server` | ASR, diarization, NMT, TTS, HTTP API, realtime WebSocket, and playground |
@@ -145,6 +147,7 @@ runtime tradeoffs.
 | `NEMO_SPEECH_BUILD_DIAR` | ON | Standalone and ASR-integrated diarization |
 | `NEMO_SPEECH_BUILD_TTS` | ON | TTS runtime, C ABI, and CLI |
 | `NEMO_SPEECH_BUILD_NMT` | OFF | NMT through llama.cpp |
+| `NEMO_SPEECH_BUILD_S2S` | OFF | VoiceChat runtime and realtime server integration |
 | `NEMO_SPEECH_BUILD_CLI` | ON | Unified `nemo-speech` executable |
 | `NEMO_SPEECH_BUILD_MIC_CAPTURE` | ON | Microphone capture in the CLI and live example |
 | `NEMO_SPEECH_BUILD_HTTP` | OFF | HTTP, realtime WebSocket, and playground |

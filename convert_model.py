@@ -16,7 +16,13 @@ from conversion import ARCHITECTURES, ConversionRequest, convert_model
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="local checkpoint/directory or Hugging Face repository ID")
-    parser.add_argument("--outfile", "-o", type=Path, required=True, help="output GGUF path")
+    parser.add_argument(
+        "--outfile",
+        "-o",
+        type=Path,
+        required=True,
+        help="output GGUF path, or output artifact directory for S2S",
+    )
     parser.add_argument(
         "--architecture",
         choices=("auto", *ARCHITECTURES),
@@ -57,6 +63,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--from-whisper-ggml", type=Path, help="convert a whisper.cpp Silero VAD file"
     )
+    parser.add_argument(
+        "--llama-cpp",
+        type=Path,
+        help="llama.cpp checkout used for S2S and NMT conversion (default: ./llama.cpp)",
+    )
+    parser.add_argument(
+        "--llama-quantize",
+        type=Path,
+        help="advanced: use this llama-quantize binary instead of automatic provisioning",
+    )
+    parser.add_argument(
+        "--no-build-quantizer",
+        action="store_true",
+        help="disable the automatic S2S llama-quantize build",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="overwrite existing S2S bundle artifacts"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and print the S2S conversion plan without writing artifacts",
+    )
     return parser.parse_args()
 
 
@@ -76,13 +105,19 @@ def main() -> int:
         local_transformer_outtype=args.local_transformer_outtype,
         silero_version=args.silero_version,
         from_whisper_ggml=args.from_whisper_ggml,
+        llama_cpp=args.llama_cpp,
+        llama_quantize=args.llama_quantize,
+        auto_build_quantizer=not args.no_build_quantizer,
+        force=args.force,
+        dry_run=args.dry_run,
     )
     try:
         architecture = convert_model(request)
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         print(f"convert_model.py: error: {error}", file=sys.stderr)
         return 1
-    print(f"converted {architecture} model to {args.outfile}")
+    if not args.dry_run:
+        print(f"converted {architecture} model to {args.outfile}")
     return 0
 
 
