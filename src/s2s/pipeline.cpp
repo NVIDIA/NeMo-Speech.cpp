@@ -1183,6 +1183,8 @@ S2SPipeline::rnnt_eou_step(S2SStream& st, const float* asr_emb, int n_frames, in
 
 void
 S2SPipeline::apply_rnnt_turn_taking(S2SStream& st) {
+    if (st.steps_exhausted)
+        return;
     const int t = st.decoder_global_step;
     int32_t current_token = static_cast<int32_t>(st.text_tokens[t]);
     const auto reset_tts_for_turn = [&] {
@@ -1371,7 +1373,7 @@ S2SPipeline::parse_function_tokens(
     // Timeouts advance once per response frame.
     if (st.fn_state == S2SStream::FnState::WaitingForRequest ||
         st.fn_state == S2SStream::FnState::WaitingForResponse) {
-        st.fn_frames_in_state += cfg_.steps_per_call;
+        st.fn_frames_in_state += static_cast<int>(toks.size());
         if (st.fn_frames_in_state >= cfg_.fn_call_timeout_frames) {
             reset_fn_call_state(st);
             return;
@@ -1524,14 +1526,13 @@ S2SPipeline::maybe_start_fast_paths(S2SStream& st) {
 // Output decode
 // ---------------------------------------------------------------------------
 void
-S2SPipeline::decode_outputs(S2SStream& st, S2SChunkResult& out) {
-    const int t = st.decoder_global_step;
-    const int start_idx = std::max(0, t - cfg_.steps_per_call);
-    const int end_idx = start_idx + cfg_.steps_per_call;
+S2SPipeline::decode_outputs(S2SStream& st, S2SChunkResult& out, int completed_steps) {
+    const int end_idx = std::min(st.decoder_global_step, cfg_.max_steps);
+    const int start_idx = std::max(0, end_idx - completed_steps);
     const int Q = codec_->config().n_quantizers;
 
     // Text: drop pads, render specials literally.
-    for (int i = start_idx; i < end_idx && i < cfg_.max_steps; i++) {
+    for (int i = start_idx; i < end_idx; i++) {
         const int32_t tok = static_cast<int32_t>(st.text_tokens[i]);
         if (tok == pad_id_)
             continue;
@@ -1540,7 +1541,7 @@ S2SPipeline::decode_outputs(S2SStream& st, S2SChunkResult& out) {
 
     // Function tokens of this chunk -> state machine + sanitized payload.
     std::vector<int32_t> fn_toks;
-    for (int i = start_idx; i < end_idx && i < cfg_.max_steps; i++)
+    for (int i = start_idx; i < end_idx; i++)
         fn_toks.push_back(static_cast<int32_t>(st.function_tokens[i]));
     parse_function_tokens(st, fn_toks, out.function_text);
     if (out.function_text.empty() && !st.pending_function_text.empty()) {
@@ -1554,9 +1555,10 @@ S2SPipeline::decode_outputs(S2SStream& st, S2SChunkResult& out) {
     }
 
     // Codec decode of exactly this chunk's frames.
-    codec_->decode_wav(
-        st.seq_id, st.audio_tokens.data() + static_cast<size_t>(start_idx) * Q, cfg_.steps_per_call,
-        out.audio);
+    if (completed_steps > 0)
+        codec_->decode_wav(
+            st.seq_id, st.audio_tokens.data() + static_cast<size_t>(start_idx) * Q, completed_steps,
+            out.audio);
     if (start_idx == 0 && !out.audio.empty()) {
         // First-chunk trim: drop the frame produced by the TTS prompt prefill.
         const int trim = codec_->samples_per_frame();
@@ -1708,10 +1710,13 @@ S2SPipeline::process_chunk(
         return std::chrono::duration<double, std::milli>(clk::now() - a).count();
     };
     double t_llm = 0, t_tts = 0, t_rnnt = 0;
+    int completed_steps = 0;
     for (int step = 0; step < cfg_.steps_per_call; step++) {
         auto t0 = clk::now();
         llm_step(st, encoded.data(), n_frames, step);
         t_llm += ms_since(t0);
+        if (st.steps_exhausted)
+            break;
         t0 = clk::now();
         rnnt_eou_step(st, asr_emb.data(), n_frames, step);
         apply_rnnt_turn_taking(st);
@@ -1722,18 +1727,22 @@ S2SPipeline::process_chunk(
         t_tts += ms_since(t0);
         st.audio_chunk_idx = std::min(st.audio_chunk_idx + 1, cfg_.max_chunks_for_inference - 1);
         st.decoder_global_step++;
-        if (st.steps_exhausted)
+        completed_steps++;
+        if (st.decoder_global_step >= cfg_.max_steps) {
+            st.steps_exhausted = true;
             break;
+        }
     }
 
     auto t_dec0 = clk::now();
-    decode_outputs(st, out);
+    decode_outputs(st, out, completed_steps);
     if (dbg) {
         std::fprintf(
             stderr, "[s2s-timing] step=%d llm=%.1f tts=%.1f rnnt=%.1f codec+dec=%.1f\n",
             st.decoder_global_step, t_llm, t_tts, t_rnnt, ms_since(t_dec0));
     }
-    maybe_start_fast_paths(st);
+    if (!st.steps_exhausted)
+        maybe_start_fast_paths(st);
     return out;
 }
 

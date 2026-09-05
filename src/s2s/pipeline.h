@@ -228,7 +228,7 @@ class S2SPipeline {
     int rnnt_joint_token(
         S2SStream::RnntDecoderState& state, const float* frame, const float* logit_bias = nullptr);
     static void rnnt_commit_token(S2SStream::RnntDecoderState& state, int token);
-    void decode_outputs(S2SStream& st, S2SChunkResult& out);
+    void decode_outputs(S2SStream& st, S2SChunkResult& out, int completed_steps);
     void maybe_start_fast_paths(S2SStream& st);
     void fast_extract_tool_tokens(S2SStream& st);
     void fast_inject_response_tokens(S2SStream& st);

@@ -7,9 +7,9 @@ components:
   playground. It loads each configured model once.
 - `riva_server` hosts the Riva-compatible gRPC services.
 
-Full-duplex VoiceChat is available through the realtime WebSocket API hosted by
-`nemo-speech serve`. The server loads the model once per process, while every
-client connection owns independent conversation state.
+Full-duplex VoiceChat is available only through the realtime WebSocket API
+hosted by `nemo-speech serve`. The server loads the model once per process,
+while every client connection owns independent conversation state.
 
 They are separate processes and do not share loaded models. The `*-server`
 presets include HTTP support for ASR, diarization, NMT, and TTS without gRPC.

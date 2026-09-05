@@ -16,8 +16,7 @@ namespace ggml_runtime {
 
 static ggml_tensor*
 round_bf16_output(ggml_context* ctx, ggml_tensor* tensor) {
-    // The CUDA backend fuses a preceding broadcast bias with these casts,
-    // retaining BF16 output semantics without materializing either cast.
+    // Portable BF16 rounding; CUDA fuses the preceding bias with these casts.
     return ggml_cast(ctx, ggml_cast(ctx, tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
 }
 

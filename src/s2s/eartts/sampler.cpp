@@ -343,6 +343,8 @@ EarTTSSampler::ensure_host_tables() {
         return;
     auto dequant = [&](const std::string& name, std::vector<float>& dst) {
         auto ne = loader_->get_tensor_ne(name);
+        if (ne.empty() || std::any_of(ne.begin(), ne.end(), [](int64_t d) { return d <= 0; }))
+            throw std::runtime_error("eartts: " + name + " has invalid dimensions");
         int64_t n = 1;
         for (int64_t d : ne) n *= d;
         const ggml_type t = loader_->get_tensor_type(name);

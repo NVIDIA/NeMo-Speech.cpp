@@ -192,7 +192,7 @@ static bool
 nc_model_load(
     const std::string& fname, nc_model& model, bool force_cpu = false, bool verbose = false) {
     const ggml_nvtx::range nvtx_range("nanocodec_model_load");
-    nemo_speech::common::ensure_ggml_logging();
+    nemo_speech::common::ensure_ggml_logging(verbose);
 
     gguf_init_params params = {
         /*.no_alloc =*/true,

@@ -21,8 +21,10 @@ patch_series_applied_without_git() (
     git init --bare --quiet "${plain_git_dir}"
     GIT_INDEX_FILE="${plain_index}" \
         git --git-dir="${plain_git_dir}" --work-tree="${source_tree}" read-tree --empty
-    mapfile -t patched_paths \
-        < <(sed -n -e 's|^--- a/||p' -e 's|^+++ b/||p' "${patch_files[@]}" | sort -u)
+    patched_paths=()
+    while IFS= read -r path; do
+        patched_paths+=("${path}")
+    done < <(sed -n -e 's|^--- a/||p' -e 's|^+++ b/||p' "${patch_files[@]}" | sort -u)
     current_paths=()
     for path in "${patched_paths[@]}"; do
         if [ -e "${source_tree}/${path}" ] || [ -L "${source_tree}/${path}" ]; then

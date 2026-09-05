@@ -39,8 +39,10 @@ if git -c "safe.directory=${LLAMA}" -C "${LLAMA}" rev-parse --git-dir >/dev/null
         fi
     done
 
-    mapfile -d '' patched_paths \
-        < <(GIT_INDEX_FILE="${expected_index}" git -c "safe.directory=${LLAMA}" -C "${LLAMA}" \
+    patched_paths=()
+    while IFS= read -r -d '' path; do
+        patched_paths+=("${path}")
+    done < <(GIT_INDEX_FILE="${expected_index}" git -c "safe.directory=${LLAMA}" -C "${LLAMA}" \
             diff --cached --name-only -z HEAD)
     GIT_INDEX_FILE="${current_index}" git -c "safe.directory=${LLAMA}" -C "${LLAMA}" read-tree HEAD
     if [ "${#patched_paths[@]}" -ne 0 ]; then
