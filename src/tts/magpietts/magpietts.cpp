@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -496,6 +497,30 @@ stream_run_metrics::inter_chunk_min_value_ms() const {
     return e2e.inter_event_min_value_ms();
 }
 
+bool
+magpie_require_valid_audio(const std::vector<float>& audio) {
+    if (audio.empty()) {
+        // A chunk with no frames decodes to no samples; nothing to reject.
+        return true;
+    }
+    const float first = audio.front();
+    bool uniform = true;
+    for (float x : audio) {
+        if (!std::isfinite(x)) {
+            fprintf(stderr, "codec produced audio that is not finite (NaN or infinity)\n");
+            return false;
+        }
+        uniform = uniform && (x == first);
+    }
+    if (uniform && (first == 1.0f || first == -1.0f)) {
+        fprintf(
+            stderr, "codec produced %zu audio samples pinned to a single full-scale value\n",
+            audio.size());
+        return false;
+    }
+    return true;
+}
+
 struct stream_audio_outputs {
     int sample_rate = 0;
     uint64_t samples_written = 0;
@@ -677,6 +702,10 @@ decode_and_stream_chunk(
         decoded = decoder.decode(codec_frames, threads, audio);
     }
     if (!decoded) {
+        return false;
+    }
+    // Before overlap-add, which blends an invalid chunk into a valid one.
+    if (!magpie_require_valid_audio(audio)) {
         return false;
     }
     const int64_t decoded_us = ggml_time_us();

@@ -12,6 +12,10 @@ add_executable(test_magpietts_frame_stacking test_magpietts_frame_stacking.cpp)
 target_link_libraries(test_magpietts_frame_stacking PRIVATE nemo_speech_tts_magpietts)
 add_test(NAME magpietts_frame_stacking COMMAND test_magpietts_frame_stacking)
 
+add_executable(test_magpietts_audio_sanity test_magpietts_audio_sanity.cpp)
+target_link_libraries(test_magpietts_audio_sanity PRIVATE nemo_speech_tts_magpietts)
+add_test(NAME magpietts_audio_sanity COMMAND test_magpietts_audio_sanity)
+
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_magpietts_cached_attention test_magpietts_cached_attention.cpp)
     target_link_libraries(test_magpietts_cached_attention PRIVATE nemo_speech_tts_magpietts)
