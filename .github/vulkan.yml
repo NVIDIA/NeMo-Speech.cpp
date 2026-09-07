@@ -1,0 +1,155 @@
+name: Build and Test
+
+# Builds ASR, diarization, and TTS on the GitHub-hosted runners, runs the
+# model-free ctest suite, then a CLI smoke test with real models.
+#
+# Coverage per job:
+# Windows Vulkan  - build, ctest, Vulkan inference
+# CUDA and Vulkan run on NVIDIA's self-hosted GPU runners in gpu.yml.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NEMO_SPEECH_MODEL_DIR: ${{ github.workspace }}/.ci-models
+
+jobs:
+
+
+  windows-vulkan:
+    name: Windows CPU
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # open_jtalk and cppjieba are required for -TtsJa and -TtsZh.
+      # --recursive is required because cppjieba contains a nested submodule (limonp).
+      - name: Initialize submodules
+        run: git submodule update --init --recursive --depth 1 ggml llama.cpp third_party/open_jtalk third_party/cppjieba
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install -y ninja --no-progress
+          }
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install -y --no-progress vulkan-sdk
+
+          # Read VULKAN_SDK from registry or locate fallback path
+          $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+          if (-not $vulkan) {
+            $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'User')
+          }
+          if (-not $vulkan -and (Test-Path "C:\VulkanSDK")) {
+            $latest = Get-ChildItem -Path "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($latest) { $vulkan = $latest.FullName }
+          }
+
+          if (-not $vulkan -or -not (Test-Path (Join-Path $vulkan "Bin\glslc.exe"))) {
+            throw "Vulkan SDK or glslc.exe was not found after installation."
+          }
+
+          Write-Host "Vulkan SDK installed at: $vulkan"
+          # Export to subsequent steps
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan"
+          Add-Content -Path $env:GITHUB_PATH -Value "$vulkan\Bin"
+
+      - name: Verify Vulkan SDK
+        shell: pwsh
+        run: |
+          glslc --version
+
+      - name: Restore vcpkg binaries
+        # actions/cache only saves in its post step when the job succeeds, s
+        # a failing test run threw away 30 minutes of dependency builds.
+        # Split restore/save and save right after a successful build.
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-windows-x64-vulkan-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
+          restore-keys: vcpkg-windows-x64-vulkan-
+
+      - name: Configure and build
+        id: build
+        shell: pwsh
+        run: |
+          scripts\windows\build.ps1 -Config Release -Backend vulkan -Profile core -TtsJa -TtsZh -Tests `
+            -VcpkgTriplet x64-windows-static-md-release -BuildDir "${{ github.workspace }}\build\windows-vulkan"
+
+      - name: Save vcpkg binaries
+        # Keys are immutable, so only save a fully built dependency set. Test
+        # failures later in the job do not prevent the save.
+        if: steps.build.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Stage installation (bin, lib, share)
+        shell: pwsh
+        # Mirrors the installation layout in scripts/install.ps1
+        run: |
+          cmake --install "${{ github.workspace }}\build\windows-vulkan" --config Release --prefix "${{ github.workspace }}\dist"
+
+      - name: Verify staged binaries
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\dist\bin\nemo-speech.exe" --version
+          & "${{ github.workspace }}\dist\bin\nemo-speech.exe" --json doctor
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nemo-speech-windows-vulkan-release
+          path: dist
+          retention-days: 14
+
+      - name: Unit tests
+        shell: pwsh
+        run: ctest --test-dir build\windows-vulkan --output-on-failure --timeout 600
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Model smoke test
+        # Because the GitHub-hosted VM has no physical GPU/Vulkan ICD,
+        # we smoke test the built binary on CPU to ensure proper linkage.
+        shell: pwsh
+        run: |
+          python tests\ci\model_smoke.py `
+            --binary build\windows-vulkan\bin\nemo-speech.exe `
+            --backend cpu `
+            --audio test_files\asr\wav\test\jfk.wav
+
+      - name: Vulkan backend probe (non-blocking)
+        # Reports device enumeration in the logs without breaking the build
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          build\windows-vulkan\bin\nemo-speech.exe --json doctor
+          build\windows-vulkan\bin\nemo-speech.exe --verbose transcribe `
+            test_files\asr\wav\test\jfk.wav --backend vulkan
