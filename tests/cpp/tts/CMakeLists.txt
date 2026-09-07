@@ -12,6 +12,10 @@ add_executable(test_magpietts_frame_stacking test_magpietts_frame_stacking.cpp)
 target_link_libraries(test_magpietts_frame_stacking PRIVATE nemo_speech_tts_magpietts)
 add_test(NAME magpietts_frame_stacking COMMAND test_magpietts_frame_stacking)
 
+add_executable(test_nanocodec_decode_guard test_nanocodec_decode_guard.cpp)
+target_link_libraries(test_nanocodec_decode_guard PRIVATE nemo_speech_tts_nanocodec)
+add_test(NAME nanocodec_decode_guard COMMAND test_nanocodec_decode_guard)
+
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_magpietts_cached_attention test_magpietts_cached_attention.cpp)
     target_link_libraries(test_magpietts_cached_attention PRIVATE nemo_speech_tts_magpietts)

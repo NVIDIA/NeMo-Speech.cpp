@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,21 @@
 static constexpr int NANO_CODEC_MAX_NODES = 32768;
 
 using nc_hparams = nemo_speech::tts::nanocodec::NanoCodecHParams;
+
+// The graph no longer clamps, so a NaN or an infinity is still visible here.
+// Reject those, then restore the bound the graph used to apply, so callers get
+// the same range they always did.
+static bool
+require_finite_audio(std::vector<float>& audio) {
+    if (!nemo_speech::tts::nanocodec::is_finite_audio(audio)) {
+        fprintf(stderr, "NanoCodec decoded audio that is not finite (NaN or infinity)\n");
+        return false;
+    }
+    for (float& x : audio) {
+        x = std::max(-1.0f, std::min(1.0f, x));
+    }
+    return true;
+}
 
 static bool
 is_default_graph_node_name(const ggml_tensor* tensor) {
@@ -808,7 +824,6 @@ decode_eval(
 
         x = half_snake(ctx, x, model.post_activation);
         x = causal_conv1d(ctx, x, model.post_conv);
-        x = ggml_clamp(ctx, x, -1.0f, 1.0f);
         ggml_set_name(x, "nanocodec_audio");
 
         gf = ggml_new_graph_custom(ctx, NANO_CODEC_MAX_NODES, false);
@@ -855,7 +870,7 @@ decode_eval(
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
-    return true;
+    return require_finite_audio(audio);
 }
 
 static bool
@@ -896,7 +911,6 @@ nc_stream_decode_graph_init(
 
         x = half_snake(graph.ctx, x, model.post_activation);
         x = nc_stream_causal_conv1d(graph.ctx, x, model.post_conv, state, graph.io);
-        x = ggml_clamp(graph.ctx, x, -1.0f, 1.0f);
         ggml_set_name(x, "nanocodec_stream_audio");
         ggml_set_output(x);
         graph.audio = x;
@@ -998,6 +1012,25 @@ decode_eval_stream(
     }
 
     {
+        const ggml_nvtx::range nvtx_audio("nanocodec_stream_graph_get_audio");
+        ggml_backend_tensor_get(
+            graph.audio, graph.audio_data.data(), 0, graph.audio_data.size() * sizeof(float));
+    }
+
+    // Validate everything the graph produced, not just the part this chunk
+    // returns. A partial final chunk leaves a padded suffix that feeds no
+    // audio but shares the convolution state committed below.
+    if (!require_finite_audio(graph.audio_data)) {
+        // Leave the persistent stream state on the last chunk that decoded
+        // cleanly, so a rejected chunk cannot poison whatever decodes next.
+        return false;
+    }
+
+    const size_t keep_samples =
+        std::min(graph.audio_data.size(), frames.size() * graph.samples_per_frame);
+    audio.assign(graph.audio_data.begin(), graph.audio_data.begin() + (ptrdiff_t)keep_samples);
+
+    {
         const ggml_nvtx::range nvtx_outputs("nanocodec_stream_graph_get_outputs");
         for (const nc_stream_pending_tensor& pending : graph.io.outputs) {
             nc_stream_cache& cache = nc_stream_get_or_create_cache(state, pending);
@@ -1006,14 +1039,7 @@ decode_eval_stream(
                     pending.tensor, cache.data.data(), 0, cache.data.size() * sizeof(float));
             }
         }
-
-        ggml_backend_tensor_get(
-            graph.audio, graph.audio_data.data(), 0, graph.audio_data.size() * sizeof(float));
     }
-
-    const size_t keep_samples =
-        std::min(graph.audio_data.size(), frames.size() * graph.samples_per_frame);
-    audio.assign(graph.audio_data.begin(), graph.audio_data.begin() + (ptrdiff_t)keep_samples);
     return true;
 }
 
@@ -1085,6 +1111,16 @@ require_loaded(const NanoCodecModel* model) {
 }
 
 }  // namespace
+
+bool
+is_finite_audio(const std::vector<float>& audio) {
+    for (float x : audio) {
+        if (!std::isfinite(x)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 NanoCodecModel::NanoCodecModel() : impl_(std::make_unique<Impl>()) {}
 
