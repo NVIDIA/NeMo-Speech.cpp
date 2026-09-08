@@ -176,6 +176,9 @@ bool magpie_stream_runtime_synthesize(
     const std::vector<int32_t>& tokens, const magpie_pcm_callback& pcm_callback,
     stream_run_metrics& metrics);
 
+// Logs and returns false when a decoded chunk cannot be speech.
+bool magpie_require_valid_audio(const std::vector<float>& audio);
+
 const char* magpie_longform_mode_name(magpie_longform_mode mode);
 bool parse_magpie_longform_mode(const std::string& value, magpie_longform_mode& mode);
 
