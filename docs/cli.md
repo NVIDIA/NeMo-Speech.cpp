@@ -153,7 +153,8 @@ For ASR plus speaker labels without the other stages:
 nemo-speech transcribe meeting.wav --diarize --json
 ```
 
-Sortformer v2 supports up to four speakers. Diarization enables
+Speaker capacity comes from the loaded Sortformer model (four for V2, eight
+for supported V3). Diarization enables
 word timestamps automatically and places a 1-based `speaker` value on each
 word in JSON output.
 
@@ -170,13 +171,15 @@ nemo-speech diarize recordings/ \
 
 Directory inputs load one shared model and dynamically batch compatible steps.
 Relative paths are preserved. A stateful streaming pass is the default and is
-appropriate for long recordings. `--preset offline` selects larger streaming
-chunks and caches; it does not enable full attention. Use `--offline` for one
-full-attention pass over a short recording. The indexed model's positional
-table limits that path to about 6.6 minutes, so use the default streaming pass
-for longer audio.
+appropriate for long recordings. The default geometry is a runtime preset
+selected by model version, not the checkpoint's stored streaming geometry.
+Explicit `--preset streaming|offline` selects V2 geometry;
+`--preset v3-streaming|v3-offline` selects V3 geometry. The `offline` presets
+still use streaming state with larger chunks/caches. Use `--offline` for one
+full-attention pass over a short recording; use streaming for long audio.
 
-Sortformer v2 supports up to four speakers. Segmentation thresholds
+Sortformer V2 returns 80 ms probabilities and supported high-resolution V3
+returns 10 ms probabilities. Segmentation thresholds
 are dataset-dependent; use `--onset`, `--offset`, `--pad-onset`, `--pad-offset`,
 `--min-duration-on`, and `--min-duration-off` when applying a checkpoint's
 published postprocessing configuration.

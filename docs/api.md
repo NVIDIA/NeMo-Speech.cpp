@@ -47,7 +47,7 @@ uses the `/v1/audio/transcriptions/realtime` WebSocket described below.
 | `verbatim` | bool | `false` | skip inverse text normalization |
 | `profanity_filter` | bool | `false` | mask words from the configured list |
 | `diarization` | bool | `false` | tag words with speakers (requires `verbose_json` and a diarizer model) |
-| `max_speaker_count` | int | ignored | deprecated compatibility field; Sortformer v2 supports up to four speakers |
+| `max_speaker_count` | int | ignored | deprecated compatibility field; capacity comes from the loaded Sortformer model |
 | `speech_contexts` | JSON array | none | word boosting, `[{"phrases": ["..."], "boost": N}]` - same shape as gRPC; scoring: [word boosting](asr/configuration.md#word-boosting) |
 | `prompt` | string | none | OpenAI-compat: one boosted phrase at boost 10 |
 
@@ -82,7 +82,7 @@ discards buffered audio (`input_audio_buffer.cleared`).
 | `profanity_filter` | bool | `false` | mask words from the configured list |
 | `word_timestamps` | bool | `false` | word timings on final events |
 | `speaker_diarization` | bool | `false` | tag words with speakers; requires a loaded diarizer |
-| `max_speaker_count` | int | ignored | deprecated compatibility field; Sortformer v2 supports up to four speakers |
+| `max_speaker_count` | int | ignored | deprecated compatibility field; capacity comes from the loaded Sortformer model |
 | `endpointing_ms` | number | server default | end-of-utterance silence threshold |
 | `speech_contexts` | array | none | word boosting, as in `/v1/audio/transcriptions` |
 | `prompt` | string | none | OpenAI-compat: one boosted phrase at boost 10 |

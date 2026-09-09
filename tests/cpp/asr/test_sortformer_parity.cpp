@@ -10,18 +10,21 @@
 // Reference data: scripts/asr/dump_sortformer_reference.py (NeMo runtime
 // geometry) -> export_ref_bins.py.
 //
-// Usage: test_sortformer_parity <model.gguf> <ref-bins-dir> [--gpu]
+// V2/V3 neural-step cases use dump_sortformer_reference.py --steady-state.
+// Usage: test_sortformer_parity <model.gguf> <ref-bins-dir> [--gpu] [--q8]
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "aosc_state.h"
 #include "diar_pipeline.h"
+#include "numeric_parity.h"
 #include "sortformer_model.h"
 
 namespace {
@@ -31,11 +34,6 @@ struct RefArray {
     std::vector<float> f;
     std::vector<int64_t> i;
     bool is_f32 = true;
-    int64_t numel() const {
-        int64_t n = 1;
-        for (auto d : shape) n *= d;
-        return n;
-    }
 };
 
 RefArray
@@ -47,19 +45,35 @@ load_ref(const std::string& dir, const std::string& key) {
     std::ifstream f(path, std::ios::binary);
     if (!f)
         throw std::runtime_error("missing reference array: " + path);
-    char magic[4];
+    char magic[4] = {};
     f.read(magic, 4);
     if (std::memcmp(magic, "NERB", 4) != 0)
         throw std::runtime_error("bad magic: " + path);
-    uint32_t code;
-    int64_t n_dims;
+    uint32_t code = 0;
+    int64_t n_dims = 0;
     f.read(reinterpret_cast<char*>(&code), 4);
     f.read(reinterpret_cast<char*>(&n_dims), 8);
+    if (!f || code > 1 || n_dims < 0 || n_dims > 8)
+        throw std::runtime_error("invalid reference header: " + path);
     RefArray a;
     a.is_f32 = (code == 0);
     a.shape.resize(n_dims);
     f.read(reinterpret_cast<char*>(a.shape.data()), 8 * n_dims);
-    const int64_t n = a.numel();
+    if (!f)
+        throw std::runtime_error("truncated reference shape: " + path);
+    int64_t n = 1;
+    for (const auto dim : a.shape) {
+        if (dim < 0 || (dim != 0 && n > std::numeric_limits<int64_t>::max() / dim))
+            throw std::runtime_error("invalid reference dimensions: " + path);
+        n *= dim;
+    }
+    const auto data_start = f.tellg();
+    f.seekg(0, std::ios::end);
+    const auto remaining = f.tellg() - data_start;
+    const int64_t width = a.is_f32 ? 4 : 8;
+    if (remaining < 0 || remaining % width != 0 || remaining / width != n)
+        throw std::runtime_error("reference payload size mismatch: " + path);
+    f.seekg(data_start);
     if (a.is_f32) {
         a.f.resize(n);
         f.read(reinterpret_cast<char*>(a.f.data()), 4 * n);
@@ -89,34 +103,93 @@ chunk_key(int c, const char* field) {
 
 float
 max_abs_diff(const std::vector<float>& a, const std::vector<float>& b, size_t n) {
-    float m = 0.f;
-    for (size_t i = 0; i < n; i++) {
-        const float d = std::fabs(a[i] - b[i]);
-        if (d > m)
-            m = d;
+    return finite_max_abs_diff(a, b, n);
+}
+
+int
+check_neural_steps(
+    nemo_speech::asr::SortformerModel& model, const std::string& dir, bool gpu, bool q8) {
+    const auto& cfg = model.cfg();
+    const int n_cases = static_cast<int>(load_ref(dir, "n_cases").i.at(0));
+    if (n_cases <= 0 || load_ref(dir, "output_factor").i.at(0) != cfg.upsample_factor)
+        throw std::runtime_error("reference/model resolution mismatch or empty reference");
+    bool ok = true;
+    for (int c = 0; c < n_cases; ++c) {
+        char prefix[32];
+        std::snprintf(prefix, sizeof(prefix), "case%03d/", c);
+        auto read = [&](const char* field, int columns) {
+            auto array = load_ref(dir, std::string(prefix) + field);
+            if (!array.is_f32 || array.shape.size() != 2 || array.shape[1] != columns)
+                throw std::runtime_error("reference shape/type mismatch: " + std::string(field));
+            return array;
+        };
+        const auto mel = read("mel_window", cfg.n_mels);
+        const auto cache = read("spkcache", cfg.encoder.d_model);
+        const auto fifo = read("fifo", cfg.encoder.d_model);
+        const auto embs = read("pre_encode", cfg.encoder.d_model);
+        const auto coarse = read("preds_full", cfg.num_speakers);
+        const auto native = read("preds_native", cfg.num_speakers);
+        const auto out = model.run_chunk(
+            mel.f.data(), static_cast<int>(mel.shape[0]), cache.f.data(),
+            static_cast<int>(cache.shape[0]), fifo.f.data(), static_cast<int>(fifo.shape[0]));
+        const auto& native_preds = cfg.is_v3() ? out.native_preds : out.preds;
+        const int native_frames = cfg.is_v3() ? out.native_total_frames : out.total_frames;
+        if (out.chunk_frames != embs.shape[0] || out.total_frames != coarse.shape[0] ||
+            native_frames != native.shape[0])
+            throw std::runtime_error("neural-step output frame count mismatch");
+        const float d_emb = finite_max_abs_diff(out.chunk_embs, embs.f);
+        const float d_coarse = finite_max_abs_diff(out.preds, coarse.f);
+        const float d_native = finite_max_abs_diff(native_preds, native.f);
+        // Embeddings scale with the mel input; probabilities are bounded [0,1].
+        // Use relative embedding error for real-audio fixtures, with separate
+        // FP32, CUDA F16-convolution, and Q8 quantization budgets.
+        float emb_scale = 1.0f;
+        for (float value : embs.f) emb_scale = std::max(emb_scale, std::abs(value));
+        const float relative_emb = d_emb / emb_scale;
+        const float emb_tolerance = q8 ? 2e-2f : (!cfg.is_v3() ? 1e-2f : (gpu ? 1e-3f : 1e-5f));
+        const float prob_tolerance = q8 ? 2e-2f : (!cfg.is_v3() ? 1e-2f : (gpu ? 2e-3f : 5e-4f));
+        const bool passed = std::isfinite(d_emb) && relative_emb <= emb_tolerance &&
+                            d_coarse <= prob_tolerance && d_native <= prob_tolerance;
+        std::printf(
+            "[parity] case %d cache=%ld fifo=%ld: native %.3e coarse %.3e embs %.3e relative_emb "
+            "%.3e %s\n",
+            c, (long)cache.shape[0], (long)fifo.shape[0], d_native, d_coarse, d_emb, relative_emb,
+            passed ? "OK" : "FAIL");
+        ok = ok && passed;
     }
-    return m;
+    return ok ? 0 : 1;
 }
 
 }  // namespace
 
 int
-main(int argc, char** argv) {
+main(int argc, char** argv) try {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <model.gguf> <ref-bins-dir> [--gpu]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model.gguf> <ref-bins-dir> [--gpu] [--q8]\n", argv[0]);
         return 2;
     }
     const std::string gguf_path = argv[1];
     const std::string ref_dir = argv[2];
     bool use_gpu = false;
-    for (int i = 3; i < argc; i++)
+    bool q8 = false;
+    for (int i = 3; i < argc; i++) {
         if (std::string(argv[i]) == "--gpu")
             use_gpu = true;
+        else if (std::string(argv[i]) == "--q8")
+            q8 = true;
+        else
+            throw std::runtime_error("unknown option: " + std::string(argv[i]));
+    }
 
     ggml_runtime::Params backend_params;
     backend_params.use_gpu = use_gpu;
     ggml_runtime::BackendManager bm(backend_params);
     nemo_speech::asr::SortformerModel model(bm, gguf_path);
+
+    if (has_ref(ref_dir, "n_cases"))
+        return check_neural_steps(model, ref_dir, use_gpu, q8);
+    if (model.cfg().is_v3() || q8)
+        throw std::runtime_error("V3/Q8 parity requires a --steady-state reference dump");
 
     const int n_chunks = static_cast<int>(load_ref(ref_dir, "n_chunks").i[0]);
     std::printf("[parity] %d chunks, teacher-forced graph check\n", n_chunks);
@@ -168,6 +241,8 @@ main(int argc, char** argv) {
         const size_t n_pred = static_cast<size_t>(l1 + l2 + t3) * ref_preds.shape[1];
         // pre_encode embeddings span +-150+; measure them relative to the
         // reference scale (the F16 conv stem bounds this at a few e-3).
+        if (ref_pre.f.size() < n_pre)
+            throw std::runtime_error("reference embeddings too short");
         float pre_scale = 1.f;
         for (size_t i = 0; i < n_pre; i++) pre_scale = std::max(pre_scale, std::fabs(ref_pre.f[i]));
         const float d_pre = max_abs_diff(out.chunk_embs, ref_pre.f, n_pre) / pre_scale;
@@ -208,7 +283,9 @@ main(int argc, char** argv) {
     geo.spkcache_update_period = static_cast<int>(geom.i[5]);
 
     const auto& mcfg = model.cfg();
-    nemo_speech::asr::AoscState st(geo, mcfg.scoring, mcfg.num_speakers, mcfg.encoder.d_model);
+    nemo_speech::asr::AoscState st(
+        geo, mcfg.scoring, mcfg.num_speakers, mcfg.encoder.d_model,
+        model.learnable_silence_embedding());
     const int sub = mcfg.encoder.subsampling_factor;
 
     float worst_state = 0.f;
@@ -245,12 +322,12 @@ main(int argc, char** argv) {
                 (long)ref_spk.shape[0], (long)ref_fifo.shape[0], (long)ref_nsil);
             return 1;
         }
-        d = std::max(d, max_abs_diff(st.spkcache(), ref_spk.f, ref_spk.f.size()));
-        d = std::max(d, max_abs_diff(st.fifo(), ref_fifo.f, ref_fifo.f.size()));
-        d = std::max(d, max_abs_diff(st.mean_sil_emb(), ref_sil.f, ref_sil.f.size()));
+        d = std::max(d, finite_max_abs_diff(st.spkcache(), ref_spk.f));
+        d = std::max(d, finite_max_abs_diff(st.fifo(), ref_fifo.f));
+        d = std::max(d, finite_max_abs_diff(st.mean_sil_emb(), ref_sil.f));
         if (has_ref(ref_dir, chunk_key(c, "spkcache_preds_after")) && st.spkcache_preds_valid()) {
             auto rp = load_ref(ref_dir, chunk_key(c, "spkcache_preds_after"));
-            d = std::max(d, max_abs_diff(st.spkcache_preds(), rp.f, rp.f.size()));
+            d = std::max(d, finite_max_abs_diff(st.spkcache_preds(), rp.f));
         }
         if (d > worst_state)
             worst_state = d, worst_state_chunk = c;
@@ -265,7 +342,9 @@ main(int argc, char** argv) {
     // Divergence accumulates (F16 conv floor feeds the state); report the
     // emitted-probability drift vs NeMo per chunk, gate loosely.
     // ------------------------------------------------------------------
-    nemo_speech::asr::AoscState st3(geo, mcfg.scoring, mcfg.num_speakers, mcfg.encoder.d_model);
+    nemo_speech::asr::AoscState st3(
+        geo, mcfg.scoring, mcfg.num_speakers, mcfg.encoder.d_model,
+        model.learnable_silence_embedding());
     float worst_e2e = 0.f;
     int worst_e2e_chunk = -1;
     for (int c = 0; c < n_chunks; c++) {
@@ -286,7 +365,7 @@ main(int argc, char** argv) {
             st3.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc, rc);
 
         auto ref_cp = load_ref(ref_dir, chunk_key(c, "chunk_preds"));
-        const float d = max_abs_diff(emitted, ref_cp.f, std::min(emitted.size(), ref_cp.f.size()));
+        const float d = finite_max_abs_diff(emitted, ref_cp.f);
         if (d > worst_e2e)
             worst_e2e = d, worst_e2e_chunk = c;
     }
@@ -325,6 +404,9 @@ main(int argc, char** argv) {
             const int64_t t_cmp = std::min<int64_t>(mel_frames, mel_valid);
             for (int64_t t = 0; t < t_cmp; t++)
                 for (int m = 0; m < n_mels; m++) {
+                    if (!std::isfinite(mel[t * n_mels + m]) ||
+                        !std::isfinite(ref_mel.f[m * ref_t + t]))
+                        throw std::runtime_error("non-finite frontend output/reference");
                     const float df = std::fabs(mel[t * n_mels + m] - ref_mel.f[m * ref_t + t]);
                     if (df > dmax)
                         dmax = df, dmax_t = t, dmax_m = m;
@@ -356,9 +438,11 @@ main(int argc, char** argv) {
         stream.finish();
 
         // Compare emitted frames before the tail region.
-        const int64_t n_tail_guard = 3 * geo.chunk_len;  // last few chunks
+        const int64_t n_tail_guard = 3 * geo.chunk_len * mcfg.upsample_factor;
         const int64_t n_cmp =
             std::min<int64_t>(stream.n_frames(), ref_total.shape[0]) - n_tail_guard;
+        if (n_cmp <= 0)
+            throw std::runtime_error("reference audio too short for pipeline parity");
         float d = 0.f;
         int64_t worst_f = -1;
         int64_t over_05 = 0, argmax_flips = 0;
@@ -368,6 +452,8 @@ main(int argc, char** argv) {
             for (int s = 0; s < mcfg.num_speakers; s++) {
                 const float po = stream.frame_probs()[f * mcfg.num_speakers + s];
                 const float pr = ref_total.f[f * mcfg.num_speakers + s];
+                if (!std::isfinite(po) || !std::isfinite(pr))
+                    throw std::runtime_error("non-finite pipeline output/reference");
                 frame_d = std::max(frame_d, std::fabs(po - pr));
                 if (po > stream.frame_probs()[f * mcfg.num_speakers + am_ours])
                     am_ours = s;
@@ -396,4 +482,8 @@ main(int argc, char** argv) {
 
     std::printf("[parity] %s\n", ok ? "OK" : "FAIL");
     return ok ? 0 : 1;
+}
+catch (const std::exception& error) {
+    std::fprintf(stderr, "[parity] %s\n", error.what());
+    return 1;
 }

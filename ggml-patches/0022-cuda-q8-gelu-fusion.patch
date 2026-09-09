@@ -1,0 +1,288 @@
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4758,6 +4758,68 @@
+         }
+     }
+ 
++    // Q8 projection + broadcast bias + exact GELU_ERF, optionally cast to F16.
++    // cuBLASLt's GELU epilogue is approximate, so combine bias, erf, and cast
++    // in one post-GEMM kernel. Linear's bias add is an
++    // in-place view of the matmul output, so use subgraph validation rather
++    // than the linear-chain helper that rejects intermediate views.
++    static const bool disable_q8_gelu = []() {
++        const char * value = getenv("GGML_SKINNY_Q8_GELU");
++        return value != nullptr && value[0] == '0';
++    }();
++    if (!disable_q8_gelu && ggml_can_fuse_subgraph(
++            cgraph, i,
++            { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_CPY },
++            { i + 3 })) {
++        ggml_tensor *       mm_node   = cgraph->nodes[i];
++        ggml_tensor *       bias_node = cgraph->nodes[i + 1];
++        ggml_tensor *       gelu_node = cgraph->nodes[i + 2];
++        ggml_tensor *       cast_node = cgraph->nodes[i + 3];
++        const ggml_tensor * bias =
++            bias_node->src[0] == mm_node ? bias_node->src[1] :
++            bias_node->src[1] == mm_node ? bias_node->src[0] : nullptr;
++        if (bias != nullptr && gelu_node->src[0] == bias_node &&
++            cast_node->src[0] == gelu_node &&
++            ggml_get_unary_op(gelu_node) == GGML_UNARY_OP_GELU_ERF &&
++            mm_node->type == GGML_TYPE_F32 && bias_node->type == GGML_TYPE_F32 &&
++            gelu_node->type == GGML_TYPE_F32 && cast_node->type == GGML_TYPE_F16 &&
++            bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
++            ggml_nelements(bias) == mm_node->ne[0] &&
++            bias->ne[0] == mm_node->ne[0] &&
++            ggml_is_contiguous(cast_node) &&
++            ggml_are_same_shape(mm_node, cast_node) &&
++            ggml_cuda_skinny_q8_gelu_supported(
++                mm_node->src[0], mm_node->src[1], mm_node)) {
++            ggml_cuda_mul_mat_skinny_q8_bias_gelu(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], bias, cast_node);
++            return 3;
++        }
++    }
++    if (!disable_q8_gelu && ggml_can_fuse_subgraph(
++            cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY }, { i + 2 })) {
++        ggml_tensor *       mm_node   = cgraph->nodes[i];
++        ggml_tensor *       bias_node = cgraph->nodes[i + 1];
++        ggml_tensor *       gelu_node = cgraph->nodes[i + 2];
++        const ggml_tensor * bias =
++            bias_node->src[0] == mm_node ? bias_node->src[1] :
++            bias_node->src[1] == mm_node ? bias_node->src[0] : nullptr;
++        if (bias != nullptr && gelu_node->src[0] == bias_node &&
++            ggml_get_unary_op(gelu_node) == GGML_UNARY_OP_GELU_ERF &&
++            mm_node->type == GGML_TYPE_F32 && bias_node->type == GGML_TYPE_F32 &&
++            gelu_node->type == GGML_TYPE_F32 &&
++            bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
++            ggml_nelements(bias) == mm_node->ne[0] &&
++            bias->ne[0] == mm_node->ne[0] &&
++            ggml_is_contiguous(gelu_node) &&
++            ggml_are_same_shape(mm_node, gelu_node) &&
++            ggml_cuda_skinny_q8_gelu_supported(
++                mm_node->src[0], mm_node->src[1], mm_node)) {
++            ggml_cuda_mul_mat_skinny_q8_bias_gelu(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], bias, gelu_node);
++            return 2;
++        }
++    }
++
+     // skinny-q8 GEMM + row-vector bias: the upstream MUL_MAT+ADD fusion below
+     // requires a same-shape add, so the classic broadcast Linear bias
+     // ([M] over [M,N]) never qualifies — fold it into the skinny GEMM's
+--- a/src/ggml-cuda/skinny-q8.cu
++++ b/src/ggml-cuda/skinny-q8.cu
+@@ -410,6 +410,17 @@
+     }
+     dst[i] = value;
+ }
++
++template <typename T>
++static __global__ void skq8_bias_gelu_erf(
++        const float * src, const float * bias, T * dst, int m, int64_t count) {
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= count) {
++        return;
++    }
++    const float x = src[i] + bias[i % m];
++    dst[i] = (T) (0.5f * x * (1.0f + erff(x * 0.7071067811865475f)));
++}
+ #endif
+ 
+ // Repacked-weight cache. Keyed by the weight tensor's device pointer; entries
+@@ -546,9 +557,21 @@
+ #endif
+ }
+ 
++bool ggml_cuda_skinny_q8_gelu_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
++    const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
++    return ggml_cuda_skinny_q8_supported(src0, src1, dst) &&
++           skq8_cublas_f16_enabled_for_n(total_n);
++#else
++    GGML_UNUSED_VARS(src0, src1, dst);
++    return false;
++#endif
++}
++
+ static void skq8_run(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+-    const ggml_tensor * bias, const ggml_tensor * residual, ggml_tensor * dst) {
++    const ggml_tensor * bias, const ggml_tensor * residual, bool gelu, ggml_tensor * dst) {
+     const int64_t M  = src0->ne[1];
+     const int64_t K  = src0->ne[0];
+     const int64_t N  = ggml_nelements(src1) / src1->ne[0];
+@@ -656,6 +679,11 @@
+             const bool residual_in_place =
+                 residual != nullptr && residual->data == dst->data;
+             const float beta = residual_in_place ? 1.0f : 0.0f;
++            ggml_cuda_pool_alloc<float> gelu_input(ctx.pool());
++            float * gemm_dst = (float *) dst->data;
++            if (gelu && dst->type != GGML_TYPE_F32) {
++                gemm_dst = gelu_input.alloc((size_t) M * N);
++            }
+             cublasHandle_t handle = ctx.cublas_handle();
+             CUBLAS_CHECK(cublasSetStream(handle, stream));
+             CUBLAS_CHECK(cublasGemmEx(
+@@ -663,8 +691,21 @@
+                 (int) M, (int) N, (int) K,
+                 &alpha, planes.f16, CUDA_R_16F, (int) K,
+                 activation, CUDA_R_16F, (int) K,
+-                &beta, dst->data, CUDA_R_32F, (int) M,
++                &beta, gemm_dst, CUDA_R_32F, (int) M,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++            if (gelu) {
++                GGML_ASSERT(bias != nullptr && residual == nullptr);
++                const int64_t count = M * N;
++                if (dst->type == GGML_TYPE_F16) {
++                    skq8_bias_gelu_erf<<<(count + 255) / 256, 256, 0, stream>>>(
++                        gemm_dst, (const float *) bias->data, (half *) dst->data, (int) M, count);
++                } else {
++                    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++                    skq8_bias_gelu_erf<<<(count + 255) / 256, 256, 0, stream>>>(
++                        gemm_dst, (const float *) bias->data, (float *) dst->data, (int) M, count);
++                }
++                return;
++            }
+             if (bias != nullptr || (residual != nullptr && !residual_in_place)) {
+                 const int64_t count = M * N;
+                 skq8_add_epilogue_f32<<<(count + 255) / 256, 256, 0, stream>>>(
+@@ -689,6 +730,7 @@
+     }
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(residual == nullptr);
++    GGML_ASSERT(!gelu);
+ #endif
+ 
+     // Quantize activations into the zero-padded buffer (all columns, once —
+@@ -745,17 +787,23 @@
+ void ggml_cuda_mul_mat_skinny_q8(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     ggml_tensor * dst) {
+-    skq8_run(ctx, src0, src1, nullptr, nullptr, dst);
++    skq8_run(ctx, src0, src1, nullptr, nullptr, false, dst);
+ }
+ 
+ void ggml_cuda_mul_mat_skinny_q8_bias(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     const ggml_tensor * bias, ggml_tensor * dst) {
+-    skq8_run(ctx, src0, src1, bias, nullptr, dst);
++    skq8_run(ctx, src0, src1, bias, nullptr, false, dst);
+ }
+ 
+ void ggml_cuda_mul_mat_skinny_q8_bias_residual(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     const ggml_tensor * bias, const ggml_tensor * residual, ggml_tensor * dst) {
+-    skq8_run(ctx, src0, src1, bias, residual, dst);
++    skq8_run(ctx, src0, src1, bias, residual, false, dst);
++}
++
++void ggml_cuda_mul_mat_skinny_q8_bias_gelu(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst) {
++    skq8_run(ctx, src0, src1, bias, nullptr, true, dst);
+ }
+--- a/src/ggml-cuda/skinny-q8.cuh
++++ b/src/ggml-cuda/skinny-q8.cuh
+@@ -10,6 +10,9 @@
+ bool ggml_cuda_skinny_q8_residual_supported(
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ 
++bool ggml_cuda_skinny_q8_gelu_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++
+ void ggml_cuda_mul_mat_skinny_q8(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     ggml_tensor * dst);
+@@ -23,3 +26,7 @@
+ void ggml_cuda_mul_mat_skinny_q8_bias_residual(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+     const ggml_tensor * bias, const ggml_tensor * residual, ggml_tensor * dst);
++
++void ggml_cuda_mul_mat_skinny_q8_bias_gelu(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst);
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5744,6 +5744,65 @@
+     }
+ };
+ 
++// Zero projection weights isolate GELU_ERF semantics from quantization error.
++// Biases span the nonlinear region, where a tanh GELU substitution is detectable.
++struct test_q8_gelu_erf_fusion : public test_case {
++    const ggml_type input_type;
++    const ggml_type output_type;
++    const int64_t batch;
++    const bool preserve_intermediate;
++
++    test_q8_gelu_erf_fusion(ggml_type input_type, ggml_type output_type,
++                            int64_t batch, bool preserve_intermediate)
++        : input_type(input_type), output_type(output_type), batch(batch),
++          preserve_intermediate(preserve_intermediate) {}
++
++    std::string vars() override {
++        return VARS_TO_STR4(input_type, output_type, batch, preserve_intermediate);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "Q8_GELU_ERF_FUSION";
++    }
++
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 1e-12; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 128, 128);
++        ggml_set_name(weight, "encoder.gelu_test.weight");
++        auto * input = ggml_new_tensor_3d(ctx, input_type, 128, 16, batch);
++        auto * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
++        ggml_set_name(bias, "gelu_test.bias");
++        auto * biased = ggml_add_inplace(ctx, ggml_mul_mat(ctx, weight, input), bias);
++        if (preserve_intermediate) {
++            ggml_set_output(biased);
++        }
++        auto * out = ggml_gelu_erf(ctx, biased);
++        return output_type == GGML_TYPE_F16 ? ggml_cast(ctx, out, output_type) : out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->view_src != nullptr) {
++                continue;
++            }
++            if (t->type == GGML_TYPE_Q8_0) {
++                ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
++            } else if (strcmp(t->name, "gelu_test.bias") == 0) {
++                std::vector<float> values(128);
++                for (int i = 0; i < 128; ++i) {
++                    values[i] = -3.0f + 6.0f * i / 127;
++                }
++                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ struct test_mul_mat_vec_fusion : public test_case {
+     const ggml_type type;
+     const ggml_glu_op glu_op;
+@@ -8524,6 +8583,15 @@
+                                                   256, 16, 16, {ne2, 1}, {1, 1}));
+     }
+ 
++    for (auto output_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (int64_t batch : {1, 8, 64, 128, 256}) {
++            for (bool preserve : {false, true}) {
++                test_cases.emplace_back(new test_q8_gelu_erf_fusion(
++                    GGML_TYPE_F32, output_type, batch, preserve));
++            }
++        }
++    }
++
+     // add_id
+     for (ggml_type type_a : {GGML_TYPE_F32}) {
+         for (ggml_type type_b : {GGML_TYPE_F32}) {

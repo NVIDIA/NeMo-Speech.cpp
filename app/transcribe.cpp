@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -556,6 +557,26 @@ command_transcribe(int argc, char** argv) {
             throw std::invalid_argument("--output is only valid for one input; use --output-dir");
         if (!directory && !options.output_dir.empty())
             throw std::invalid_argument("--output-dir is only valid for a directory input");
+        // Preflight destinations before loading models or starting workers.
+        // WAV and WAVE (including case variants) may share the same stem.
+        fs::path output_dir = options.output_dir;
+        if (directory && output_dir.empty())
+            output_dir = fs::current_path() / "transcripts";
+        std::vector<fs::path> destinations(inputs.size());
+        if (directory) {
+            std::map<fs::path, fs::path> owners;
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                fs::path relative = relative_output_path(options.input, inputs[i]);
+                relative.replace_extension(extension(options.format));
+                destinations[i] = output_dir / relative;
+                const auto key = fs::weakly_canonical(destinations[i]);
+                const auto [owner, inserted] = owners.emplace(key, inputs[i]);
+                if (!inserted)
+                    throw std::invalid_argument(
+                        "output collision: " + owner->second.string() + " and " +
+                        inputs[i].string() + " both map to " + key.string());
+            }
+        }
         const int configured_gpu = options.device_set ? options.gpu : options.engine.backend.gpu;
         const int concurrency =
             options.live ? 1
@@ -664,9 +685,13 @@ command_transcribe(int argc, char** argv) {
         }
 #endif
 
+        // Publish each completed transcript atomically so finished files remain
+        // available if another input fails or the process is interrupted.
         std::vector<Transcript> transcripts(inputs.size());
         std::vector<std::string> errors(inputs.size());
         std::atomic<size_t> next{0};
+        size_t completed = 0;  // Guarded by progress_mutex.
+        std::mutex progress_mutex;
         std::vector<std::thread> workers;
         for (int thread = 0; thread < concurrency; ++thread) {
             workers.emplace_back([&] {
@@ -686,9 +711,30 @@ command_transcribe(int argc, char** argv) {
                             transcripts[index].target_language = translated.language_code;
                         }
 #endif
+                        if (directory) {
+                            const std::string contents =
+                                render(transcripts[index], options.format, inputs[index]);
+                            write_text_file(destinations[index], contents, options.force);
+                            // Do not retain every transcript for the lifetime
+                            // of a large directory job after it is on disk.
+                            transcripts[index] = {};
+                        }
                     }
                     catch (const std::exception& error) {
                         errors[index] = error.what();
+                    }
+                    if (directory && !cli_quiet()) {
+                        const std::lock_guard<std::mutex> lock(progress_mutex);
+                        const size_t done = ++completed;
+                        if (errors[index].empty())
+                            std::fprintf(
+                                stderr, "[%zu/%zu] %s -> %s\n", done, inputs.size(),
+                                inputs[index].string().c_str(),
+                                destinations[index].string().c_str());
+                        else
+                            std::fprintf(
+                                stderr, "[%zu/%zu] %s failed: %s\n", done, inputs.size(),
+                                inputs[index].string().c_str(), errors[index].c_str());
                     }
                 }
             });
@@ -696,9 +742,6 @@ command_transcribe(int argc, char** argv) {
         for (auto& worker : workers) worker.join();
 
         int failures = 0;
-        fs::path output_dir = options.output_dir;
-        if (directory && output_dir.empty())
-            output_dir = fs::current_path() / "transcripts";
         for (size_t i = 0; i < inputs.size(); ++i) {
             if (!errors[i].empty()) {
                 print_cli_error(
@@ -706,25 +749,19 @@ command_transcribe(int argc, char** argv) {
                 ++failures;
                 continue;
             }
+            if (directory)
+                continue;  // published atomically by the worker
             const std::string contents = render(transcripts[i], options.format, inputs[i]);
-            if (!directory && options.output.empty()) {
+            if (options.output.empty()) {
                 std::fwrite(contents.data(), 1, contents.size(), stdout);
                 continue;
             }
-            fs::path destination;
-            if (!directory) {
-                destination = options.output;
-            } else {
-                fs::path relative = relative_output_path(options.input, inputs[i]);
-                relative.replace_extension(extension(options.format));
-                destination = output_dir / relative;
-            }
             try {
-                write_text_file(destination, contents, options.force);
+                write_text_file(options.output, contents, options.force);
                 if (!cli_quiet())
                     std::fprintf(
                         stderr, "%s -> %s\n", inputs[i].string().c_str(),
-                        destination.string().c_str());
+                        options.output.string().c_str());
             }
             catch (const std::exception& error) {
                 print_cli_error("transcribe", error.what(), 1, "runtime_error");

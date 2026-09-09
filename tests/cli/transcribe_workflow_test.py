@@ -63,6 +63,8 @@ def main() -> None:
         )
         require(result.returncode == 1, "one existing output must produce a partial failure")
         require(result.stdout == "", "directory results must be written to the output directory")
+        progress = [int(value) for value in re.findall(r"\[(\d+)/3\]", result.stderr)]
+        require(progress == [1, 2, 3], f"per-file completion progress: {result.stderr}")
         require("3 files (1 failed)" in result.stderr, "deterministic directory summary")
         require(existing.read_text(encoding="utf-8") == "do not replace\n", "existing output")
         for path in (outputs / "first.srt", outputs / "nested" / "third.srt"):
@@ -73,6 +75,39 @@ def main() -> None:
                 f"SRT timestamp: {path}",
             )
             require(len(text.splitlines()) >= 4, f"SRT transcript: {path}")
+
+        # Both extensions are accepted inputs but would share first.srt and
+        # first.srt.tmp. Reject the whole job before starting any workers,
+        # regardless of whether replacement was requested.
+        shutil.copy2(source, inputs / "first.wave")
+        for force in ([], ["--force"]):
+            collision_output = root / ("collision-force" if force else "collision")
+            result = subprocess.run(
+                [
+                    args.binary,
+                    "transcribe",
+                    str(inputs),
+                    "--model",
+                    args.model,
+                    "--recursive",
+                    "--output-dir",
+                    str(collision_output),
+                    "--concurrency",
+                    "2",
+                    "--format",
+                    "srt",
+                    "--no-warmup",
+                    *force,
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=args.timeout,
+            )
+            require(result.returncode == 2, f"collision must be invalid input: {result.stderr}")
+            require("output collision" in result.stderr, "collision diagnostic")
+            require("first.wav" in result.stderr and "first.wave" in result.stderr, "both inputs")
+            require(not collision_output.exists(), "collision must not publish any files")
 
 
 if __name__ == "__main__":

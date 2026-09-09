@@ -125,11 +125,14 @@ Recognizer::Recognizer(RecognizerConfig cfg)
 
     if (!cfg_.diar.model_path.empty()) {
         diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path, cfg_.batching);
-        const DiarGeometry geo = cfg_.diar.resolved_geometry();
+        const DiarGeometry geo = diar_model_->resolved_geometry(cfg_.diar.resolved_geometry());
+        const auto& diar_cfg = diar_model_->cfg();
         GGMLF_LOG_INFO(
-            "[recognizer] diarizer loaded: %s (spkcache=%d fifo=%d chunk=%d rc=%d)\n",
-            cfg_.diar.model_path.c_str(), geo.spkcache_len, geo.fifo_len, geo.chunk_len,
-            geo.chunk_right_context);
+            "[recognizer] diarizer loaded: %s (%s, speakers=%d, output=%.0fms, "
+            "spkcache=%d fifo=%d chunk=%d lc=%d rc=%d)\n",
+            cfg_.diar.model_path.c_str(), diar_cfg.is_v3() ? "v3" : "v2", diar_cfg.num_speakers,
+            diar_cfg.seconds_per_output_frame() * 1000.0, geo.spkcache_len, geo.fifo_len,
+            geo.chunk_len, geo.chunk_left_context, geo.chunk_right_context);
     }
     log_model_status();
 }

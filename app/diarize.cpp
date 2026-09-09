@@ -101,7 +101,7 @@ print_diarize_help(const char* program) {
         "  --device, --backend DEVICE\n"
         "                            auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
         "  --offline                 Full-attention mode for short audio\n"
-        "  --preset NAME             streaming or offline geometry\n"
+        "  --preset NAME             V2: streaming/offline; V3: v3-streaming/v3-offline\n"
         "  --config FILE             Load diarization YAML configuration\n"
         "  --format text|json|rttm   Output format (default: text)\n"
         "  --recording-id NAME       RTTM recording id\n"

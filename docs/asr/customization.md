@@ -52,7 +52,8 @@ is requested without one. Word timestamps are enabled automatically. See
 [ASR configuration](configuration.md#key-reference) and
 [Sortformer models](models.md#sortformer-speaker-diarization).
 
-Sortformer v2 supports up to four speakers.
+Speaker capacity comes from the loaded Sortformer model: four for V2 and eight
+for supported high-resolution V3.
 
 For diarization without ASR, use `nemo-speech diarize` or the standalone
 `nemo_speech_diar_*` C API.

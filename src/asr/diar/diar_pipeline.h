@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Standalone streaming diarization pipeline: audio in -> per-frame speaker
-// probabilities (80 ms frames) + word/segment-level speaker attribution.
+// probabilities at the model's native cadence (80 ms for v2, 10 ms for v3)
+// plus word/segment-level speaker attribution.
 //
 // The diarizer owns a model-specific mel frontend, slides an
 // [lc | chunk | rc] window, and carries AOSC state between chunks. It can run
@@ -25,10 +26,10 @@ namespace nemo_speech::asr {
 // Recognizer-level diarization config.
 struct DiarConfig {
     std::string model_path;  // empty = diarization not available
-    // Named geometry preset ("streaming" | "offline" - see DiarGeometry).
+    // Named geometry preset (see DiarGeometry). With neither a preset nor
+    // individual overrides, the runtime selects the model-specific default.
     // When set it REPLACES the individual geometry keys below
-    // (the parser cannot tell explicit values from defaults, so mixing a
-    // preset with individual overrides is not supported).
+    // (mixing a preset with individual overrides is not supported).
     std::string preset;
     DiarGeometry geometry;
 
@@ -40,17 +41,18 @@ struct DiarConfig {
         p.Register("model_path", &model_path, "Sortformer diarizer GGUF path", {"--diar-model"});
         p.Register(
             "preset", &preset,
-            "diarizer geometry preset (streaming | offline); "
+            "diarizer geometry preset (streaming | offline | v3-streaming | v3-offline); "
             "overrides the individual geometry keys",
             {"--diar-preset"});
         p.Register(
-            "chunk", &geometry.chunk_len, "diarizer chunk length (80ms frames)", {"--diar-chunk"});
+            "chunk", &geometry.chunk_len, "diarizer chunk length (coarse 80ms frames)",
+            {"--diar-chunk"});
         p.Register(
             "right_context", &geometry.chunk_right_context,
-            "diarizer chunk right context (80ms frames)", {"--diar-rc"});
+            "diarizer chunk right context (coarse 80ms frames)", {"--diar-rc"});
         p.Register(
             "left_context", &geometry.chunk_left_context,
-            "diarizer chunk left context (80ms frames)", {"--diar-lc"});
+            "diarizer chunk left context (coarse 80ms frames)", {"--diar-lc"});
         p.Register("fifo", &geometry.fifo_len, "diarizer FIFO length (frames)", {"--diar-fifo"});
         p.Register(
             "spkcache", &geometry.spkcache_len, "diarizer speaker cache length (frames)",
@@ -72,12 +74,13 @@ class DiarModel {
     MelSpectrogramExtractor& fe() { return fe_; }
     const SortformerModelConfig& cfg() const { return model_.cfg(); }
     BatchMetrics batch_metrics() const { return model_.batch_metrics(); }
+    DiarGeometry resolved_geometry(const DiarGeometry& requested) const;
 
     // Full offline diarization: one forward pass over the whole file with
     // full self-attention and NO streaming state (NeMo streaming_mode=False;
     // the per-chunk graph with empty spkcache/fifo is exactly that forward).
     // Returns per-frame speaker probabilities, (n_frames x n_spk) frame-major,
-    // one frame per 80 ms. Bounded by the rel-pos table: audio longer than
+    // one frame per model output step. Bounded by the position table: audio longer than
     // pos_emb_max_len encoder frames (5000 = ~6.6 min) throws - use
     // DiarStream for long-form.
     std::vector<float> diarize_offline(const float* audio, size_t n_samples, int64_t* n_frames);
@@ -130,11 +133,11 @@ class DiarStream {
     // timeline covers `target_frame` or no whole encoder frame of new mel
     // remains. Called by the recognizer when a final's words end past the
     // diarized frontier, so word tags there come from real predictions
-    // instead of last-frame extrapolation. Chunks stay on the 80 ms encoder
-    // frame grid; the stream continues normally afterwards.
+    // instead of last-frame extrapolation. Chunks stay on the coarse 80 ms
+    // encoder grid; the public timeline uses the model's native cadence.
     void flush_available(int64_t target_frame);
 
-    // Total emitted 80 ms frames (monotonic; includes frames whose raw
+    // Total emitted native-cadence frames (monotonic; includes frames whose raw
     // probabilities were compacted away, see below).
     int64_t n_frames() const { return probs_base_ + static_cast<int64_t>(probs_.size()) / n_spk_; }
     // Retained per-frame speaker probabilities, frame-major, covering frames
@@ -145,9 +148,10 @@ class DiarStream {
     double seconds_per_frame() const { return sec_per_frame_; }
 
     // Long-stream memory bound. The raw probability timeline would otherwise
-    // grow forever (n_spk floats / 80 ms) and every segments() call would
-    // re-segment all of it. Once more than `trigger_frames` are retained, the
-    // prefix up to an all-speaker-silent gap (leaving at least `retain_frames`)
+    // grow forever (n_spk floats per native output frame) and every segments()
+    // call would re-segment all of it. Once more than `trigger_frames` are
+    // retained, the prefix up to an all-speaker-silent gap (leaving at least
+    // `retain_frames`)
     // is converted to frozen segments (using the library-default segmentation
     // config) and its raw probabilities are dropped. Cutting only inside a
     // silent gap longer than the postprocessing's temporal reach makes
@@ -185,6 +189,7 @@ class DiarStream {
     int n_spk_;
     int sub_;  // mel frames per encoder frame
     double sec_per_frame_;
+    int word_anchor_frames_;
 
     AoscState state_;
     ChannelBirthGate birth_gate_;
@@ -204,9 +209,9 @@ class DiarStream {
     std::vector<float> probs_;              // retained timeline tail (see frame_probs_base)
     int64_t probs_base_ = 0;                // emitted frames compacted off the front
     std::vector<DiarSegment> frozen_segs_;  // finalized segments before probs_base_
-    // ~20 min trigger / ~10 min retained at 80 ms frames.
-    int64_t compact_trigger_frames_ = 15000;
-    int64_t compact_retain_frames_ = 7500;
+    // Initialized to ~20 min trigger / ~10 min retained at native cadence.
+    int64_t compact_trigger_frames_ = 0;
+    int64_t compact_retain_frames_ = 0;
 };
 
 }  // namespace nemo_speech::asr

@@ -47,6 +47,8 @@ python3 convert_model.py nvidia/nemotron-speech-streaming-en-0.6b \
   --outfile models/asr.gguf
 python3 convert_model.py nvidia/diar_streaming_sortformer_4spk-v2 \
   --outfile models/diarization.gguf --outtype q8_0
+python3 convert_model.py nvidia/Nemotron-3-Diarization \
+  --outfile models/diarization-v3.gguf --outtype f32
 python3 convert_model.py silero --outfile models/vad.gguf
 ```
 

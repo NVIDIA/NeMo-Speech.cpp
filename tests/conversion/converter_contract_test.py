@@ -23,6 +23,8 @@ from safetensors.torch import save_file
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from conversion.diarization import is_high_resolution_v3
+from conversion.diarization import remap as remap_diarization
 from conversion.registry import (
     ConversionRequest,
     _convert_nmt,
@@ -394,6 +396,33 @@ class ConverterContractTest(unittest.TestCase):
             llama_cpp = Path(temporary) / "llama.cpp"
             with self.assertRaisesRegex(FileNotFoundError, "automatic build is disabled"):
                 ensure_quantizer(llama_cpp, auto_build=False)
+
+    def test_sortformer_v2_v3_contract_detection_and_remapping(self) -> None:
+        v2 = {
+            "encoder": {
+                "self_attention_model": "rel_pos",
+                "subsampling": "dw_striding",
+            }
+        }
+        v3 = {
+            "high_resolution": True,
+            "encoder": {
+                "self_attention_model": "rope",
+                "subsampling": "feature_stacking",
+            },
+        }
+        self.assertFalse(is_high_resolution_v3(v2))
+        self.assertTrue(is_high_resolution_v3(v3))
+        self.assertFalse(is_high_resolution_v3({**v3, "high_resolution": False}))
+        self.assertEqual(
+            remap_diarization("sortformer_modules.subpixel_upsample.weight"),
+            "subpixel_upsample.weight",
+        )
+        self.assertEqual(
+            remap_diarization("sortformer_modules.learnable_sil_emb"),
+            "learnable_sil_emb",
+        )
+        self.assertIsNone(remap_diarization("sortformer_modules.hidden_to_spks.weight"))
 
     def test_archive_traversal_and_links_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

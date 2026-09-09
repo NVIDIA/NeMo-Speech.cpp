@@ -152,13 +152,32 @@ ChannelBirthGate::is_established(int speaker) const {
 }
 
 DiarGeometry
+DiarGeometry::resolved(bool is_v3) const {
+    DiarGeometry result = *this;
+    const auto defaults = is_v3 ? v3_streaming() : riva_streaming();
+    for (auto field :
+         {&DiarGeometry::spkcache_len, &DiarGeometry::fifo_len, &DiarGeometry::chunk_len,
+          &DiarGeometry::spkcache_update_period, &DiarGeometry::chunk_left_context,
+          &DiarGeometry::chunk_right_context}) {
+        if (result.*field == -1)
+            result.*field = defaults.*field;
+    }
+    return result;
+}
+
+DiarGeometry
 DiarGeometry::preset(const std::string& name) {
     if (name == "streaming")
         return riva_streaming();
     if (name == "offline")
         return riva_offline();
+    if (name == "v3-streaming")
+        return v3_streaming();
+    if (name == "v3-offline")
+        return v3_offline();
     throw std::invalid_argument(
-        "unknown diarizer geometry preset '" + name + "' (expected streaming | offline)");
+        "unknown diarizer geometry preset '" + name +
+        "' (expected streaming | offline | v3-streaming | v3-offline)");
 }
 
 void
@@ -184,13 +203,18 @@ DiarGeometry::validate(int n_spk, int sil_frames_per_spk, int pos_emb_max_len) c
     if (total > pos_emb_max_len)
         fail(
             "total sequence length " + std::to_string(total) +
-            " exceeds the encoder rel-pos table (" + std::to_string(pos_emb_max_len) + ")");
+            " exceeds the encoder position limit (" + std::to_string(pos_emb_max_len) + ")");
 }
 
 AoscState::AoscState(
-    const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim)
+    const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim,
+    const std::vector<float>& learned_silence)
     : geo_(geo), sc_(scoring), n_spk_(n_spk), emb_dim_(emb_dim) {
-    mean_sil_emb_.assign(emb_dim_, 0.f);
+    if (!learned_silence.empty() && static_cast<int>(learned_silence.size()) != emb_dim_) {
+        throw std::invalid_argument("AoscState: learned silence embedding has wrong dimension");
+    }
+    use_learned_silence_ = !learned_silence.empty();
+    mean_sil_emb_ = use_learned_silence_ ? learned_silence : std::vector<float>(emb_dim_, 0.f);
 }
 
 // NeMo `_get_silence_profile`: running mean embedding over frames whose
@@ -257,7 +281,8 @@ AoscState::update(const float* chunk_embs, int t3, const float* preds, int lc, i
 
         const float* pop_embs = fifo_.data();
         const float* pop_preds = fifo_preds_full.data();
-        accumulate_silence(pop_embs, pop_preds, pop);
+        if (!use_learned_silence_)
+            accumulate_silence(pop_embs, pop_preds, pop);
 
         spkcache_.insert(spkcache_.end(), pop_embs, pop_embs + static_cast<size_t>(pop) * emb_dim_);
         if (spkcache_preds_valid()) {

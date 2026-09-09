@@ -25,6 +25,7 @@
 
 #include "diar_pipeline.h"
 #include "fe.h"
+#include "numeric_parity.h"
 
 using namespace nemo_speech::asr;
 
@@ -32,7 +33,7 @@ static const char* kUsage =
     "usage: %s <sortformer.gguf> <audio.wav> [--gpu] [--offline] [--rttm NAME]\n"
     "    [--dump-probs FILE] [--push-ms MS] [--compact-frames N]\n"
     "    [--batching-check]\n"
-    "    [--preset streaming|offline]\n"
+    "    [--preset streaming|offline|v3-streaming|v3-offline]\n"
     "    [--chunk N] [--rc N] [--lc N] [--fifo N] [--spkcache N] [--update N]\n"
     "    [--onset P] [--offset P] [--pad-onset S] [--pad-offset S] [--min-on S] [--min-off S]\n";
 
@@ -147,8 +148,7 @@ main(int argc, char** argv) {
     double sec_per_frame = 0.0;
     if (offline) {
         probs = model.diarize_offline(audio.data(), audio.size(), &n_frames);
-        sec_per_frame =
-            model.cfg().encoder.subsampling_factor * static_cast<double>(model.cfg().window_stride);
+        sec_per_frame = model.cfg().seconds_per_output_frame();
         segs = diar_segments_from_probs(
             probs.data(), n_frames, model.cfg().num_speakers, sec_per_frame, seg_cfg);
     } else {
@@ -179,11 +179,16 @@ main(int argc, char** argv) {
         constexpr int kChunkMelFrames = 64;
         const int d_model = model.cfg().encoder.d_model;
         std::vector<ChunkInput> chunk_inputs(4);
-        const int state_lengths[4][2] = {{0, 0}, {4, 7}, {9, 3}, {2, 19}};
+        const int heterogeneous_state_lengths[4][2] = {{0, 0}, {4, 7}, {9, 3}, {2, 19}};
         for (size_t lane = 0; lane < chunk_inputs.size(); ++lane) {
             auto& input = chunk_inputs[lane];
-            input.spkcache_frames = state_lengths[lane][0];
-            input.fifo_frames = state_lengths[lane][1];
+            // V3 batches exact state lengths so compact sequences retain the
+            // same RoPE positions as scalar execution. Lock-step production
+            // streams naturally share these steady-state lengths.
+            input.spkcache_frames = model.cfg().is_v3() ? DiarGeometry::v3_streaming().spkcache_len
+                                                        : heterogeneous_state_lengths[lane][0];
+            input.fifo_frames = model.cfg().is_v3() ? DiarGeometry::v3_streaming().fifo_len
+                                                    : heterogeneous_state_lengths[lane][1];
             input.mel.resize(static_cast<size_t>(model.cfg().n_mels) * kChunkMelFrames);
             input.spkcache.resize(static_cast<size_t>(d_model) * input.spkcache_frames);
             input.fifo.resize(static_cast<size_t>(d_model) * input.fifo_frames);
@@ -223,34 +228,41 @@ main(int argc, char** argv) {
             const auto& reference = chunk_references[lane];
             if (result.total_frames != reference.total_frames ||
                 result.chunk_frames != reference.chunk_frames ||
+                result.native_total_frames != reference.native_total_frames ||
+                result.native_preds.size() != reference.native_preds.size() ||
                 result.preds.size() != reference.preds.size() ||
                 result.chunk_embs.size() != reference.chunk_embs.size()) {
-                std::fprintf(stderr, "heterogeneous state batch output shape changed\n");
+                std::fprintf(stderr, "state batch output shape changed\n");
                 return 1;
             }
             double max_abs = 0.0;
             double square_error = 0.0;
             size_t count = 0;
             auto compare = [&](const std::vector<float>& got, const std::vector<float>& expected) {
+                const double local_max = finite_max_abs_diff(got, expected);
+                max_abs = std::max(max_abs, local_max);
                 for (size_t i = 0; i < got.size(); ++i) {
                     const double delta = static_cast<double>(got[i]) - expected[i];
-                    max_abs = std::max(max_abs, std::abs(delta));
                     square_error += delta * delta;
                     ++count;
                 }
+                return local_max;
             };
-            compare(result.preds, reference.preds);
-            compare(result.chunk_embs, reference.chunk_embs);
+            const double pred_max = compare(result.preds, reference.preds);
+            const double emb_max = compare(result.chunk_embs, reference.chunk_embs);
+            const double native_max = compare(result.native_preds, reference.native_preds);
             const double rmse = std::sqrt(square_error / std::max<size_t>(1, count));
             heterogeneous_max_abs = std::max(heterogeneous_max_abs, max_abs);
             heterogeneous_max_rmse = std::max(heterogeneous_max_rmse, rmse);
             // Allow bounded B=1/B>1 Q8 CUDA reduction drift; speaker segments
             // are still checked below for functional parity.
             // Single-chunk thresholds should be tighter than accumulated streaming thresholds
-            if (max_abs > 1e-1 || rmse > 5e-3) {
+            if (!std::isfinite(max_abs) || !std::isfinite(rmse) || max_abs > 1e-1 || rmse > 5e-3) {
                 std::fprintf(
-                    stderr, "heterogeneous state batch lane %zu parity delta max=%.3e rmse=%.3e\n",
-                    lane, max_abs, rmse);
+                    stderr,
+                    "state batch lane %zu parity delta max=%.3e rmse=%.3e "
+                    "(coarse=%.3e embs=%.3e native=%.3e)\n",
+                    lane, max_abs, rmse, pred_max, emb_max, native_max);
                 return 1;
             }
         }
@@ -258,12 +270,13 @@ main(int argc, char** argv) {
         if (chunk_metrics_after.target_reached_batches <=
                 chunk_metrics_before.target_reached_batches ||
             chunk_metrics_after.max_observed_batch < 4) {
-            std::fprintf(stderr, "heterogeneous state requests did not coalesce at B=4\n");
+            std::fprintf(stderr, "state requests did not coalesce at B=4\n");
             return 1;
         }
         std::fprintf(
-            stdout, "heterogeneous state B=4 parity PASS (max=%.3e rmse=%.3e)\n",
-            heterogeneous_max_abs, heterogeneous_max_rmse);
+            stdout, "%s state B=4 parity PASS (max=%.3e rmse=%.3e)\n",
+            model.cfg().is_v3() ? "equal-length" : "heterogeneous", heterogeneous_max_abs,
+            heterogeneous_max_rmse);
 
         struct BatchedResult {
             std::vector<float> probabilities;
@@ -311,11 +324,10 @@ main(int argc, char** argv) {
                 std::fprintf(stderr, "batched diarization output length mismatch\n");
                 return 1;
             }
-            double max_abs = 0.0;
+            const double max_abs = finite_max_abs_diff(got, reference.probabilities);
             double square_error = 0.0;
             for (size_t i = 0; i < got.size(); ++i) {
                 const double delta = static_cast<double>(got[i]) - reference.probabilities[i];
-                max_abs = std::max(max_abs, std::abs(delta));
                 square_error += delta * delta;
             }
             const double rmse = std::sqrt(square_error / std::max<size_t>(1, got.size()));
@@ -324,13 +336,27 @@ main(int argc, char** argv) {
             // can amplify a few frame probabilities even for F32 weights, so
             // bound both the isolated and aggregate drift and verify the
             // resulting speaker segments exactly below.
-            if (max_abs > 1.25e-1 || rmse > 7.5e-3) {
+            if (!std::isfinite(max_abs) || !std::isfinite(rmse) || max_abs > 1.25e-1 ||
+                rmse > 7.5e-3) {
                 std::fprintf(
-                    stderr, "batched diarization parity delta max=%.3e rmse=%.3e\n", max_abs, rmse);
+                    stderr, "batched diarization lane %zu parity delta max=%.3e rmse=%.3e\n",
+                    result_index, max_abs, rmse);
                 return 1;
             }
             if (result.segments.size() != reference.segments.size()) {
-                std::fprintf(stderr, "batched diarization segment count changed\n");
+                std::fprintf(
+                    stderr,
+                    "batched diarization lane %zu segment count changed: %zu != %zu "
+                    "(max=%.3e rmse=%.3e)\n",
+                    result_index, result.segments.size(), reference.segments.size(), max_abs, rmse);
+                for (const auto& segment : reference.segments)
+                    std::fprintf(
+                        stderr, "  reference spk=%d %.3f-%.3f\n", segment.speaker, segment.t0,
+                        segment.t1);
+                for (const auto& segment : result.segments)
+                    std::fprintf(
+                        stderr, "  batched   spk=%d %.3f-%.3f\n", segment.speaker, segment.t0,
+                        segment.t1);
                 return 1;
             }
             for (size_t i = 0; i < reference.segments.size(); ++i) {

@@ -146,9 +146,12 @@ package), or whisper.cpp's bundled checkpoint for the offline path.
 
 ### Sortformer speaker diarization
 
-Used for ASR speaker tags and standalone `nemo-speech diarize`. Sortformer v2
-supports up to four speakers, with stateful streaming for long recordings and
-full-attention inference for short recordings. Convert it with:
+Used for ASR speaker tags and standalone `nemo-speech diarize`. The runtime
+supports both the four-speaker Sortformer V2 and the high-resolution,
+eight-speaker Sortformer V3. Both provide stateful streaming for long
+recordings and full-attention inference for short recordings.
+
+Convert V2 from its Hugging Face repository:
 
 ```bash
 python3 convert_model.py nvidia/diar_streaming_sortformer_4spk-v2 \
@@ -156,12 +159,45 @@ python3 convert_model.py nvidia/diar_streaming_sortformer_4spk-v2 \
 # --outtype f32 is the default; f16 and q8_0 produce smaller artifacts.
 ```
 
-Enable with `--diar-model models/sortformer-v2-f32.gguf`; streaming geometry
-comes from `--diar-preset` (see [configuration](configuration.md)). Segment
-postprocessing defaults follow the checkpoint and may need tuning for your
-audio.
+Convert the final V3 checkpoint from its Hugging Face repository:
 
-Source: [nvidia/diar_streaming_sortformer_4spk-v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2).
+```bash
+python3 convert_model.py nvidia/Nemotron-3-Diarization \
+    --outfile models/Nemotron-3-Diarization.f32.gguf
+# Portable INT8 deployment artifact (Q8_0 linear weights):
+python3 convert_model.py nvidia/Nemotron-3-Diarization \
+    --outfile models/Nemotron-3-Diarization.q8_0.gguf --outtype q8_0
+```
+
+Enable either model with `--diar-model MODEL.gguf`. With no geometry overrides,
+the runtime selects the matching low-latency preset: V2 uses
+`spkcache=160, fifo=80, chunk=20`, while V3 uses
+`spkcache=264, fifo=188, chunk=6, update=144, lc=1, rc=7`. These values are on
+the shared coarse 80 ms AOSC grid. V3 emits public speaker probabilities every
+10 ms; V2 emits them every 80 ms. Explicit `--diar-preset` choices are
+`streaming`, `offline`, `v3-streaming`, and `v3-offline` (see
+[configuration](configuration.md)).
+
+Without an explicit preset, individual geometry overrides inherit all omitted
+fields from the model's low-latency defaults. `-1` leaves a field automatic;
+explicit values, including zero context and the V2 default chunk of 20, are
+preserved. A named preset still replaces the individual geometry keys.
+
+V3 uses 8x feature stacking, a 31-layer pre-LN RoPE Transformer with eight
+64-dimensional attention heads, subpixel upsampling, and its learned silence
+embedding for AOSC cache compression. CUDA builds execute its attention through
+ggml's fused flash-attention operator; this is ggml backend flash attention,
+not an externally versioned FlashAttention-2/3 package.
+
+In the combined ASR pipeline, diarization remains a sidecar timeline: the ASR
+word timestamps are assigned the strongest Sortformer channel around each word
+onset. This is compatible with V2 and V3 but is distinct from Speech's
+speaker-conditioned multi-talker ASR graph.
+
+Segment postprocessing is dataset-sensitive and may need tuning for your audio.
+
+V2 source: [nvidia/diar_streaming_sortformer_4spk-v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2).
+V3 source: [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization).
 
 ### PnC (punctuation + capitalization)
 

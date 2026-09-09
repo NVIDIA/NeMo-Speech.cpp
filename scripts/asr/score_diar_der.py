@@ -39,8 +39,10 @@ from pyannote.metrics.diarization import DiarizationErrorRate
 GEOMETRY_PRESETS = {
     "streaming": dict(chunk=20, lc=0, rc=0, fifo=80, spkcache=160, update=80),
     "offline": dict(chunk=100, lc=0, rc=0, fifo=100, spkcache=312, update=100),
+    "v3-streaming": dict(chunk=6, lc=1, rc=7, fifo=188, spkcache=264, update=144),
+    "v3-offline": dict(chunk=264, lc=1, rc=1, fifo=0, spkcache=264, update=188),
 }
-DEFAULT_GEOMETRY = "streaming"
+DEFAULT_GEOMETRY = "auto"
 POSTPROC_CALLHOME = dict(
     onset=0.641,
     offset=0.561,
@@ -49,7 +51,6 @@ POSTPROC_CALLHOME = dict(
     min_duration_on=0.511,
     min_duration_off=0.296,
 )
-SEC_PER_FRAME = 0.08
 
 
 def geometry_cli_args(geom: dict) -> list[str]:
@@ -93,12 +94,12 @@ def parse_rttm_lines(lines):
     return ann_by_file
 
 
-def probs_to_annotation(probs, uri, pp=POSTPROC_CALLHOME) -> Annotation:
+def probs_to_annotation(probs, uri, seconds_per_frame: float, pp=POSTPROC_CALLHOME) -> Annotation:
     """NumPy (T, n_spk) frame probs -> Annotation, DiarStream::segments() rules
     (onset/offset hysteresis -> pad -> fill short gaps -> drop short segments)."""
     ann = Annotation(uri=uri)
     n, n_spk = probs.shape
-    total = n * SEC_PER_FRAME
+    total = n * seconds_per_frame
     for s in range(n_spk):
         segs = []
         active, start = False, 0
@@ -110,12 +111,12 @@ def probs_to_annotation(probs, uri, pp=POSTPROC_CALLHOME) -> Annotation:
                 active = False
                 segs.append(
                     (
-                        max(0.0, start * SEC_PER_FRAME - pp["pad_onset"]),
-                        min(total, f * SEC_PER_FRAME + pp["pad_offset"]),
+                        max(0.0, start * seconds_per_frame - pp["pad_onset"]),
+                        min(total, f * seconds_per_frame + pp["pad_offset"]),
                     )
                 )
         if active:
-            segs.append((max(0.0, start * SEC_PER_FRAME - pp["pad_onset"]), total))
+            segs.append((max(0.0, start * seconds_per_frame - pp["pad_onset"]), total))
         merged = []
         for t0, t1 in segs:
             if merged and t0 - merged[-1][1] < pp["min_duration_off"]:
@@ -144,8 +145,8 @@ def main() -> int:
     ap.add_argument(
         "--preset",
         default=DEFAULT_GEOMETRY,
-        choices=sorted(GEOMETRY_PRESETS),
-        help="streaming geometry applied to both the C++ CLI and NeMo baseline",
+        choices=["auto", *sorted(GEOMETRY_PRESETS)],
+        help="geometry applied to both runtimes; auto selects from model metadata",
     )
     ap.add_argument(
         "--cli-arg",
@@ -195,7 +196,7 @@ def main() -> int:
                 print(f"  {mf}", file=sys.stderr)
             return 1
 
-    geom = GEOMETRY_PRESETS[args.preset]
+    geom = None if args.preset == "auto" else GEOMETRY_PRESETS[args.preset]
     metric_ours = DiarizationErrorRate(collar=2 * args.collar, skip_overlap=args.skip_overlap)
     uems = {}
     for w in wavs:
@@ -204,7 +205,9 @@ def main() -> int:
             lines = hyp_path.read_text().splitlines()
         else:
             cmd = [args.cli, args.model, str(w), "--rttm", w.stem]
-            cmd += geometry_cli_args(geom) + args.cli_arg
+            if geom is not None:
+                cmd += geometry_cli_args(geom)
+            cmd += args.cli_arg
             if args.gpu:
                 cmd.append("--gpu")
             out = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -229,8 +232,12 @@ def main() -> int:
             restore_path=args.nemo_ckpt, map_location=device
         )
         model.eval().to(device)
-        # Same geometry as the C++ side, from the shared preset table.
-        apply_geometry_to_nemo(model.sortformer_modules, geom)
+        # Same geometry as the C++ side, from the shared preset table. With
+        # auto, select by the checkpoint's high-resolution contract.
+        high_resolution = bool(getattr(model, "high_resolution", False))
+        nemo_geom = geom or GEOMETRY_PRESETS["v3-streaming" if high_resolution else "streaming"]
+        apply_geometry_to_nemo(model.sortformer_modules, nemo_geom)
+        seconds_per_frame = 0.01 if high_resolution else 0.08
         model.preprocessor.featurizer.dither = 0.0
         model.streaming_mode = True
 
@@ -245,7 +252,7 @@ def main() -> int:
                 sig = torch.from_numpy(audio).unsqueeze(0).to(device)
                 sig_len = torch.tensor([sig.shape[1]], device=device)
                 preds = model.forward(audio_signal=sig, audio_signal_length=sig_len)
-                hyp = probs_to_annotation(preds[0].cpu().numpy(), w.stem)
+                hyp = probs_to_annotation(preds[0].cpu().numpy(), w.stem, seconds_per_frame)
                 d = metric_nemo(refs[w.stem], hyp, uem=uems[w.stem])
                 print(f"[der]   nemo {w.stem[:16]}...: {d:.4f}")
         der_nemo = abs(metric_nemo)
