@@ -52,6 +52,10 @@ add_executable(test_diar_state test_diar_state.cpp)
 target_link_libraries(test_diar_state PRIVATE nemo_speech_asr)
 add_test(NAME diar_state COMMAND test_diar_state)
 
+add_executable(test_diar_frame_lookup test_diar_frame_lookup.cpp)
+target_link_libraries(test_diar_frame_lookup PRIVATE nemo_speech_asr)
+add_test(NAME diar_frame_lookup COMMAND test_diar_frame_lookup)
+
 add_executable(test_diar_recognizer test_diar_recognizer.cpp)
 target_link_libraries(test_diar_recognizer PRIVATE nemo_speech_asr)
 
