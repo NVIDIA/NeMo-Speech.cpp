@@ -10,6 +10,6 @@ protobuf>=4.21,<5
 safetensors>=0.4,<1
 sentencepiece>=0.1.98,<0.3.0
 silero-vad==6.2.0
-torch~=2.6.0
-torchaudio~=2.6.0
+torch
+torchaudio
 transformers==5.5.1
