@@ -18,15 +18,14 @@ into 22050 Hz mono PCM audio.
 The examples below assume these files are available:
 
 ```text
-models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf
+models/magpie-tts/magpie.gguf
 models/magpie-tts/extracted
 models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf
 ```
 
-`magpie_tts_multilingual_357m.v2602.f16.gguf` is the MagpieTTS autoregressive
-model. The `extracted` directory is the unpacked MagpieTTS `.nemo` checkpoint
-and is needed by the tokenizer. The NanoCodec GGUF is the token-to-audio
-decoder.
+`magpie.gguf` is an example path for the MagpieTTS autoregressive model. The
+`extracted` directory is the unpacked MagpieTTS `.nemo` checkpoint and is
+needed by the tokenizer. The NanoCodec GGUF is the token-to-audio decoder.
 
 ## Build
 
@@ -49,7 +48,7 @@ Convert the MagpieTTS `.nemo` checkpoint or extracted checkpoint directory:
 
 ```bash
 python convert_model.py models/magpie-tts/extracted \
-  --outfile models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+  --outfile models/magpie-tts/magpie.gguf \
   --outtype f16 \
   --metadata-json models/magpie-tts/magpie_tts_multilingual_357m.gguf.json
 ```
@@ -81,7 +80,7 @@ It accepts text by default and also supports pre-tokenized IDs for diagnostics:
 
 ```bash
 build/cuda-tts/bin/synthesize_text \
-  --tts.magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+  --tts.magpie-model models/magpie-tts/magpie.gguf \
   --tts.codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
   --tts.tokenizer-model-dir models/magpie-tts/extracted \
   --tts.text "Hello world." \
@@ -103,7 +102,7 @@ Launch the server:
 
 ```bash
 build/cuda-full/bin/riva_server \
-  --tts.magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+  --tts.magpie-model models/magpie-tts/magpie.gguf \
   --tts.codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
   --tts.tokenizer-model-dir models/magpie-tts/extracted \
   --bind 0.0.0.0:50051 \

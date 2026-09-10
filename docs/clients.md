@@ -57,8 +57,8 @@ than placing an API key in a public page.
 ## curl
 
 The speech example requires a TTS model. Start a TTS-only server with
-`nemo-speech serve --tts-model magpie`, or add `--tts-model magpie` to the ASR
-server command above.
+`nemo-speech serve --tts-model models/magpie-tts/magpie.gguf`, or add that
+option to the ASR server command above.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/audio/transcriptions \

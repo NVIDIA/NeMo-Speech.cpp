@@ -16,39 +16,15 @@ options are omitted.
 
 Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidia/magpie_tts_multilingual_357m)
 
-```bash
-# Download the v2602 GGUF and its matching tokenizer archive from their
-# immutable revisions.
-hf download nvidia/magpie_tts_multilingual_357m \
-    --include magpie_tts_multilingual_357m.v2602.f16.gguf \
-    --revision 452ef560f972c38d5fc16476259aac9456453547 \
-    --local-dir models/magpie-tts
-hf download nvidia/magpie_tts_multilingual_357m \
-    --include magpie_tts_multilingual_357m.nemo \
-    --revision 34d7e40da85cabc97f92198889b65cea27bc7fd1 \
-    --local-dir models/magpie-tts
+Use `nemo-speech pull magpie` to download the GGUF and matching tokenizer
+assets pinned by the model index. For manually managed checkpoints, download
+the GGUF and `.nemo` archive from the same Hugging Face revision and pass their
+local paths explicitly.
 
-# Extract the tokenizer assets loaded by the runtime.
-mkdir -p models/magpie-tts/extracted
-tar -xf models/magpie-tts/magpie_tts_multilingual_357m.nemo \
-    -C models/magpie-tts/extracted
-```
-
-MagpieTTS v2607 uses factor-2 frame stacking and must currently be converted
-locally before use:
-
-```bash
-hf download nvidia/magpie_tts_multilingual_357m \
-    magpie_tts_multilingual_357m.nemo \
-    --revision v2607 --local-dir models/magpie-tts-v2607
-python3 convert_model.py models/magpie-tts-v2607/magpie_tts_multilingual_357m.nemo \
-    --outfile models/magpie-tts-v2607/magpie_tts_multilingual_357m.v2607.f16.gguf
-mkdir -p models/magpie-tts-v2607/extracted
-tar -xf models/magpie-tts-v2607/magpie_tts_multilingual_357m.nemo \
-    -C models/magpie-tts-v2607/extracted
-```
-
-Both v2602 (factor 1) and v2607 (factor 2) use the same NanoCodec decoder.
+v2602 generates one codec frame per autoregressive step, while v2607 uses a
+frame-stacking factor of 2. This is independent of `tts.chunk-frames`, which
+groups generated frames for NanoCodec streaming. Both versions use the same
+NanoCodec decoder.
 
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
 they are not part of the GGUF. The built-in pull extracts only the required,
