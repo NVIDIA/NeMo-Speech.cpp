@@ -20,6 +20,7 @@ PAYLOAD = b"NeMo-Speech.cpp model-store fixture\n"
 CODEC_PAYLOAD = b"NeMo-Speech.cpp codec fixture\n"
 TTS_PAYLOAD = b"NeMo-Speech.cpp TTS fixture\n"
 TOKENIZER_PAYLOAD = b"tokenizer configuration\n"
+UPDATED_TOKENIZER_PAYLOAD = b"updated tokenizer configuration\n"
 TTS_REVISION = "1" * 40
 TOKENIZER_REVISION = "3" * 40
 CODEC_REVISION = "2" * 40
@@ -31,6 +32,7 @@ class ArtifactHandler(http.server.BaseHTTPRequestHandler):
     requests = 0
     request_counts: dict[str, int] = {}
     request_paths: list[str] = []
+    range_headers: list[str | None] = []
     payloads: dict[str, bytes] = {}
 
     def do_GET(self) -> None:
@@ -46,6 +48,7 @@ class ArtifactHandler(http.server.BaseHTTPRequestHandler):
         start = 0
         end = len(payload) - 1
         range_header = self.headers.get("Range")
+        type(self).range_headers.append(range_header)
         if range_header:
             assert range_header.startswith("bytes=")
             bounds = range_header.removeprefix("bytes=").split("-", 1)
@@ -87,6 +90,38 @@ def tokenizer_archive() -> bytes:
         weights.size = 1
         bundle.addfile(weights, io.BytesIO(b"x"))
     return output.getvalue()
+
+
+def ranged_tokenizer_archive() -> tuple[bytes, list[dict[str, int | str]], bytes]:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as bundle:
+        tokenizer = tarfile.TarInfo("tokenizer.txt")
+        tokenizer.size = len(TOKENIZER_PAYLOAD)
+        tokenizer.pax_headers = {"mtime": "0.0"}
+        bundle.addfile(tokenizer, io.BytesIO(TOKENIZER_PAYLOAD))
+        weights = tarfile.TarInfo("model_weights.ckpt")
+        weights.size = 4096
+        weights.pax_headers = {"mtime": "0.0"}
+        bundle.addfile(weights, io.BytesIO(b"x" * weights.size))
+        updated = tarfile.TarInfo("tokenizer.txt")
+        updated.size = len(UPDATED_TOKENIZER_PAYLOAD)
+        updated.pax_headers = {"mtime": "0.0"}
+        bundle.addfile(updated, io.BytesIO(UPDATED_TOKENIZER_PAYLOAD))
+    archive = output.getvalue()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r") as bundle:
+        members = bundle.getmembers()
+    weights = next(member for member in members if member.name == "model_weights.ckpt")
+    updated = [member for member in members if member.name == "tokenizer.txt"][-1]
+    ranges: list[dict[str, int | str]] = [
+        {
+            "start": 0,
+            "end": weights.offset_data - 1,
+            "stop_before": "model_weights.ckpt",
+        },
+        {"start": updated.offset, "end": len(archive) - 1},
+    ]
+    selected = b"".join(archive[int(item["start"]) : int(item["end"]) + 1] for item in ranges)
+    return archive, ranges, selected
 
 
 def file_artifact(role: str, filename: str, payload: bytes, sha256: str | None = None) -> dict:
@@ -187,6 +222,7 @@ def main() -> None:
         ArtifactHandler.requests = 0
         ArtifactHandler.request_counts = {}
         ArtifactHandler.request_paths = []
+        ArtifactHandler.range_headers = []
         ArtifactHandler.payloads = {
             "tiny.gguf": PAYLOAD,
             "tiny-tts.gguf": TTS_PAYLOAD,
@@ -292,6 +328,43 @@ def main() -> None:
             assert ArtifactHandler.request_counts["tiny-tts.gguf"] == 1
             assert ArtifactHandler.request_counts["tiny-tts.nemo"] == 2
             assert ArtifactHandler.request_counts["tiny-codec.gguf"] == 1
+
+            ranged_archive, ranges, selected = ranged_tokenizer_archive()
+            ranged_index = json.loads(index.read_text(encoding="utf-8"))
+            ranged_artifact = ranged_index["models"][1]["artifacts"][1]
+            ranged_artifact["type"] = "tar-ranges"
+            ranged_artifact["size"] = len(selected)
+            ranged_artifact["sha256"] = hashlib.sha256(selected).hexdigest()
+            ranged_artifact["ranges"] = ranges
+            ranged_artifact["members"][0] = {
+                "name": "tokenizer.txt",
+                "size": len(UPDATED_TOKENIZER_PAYLOAD),
+                "sha256": hashlib.sha256(UPDATED_TOKENIZER_PAYLOAD).hexdigest(),
+            }
+            del ranged_artifact["range_end"]
+            del ranged_artifact["stop_before"]
+            index.write_text(json.dumps(ranged_index), encoding="utf-8")
+            ArtifactHandler.payloads["tiny-tts.nemo"] = ranged_archive
+            ranged_cache = root / "ranged-cache"
+            ranged_environment = {
+                **environment,
+                "NEMO_SPEECH_MODEL_DIR": str(ranged_cache),
+            }
+            range_header_start = len(ArtifactHandler.range_headers)
+            ranged_pull = run(binary, ranged_environment, "--json", "pull", "tiny-tts")
+            assert ranged_pull.returncode == 0, ranged_pull.stderr
+            ranged_tokenizer = pathlib.Path(json.loads(ranged_pull.stdout)["artifacts"][1]["path"])
+            assert (ranged_tokenizer / "tokenizer.txt").read_bytes() == UPDATED_TOKENIZER_PAYLOAD
+            assert not (ranged_tokenizer / "model_weights.ckpt").exists()
+            expected_ranges = [f'bytes={item["start"]}-{item["end"]}' for item in ranges]
+            actual_ranges = [
+                value
+                for value in ArtifactHandler.range_headers[range_header_start:]
+                if value is not None
+            ]
+            assert actual_ranges == expected_ranges
+            ArtifactHandler.payloads["tiny-tts.nemo"] = tokenizer_tar
+            write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
 
             previous_mtime = destination.stat().st_mtime_ns
             destination.write_bytes(b"x" * len(PAYLOAD))
