@@ -114,6 +114,20 @@ std::vector<DiarSegment> diar_segments_from_probs(
     const float* probs, int64_t n_frames, int n_spk, double sec_per_frame,
     const DiarSegmentationCfg& cfg);
 
+// Speaker for a [start_frame, end_frame) range. `probs` is the live retained
+// window (frames [probs_base, probs_base + probs.size()/n_spk)); `frozen` is
+// any prefix already compacted out of it (see DiarStream::maybe_compact()).
+// A range that starts before probs_base is resolved against `frozen`
+// (nearest segment by time if the range falls in a gap) instead of being
+// silently clamped into the live window - the naive clamp is only correct
+// when every query lands "near the frontier" shortly after the audio was
+// processed, which does not hold for callers that tag words long after the
+// fact (e.g. a whole-file batch pass). Returns -1 when nothing has been
+// emitted yet for the range.
+int speaker_for_frame_range(
+    const std::vector<float>& probs, int64_t probs_base, int n_spk, double sec_per_frame,
+    const std::vector<DiarSegment>& frozen, int64_t start_frame, int64_t end_frame);
+
 // Per-stream streaming state + timeline.
 class DiarStream {
    public:

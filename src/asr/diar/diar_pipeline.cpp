@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 
 using namespace nemo_speech::asr;
@@ -218,26 +219,70 @@ DiarStream::flush_available(int64_t target_frame) {
     }
 }
 
+namespace {
+
+// Nearest frozen-segment speaker for a time range that starts before the
+// live window. `frozen` is sorted by t0 (see DiarStream::maybe_compact()).
+// Returns -1 when `frozen` is empty.
 int
-DiarStream::speaker_for_frames(int64_t start_frame, int64_t end_frame) const {
-    const int64_t n = n_frames();
-    if (n == 0 || probs_.empty())
+speaker_from_frozen(const std::vector<DiarSegment>& frozen, double t0, double t1) {
+    if (frozen.empty())
         return -1;
-    // riva extrapolates words past the diarized frontier with the last frame;
-    // symmetrically, ranges before the retained window (only reachable when a
-    // caller tags words hours after they were spoken) clamp to its first
-    // frame. Word tagging happens near the frontier, so the clamp is inert in
-    // practice.
-    start_frame = std::min(std::max<int64_t>(start_frame, probs_base_), n - 1);
+    // First segment that could overlap [t0, t1): the first whose end is
+    // after t0.
+    auto it = std::lower_bound(
+        frozen.begin(), frozen.end(), t0,
+        [](const DiarSegment& seg, double t) { return seg.t1 <= t; });
+    if (it != frozen.end() && it->t0 < t1)
+        return it->speaker;
+    // No direct overlap - the range sits in a gap the segmenter dropped
+    // (e.g. a short silence). Use whichever neighbor is temporally closer.
+    if (it == frozen.begin())
+        return it->speaker;
+    if (it == frozen.end())
+        return std::prev(it)->speaker;
+    const auto prev = std::prev(it);
+    return (t0 - prev->t1 <= it->t0 - t1) ? prev->speaker : it->speaker;
+}
+
+}  // namespace
+
+int
+nemo_speech::asr::speaker_for_frame_range(
+    const std::vector<float>& probs, int64_t probs_base, int n_spk, double sec_per_frame,
+    const std::vector<DiarSegment>& frozen, int64_t start_frame, int64_t end_frame) {
+    if (start_frame < probs_base) {
+        // This range was already compacted out of the live window (see
+        // DiarStream::maybe_compact()). The clamp below would silently
+        // substitute whatever sits at the live window's edge; ask the
+        // frozen segments, which actually cover this span, instead.
+        const int frozen_speaker =
+            speaker_from_frozen(frozen, start_frame * sec_per_frame, end_frame * sec_per_frame);
+        if (frozen_speaker >= 0)
+            return frozen_speaker;
+        // Nothing frozen this early either (e.g. compaction hasn't run
+        // yet) - fall through to the live-window clamp below.
+    }
+    const int64_t n = probs_base + static_cast<int64_t>(probs.size()) / n_spk;
+    if (n == 0 || probs.empty())
+        return -1;
+    // riva extrapolates words past the diarized frontier with the last frame.
+    start_frame = std::min(std::max<int64_t>(start_frame, probs_base), n - 1);
     end_frame = std::max(start_frame + 1, std::min(end_frame, n));
-    std::vector<double> mean(n_spk_, 0.0);
+    std::vector<double> mean(n_spk, 0.0);
     for (int64_t f = start_frame; f < end_frame; f++)
-        for (int s = 0; s < n_spk_; s++) mean[s] += probs_[(f - probs_base_) * n_spk_ + s];
+        for (int s = 0; s < n_spk; s++) mean[s] += probs[(f - probs_base) * n_spk + s];
     int best = 0;
-    for (int s = 1; s < n_spk_; s++)
+    for (int s = 1; s < n_spk; s++)
         if (mean[s] > mean[best])
             best = s;
     return best;
+}
+
+int
+DiarStream::speaker_for_frames(int64_t start_frame, int64_t end_frame) const {
+    return speaker_for_frame_range(
+        probs_, probs_base_, n_spk_, sec_per_frame_, frozen_segs_, start_frame, end_frame);
 }
 
 int
