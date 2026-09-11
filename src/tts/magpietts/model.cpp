@@ -1780,11 +1780,16 @@ MagpieLongformAttentionPriorState::update(
     }
     const int last_rel = std::max(0, std::min(search_start_abs - left_offset_, text_len_ - 1));
 
-    int attended_rel = last_rel;
     const int search_end =
         std::min(last_rel + std::max(0, h.attention_prior_lookahead_window), text_len_ - 3);
+    // An empty search window means attention has reached the last few tokens of
+    // the text: the reference treats that as the sentence having ended and jumps
+    // to the final position, which is what lets the chunk finish. Holding at
+    // last_rel instead leaves the chunk creeping forward one token per
+    // advance_threshold steps, on the sink escape alone -- which is where
+    // degenerate chunks running 291 steps against a mean of 120 came from.
+    int attended_rel = search_end > last_rel ? last_rel : text_len_ - 1;
     if (search_end > last_rel) {
-        attended_rel = last_rel;
         float best = alignment_scores[(size_t)last_rel];
         for (int i = last_rel + 1; i < search_end; ++i) {
             if (alignment_scores[(size_t)i] > best) {
