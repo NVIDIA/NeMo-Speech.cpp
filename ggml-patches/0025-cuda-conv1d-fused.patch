@@ -1,0 +1,467 @@
+diff --git a/include/ggml.h b/include/ggml.h
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -584,6 +584,7 @@
+         GGML_OP_GLU,
+ 
+         GGML_OP_FUSED_ATTN,
++        GGML_OP_CONV1D_FUSED,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -2498,6 +2499,27 @@
+             float                 scale,
+             bool                  merge_heads);
+ 
++    // Fused causal 1-D convolution over [T, C] activations (T contiguous, CUDA only):
++    //   y[co][t] = bias[co] + sum_{ci,k} act(xcat[ci][t + k*dilation]) * w[k][ci][co]
++    // where xcat = [cache | x] along T (cache may be NULL) and act is an optional half-snake
++    // activation (alpha/alpha_inv over the first snake_channels channels, leaky-relu(slope) on
++    // the rest; pass alpha == NULL for identity). w_packed is F16 [cin_pad, cout_pad, K]
++    // (ne0 = cin_pad; both paddings multiples of 16, zero filled). Output F32 [T_out, cout].
++    GGML_API struct ggml_tensor * ggml_conv1d_fused(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * cache,
++            struct ggml_tensor  * w_packed,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * alpha,
++            struct ggml_tensor  * alpha_inv,
++            int                   kernel,
++            int                   dilation,
++            int                   cout,
++            int                   snake_channels,
++            float                 slope);
++
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+            struct ggml_context * ctx,
+diff --git a/src/ggml.c b/src/ggml.c
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1080,9 +1080,10 @@
+     "GLU",
+ 
+     "FUSED_ATTN",
++    "CONV1D_FUSED",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
++static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1192,9 +1193,10 @@
+     "glu(x)",
+ 
+     "fused_attn(q,k,v,p)",
++    "conv1d_fused(x,w)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
++static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5548,6 +5550,45 @@
+         merge_heads);
+ }
+ 
++struct ggml_tensor * ggml_conv1d_fused(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * cache,
++        struct ggml_tensor  * w_packed,
++        struct ggml_tensor  * bias,
++        struct ggml_tensor  * alpha,
++        struct ggml_tensor  * alpha_inv,
++        int                   kernel,
++        int                   dilation,
++        int                   cout,
++        int                   snake_channels,
++        float                 slope) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(w_packed->type == GGML_TYPE_F16);
++    GGML_ASSERT(w_packed->ne[2] == kernel);
++    GGML_ASSERT(w_packed->ne[0] >= x->ne[1] && (w_packed->ne[0] % 16) == 0);  // cin_pad
++    GGML_ASSERT(w_packed->ne[1] >= cout && (w_packed->ne[1] % 16) == 0);       // cout_pad
++    GGML_ASSERT(bias == NULL || ggml_nelements(bias) == cout);  // [cout] or [1, cout, 1]
++    GGML_ASSERT(cache == NULL || (cache->type == GGML_TYPE_F32 && cache->ne[1] == x->ne[1]));
++    GGML_ASSERT((alpha == NULL) == (alpha_inv == NULL));
++    const int64_t cache_len = cache ? cache->ne[0] : 0;
++    const int64_t t_out = cache_len + x->ne[0] - (int64_t) (kernel - 1) * dilation;
++    GGML_ASSERT(t_out > 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t_out, cout, 1);
++    int32_t params[5] = { kernel, dilation, snake_channels, alpha ? 1 : 0, 0 };
++    memcpy(&params[4], &slope, sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++    result->op     = GGML_OP_CONV1D_FUSED;
++    result->src[0] = x;
++    result->src[1] = w_packed;
++    result->src[2] = bias;
++    result->src[3] = cache;
++    result->src[4] = alpha;
++    result->src[5] = alpha_inv;
++    return result;
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1992,6 +1992,10 @@
+             {
+                 GGML_ABORT("FUSED_ATTN has no CPU path (CUDA-only)");
+             } break;
++        case GGML_OP_CONV1D_FUSED:
++            {
++                GGML_ABORT("CONV1D_FUSED has no CPU path (CUDA-only)");
++            } break;
+         case GGML_OP_FLASH_ATTN_BACK:
+             {
+                 int32_t t = ggml_get_op_params_i32(tensor, 0);
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -439,6 +439,7 @@
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_CONV1D_FUSED:
+         case GGML_OP_FUSED_ATTN:
+             return false;  // CUDA-only; CPU falls back to the unfused graph
+         case GGML_OP_CPY:
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -26,6 +26,7 @@
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
+ #include "ggml-cuda/fused-attention.cuh"
++#include "ggml-cuda/conv1d-fused.cuh"
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
+@@ -3319,6 +3320,9 @@
+         case GGML_OP_FUSED_ATTN:
+             ggml_cuda_op_fused_attention(ctx, dst);
+             break;
++        case GGML_OP_CONV1D_FUSED:
++            ggml_cuda_op_conv1d_fused(ctx, dst);
++            break;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             ggml_cuda_cross_entropy_loss(ctx, dst);
+             break;
+@@ -6354,6 +6358,8 @@
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_FUSED_ATTN:
+             return (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0;  // d_k power of two
++        case GGML_OP_CONV1D_FUSED:
++            return ggml_cuda_conv1d_fused_supported(op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+         case GGML_OP_OPT_STEP_ADAMW:
+diff --git a/src/ggml-cuda/conv1d-fused.cu b/src/ggml-cuda/conv1d-fused.cu
+new file mode 100644
+--- /dev/null
++++ b/src/ggml-cuda/conv1d-fused.cu
+@@ -0,0 +1,286 @@
++#include "conv1d-fused.cuh"
++
++// Fused causal 1-D convolution as an implicit GEMM on tensor cores (mma.sync m16n8k16, F16 in,
++// F32 accumulate):
++//   y[co][t] = bias[co] + sum_{ci,k} act(xcat[ci][t + k*d]) * w[k][co][ci]
++// xcat = [cache | x] along time; act is an optional half-snake applied while the input window is
++// staged in shared memory. A block owns a BM(time) x BN(cout) tile and a range of 16-channel
++// chunks (split-K over channels for small grids, reduced with atomics into a zeroed output).
++// Weights are packed [K][cout_pad][cin_pad] (ci contiguous) so B fragments are 32-bit loads.
++namespace {
++
++constexpr int CF_THREADS = 128;
++constexpr int CF_BK      = 16;             // channels per chunk
++constexpr int CF_BN      = 32;             // cout per block
++constexpr int CF_LDW     = 24;             // halves per window row [t][ci]
++constexpr int CF_LDB     = 24;             // halves per weight row  [co][ci]
++constexpr int CF_MAX_K   = 11;
++constexpr int CF_MAX_WIN = 64 + 10 * 5;    // BM + (K-1)*d for the largest supported shape
++constexpr int CF_PF      = 24;             // window elements prefetched per thread
++
++struct conv1d_fused_params {
++    const float * x;        // [C][T]  (row stride xs)
++    const float * cache;    // [C][cache_len] (row stride cs) or nullptr
++    const half  * w;        // [K][cout_pad][cin_pad]
++    const float * bias;     // [cout] or nullptr
++    const float * alpha;    // [snake_ch] or nullptr
++    const float * inv_b;    // [snake_ch]
++    float       * y;        // [cout][t_out] (row stride ys)
++    long xs, cs, ys;
++    int T, cache_len, t_out, cin, cin_pad, cout, cout_pad, K, d, snake_ch;
++    int chunks_per_split, n_chunks, splits;
++    float slope;
++};
++
++__device__ __forceinline__ void cf_cp_async16(void * smem, const void * gmem) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
++}
++__device__ __forceinline__ void cf_cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++__device__ __forceinline__ void cf_cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::); }
++
++__device__ __forceinline__ void cf_mma_16816(float (&c)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++// BM = 64: warps 2(t) x 2(co), warp tile 32 x 16. BM = 16: warps 1 x 4, warp tile 16 x 8.
++template <int BM>
++__global__ void __launch_bounds__(CF_THREADS) conv1d_fused_kernel(const conv1d_fused_params p) {
++#if __CUDA_ARCH__ >= 800
++    constexpr int WARPS_M = BM == 64 ? 2 : 1;
++    constexpr int WARPS_N = 4 / WARPS_M;
++    constexpr int WM = BM / WARPS_M;         // 32 or 16
++    constexpr int WN = CF_BN / WARPS_N;      // 16 or 8
++    constexpr int FM = WM / 16;              // A fragments per warp
++    constexpr int FN = WN / 8;               // B fragments per warp
++    constexpr int B_CHUNK = CF_MAX_K * CF_BN * CF_LDB;   // halves per weight buffer
++    constexpr int LDC = CF_BN + 4;
++
++    __shared__ __align__(16) half  s_b[2 * B_CHUNK];                 // 2 x 11 x 32 x 24 halves = 33 KB
++    __shared__ __align__(16) half  s_win[CF_MAX_WIN * CF_LDW];         // [t][ci]
++    float * s_c = reinterpret_cast<float *>(s_b);                       // epilogue staging aliases s_b
++
++    const int K = p.K;
++    const int tid  = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int wm   = warp % WARPS_M;
++    const int wn   = warp / WARPS_M;
++    const int t0   = blockIdx.x * BM;
++    const int co0  = blockIdx.y * CF_BN;
++    const int win  = BM + (K - 1) * p.d;
++    const int total_in = p.cache_len + p.T;
++    const int c_begin = blockIdx.z * p.chunks_per_split;
++    const int c_end   = min(p.n_chunks, c_begin + p.chunks_per_split);
++
++    float acc[FM][FN][4];
++#pragma unroll
++    for (int i = 0; i < FM; ++i)
++#pragma unroll
++        for (int j = 0; j < FN; ++j)
++#pragma unroll
++            for (int r = 0; r < 4; ++r) acc[i][j][r] = 0.0f;
++
++    // weights of chunk c (all taps, 32 co x 16 ci per tap) -> buffer buf
++    auto stage_b = [&](int c, int buf) {
++        const int ci0 = c * CF_BK;
++        half * dst = s_b + buf * B_CHUNK;
++        for (int e = tid; e < K * CF_BN * 2; e += CF_THREADS) {  // 2 x 16-byte pieces per row
++            const int row = e >> 1;                // k*32 + n
++            const int piece = e & 1;
++            const int k = row / CF_BN;
++            const int n = row - k * CF_BN;
++            const int co = co0 + n;
++            half * d = dst + (k * CF_BN + n) * CF_LDB + piece * 8;
++            if (co < p.cout_pad) {
++                cf_cp_async16(d, p.w + ((size_t) k * p.cout_pad + co) * p.cin_pad + ci0 + piece * 8);
++            } else {
++                *reinterpret_cast<uint4 *>(d) = make_uint4(0, 0, 0, 0);
++            }
++        }
++        cf_cp_async_commit();
++    };
++    float pf[CF_PF];
++    auto fetch_window = [&](int c) {
++        const int ci0 = c * CF_BK;
++#pragma unroll
++        for (int i = 0; i < CF_PF; ++i) {
++            const int e = tid + i * CF_THREADS;
++            float v = 0.0f;
++            if (e < CF_BK * win) {
++                const int j = e / win;
++                const int u = e - j * win;
++                const int ci = ci0 + j;
++                const int g = t0 + u;
++                if (ci < p.cin && g < total_in) {
++                    v = g < p.cache_len ? p.cache[(size_t) ci * p.cs + g] : p.x[(size_t) ci * p.xs + (g - p.cache_len)];
++                }
++            }
++            pf[i] = v;
++        }
++    };
++    auto store_window = [&](int c) {
++        const int ci0 = c * CF_BK;
++#pragma unroll
++        for (int i = 0; i < CF_PF; ++i) {
++            const int e = tid + i * CF_THREADS;
++            if (e < CF_BK * win) {
++                const int j = e / win;
++                const int u = e - j * win;
++                const int ci = ci0 + j;
++                float v = pf[i];
++                if (p.alpha && ci < p.cin) {
++                    if (ci < p.snake_ch) {
++                        const float sn = sinf(p.alpha[ci] * v);
++                        v = v + sn * sn * p.inv_b[ci];
++                    } else {
++                        v = v > 0.0f ? v : v * p.slope;
++                    }
++                }
++                s_win[u * CF_LDW + j] = __float2half(v);
++            }
++        }
++    };
++
++    if (c_begin < c_end) {
++        stage_b(c_begin, 0);
++        fetch_window(c_begin);
++    }
++    const int a_row = lane >> 2;          // 0..7
++    const int a_col = (lane & 3) * 2;     // 0,2,4,6
++    for (int c = c_begin; c < c_end; ++c) {
++        const int buf = (c - c_begin) & 1;
++        __syncthreads();                   // previous chunk's readers are done with s_win / s_b[buf^1]
++        store_window(c);
++        cf_cp_async_wait_all();
++        __syncthreads();
++        if (c + 1 < c_end) {
++            stage_b(c + 1, buf ^ 1);
++            fetch_window(c + 1);
++        }
++        const half * bcur = s_b + buf * B_CHUNK;
++        for (int k = 0; k < K; ++k) {
++            const int shift = k * p.d;
++            unsigned bfrag[FN][2];
++#pragma unroll
++            for (int j = 0; j < FN; ++j) {
++                const half * brow = bcur + (k * CF_BN + wn * WN + j * 8 + a_row) * CF_LDB + a_col;
++                bfrag[j][0] = *reinterpret_cast<const unsigned *>(brow);
++                bfrag[j][1] = *reinterpret_cast<const unsigned *>(brow + 8);
++            }
++#pragma unroll
++            for (int i = 0; i < FM; ++i) {
++                const half * arow = s_win + (shift + wm * WM + i * 16 + a_row) * CF_LDW + a_col;
++                unsigned afrag[4];
++                afrag[0] = *reinterpret_cast<const unsigned *>(arow);
++                afrag[1] = *reinterpret_cast<const unsigned *>(arow + 8 * CF_LDW);
++                afrag[2] = *reinterpret_cast<const unsigned *>(arow + 8);
++                afrag[3] = *reinterpret_cast<const unsigned *>(arow + 8 * CF_LDW + 8);
++#pragma unroll
++                for (int j = 0; j < FN; ++j) cf_mma_16816(acc[i][j], afrag, bfrag[j]);
++            }
++        }
++    }
++    // epilogue: accumulators -> shared [t][co] -> rows of y (coalesced along t)
++    __syncthreads();
++#pragma unroll
++    for (int i = 0; i < FM; ++i) {
++#pragma unroll
++        for (int j = 0; j < FN; ++j) {
++            const int m = wm * WM + i * 16 + a_row;
++            const int n = wn * WN + j * 8 + a_col;
++            s_c[m * LDC + n]           = acc[i][j][0];
++            s_c[m * LDC + n + 1]       = acc[i][j][1];
++            s_c[(m + 8) * LDC + n]     = acc[i][j][2];
++            s_c[(m + 8) * LDC + n + 1] = acc[i][j][3];
++        }
++    }
++    __syncthreads();
++    for (int e = tid; e < BM * CF_BN; e += CF_THREADS) {
++        const int n = e / BM;
++        const int m = e - n * BM;
++        const int t = t0 + m;
++        const int co = co0 + n;
++        if (t < p.t_out && co < p.cout) {
++            const float bv = (p.bias && blockIdx.z == 0) ? p.bias[co] : 0.0f;
++            const float v = s_c[m * LDC + n] + bv;
++            if (p.splits > 1) atomicAdd(p.y + (size_t) co * p.ys + t, v);
++            else p.y[(size_t) co * p.ys + t] = v;
++        }
++    }
++#else
++    GGML_UNUSED(p);
++#endif
++}
++
++}  // namespace
++
++bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op) {
++    const ggml_tensor * x = op->src[0];
++    const ggml_tensor * w = op->src[1];
++    const ggml_tensor * cache = op->src[3];
++    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) return false;
++    if (x->nb[0] != sizeof(float) || (cache && cache->nb[0] != sizeof(float))) return false;
++    if (!ggml_is_contiguous(w)) return false;
++    const int K = ((const int32_t *) op->op_params)[0];
++    const int d = ((const int32_t *) op->op_params)[1];
++    if (K < 1 || K > CF_MAX_K || 64 + (K - 1) * d > CF_MAX_WIN) return false;
++    if ((w->ne[0] % 16) != 0 || (w->ne[1] % 16) != 0) return false;
++    return true;
++}
++
++void ggml_cuda_op_conv1d_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x     = dst->src[0];
++    const ggml_tensor * w     = dst->src[1];
++    const ggml_tensor * bias  = dst->src[2];
++    const ggml_tensor * cache = dst->src[3];
++    const ggml_tensor * alpha = dst->src[4];
++    const ggml_tensor * inv_b = dst->src[5];
++    const int32_t * op = (const int32_t *) dst->op_params;
++
++    conv1d_fused_params p{};
++    p.x = (const float *) x->data;
++    p.cache = cache ? (const float *) cache->data : nullptr;
++    p.w = (const half *) w->data;
++    p.bias = bias ? (const float *) bias->data : nullptr;
++    p.alpha = (op[3] && alpha) ? (const float *) alpha->data : nullptr;
++    p.inv_b = (op[3] && inv_b) ? (const float *) inv_b->data : nullptr;
++    p.y = (float *) dst->data;
++    p.xs = (long) (x->nb[1] / sizeof(float));
++    p.cs = cache ? (long) (cache->nb[1] / sizeof(float)) : 0;
++    p.ys = (long) (dst->nb[1] / sizeof(float));
++    p.T = (int) x->ne[0];
++    p.cache_len = cache ? (int) cache->ne[0] : 0;
++    p.t_out = (int) dst->ne[0];
++    p.cin = (int) x->ne[1];
++    p.cin_pad = (int) w->ne[0];
++    p.cout = (int) dst->ne[1];
++    p.cout_pad = (int) w->ne[1];
++    p.K = op[0];
++    p.d = op[1];
++    p.snake_ch = op[2];
++    memcpy(&p.slope, &op[4], sizeof(float));
++    p.n_chunks = p.cin_pad / CF_BK;
++
++    cudaStream_t stream = ctx.stream();
++    const int BM = p.t_out >= 64 ? 64 : 16;
++    const int tiles_m = (p.t_out + BM - 1) / BM;
++    const int tiles_n = (p.cout + CF_BN - 1) / CF_BN;
++    // Split the channel chunks across blocks until the grid covers the device (~128 blocks).
++    int splits = 1;
++    const int tiles = tiles_m * tiles_n;
++    if (tiles < 128) splits = min(p.n_chunks, (128 + tiles - 1) / tiles);
++    if (splits < 1) splits = 1;
++    p.splits = splits;
++    p.chunks_per_split = (p.n_chunks + splits - 1) / splits;
++    if (splits > 1) {
++        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
++    }
++    dim3 grid(tiles_m, tiles_n, splits);
++    if (BM == 64) conv1d_fused_kernel<64><<<grid, CF_THREADS, 0, stream>>>(p);
++    else          conv1d_fused_kernel<16><<<grid, CF_THREADS, 0, stream>>>(p);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/src/ggml-cuda/conv1d-fused.cuh b/src/ggml-cuda/conv1d-fused.cuh
+new file mode 100644
+--- /dev/null
++++ b/src/ggml-cuda/conv1d-fused.cuh
+@@ -0,0 +1,4 @@
++#include "common.cuh"
++
++bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op);
++void ggml_cuda_op_conv1d_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

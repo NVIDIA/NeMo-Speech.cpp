@@ -23,11 +23,14 @@ ggml_tensor* cross_attention(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     ggml_tensor* x, ggml_tensor* memory, ggml_tensor* attn_prior = nullptr,
     ggml_tensor** last_attn = nullptr);
+// softmax_bias (optional): additive [n_kv_override] bias fused into soft_max_ext (scale + bias +
+// softmax in one kernel); the attention then spans n_kv_override cached rows (padded text
+// capacity) and attn_prior is ignored (fold the log prior into the bias).
 ggml_tensor* cross_attention_cached(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x,
-    ggml_tensor* attn_prior = nullptr, ggml_tensor** last_attn = nullptr,
-    bool prior_is_log = false);
+    ggml_tensor* attn_prior = nullptr, ggml_tensor** last_attn = nullptr, bool prior_is_log = false,
+    ggml_tensor* softmax_bias = nullptr, int64_t n_kv_override = 0);
 ggml_tensor* transformer_forward(
     ggml_context* ctx, const magpietts_transformer& tr, ggml_tensor* x, ggml_tensor* pos,
     ggml_tensor* cond, ggml_tensor* attn_prior = nullptr,

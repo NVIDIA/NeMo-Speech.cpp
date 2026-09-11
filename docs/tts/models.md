@@ -26,6 +26,14 @@ frame-stacking factor of 2. This is independent of `tts.chunk-frames`, which
 groups generated frames for NanoCodec streaming. Both versions use the same
 NanoCodec decoder.
 
+The fused CUDA decode path needs a Q8_0 GGUF. Convert the `.nemo` locally
+(Q8_0 is the converter default):
+
+```bash
+python3 convert_model.py magpie_tts_multilingual_357m.nemo \
+    --outfile magpie_tts_multilingual_357m.v2607.q8_0.gguf
+```
+
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
 they are not part of the GGUF. The built-in pull extracts only the required,
 pinned tokenizer members and verifies each one. For a custom Magpie checkpoint,
@@ -80,13 +88,20 @@ nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 
 The unified [`convert_model.py`](../../convert_model.py) entry point accepts
 compatible local `.nemo` archives and extracted NeMo checkpoints. It defaults
-to `--outtype f16` for MagpieTTS and NanoCodec; pass `--outtype f32` to retain
-full precision. The converter is a source-tree Python tool and is not included
+to `--outtype q8_0` for MagpieTTS and `--outtype f16` for NanoCodec; pass
+`--outtype f16` or `--outtype f32` to keep MagpieTTS unquantized. The `q8_0`
+output stores the decoder attention and feed-forward projections, the
+local-transformer output projections and the final projection as Q8_0 and keeps
+everything else f16. On CUDA this halves the weight bytes streamed per decoder
+step and enables the fused local-transformer chain kernel with in-kernel
+sampling, for about 12% higher real-time factor than the f16 file at unchanged
+output quality (validated on MagpieTTS v2607). The converter is a source-tree
+Python tool and is not included
 in native release archives; see [Model conversion](../model-conversion.md) for
 environment setup.
 
 ```bash
-python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.f16.gguf
+python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.q8_0.gguf
 ```
 
 Conversion does not require `nemo_toolkit`. The optional

@@ -117,7 +117,10 @@ stock comparison therefore requires both a pristine ggml checkout and
 - **0014-cuda-fused-attention-extensions.patch** - generalizes fused attention
   to standard and relative-position modes, persistent circular K/V caches,
   active-length state, streaming FastConformer shapes, and Magpie's cached
-  single-query shape.
+  single-query shape. The `q_len == 1`, `d_k == 64` cached kernel splits the
+  key range across blocks (about 96 keys per block, up to 8 blocks per head)
+  with a last-arriving-block merge, so an autoregressive decoder step uses
+  several SMs per head instead of one.
 
 - **0015-cuda-ctc-batch-fusions.patch** - adds BatchNorm, transpose/SiLU,
   affine LayerNorm, and cached-F16 projection epilogues used by batched
@@ -127,7 +130,10 @@ stock comparison therefore requires both a pristine ggml checkout and
   axes after flattened Conv1D matrix multiplication.
 
 - **0017-cuda-stream-interop.patch** - exposes borrowed access to the active
-  CUDA stream and stable graph templates for external graph composition.
+  CUDA stream and stable graph templates for external graph composition, and
+  adds `ggml_backend_cuda_set_stream_priority()` so a latency-critical backend
+  (the MagpieTTS decoder) can run its streams at a higher CUDA stream priority
+  than a concurrent worker backend (the NanoCodec vocoder).
 
 - **0018-metal-tensor-api-dynamic-k.patch** - backports upstream ggml `33c9ea5`
   (llama/27450), which stops the Metal tensor-API matmul reading `src1` out of
@@ -176,6 +182,19 @@ stock comparison therefore requires both a pristine ggml checkout and
   and any planes they own, when their CUDA weight buffer is freed or cleared.
   The cache was keyed only by device address, so weights later allocated at a
   reused address were treated as already repacked.
+
+- **0024-cuda-im2col-1d-tiled.patch** - a tiled, coalesced fast path for 1D
+  `im2col` (`IH == KH == OH == 1`) that stages a channel-by-time input tile
+  through shared memory and writes consecutive output rows with consecutive
+  threads; the generic kernel strides across channels and re-reads every input
+  `KW` times. Layered on 0020, which also edits `im2col.cu`.
+
+- **0025-cuda-conv1d-fused.patch** - adds the `ggml_conv1d_fused` op: a causal
+  1D convolution over an F16 cache-prefix plus current input, computed as an
+  implicit GEMM with `mma.sync` tensor-core fragments (F16 inputs, F32
+  accumulation, split-K, fused bias epilogue) from weights pre-packed as
+  `[K][cout][cin]`. Replaces the im2col + cuBLAS decomposition in the NanoCodec
+  decoder; a CPU reference implementation is included for testing.
 
 ## Regenerating after editing ggml
 

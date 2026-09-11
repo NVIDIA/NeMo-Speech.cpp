@@ -8,6 +8,19 @@
 struct magpietts_cuda_sampler;
 
 magpietts_cuda_sampler* magpietts_cuda_sampler_create(int codebooks);
+// Device array of the current frame's sampled codes (one int32 per stacked codebook).
+const int32_t* magpietts_cuda_sampler_codes_device(const magpietts_cuda_sampler* sampler);
+// Raw device buffers of the sampler for kernels that sample in-place (fused local transformer).
+struct magpietts_cuda_sampler_device_pointers_t {
+    const void* config = nullptr;  // magpietts_cuda_sampling_config on the device
+    int32_t* codes = nullptr;      // [codebooks]
+    int32_t* argmax = nullptr;     // [codebooks]
+    int32_t* top_ids = nullptr;    // [codebooks][MAX_VOCAB] scratch
+    float* top_vals = nullptr;     // [codebooks][MAX_VOCAB] scratch
+    int top_k = 0;                 // host mirror of the configured top-k
+};
+bool magpietts_cuda_sampler_device_pointers(
+    const magpietts_cuda_sampler* sampler, magpietts_cuda_sampler_device_pointers_t* out);
 void magpietts_cuda_sampler_free(magpietts_cuda_sampler* sampler);
 bool magpietts_cuda_device_is_uma(void);
 
