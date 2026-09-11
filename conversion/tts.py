@@ -15,6 +15,7 @@ here.
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,12 +23,27 @@ from typing import Any
 import gguf
 import numpy as np
 import torch
+from gguf.quants import quantize
 
 from .source import extract_archive, find_checkpoint_files, load_state_dict, read_checkpoint_config
 from .tts_tokenizer_profiles import tokenizer_profile
 
 SPECIAL_AUDIO_TOKENS = 8
 SPEAKER_NAMES = ["John", "Sofia", "Aria", "Jason", "Leo"]
+
+# 2-D projection weights stored as Q8_0 by ``--outtype q8_0``: the decoder attention and
+# feed-forward projections (per-tap Conv1d slices), the local-transformer output projections
+# and the final projection. Everything else keeps the f16 layout. The CUDA runtime reads
+# these through its Q8 GEMV/GEMM paths and the fused local-transformer kernels sample in-kernel
+# only when the output projections are Q8_0.
+Q8_PROJECTION_WEIGHT = re.compile(
+    r"(self_attention\.(qkv_net|o_net)\.weight"
+    r"|cross_attention\.(q_net|kv_net|o_net)\.weight"
+    r"|pos_ff\.(proj|o_net)\.conv\.weight\.k\d+"
+    r"|local_transformer_out_projections\.\d+\.weight"
+    r"|final_proj\.weight)$"
+)
+Q8_BLOCK = 32
 
 
 def extract_nemo(path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
@@ -276,10 +292,19 @@ def should_store_f32(name: str, tensor: torch.Tensor) -> bool:
     return name.endswith(".bias")
 
 
+def is_q8_projection(name: str, tensor: torch.Tensor) -> bool:
+    return (
+        tensor.is_floating_point()
+        and tensor.ndim == 2
+        and int(tensor.shape[-1]) % Q8_BLOCK == 0
+        and Q8_PROJECTION_WEIGHT.search(name) is not None
+    )
+
+
 def tensor_to_numpy(name: str, tensor: torch.Tensor, outtype: str) -> np.ndarray:
     tensor = tensor.detach().cpu().contiguous()
     if tensor.is_floating_point():
-        if outtype == "f16" and not should_store_f32(name, tensor):
+        if outtype in ("f16", "q8_0") and not should_store_f32(name, tensor):
             tensor = tensor.to(torch.float16)
         else:
             tensor = tensor.to(torch.float32)
@@ -289,6 +314,11 @@ def tensor_to_numpy(name: str, tensor: torch.Tensor, outtype: str) -> np.ndarray
 
 
 def add_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tensor, outtype: str) -> None:
+    if outtype == "q8_0" and is_q8_projection(name, tensor):
+        f32 = tensor.detach().cpu().contiguous().to(torch.float32).numpy()
+        q8 = quantize(f32, gguf.GGMLQuantizationType.Q8_0)
+        writer.add_tensor(name, q8, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+        return
     writer.add_tensor(name, tensor_to_numpy(name, tensor, outtype))
 
 
@@ -378,6 +408,7 @@ def convert(
         summary["tensors_written"] = n_written
         summary["tensors_skipped"] = skipped
         summary["output"] = str(output)
+        summary["outtype"] = outtype
         summary["local_transformer_outtype"] = local_transformer_outtype or outtype
         if metadata_json:
             metadata_json.parent.mkdir(parents=True, exist_ok=True)

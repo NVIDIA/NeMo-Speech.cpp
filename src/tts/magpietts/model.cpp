@@ -858,6 +858,15 @@ magpietts_model_load_impl(
     if (!model.backend) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
+#if defined(GGML_USE_CUDA)
+    if (model.backend && ggml_backend_is_cuda(model.backend)) {
+        // The decoder/local-transformer stream is the latency-critical path; run it at the
+        // highest CUDA stream priority so the concurrent NanoCodec worker (default priority)
+        // does not delay its small kernels.
+        constexpr int kHighestPriority = -100;  // clamped to the device range by ggml
+        ggml_backend_cuda_set_stream_priority(model.backend, kHighestPriority);
+    }
+#endif
     if (!model.backend) {
         fprintf(stderr, "failed to initialize ggml backend\n");
         return false;
@@ -1190,16 +1199,17 @@ ggml_tensor*
 cross_attention_cached(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x, ggml_tensor* attn_prior,
-    ggml_tensor** last_attn, bool prior_is_log) {
+    ggml_tensor** last_attn, bool prior_is_log, ggml_tensor* softmax_bias, int64_t n_kv_override) {
     const int64_t d_head = tr.n_cross_dhead;
     const int64_t n_head = tr.n_cross_head;
     const int64_t cross_dim = d_head * n_head;
     const int64_t n_q = x->ne[1];
-    const int64_t n_kv = cross_kv.text_len;
+    const int64_t n_kv = softmax_bias ? n_kv_override : cross_kv.text_len;
+    const int64_t row_stride = cross_kv.capacity > 0 ? cross_kv.capacity : cross_kv.text_len;
 
     ggml_tensor* q = linear(ctx, layer.cross_q, x);
     const size_t layer_offset =
-        (size_t)layer_index * n_kv * cross_dim * ggml_element_size(cross_kv.memory_k);
+        (size_t)layer_index * row_stride * cross_dim * ggml_element_size(cross_kv.memory_k);
 
     ggml_tensor* qh = ggml_permute(ctx, ggml_cont_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
     ggml_tensor* kh = ggml_permute(
@@ -1209,18 +1219,23 @@ cross_attention_cached(
             n_head, n_kv),
         0, 2, 1, 3);
     ggml_tensor* kq = ggml_mul_mat(ctx, kh, qh);
-    kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
     ggml_tensor* kq_soft = nullptr;
-    if (attn_prior && prior_is_log) {
-        kq_soft = ggml_soft_max(ctx, ggml_add(ctx, kq, ggml_repeat(ctx, attn_prior, kq)));
+    if (softmax_bias) {
+        // scale + additive bias (log prior and/or padding mask) + softmax in one kernel
+        kq_soft = ggml_soft_max_ext(ctx, kq, softmax_bias, 1.0f / std::sqrt((float)d_head), 0.0f);
     } else {
-        kq_soft = ggml_soft_max(ctx, kq);
-    }
-    if (attn_prior && !prior_is_log) {
-        ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
-        kq_soft = ggml_mul(ctx, kq_soft, prior);
-        ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
-        kq_soft = ggml_div(ctx, kq_soft, normalizer);
+        kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
+        if (attn_prior && prior_is_log) {
+            kq_soft = ggml_soft_max(ctx, ggml_add(ctx, kq, ggml_repeat(ctx, attn_prior, kq)));
+        } else {
+            kq_soft = ggml_soft_max(ctx, kq);
+        }
+        if (attn_prior && !prior_is_log) {
+            ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
+            kq_soft = ggml_mul(ctx, kq_soft, prior);
+            ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
+            kq_soft = ggml_div(ctx, kq_soft, normalizer);
+        }
     }
     if (last_attn) {
         const size_t offset = (size_t)(n_q - 1) * kq_soft->nb[1];

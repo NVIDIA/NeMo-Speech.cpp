@@ -16,7 +16,13 @@
 #include "nvtx_utils.h"
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
+#include <cuda_runtime.h>
+
+#include <cstdlib>
+#include <vector>
+
 #include "ggml-cuda.h"
+#include "magpietts_lt_fused.h"
 #endif
 
 namespace nemo_speech::tts {
@@ -97,6 +103,10 @@ class LocalTransformerGraphBank {
     DecoderKvCache cond_cache;
     DecoderKvCache uncond_cache;
     LocalTransformerCudaAttentionCache pair_cuda_attention_cache;
+    // Fused CUDA round implementation (magpietts_lt_fused*), created lazily for the CFG
+    // pair path when the weight layout is supported; nullptr otherwise.
+    void* fused = nullptr;
+    bool fused_checked = false;
 };
 
 using local_transformer_graph = LocalTransformerGraph;
@@ -548,6 +558,10 @@ LocalTransformerGraphBank::operator=(LocalTransformerGraphBank&& other) noexcept
         cond_cache = std::move(other.cond_cache);
         uncond_cache = std::move(other.uncond_cache);
         pair_cuda_attention_cache = std::move(other.pair_cuda_attention_cache);
+        fused = other.fused;
+        fused_checked = other.fused_checked;
+        other.fused = nullptr;
+        other.fused_checked = false;
     }
     return *this;
 }
@@ -560,6 +574,13 @@ LocalTransformerGraphBank::reset() {
     cond_cache.reset();
     uncond_cache.reset();
     pair_cuda_attention_cache.reset();
+#if defined(MAGPIETTS_CUDA_SAMPLING)
+    if (fused) {
+        magpietts_lt_fused_free(static_cast<magpietts_lt_fused*>(fused));
+    }
+#endif
+    fused = nullptr;
+    fused_checked = false;
 }
 
 bool
@@ -1304,6 +1325,233 @@ sample_local_codebooks_impl(
 }
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
+// ---------------------------------------------------------------------------------------
+// Fused CUDA local-transformer round path (magpietts_lt_fused.cu)
+// ---------------------------------------------------------------------------------------
+static void
+local_transformer_fused_try_create(
+    const magpietts_model& model, local_transformer_graph_bank& bank, bool use_cfg) {
+    if (bank.fused_checked) {
+        return;
+    }
+    bank.fused_checked = true;
+    // Fused CUDA local-transformer path (planar Q8 round kernels, persistent chain kernel,
+    // in-kernel sampling). Default on; MAGPIETTS_LT_FUSED=0 falls back to the ggml round graphs.
+    const char* env = getenv("MAGPIETTS_LT_FUSED");
+    if (env && atoi(env) == 0) {
+        return;
+    }
+    const auto& h = model.hparams;
+    const magpietts_transformer& tr = model.local;
+    if (!use_cfg || model.lt_in_w || tr.kernel != 1 || tr.norm_out || tr.layers.empty() ||
+        tr.n_head <= 0 || tr.n_embd != h.n_embd || !tr.pos_emb ||
+        !magpietts_fused_cached_attention_available(model.backend)) {
+        return;
+    }
+    const int rounds = h.stacked_audio_codebooks();
+    if ((int)model.audio_embeddings.size() < rounds || (int)model.lt_out_w.size() < rounds ||
+        (int)model.lt_out_b.size() < rounds) {
+        return;
+    }
+    std::vector<magpietts_lt_fused_layer_weights> layers(tr.layers.size());
+    for (size_t il = 0; il < tr.layers.size(); ++il) {
+        const magpietts_layer& L = tr.layers[il];
+        if (!L.self_qkv || !L.self_o || L.ff_proj.size() != 1 || L.ff_out.size() != 1 ||
+            !L.norm_self || !L.norm_ff || L.norm_self->type != GGML_TYPE_F32 ||
+            L.norm_ff->type != GGML_TYPE_F32) {
+            return;
+        }
+        layers[il].qkv = L.self_qkv->data;
+        layers[il].qkv_type = (int)L.self_qkv->type;
+        layers[il].o = L.self_o->data;
+        layers[il].o_type = (int)L.self_o->type;
+        layers[il].ff1 = L.ff_proj[0]->data;
+        layers[il].ff1_type = (int)L.ff_proj[0]->type;
+        layers[il].ff2 = L.ff_out[0]->data;
+        layers[il].ff2_type = (int)L.ff_out[0]->type;
+        layers[il].norm_self = (const float*)L.norm_self->data;
+        layers[il].norm_ff = (const float*)L.norm_ff->data;
+    }
+    std::vector<const void*> audio_emb(rounds);
+    std::vector<const void*> out_w(rounds);
+    std::vector<const float*> out_b(rounds);
+    for (int r = 0; r < rounds; ++r) {
+        const ggml_tensor* e = model.audio_embeddings[(size_t)r];
+        const ggml_tensor* w = model.lt_out_w[(size_t)r];
+        const ggml_tensor* b = model.lt_out_b[(size_t)r];
+        if (!e || !w || e->type != model.audio_embeddings[0]->type ||
+            w->type != model.lt_out_w[0]->type || (b && b->type != GGML_TYPE_F32) ||
+            w->ne[1] != h.audio_vocab_size) {
+            return;
+        }
+        audio_emb[(size_t)r] = e->data;
+        out_w[(size_t)r] = w->data;
+        out_b[(size_t)r] = b ? (const float*)b->data : nullptr;
+    }
+    magpietts_lt_fused_weights w{};
+    w.n_embd = tr.n_embd;
+    w.n_head = tr.n_head;
+    w.n_ff = (int)tr.layers[0].ff_proj[0]->ne[1];
+    w.n_layers = (int)tr.layers.size();
+    w.vocab = h.audio_vocab_size;
+    w.n_rounds = rounds;
+    w.pos_rows = (int)tr.pos_emb->ne[1];
+    w.ln_eps = MAGPIETTS_LN_EPS;
+    w.layers = layers.data();
+    w.pos_emb = tr.pos_emb->data;
+    w.pos_type = (int)tr.pos_emb->type;
+    w.audio_emb = audio_emb.data();
+    w.audio_emb_type = (int)model.audio_embeddings[0]->type;
+    w.out_w = out_w.data();
+    w.out_type = (int)model.lt_out_w[0]->type;
+    w.out_b = out_b.data();
+    char error[256] = {};
+    magpietts_lt_fused* fused = magpietts_lt_fused_create(w, error, sizeof(error));
+    if (!fused) {
+        fprintf(stderr, "MagpieTTS fused local transformer unavailable: %s\n", error);
+        return;
+    }
+    // The fused path pays off through the persistent chain kernel (all rounds in one launch,
+    // int8 dot products, in-kernel sampling), which needs Q8_0 projections. With F16 weights
+    // the per-round fused kernels are slower than the ggml round graphs, so keep those.
+    if (!magpietts_lt_fused_chain_supported(fused)) {
+        fprintf(
+            stderr,
+            "MagpieTTS local transformer: fused CUDA path skipped (needs Q8_0 projections; "
+            "convert with --outtype q8_0); using ggml round graphs\n");
+        magpietts_lt_fused_free(fused);
+        return;
+    }
+    bank.fused = fused;
+    fprintf(
+        stderr,
+        "MagpieTTS local transformer: fused CUDA chain kernel enabled (%d layers, %d rounds)\n",
+        w.n_layers, w.n_rounds);
+}
+
+static bool
+local_transformer_fused_eval_cuda(
+    const magpietts_model& model, local_transformer_graph_bank& bank,
+    const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
+    int codebook_idx, magpietts_cuda_sample_request& cuda_sample) {
+    magpietts_lt_fused* fused = static_cast<magpietts_lt_fused*>(bank.fused);
+    const auto& h = model.hparams;
+    if (!fused || !cond_hidden.tensor || !uncond_hidden.tensor || !cond_hidden.tensor->data ||
+        !uncond_hidden.tensor->data) {
+        fprintf(stderr, "fused local transformer: missing decoder hidden tensors\n");
+        return false;
+    }
+    const bool building = magpietts_cuda_sampler_sequence_build_active(cuda_sample.sampler);
+    cudaStream_t stream = (cudaStream_t)ggml_backend_cuda_get_stream(model.backend);
+    char error[256] = {};
+    if (codebook_idx == 0) {
+        const size_t bytes = (size_t)h.n_embd * sizeof(float);
+        float* in_cond = magpietts_lt_fused_input_cond(fused);
+        float* in_uncond = magpietts_lt_fused_input_uncond(fused);
+        if (building) {
+            if (!magpietts_cuda_sampler_sequence_add_device_copy(
+                    cuda_sample.sampler, cond_hidden.tensor->data, in_cond, bytes, error,
+                    sizeof(error)) ||
+                !magpietts_cuda_sampler_sequence_add_device_copy(
+                    cuda_sample.sampler, uncond_hidden.tensor->data, in_uncond, bytes, error,
+                    sizeof(error))) {
+                fprintf(stderr, "fused local transformer input node failed: %s\n", error);
+                return false;
+            }
+        } else {
+            if (cudaMemcpyAsync(
+                    in_cond, cond_hidden.tensor->data, bytes, cudaMemcpyDeviceToDevice, stream) !=
+                    cudaSuccess ||
+                cudaMemcpyAsync(
+                    in_uncond, uncond_hidden.tensor->data, bytes, cudaMemcpyDeviceToDevice,
+                    stream) != cudaSuccess) {
+                fprintf(stderr, "fused local transformer input copy failed\n");
+                return false;
+            }
+        }
+    }
+    const int32_t* codes = magpietts_cuda_sampler_codes_device(cuda_sample.sampler);
+    const float* logits_cond = nullptr;
+    const float* logits_uncond = nullptr;
+    // In-kernel sampling (exact top-k, k <= 256) inside the output projection's last block.
+    magpietts_cuda_sampler_device_pointers_t sp;
+    magpietts_lt_fused_sampler fused_sampler;
+    const magpietts_lt_fused_sampler* sampler_arg = nullptr;
+    // Only when the output-projection kernel actually samples (planar Q8 output weights);
+    // F16 output projections fall back to the separate sampling kernel below.
+    if (magpietts_lt_fused_sampling_supported(fused) &&
+        magpietts_cuda_sampler_device_pointers(cuda_sample.sampler, &sp) && sp.top_k >= 1 &&
+        sp.top_k <= 256) {
+        fused_sampler.config = sp.config;
+        fused_sampler.codes = sp.codes;
+        fused_sampler.argmax = sp.argmax;
+        fused_sampler.top_ids = sp.top_ids;
+        fused_sampler.top_vals = sp.top_vals;
+        fused_sampler.audio_codebook_size = h.audio_codebook_size;
+        fused_sampler.audio_eos_id = h.audio_eos_id;
+        sampler_arg = &fused_sampler;
+    }
+    if (sampler_arg && magpietts_lt_fused_chain_supported(fused)) {
+        // Whole-frame persistent kernel: enqueued once at codebook 0; later rounds are no-ops.
+        if (codebook_idx != 0) {
+            return true;
+        }
+        if (building) {
+            void* graph = nullptr;
+            if (!magpietts_lt_fused_capture_chain(
+                    fused, &graph, sampler_arg, error, sizeof(error))) {
+                fprintf(stderr, "fused local transformer chain capture failed: %s\n", error);
+                return false;
+            }
+            const bool ok = magpietts_cuda_sampler_sequence_add_ggml_graph(
+                cuda_sample.sampler, graph, error, sizeof(error));
+            magpietts_lt_fused_destroy_graph(graph);
+            if (!ok) {
+                fprintf(stderr, "fused local transformer chain child graph failed: %s\n", error);
+                return false;
+            }
+            return true;
+        }
+        if (!magpietts_lt_fused_chain(fused, stream, sampler_arg, error, sizeof(error))) {
+            fprintf(stderr, "fused local transformer chain failed: %s\n", error);
+            return false;
+        }
+        return true;
+    }
+    if (building) {
+        void* graph = nullptr;
+        if (!magpietts_lt_fused_capture_round(
+                fused, codebook_idx, codes, &graph, &logits_cond, &logits_uncond, error,
+                sizeof(error), sampler_arg)) {
+            fprintf(stderr, "fused local transformer capture failed: %s\n", error);
+            return false;
+        }
+        const bool ok = magpietts_cuda_sampler_sequence_add_ggml_graph(
+            cuda_sample.sampler, graph, error, sizeof(error));
+        magpietts_lt_fused_destroy_graph(graph);
+        if (!ok) {
+            fprintf(stderr, "fused local transformer child graph failed: %s\n", error);
+            return false;
+        }
+    } else if (!magpietts_lt_fused_round(
+                   fused, codebook_idx, codes, stream, &logits_cond, &logits_uncond, error,
+                   sizeof(error), sampler_arg)) {
+        fprintf(stderr, "fused local transformer round failed: %s\n", error);
+        return false;
+    }
+    if (sampler_arg) {
+        return true;  // sampled inside the output projection kernel
+    }
+    if (!magpietts_cuda_sample_codebooks_device_configured(
+            cuda_sample.sampler, logits_cond, logits_uncond, 1, h.audio_vocab_size,
+            h.audio_codebook_size, h.audio_eos_id, codebook_idx, codebook_idx, error,
+            sizeof(error))) {
+        fprintf(stderr, "fused local transformer sampling failed: %s\n", error);
+        return false;
+    }
+    return true;
+}
+
 static bool
 sample_local_codebooks_cuda_impl(
     const magpietts_model& model, const magpietts_backend_tensor& cond_hidden,
@@ -1346,11 +1594,17 @@ sample_local_codebooks_cuda_impl(
     cuda_sample.forbid_audio_eos = forbid_audio_eos;
     cuda_sample.seed = seed;
     cuda_sample.frame_index = frame_index;
+    local_transformer_fused_try_create(model, local_graphs, use_cfg);
+    const bool use_fused = local_graphs.fused != nullptr && use_cfg;
     auto run_chain = [&]() {
         for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
-            if (!local_transformer_graph_bank_eval_cuda(
-                    model, local_graphs, use_cfg, cond_hidden, uncond_hidden, c, c, threads,
-                    cuda_sample)) {
+            const bool ok =
+                use_fused ? local_transformer_fused_eval_cuda(
+                                model, local_graphs, cond_hidden, uncond_hidden, c, cuda_sample)
+                          : local_transformer_graph_bank_eval_cuda(
+                                model, local_graphs, use_cfg, cond_hidden, uncond_hidden, c, c,
+                                threads, cuda_sample);
+            if (!ok) {
                 return false;
             }
         }

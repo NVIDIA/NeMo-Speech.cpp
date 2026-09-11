@@ -167,6 +167,7 @@ DecoderCrossKvCache::operator=(DecoderCrossKvCache&& other) noexcept {
         memory_k = other.memory_k;
         memory_v = other.memory_v;
         text_len = other.text_len;
+        capacity = other.capacity;
         n_layers = other.n_layers;
         n_cross_dim = other.n_cross_dim;
         valid = other.valid;
@@ -194,6 +195,7 @@ DecoderCrossKvCache::reset() {
     }
     memory_k = nullptr;
     memory_v = nullptr;
+    capacity = 0;
     text_len = 0;
     n_layers = 0;
     n_cross_dim = 0;
@@ -229,11 +231,23 @@ DecoderCrossKvCache::init(const magpietts_model& model, int requested_text_len) 
         return false;
     }
 
+    // Rows are allocated in granules so consecutive text chunks of similar length reuse the
+    // buffer (and the persistent decoder graph built on it); padded rows stay zero and are
+    // masked out of the attention by the persistent graph.
+    constexpr int kTextCapacityGranule = 128;
+    const int wanted_capacity = (requested_text_len + kTextCapacityGranule - 1) /
+                                kTextCapacityGranule * kTextCapacityGranule;
     if (ctx) {
-        if (text_len != requested_text_len || n_layers != h.n_dec_layer ||
+        if (capacity < requested_text_len || n_layers != h.n_dec_layer ||
             n_cross_dim != cross_dim) {
             reset();
         } else {
+            if (text_len != requested_text_len) {
+                ggml_backend_tensor_memset(memory_k, 0, 0, ggml_nbytes(memory_k));
+                ggml_backend_tensor_memset(memory_v, 0, 0, ggml_nbytes(memory_v));
+            }
+            text_len = requested_text_len;
+            valid = false;
             return true;
         }
     }
@@ -249,7 +263,7 @@ DecoderCrossKvCache::init(const magpietts_model& model, int requested_text_len) 
         return false;
     }
 
-    const int64_t n_elements = (int64_t)h.n_dec_layer * requested_text_len * cross_dim;
+    const int64_t n_elements = (int64_t)h.n_dec_layer * wanted_capacity * cross_dim;
     memory_k = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
     memory_v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
     buffer = ggml_backend_alloc_ctx_tensors(ctx, model.backend);
@@ -261,7 +275,10 @@ DecoderCrossKvCache::init(const magpietts_model& model, int requested_text_len) 
         return false;
     }
 
+    ggml_backend_tensor_memset(memory_k, 0, 0, ggml_nbytes(memory_k));
+    ggml_backend_tensor_memset(memory_v, 0, 0, ggml_nbytes(memory_v));
     text_len = requested_text_len;
+    capacity = wanted_capacity;
     n_layers = h.n_dec_layer;
     n_cross_dim = cross_dim;
     valid = false;
@@ -313,7 +330,7 @@ ensure_decoder_cross_kv_cache(
             ctx, kv, cross_dim, text_len, kv->nb[1], (size_t)ggml_element_size(kv) * cross_dim);
 
         const size_t layer_offset =
-            (size_t)il * text_len * cross_dim * ggml_element_size(cross_kv->memory_k);
+            (size_t)il * cross_kv->capacity * cross_dim * ggml_element_size(cross_kv->memory_k);
         ggml_tensor* k_dst =
             ggml_view_1d(ctx, cross_kv->memory_k, text_len * cross_dim, layer_offset);
         ggml_tensor* v_dst =
@@ -422,9 +439,9 @@ runtime_kv_name(int layer) {
 class PersistentDecoderModule final : public ggml_runtime::Module {
    public:
     PersistentDecoderModule(
-        const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
+        const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_capacity,
         int cache_len)
-        : model_(model), cross_kv_(cross_kv), text_len_(text_len), cache_len_(cache_len) {
+        : model_(model), cross_kv_(cross_kv), text_len_(text_capacity), cache_len_(cache_len) {
         for (int layer = 0; layer < static_cast<int>(model_.decoder.layers.size()); ++layer) {
             if (model_.decoder.layers[layer].has_cross &&
                 runtime_layer_selected(model_.decoder.estimate_alignment_from_layers, layer)) {
@@ -473,13 +490,14 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
     ggml_runtime::TensorBag build_graph(
         ggml_runtime::Session* session, ggml_runtime::TensorBag inputs,
         ggml_runtime::TensorContainer* tc) override {
-        if (inputs.tensor_count() != 4) {
-            throw std::runtime_error("Magpie persistent decoder expects four inputs");
+        if (inputs.tensor_count() != 5) {
+            throw std::runtime_error("Magpie persistent decoder expects five inputs");
         }
         const auto tokens = inputs.get_tensor(0);
         const auto position = inputs.get_tensor(1);
         const auto cache_meta = inputs.get_tensor(2);
-        const auto prior = inputs.get_tensor(3);
+        const auto prior = inputs.get_tensor(3);  // log prior + padding mask [text capacity]
+        const auto mask = inputs.get_tensor(4);   // padding mask only [text capacity]
         const auto bf_ctx = tc->get_ctx_of_buffer_type(tokens.buft);
         ggml_context* ctx = bf_ctx.ctx;
         const magpietts_hparams& h = model_.hparams;
@@ -547,8 +565,9 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
                 const bool collect =
                     runtime_layer_selected(tr.estimate_alignment_from_layers, layer_index);
                 ggml_tensor* cross = cross_attention_cached(
-                    ctx, tr, layer, cross_kv_, layer_index, cross_in,
-                    apply_prior ? prior.tensor : nullptr, collect ? &last_attn : nullptr, true);
+                    ctx, tr, layer, cross_kv_, layer_index, cross_in, nullptr,
+                    collect ? &last_attn : nullptr, true, apply_prior ? prior.tensor : mask.tensor,
+                    text_len_);
                 cond = ggml_add(ctx, cond, cross);
                 x = ggml_concat(ctx, cond, uncond, 1);
                 if (last_attn) {
@@ -638,20 +657,25 @@ class MagpieDecoder::PersistentDecoderRuntime {
         const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
         int stacked_position_budget)
         : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
+          text_capacity_(cross_kv.capacity > 0 ? cross_kv.capacity : text_len),
           stacked_position_budget_(stacked_position_budget),
           cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
-          module_(model, cross_kv, text_len, cache_len_),
+          module_(model, cross_kv, text_capacity_, cache_len_),
           session_(backend_manager_, &module_, nullptr) {
         session_.set_run_cache_capacity(1);
         session_.setup();
     }
 
+    // The graph depends on the cross cache buffer and its row capacity, not on the exact text
+    // length: chunks up to the capacity reuse the runtime (set_text_len updates the mask).
     bool matches(
         const DecoderCrossKvCache* cross_kv, int text_len, int stacked_position_budget) const {
-        return cross_kv == cross_kv_ && text_len == text_len_ &&
-               stacked_position_budget == stacked_position_budget_;
+        return cross_kv == cross_kv_ && cross_kv->capacity == text_capacity_ && text_len > 0 &&
+               text_len <= text_capacity_ && stacked_position_budget == stacked_position_budget_;
     }
+
+    void set_text_len(int text_len) { text_len_ = text_len; }
 
     bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_; }
 
@@ -728,7 +752,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
         // only the active suffix while the graph and arena shapes remain constant.
         const int32_t cache_meta[kMagpieCfgLanes * 2] = {
             ring_head_, ring_head_, valid_tokens_, valid_tokens_};
-        std::vector<float> log_prior(static_cast<size_t>(text_len_), 0.0f);
+        // Padded text rows (>= text_len_) get a large negative bias in every cross layer; layers
+        // with an attention prior additionally receive the log prior on the real rows.
+        constexpr float kPadMask = -1.0e30f;
+        std::vector<float> log_prior(static_cast<size_t>(text_capacity_), 0.0f);
+        std::vector<float> pad_mask(static_cast<size_t>(text_capacity_), 0.0f);
+        for (int i = text_len_; i < text_capacity_; ++i) {
+            log_prior[static_cast<size_t>(i)] = kPadMask;
+            pad_mask[static_cast<size_t>(i)] = kPadMask;
+        }
         if (attention && attention->prior) {
             if (static_cast<int>(attention->prior->size()) != text_len_)
                 return false;
@@ -748,11 +780,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
              GGML_TYPE_I32,
              cache_meta,
              {kMagpieCfgLanes, 2}},
-            {"magpietts.decoder.runtime.prior", GGML_TYPE_F32, log_prior.data(), {text_len_}}};
+            {"magpietts.decoder.runtime.prior", GGML_TYPE_F32, log_prior.data(), {text_capacity_}},
+            {"magpietts.decoder.runtime.mask", GGML_TYPE_F32, pad_mask.data(), {text_capacity_}}};
 
         ggml_runtime::DeviceTensor cond_device;
         ggml_runtime::DeviceTensor uncond_device;
-        std::vector<float> alignment(static_cast<size_t>(text_len_));
+        std::vector<float> alignment(static_cast<size_t>(text_capacity_));
         const bool has_alignment = module_.alignment_count() > 0;
         std::vector<ggml_runtime::Session::Output> outputs(has_alignment ? 3 : 2);
         outputs[0].index = 0;
@@ -771,7 +804,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             model_.backend, model_.backend, uncond_device.tensor, uncond_hidden_out->tensor);
 
         if (attention && attention->alignment_scores) {
-            *attention->alignment_scores = alignment;
+            attention->alignment_scores->assign(alignment.begin(), alignment.begin() + text_len_);
         }
 
         ++n_tokens_;
@@ -788,6 +821,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     const magpietts_model& model_;
     const DecoderCrossKvCache* cross_kv_ = nullptr;
     int text_len_ = 0;
+    int text_capacity_ = 0;
     int stacked_position_budget_ = 0;
     int cache_len_ = 0;
     int n_tokens_ = 0;
@@ -850,6 +884,18 @@ MagpieDecoder::evalCachedPair(
     magpietts_cuda_sample_request* cuda_sample, const magpietts_backend_tensor* text_cond_device,
     magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out,
     DecoderCrossKvCache* cond_cross_kv, const magpietts_decoder_attention* attention) const {
+    // A runtime built for another text chunk (different text length or cross cache) is stale.
+    // Drop it before choosing the path: the chunk loop has already cleared the KV caches, so
+    // this costs nothing here, whereas noticing it after the new chunk's eager prefill (inside
+    // the persistent branch below) clears the freshly filled caches and forces a second prefill.
+    if (persistent_runtime_ && cond_cross_kv != nullptr &&
+        !persistent_runtime_->matches(cond_cross_kv, text_len, stacked_position_budget)) {
+        persistent_runtime_.reset();
+        if (persistent_owns_kv_) {
+            cond_kv.clear();
+            uncond_kv.clear();
+        }
+    }
     const bool persistent_candidate =
         cuda_sample == nullptr && cond_hidden_out != nullptr && uncond_hidden_out != nullptr &&
         cond_cross_kv != nullptr && cond_cross_kv->validFor(model_, text_len) &&
@@ -858,6 +904,9 @@ MagpieDecoder::evalCachedPair(
         cond_kv.n_tokens == uncond_kv.n_tokens;
     if (persistent_candidate) {
         try {
+            if (persistent_runtime_) {
+                persistent_runtime_->set_text_len(text_len);
+            }
             if (persistent_runtime_ &&
                 !persistent_runtime_->matches(cond_cross_kv, text_len, stacked_position_budget)) {
                 // Cross-cache address, shape, or request budget changes require a new graph.
@@ -882,6 +931,7 @@ MagpieDecoder::evalCachedPair(
                 persistent_runtime_->eval(
                     audio_codes, cond_kv, uncond_kv, cond_result, uncond_result, cond_hidden_out,
                     uncond_hidden_out, attention)) {
+                persistent_owns_kv_ = true;  // KV contents now live in the runtime arena
                 return true;
             }
             persistent_runtime_.reset();
@@ -895,6 +945,7 @@ MagpieDecoder::evalCachedPair(
             uncond_kv.clear();
         }
     }
+    persistent_owns_kv_ = false;  // the eager path (re)fills cond_kv/uncond_kv memory itself
     return decoder_eval_cached_pair_impl(
         model_, text_cond, text_len, audio_codes, speaker, threads, cond_kv, uncond_kv, cond_result,
         uncond_result, cuda_sample, text_cond_device, cond_hidden_out, uncond_hidden_out,

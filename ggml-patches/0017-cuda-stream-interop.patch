@@ -1,13 +1,17 @@
 diff --git a/include/ggml-cuda.h b/include/ggml-cuda.h
+index 5436c7ef..166ef8c1 100644
 --- a/include/ggml-cuda.h
 +++ b/include/ggml-cuda.h
-@@ -23,6 +23,17 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+@@ -24,6 +24,20 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
  
  GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
  
 +// Returns the backend's current CUDA/HIP/MUSA stream for in-process device interop.
 +// The returned stream is owned by the backend and must not be destroyed by the caller.
 +GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
++// Set the CUDA stream priority used by this backend's streams (0 default; negative = higher,
++// clamped to the device range). Streams already created are recreated.
++GGML_BACKEND_API void ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int priority);
 +
 +// Returns the backend-owned native CUDA/HIP graph template for a stable GGML graph after its
 +// normal warm-up/capture has completed. The opaque handle is borrowed and is intended for runtime
@@ -19,10 +23,39 @@ diff --git a/include/ggml-cuda.h b/include/ggml-cuda.h
  // device buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 610fdf37..cdb17991 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1479,10 +1479,22 @@ struct ggml_backend_cuda_context {
+ 
+     ~ggml_backend_cuda_context();
+ 
++    // CUDA stream priority for streams created by this context (0 = default; more negative =
++    // higher priority, clamped to the device range at creation). Lets a latency-critical
++    // backend (e.g. an autoregressive decoder) win SM scheduling over a concurrent worker.
++    int stream_priority = 0;
++
+     cudaStream_t stream(int device, int stream) {
+         if (streams[device][stream] == nullptr) {
+             ggml_cuda_set_device(device);
+-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
++            if (stream_priority != 0) {
++                int least = 0, greatest = 0;
++                CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
++                const int prio = stream_priority < greatest ? greatest : (stream_priority > least ? least : stream_priority);
++                CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, prio));
++            } else {
++                CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
++            }
+         }
+         return streams[device][stream];
+     }
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index c83735a6..ad0f5e25 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -5514,6 +5514,33 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -5515,6 +5515,51 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -32,6 +65,24 @@ diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
 +    }
 +    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 +    return (void *) cuda_ctx->stream();
++}
++
++void ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int priority) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return;
++    }
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    cuda_ctx->stream_priority = priority;
++    // Recreate already-created streams so the priority applies to them as well.
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
++        for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
++            if (cuda_ctx->streams[d][i] != nullptr) {
++                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->streams[d][i]));
++                CUDA_CHECK(cudaStreamDestroy(cuda_ctx->streams[d][i]));
++                cuda_ctx->streams[d][i] = nullptr;
++            }
++        }
++    }
 +}
 +
 +void * ggml_backend_cuda_get_graph_template(

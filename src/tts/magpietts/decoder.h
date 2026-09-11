@@ -57,6 +57,7 @@ class DecoderCrossKvCache {
     ggml_tensor* memory_k = nullptr;
     ggml_tensor* memory_v = nullptr;
     int text_len = 0;
+    int capacity = 0;  // allocated text rows per layer (>= text_len); the layer stride
     int n_layers = 0;
     int n_cross_dim = 0;
     bool valid = false;
@@ -136,6 +137,7 @@ class MagpieDecoder {
     const magpietts_model& model_;
     mutable MagpiePinnedHostScratch output_staging_;
     mutable std::unique_ptr<PersistentDecoderRuntime> persistent_runtime_;
+    mutable bool persistent_owns_kv_ = false;  // KV contents live in the persistent arena
 };
 
 class MagpieCodebookSampler {
