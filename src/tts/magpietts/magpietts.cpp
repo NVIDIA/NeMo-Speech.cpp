@@ -15,7 +15,6 @@
 #include <fstream>
 #include <functional>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -263,8 +262,10 @@ class MagpieStreamingWorkspace {
     DecoderKvCache cond_kv;
     DecoderKvCache uncond_kv;
     DecoderCrossKvCache cond_cross_kv;
+    // Declared after the state: the graph holds nodes pointing at the state's
+    // cache tensors, so it must be destroyed first.
     nc::NanoCodecStreamState codec_stream_state;
-    std::map<int, nc::NanoCodecStreamGraph> codec_stream_graphs;
+    nc::NanoCodecStreamGraph codec_stream_graph;
 
    private:
     MagpieModel local_transformer_cpu_model;
@@ -666,11 +667,17 @@ decode_and_stream_chunk(
             fprintf(stderr, "stateful codec stream requested without a persistent graph\n");
             return false;
         }
-        if (!stream_graph->initialized() ||
-            stream_graph->chunkFrames() != (int)codec_frames.size()) {
-            if (!decoder.initStreamGraph(*stream_state, (int)codec_frames.size(), *stream_graph)) {
-                return false;
-            }
+        if (!stream_graph->initialized()) {
+            fprintf(stderr, "stateful codec stream graph was not initialized\n");
+            return false;
+        }
+        // Short chunks are zero-padded and trimmed inside the decoder, so a partial final
+        // chunk reuses the graph rather than forcing a rebuild.
+        if ((int)codec_frames.size() > stream_graph->chunkFrames()) {
+            fprintf(
+                stderr, "codec chunk has %zu frames, over the graph's %d\n", codec_frames.size(),
+                stream_graph->chunkFrames());
+            return false;
         }
         decoded = decoder.decodeStream(*stream_state, *stream_graph, codec_frames, threads, audio);
     } else {
@@ -742,7 +749,7 @@ struct codec_stream_worker {
     stream_audio_outputs& outputs;
     AudioPostProcessor audio_pp;
     nc::NanoCodecStreamState& stream_state;
-    std::map<int, nc::NanoCodecStreamGraph>& stream_graphs;
+    nc::NanoCodecStreamGraph& stream_graph;
     stream_run_metrics* metrics = nullptr;
     const char* run_label = "stream";
     int chunk_size = 3;
@@ -771,14 +778,13 @@ struct codec_stream_worker {
 
     codec_stream_worker(
         const nc::NanoCodecModel& codec_, nc::NanoCodecDecoder& decoder_,
-        nc::NanoCodecStreamState& stream_state_,
-        std::map<int, nc::NanoCodecStreamGraph>& stream_graphs_, int threads_,
-        stream_audio_outputs& outputs_, int samples_per_frame, int chunk_size_, int history_size_,
-        int future_frames, int window_samples, size_t queue_depth, bool true_stateful_,
-        stream_run_metrics* metrics_, const char* run_label_, bool verbose_)
+        nc::NanoCodecStreamState& stream_state_, nc::NanoCodecStreamGraph& stream_graph_,
+        int threads_, stream_audio_outputs& outputs_, int samples_per_frame, int chunk_size_,
+        int history_size_, int future_frames, int window_samples, size_t queue_depth,
+        bool true_stateful_, stream_run_metrics* metrics_, const char* run_label_, bool verbose_)
         : codec(codec_), decoder(decoder_), threads(threads_), outputs(outputs_),
           audio_pp(samples_per_frame, future_frames, window_samples), stream_state(stream_state_),
-          stream_graphs(stream_graphs_), metrics(metrics_),
+          stream_graph(stream_graph_), metrics(metrics_),
           run_label(run_label_ ? run_label_ : "stream"), chunk_size(std::max(1, chunk_size_)),
           history_size(std::max(0, history_size_)), future_size(std::max(0, future_frames)),
           true_stateful(true_stateful_), verbose(verbose_) {
@@ -976,6 +982,32 @@ struct codec_stream_worker {
         return false;
     }
 
+    // Build the fixed-size graph and push one throwaway chunk through it before any real
+    // tokens arrive. That moves the graph allocation and the backend's first-run graph
+    // capture off the first audio chunk's latency, while the acoustic model is still
+    // generating. The caches are zeroed afterwards, so the stream still starts from silence.
+    bool prewarm() {
+        const ggml_nvtx::range nvtx_range("magpietts_stream_codec_prewarm");
+        // A workspace reused across requests keeps its graph, and with it the backend's
+        // captured version of it; zeroing the caches is all a fresh stream needs.
+        if (stream_graph.initialized() && stream_graph.chunkFrames() == chunk_size) {
+            stream_state.clear();
+            return true;
+        }
+        if (!decoder.initStreamGraph(stream_state, chunk_size, stream_graph)) {
+            set_failed("failed to initialize the codec stream graph");
+            return false;
+        }
+        const nc::NanoCodecFrames warm((size_t)chunk_size, nc::NanoCodecFrame{});
+        std::vector<float> discard;
+        if (!decoder.decodeStream(stream_state, stream_graph, warm, threads, discard)) {
+            set_failed("failed to warm up the codec stream graph");
+            return false;
+        }
+        stream_state.clear();
+        return true;
+    }
+
     void run() {
         const ggml_nvtx::range nvtx_range("magpietts_stream_codec_worker_run");
         if (verbose) {
@@ -983,6 +1015,9 @@ struct codec_stream_worker {
                 stderr,
                 "codec worker started: chunk_size=%d history=%d future=%d max_buffered=%zu\n",
                 chunk_size, history_size, future_size, max_buffered_frames);
+        }
+        if (true_stateful && !prewarm()) {
+            return;
         }
         try {
             for (;;) {
@@ -1000,14 +1035,13 @@ struct codec_stream_worker {
                     }
                     continue;
                 }
-                nc::NanoCodecStreamGraph* stream_graph = nullptr;
-                if (true_stateful) {
-                    stream_graph = &stream_graphs[(int)item.frames.size()];
-                }
+                // Reads are capped at chunk_size and a short final chunk is zero-padded by
+                // the decoder, so one graph serves the whole stream.
+                nc::NanoCodecStreamGraph* graph = true_stateful ? &stream_graph : nullptr;
                 if (!decode_and_stream_chunk(
-                        codec, decoder, true_stateful ? &stream_state : nullptr, stream_graph,
-                        item.frames, threads, outputs, audio_pp, metrics, run_label,
-                        item.chunk_index, item.history_frames, item.final_read, verbose)) {
+                        codec, decoder, true_stateful ? &stream_state : nullptr, graph, item.frames,
+                        threads, outputs, audio_pp, metrics, run_label, item.chunk_index,
+                        item.history_frames, item.final_read, verbose)) {
                     set_failed("decode or audio output failed");
                     return;
                 }
@@ -1189,7 +1223,7 @@ stream_magpie_to_audio(
     }
 
     codec_stream_worker codec_worker(
-        codec, workspace.codec_decoder, workspace.codec_stream_state, workspace.codec_stream_graphs,
+        codec, workspace.codec_decoder, workspace.codec_stream_state, workspace.codec_stream_graph,
         params.codec_threads, outputs, codec.samplesPerFrame(), params.chunk_frames,
         params.codec_history_frames, params.codec_future_frames, window_samples,
         (size_t)params.codec_queue_depth, params.use_stateful_codec, &metrics, label,
