@@ -122,4 +122,11 @@ class NanoCodecDecoder {
     const NanoCodecModel* model_;
 };
 
+// True when every sample is finite. The decoder graph does not clamp its output,
+// so a NaN or an infinity produced anywhere in the codec stays visible to this
+// check instead of being folded onto a bound and returned as full-scale audio.
+// The decoder applies the bound itself once this has passed, so a decoded buffer
+// still reaches callers within [-1, 1].
+bool is_finite_audio(const std::vector<float>& audio);
+
 }  // namespace nemo_speech::tts::nanocodec
