@@ -51,6 +51,12 @@ struct magpie_stream_params {
     int steps = -1;
     int top_k = -1;
     int chunk_frames = 4;
+    int batch_size = 1;
+    // The wave needs chunk N's text window to be knowable before chunk N-1
+    // decodes. The adaptive path derives it from where that decode attended
+    // (attention_prior.lastAttendedAbsolute), so batching pins the history
+    // instead. -1 keeps the adaptive behaviour and is only legal at batch 1.
+    int longform_history_tokens = -1;
     int codec_queue_depth = 4;
     int codec_history_frames = -1;
     int codec_future_frames = 1;
@@ -128,6 +134,27 @@ struct stream_run_metrics {
 };
 
 using magpie_pcm_callback = std::function<bool(const std::vector<uint8_t>&)>;
+
+// One chunk's text window: the history spliced in front of it, where that
+// history starts in absolute token space, and the resulting length.
+struct MagpieChunkPlan {
+    std::vector<int32_t> text_window;
+    int history_len = 0;
+    int left_offset = 0;
+    int text_len = 0;
+};
+
+// Plan one long-form chunk's window. Pure: no model state, no device work.
+//
+// `required_history` is what the adaptive rule asks for so chunk N can still
+// see where chunk N-1's attention ended up. `available_history` is how many
+// tokens the previous chunk's encoder output actually holds -- the history is
+// spliced from that one chunk, so the window can never reach back further,
+// however many tokens have been seen in total.
+MagpieChunkPlan plan_text_chunk(
+    const magpietts_hparams& h, const magpie_stream_params& params,
+    const std::vector<int32_t>& prior_text_tokens, const std::vector<int32_t>& current_tokens,
+    int absolute_token_offset, int required_history, int available_history);
 
 class MagpieStreamingRuntime {
    public:

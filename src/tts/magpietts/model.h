@@ -233,6 +233,21 @@ class MagpieLongformAttentionPriorState {
 
     const std::vector<float>& prior() const { return prior_; }
     int lastAttendedAbsolute() const { return last_attended_absolute_; }
+    // Where a chunk resumes attending. Sequentially this carries over from the
+    // previous chunk's decode; a wave has not run that decode, but the value is
+    // not really a decode result: a chunk ends with attention on the last token
+    // of its window, which is the token before the next chunk's first. So it is
+    // a property of the plan, and a wave can seed it.
+    void seedLastAttendedAbsolute(int absolute, int attended_count) {
+        last_attended_absolute_ = absolute;
+        ensureAbsoluteCapacity(absolute + 1);
+        // Sequentially, every token before this chunk was attended to
+        // completion by the chunks that came before. Without that history the
+        // advance gate never fires and the chunk creeps forward one lookahead
+        // window at a time instead of moving on.
+        std::fill(
+            attended_counts_.begin(), attended_counts_.begin() + (absolute + 1), attended_count);
+    }
     int lastAttendedRelative() const;
     int leftOffset() const { return left_offset_; }
     int currentChunkLen() const { return current_chunk_len_; }
@@ -417,7 +432,7 @@ const char* magpietts_uma_mode_name(magpietts_uma_mode mode);
 bool parse_uma_mode(const std::string& value, magpietts_uma_mode& mode);
 
 bool magpietts_backend_is_cuda(ggml_backend_t backend);
-// ggml_fused_attn_cached comes from ggml-patches/0014 and has a CUDA kernel only.
+// ggml_fused_relpos_attn_cached comes from ggml-patches/0014 and has a CUDA kernel only.
 bool magpietts_fused_cached_attention_available(ggml_backend_t backend);
 
 std::vector<int32_t> parse_token_list(const std::string& text);

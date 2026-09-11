@@ -141,6 +141,13 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
     p.Register("steps", &c.steps, "Maximum decoder frames; -1 uses model default");
     p.Register("top-k", &c.top_k, "Top-k sampling; -1 uses model default");
     p.Register("chunk-frames", &c.chunk_frames, "Codec frames per streamed audio chunk");
+    p.Register(
+        "batch-size", &c.batch_size,
+        "Long-form chunks decoded together in one wave; 1 decodes sequentially");
+    p.Register(
+        "longform-history-tokens", &c.longform_history_tokens,
+        "Fixed long-form history tokens; -1 adapts to the previous chunk's alignment "
+        "and is only valid at batch-size 1");
     p.Register("codec-queue-depth", &c.codec_queue_depth, "Codec worker queue depth");
     p.Register("codec-history-frames", &c.codec_history_frames, "Rolling codec history frames");
     p.Register("codec-future-frames", &c.codec_future_frames, "Rolling codec future frames");
@@ -239,6 +246,13 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
     p.Register("steps", &c.steps, "Maximum decoder frames; -1 uses model default");
     p.Register("top-k", &c.top_k, "Top-k sampling; -1 uses model default");
     p.Register("chunk-frames", &c.chunk_frames, "Codec frames per streamed audio chunk");
+    p.Register(
+        "batch-size", &c.batch_size,
+        "Long-form chunks decoded together in one wave; 1 decodes sequentially");
+    p.Register(
+        "longform-history-tokens", &c.longform_history_tokens,
+        "Fixed long-form history tokens; -1 adapts to the previous chunk's alignment "
+        "and is only valid at batch-size 1");
     p.Register("codec-queue-depth", &c.codec_queue_depth, "Codec worker queue depth");
     p.Register("codec-history-frames", &c.codec_history_frames, "Rolling codec history frames");
     p.Register("codec-future-frames", &c.codec_future_frames, "Rolling codec future frames");

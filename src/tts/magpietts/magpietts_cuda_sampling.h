@@ -34,6 +34,9 @@ bool magpietts_cuda_sampler_sequence_finish_build_and_launch(
     magpietts_cuda_sampler* sampler, char* error, size_t error_size);
 void magpietts_cuda_sampler_sequence_abort_build(magpietts_cuda_sampler* sampler);
 void magpietts_cuda_sampler_sequence_disable(magpietts_cuda_sampler* sampler);
+// Throw away a composed chain so the next call rebuilds it. Required whenever
+// the batch width changes: the graph bakes in the shapes it was built from.
+void magpietts_cuda_sampler_sequence_invalidate(magpietts_cuda_sampler* sampler);
 bool magpietts_cuda_sampler_sequence_launch(
     magpietts_cuda_sampler* sampler, char* error, size_t error_size);
 bool magpietts_cuda_sampler_sequence_add_ggml_graph(
@@ -61,8 +64,11 @@ bool magpietts_cuda_sample_codebooks_device_configured(
     int codebooks, int vocab_size, int audio_codebook_size, int audio_eos_id, int codebook_offset,
     int output_offset, char* error, size_t error_size);
 
+// Hand `count` freshly sampled codes back to the device tensor the next round
+// consumes. A batch's codes for one round are contiguous, so this is one copy
+// rather than one per item.
 bool magpietts_cuda_copy_sampled_code_to_device(
-    magpietts_cuda_sampler* sampler, int codebook, void* dst_device, char* error,
+    magpietts_cuda_sampler* sampler, int first_codebook, int count, void* dst_device, char* error,
     size_t error_size);
 
 bool magpietts_cuda_copy_sampled_codebooks(

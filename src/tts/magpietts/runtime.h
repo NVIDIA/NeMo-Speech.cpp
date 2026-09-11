@@ -38,6 +38,12 @@ struct MagpieRuntimeConfig {
     int steps = -1;
     int top_k = -1;
     int chunk_frames = 4;
+    int batch_size = 1;
+    // The wave needs chunk N's text window to be knowable before chunk N-1
+    // decodes. The adaptive path derives it from where that decode attended
+    // (attention_prior.lastAttendedAbsolute), so batching pins the history
+    // instead. -1 keeps the adaptive behaviour and is only legal at batch 1.
+    int longform_history_tokens = -1;
     int codec_queue_depth = 4;
     int codec_history_frames = -1;
     int codec_future_frames = 1;

@@ -40,7 +40,7 @@ index fb823571..d403756e 100644
      // Q/K/V/P may be non-contiguous views as long as each d_k row is
      // contiguous — e.g. Q sliced from a fused-QKV projection and K/V read
      // head-split from a feat-major [n_feat, kv] window (the CUDA op derives
-@@ -2460,6 +2460,44 @@ extern "C" {
+@@ -2460,6 +2460,31 @@ extern "C" {
              float                 scale,
              bool                  merge_heads);
  
@@ -69,19 +69,6 @@ index fb823571..d403756e 100644
 +    // Standard cached attention. Q/K/V are [d_k, chunk_len, n_head, batch].
 +    // The current K/V chunk is attended and appended to the shared persistent
 +    // [n_feat*cache_len, slots, 2] F32 circular cache.
-+    GGML_API struct ggml_tensor * ggml_fused_attn_cached(
-+            struct ggml_context * ctx,
-+            struct ggml_tensor  * q,
-+            struct ggml_tensor  * k,
-+            struct ggml_tensor  * v,
-+            struct ggml_tensor  * mask,
-+            struct ggml_tensor  * kv_cache,
-+            struct ggml_tensor  * slot_ids,
-+            struct ggml_tensor  * cache_state,
-+            int64_t               cache_len,
-+            float                 scale,
-+            bool                  merge_heads);
-+
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
@@ -2558,7 +2545,7 @@ index 80b5802f..4f5aeb09 100644
      result->src[0] = q;
      result->src[1] = k;
      result->src[2] = v;
-@@ -5443,10 +5480,65 @@ struct ggml_tensor * ggml_fused_relpos_attn(
+@@ -5443,10 +5480,47 @@ struct ggml_tensor * ggml_fused_relpos_attn(
      result->src[4] = bias_u;
      result->src[5] = bias_v;
      result->src[6] = mask;
@@ -2603,24 +2590,6 @@ index 80b5802f..4f5aeb09 100644
 +        ctx, q, k, v, p, bias_u, bias_v, mask, kv_cache, slot_ids, cache_state, cache_len, scale,
 +        merge_heads);
 +}
-+
-+struct ggml_tensor * ggml_fused_attn_cached(
-+        struct ggml_context * ctx,
-+        struct ggml_tensor  * q,
-+        struct ggml_tensor  * k,
-+        struct ggml_tensor  * v,
-+        struct ggml_tensor  * mask,
-+        struct ggml_tensor  * kv_cache,
-+        struct ggml_tensor  * slot_ids,
-+        struct ggml_tensor  * cache_state,
-+        int64_t               cache_len,
-+        float                 scale,
-+        bool                  merge_heads) {
-+    return ggml_fused_attention_impl(
-+        ctx, q, k, v, NULL, NULL, NULL, mask, kv_cache, slot_ids, cache_state, cache_len, scale,
-+        merge_heads);
-+}
-+
  void ggml_flash_attn_ext_set_prec(
          struct ggml_tensor * a,
          enum ggml_prec       prec) {

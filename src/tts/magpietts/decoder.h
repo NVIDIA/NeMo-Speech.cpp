@@ -62,6 +62,29 @@ class DecoderCrossKvCache {
     bool valid = false;
 };
 
+// One chunk's slot in a wave. Everything here is that chunk's own; the decoder
+// reads its codes and history and writes back its hidden state and alignment.
+struct MagpieWaveDecodeItem {
+    const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
+    DecoderCrossKvCache* cross_kv = nullptr;
+    // Length is this chunk's own text_len, not the wave's widest.
+    const std::vector<float>* prior = nullptr;
+    std::vector<float>* alignment_scores = nullptr;
+};
+
+// One chunk's opening in a wave. A wave prefills every chunk's baked context
+// through one graph, so the scheduler hands the whole group over at once.
+struct MagpieWavePrefillItem {
+    const std::vector<float>* text_cond = nullptr;
+    const magpietts_backend_tensor* text_cond_device = nullptr;
+    int text_len = 0;
+    const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
+    DecoderCrossKvCache* cross_kv = nullptr;
+    // Length is this chunk's own text_len, not the wave's widest.
+    const std::vector<float>* prior = nullptr;
+    std::vector<float>* alignment_scores = nullptr;
+};
+
 struct decoder_result {
     bool logits_required = true;
     std::vector<float> logits_last;
@@ -130,12 +153,42 @@ class MagpieDecoder {
         DecoderCrossKvCache* cond_cross_kv = nullptr,
         const magpietts_decoder_attention* attention = nullptr) const;
 
+    // Decode a wave: several long-form chunks advanced one step in lockstep
+    // through one graph. Every item carries its own text, its own cross-K/V and
+    // its own history; what they share is the step index, which is what lets a
+    // single ring head and a single mask serve them all.
+    //
+    // prefillWave must have opened the same items first: it is what puts a
+    // chunk's baked context in the ring these steps append to.
+    // cond_hidden_out and uncond_hidden_out are [n_embd, items] -- the whole
+    // wave's guidance pair in one pair of tensors, which is what the batched
+    // local transformer reads.
+    bool evalWave(
+        std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget,
+        magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out) const;
+
+    // Open a whole wave: build every chunk's cross-K/V, then prefill all of
+    // their baked contexts through one graph. The self-K/V land directly in the
+    // ring evalWave appends to, and step 0's guidance pair comes back in the
+    // same [n_embd, items] tensors the steps use. Call once per wave, before
+    // the first evalWave.
+    bool prefillWave(
+        std::vector<MagpieWavePrefillItem>& items, int speaker, int threads,
+        int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out) const;
+
+    // Drop a wave runtime so the next call rebuilds it. A wave's width and its
+    // items' cross-K/V addresses are baked into the graph.
+    void resetWave() const;
+
    private:
     class PersistentDecoderRuntime;
 
     const magpietts_model& model_;
     mutable MagpiePinnedHostScratch output_staging_;
     mutable std::unique_ptr<PersistentDecoderRuntime> persistent_runtime_;
+    mutable std::unique_ptr<PersistentDecoderRuntime> wave_runtime_;
 };
 
 class MagpieCodebookSampler {

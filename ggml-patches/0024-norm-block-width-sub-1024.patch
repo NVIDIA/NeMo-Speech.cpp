@@ -1,0 +1,109 @@
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index 48538703..994f44c4 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -401,7 +401,9 @@ static void norm_mul_add_cuda(
+                 <<<blocks_num, block_size, 12 * sizeof(float2), stream>>>(
+                     x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         }
+-    } else if (ncols < 1024) {
++    } else if (ncols <= 128 || !(GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE)) {
++        // A warp-sized block is right while there is little to reduce, and is
++        // the safe default off Ampere and later.
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         if (add) {
+             norm_mul_add_f32<WARP_SIZE, true, T><<<blocks_num, block_dims, 0, stream>>>(
+@@ -410,6 +412,18 @@ static void norm_mul_add_cuda(
+             norm_mul_add_f32<WARP_SIZE, false, T><<<blocks_num, block_dims, 0, stream>>>(
+                 x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         }
++    } else if (ncols < 1024) {
++        // Between 128 and 1024 a warp gives the row only 32-way memory
++        // parallelism, and during single-token decode one such block is
++        // resident at a time, so none of that latency is hidden by other work.
++        const dim3 block_dims(256, 1, 1);
++        if (add) {
++            norm_mul_add_f32<256, true, T><<<blocks_num, block_dims, 8 * sizeof(float2), stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        } else {
++            norm_mul_add_f32<256, false, T><<<blocks_num, block_dims, 8 * sizeof(float2), stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        }
+     } else if (ncols == 1024 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
+         // Four elements per thread balances reduction work and occupancy.
+         const dim3 block_dims(256, 1, 1);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 657755fd..456fefe9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3299,6 +3299,12 @@ struct test_norm_mul_add : public test_case {
+     const std::array<int64_t, 4> ne;
+     float eps;
+     const bool broadcast;
++    // Affine LayerNorm as models actually write it: one gamma and one beta per
++    // channel, broadcast over every row. Backends gate their fused NORM+MUL+ADD
++    // kernel on exactly that (nelements(gamma) == ne[0]), so with full-shaped
++    // weights below the fused path is never reached and this test silently
++    // covers only the unfused one.
++    const bool per_row_weights;
+ 
+     std::string op_desc(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -3308,26 +3314,31 @@ struct test_norm_mul_add : public test_case {
+     bool run_whole_graph() override { return true; }
+ 
+     std::string vars() override {
+-        return VARS_TO_STR4(type, ne, eps, broadcast);
++        return VARS_TO_STR5(type, ne, eps, broadcast, per_row_weights);
+     }
+ 
+     test_norm_mul_add(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne = {128, 2, 1, 1},
+             float eps = 1e-5f,
+-            bool broadcast = false)
+-        : type(type), ne(ne), eps(eps), broadcast(broadcast) {}
++            bool broadcast = false,
++            bool per_row_weights = false)
++        : type(type), ne(ne), eps(eps), broadcast(broadcast), per_row_weights(per_row_weights) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         std::array<int64_t, 4> broadcast_dims = {ne[0], ne[1] * 2, ne[2] * 2, ne[3] * 2};
++        std::array<int64_t, 4> weight_dims = {ne[0], 1, 1, 1};
+ 
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, broadcast ? broadcast_dims.data() : ne.data());
+-        ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne.data());
+-        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_tensor * w = ggml_new_tensor(ctx, type, 4,
++                per_row_weights ? weight_dims.data() : ne.data());
++        ggml_tensor * b = ggml_new_tensor(ctx, type, 4,
++                per_row_weights ? weight_dims.data() : ne.data());
+         ggml_set_param(a); ggml_set_param(w); ggml_set_param(b);
+         ggml_set_name(a, "a"); ggml_set_name(w, "w"); ggml_set_name(b, "b");
+ 
+         // Use a, w and b early to avoid OP_NONE in graph
+-        a = ggml_add(ctx, ggml_add(ctx, a, w), b);
++        a = per_row_weights ? ggml_add(ctx, a, ggml_repeat(ctx, ggml_add(ctx, w, b), a))
++                            : ggml_add(ctx, ggml_add(ctx, a, w), b);
+ 
+         ggml_tensor * n = ggml_norm(ctx, a, eps);
+         ggml_tensor * m = ggml_mul(ctx, n, w);
+@@ -8187,6 +8198,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+         }
+     }
++
++    // norm_mul_add picks its block size from the row width: <= 128 (and any
++    // non-Ampere device) takes a warp-sized block, 768 has a block of its own,
++    // the rest of the sub-1024 range takes a wider one, and >= 1024 another.
++    // The loop above only reaches 64 and 1025, so every boundary in between was
++    // uncovered -- including the 768 case. One eps is enough; what is being
++    // exercised is the dispatch, not the arithmetic.
++    for (uint32_t n : { 129, 256, 512, 768, 1023 }) {
++        test_cases.emplace_back(
++            new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-6f, false, true));
++        test_cases.emplace_back(
++            new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, 1e-6f, true, true));
++    }
+     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
+         for (bool multi_add : {false, true}) {
+             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));

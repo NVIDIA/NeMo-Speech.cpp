@@ -26,6 +26,14 @@ tts:
   # temperature: 0.6            # omitted = model default
   # cfg-scale: 2.5              # omitted = model default
 
+  # Long-form only. batch-size decodes several text chunks in lockstep, which
+  # is worth roughly 2x on a twenty-sentence script and costs memory, not
+  # latency. It requires a fixed longform-history-tokens: the adaptive default
+  # derives chunk N's text window from chunk N-1's alignment, which a wave has
+  # not decoded yet. Set both or neither.
+  # batch-size: 16
+  # longform-history-tokens: 20   # -1 = adaptive (default), 0 = no history
+
   chunk-frames: 4
   codec-queue-depth: 4
   codec-history-frames: -1

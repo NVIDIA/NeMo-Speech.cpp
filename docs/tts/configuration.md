@@ -167,6 +167,8 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 
 | key | CLI alias | default | meaning |
 |---|---|---|---|
+| `tts.batch-size` | - | `1` | long-form chunks decoded in lockstep per wave; needs `tts.longform-history-tokens >= 0` |
+| `tts.longform-history-tokens` | - | `-1` | already-spoken text carried into a chunk's window; `-1` adapts to the previous chunk's alignment, `0` disables |
 | `tts.chunk-frames` | - | `4` | codec frames per streamed audio chunk |
 | `tts.codec-queue-depth` | - | `4` | codec worker queue depth |
 | `tts.codec-history-frames` | - | `-1` | rolling codec history frames |

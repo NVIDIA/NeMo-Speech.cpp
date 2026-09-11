@@ -70,6 +70,10 @@ tts:
   steps: -1                     # -1 = model default
   top-k: -1                     # -1 = model default
 
+  # Long-form only, and both are needed together. See docs/tts/configuration.md.
+  # batch-size: 16
+  # longform-history-tokens: 20
+
   chunk-frames: 4
   codec-queue-depth: 4
   codec-history-frames: -1

@@ -296,6 +296,25 @@ magpietts_cuda_sampler_create(int codebooks) {
 }
 
 void
+magpietts_cuda_sampler_sequence_invalidate(magpietts_cuda_sampler* sampler) {
+    if (!sampler) {
+        return;
+    }
+    // The composed graph bakes in the shapes it was built from, so a change of
+    // batch width has to throw it away and recompose rather than replay a graph
+    // sized for a different wave.
+    if (sampler->sequence_exec) {
+        cudaGraphExecDestroy(sampler->sequence_exec);
+        sampler->sequence_exec = nullptr;
+    }
+    if (sampler->sequence_graph) {
+        cudaGraphDestroy(sampler->sequence_graph);
+        sampler->sequence_graph = nullptr;
+    }
+    sampler->sequence_warm = false;
+}
+
+void
 magpietts_cuda_sampler_free(magpietts_cuda_sampler* sampler) {
     if (!sampler) {
         return;
@@ -451,6 +470,7 @@ magpietts_cuda_sampler_sequence_finish_build_and_launch(
         cudaGraphDestroy(graph);
         sampler->sequence_graph = nullptr;
         set_error(error, error_size, "failed to instantiate CUDA local sequence graph", err);
+        (void)cudaGetLastError();
         return false;
     }
     err = cudaGraphLaunch(exec, sampler->stream);
@@ -528,6 +548,12 @@ magpietts_cuda_sampler_sequence_add_ggml_graph(
         reinterpret_cast<cudaGraph_t>(graph_template));
     if (err != cudaSuccess) {
         set_error(error, error_size, "failed to add GGML child graph to CUDA local sequence", err);
+        // Composing the chain is an optimisation and the caller falls back to
+        // launching it eagerly. Clear the error so the fallback is testing
+        // itself rather than inheriting this one: a failed graph call leaves a
+        // sticky error that makes the next launch fail too, which turns a
+        // missing optimisation into a dead run.
+        (void)cudaGetLastError();
         return false;
     }
     sampler->sequence_tail = node;
@@ -685,20 +711,23 @@ magpietts_cuda_sample_codebooks_device_configured(
 
 bool
 magpietts_cuda_copy_sampled_code_to_device(
-    magpietts_cuda_sampler* sampler, int codebook, void* dst_device, char* error,
+    magpietts_cuda_sampler* sampler, int first_codebook, int count, void* dst_device, char* error,
     size_t error_size) {
-    if (!sampler || !dst_device) {
+    if (!sampler || !dst_device || count <= 0) {
         set_error(error, error_size, "invalid CUDA sampled-code copy arguments");
         return false;
     }
-    if (codebook < 0 || codebook >= sampler->codebooks) {
+    if (first_codebook < 0 || first_codebook + count > sampler->codebooks) {
         set_error(error, error_size, "invalid CUDA sampled-code index");
         return false;
     }
 
+    // One round of a batch writes `count` contiguous slots, so the handoff to
+    // the next round is a single copy rather than one per item.
     if (sampler->sequence_build_active) {
         return magpietts_cuda_sampler_sequence_add_device_copy(
-            sampler, sampler->d_codes + codebook, dst_device, sizeof(int32_t), error, error_size);
+            sampler, sampler->d_codes + first_codebook, dst_device, (size_t)count * sizeof(int32_t),
+            error, error_size);
     }
 
     cudaError_t err = cudaSuccess;
@@ -710,8 +739,8 @@ magpietts_cuda_copy_sampled_code_to_device(
         }
     }
     err = cudaMemcpyAsync(
-        dst_device, sampler->d_codes + codebook, sizeof(int32_t), cudaMemcpyDeviceToDevice,
-        sampler->stream);
+        dst_device, sampler->d_codes + first_codebook, (size_t)count * sizeof(int32_t),
+        cudaMemcpyDeviceToDevice, sampler->stream);
     if (err != cudaSuccess) {
         set_error(error, error_size, "failed to copy CUDA sampled code to device", err);
         return false;

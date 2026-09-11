@@ -21,6 +21,8 @@
 
 namespace nemo_speech::tts {
 
+static constexpr int64_t kMagpieLocalKqMaskPad = 64;
+
 class LocalTransformerCudaAttentionCache {
    public:
     LocalTransformerCudaAttentionCache() = default;
@@ -39,8 +41,11 @@ class LocalTransformerCudaAttentionCache {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     std::vector<ggml_tensor*> layers;
-    std::vector<ggml_tensor*> cache_states;
-    ggml_tensor* slot_ids = nullptr;
+    // One append row and one mask per codebook round. Both are constant -- round
+    // c always writes slot c and reads slots 0..c -- so they are filled once at
+    // init and never touched per step.
+    std::vector<ggml_tensor*> write_rows;
+    std::vector<ggml_tensor*> masks;
     int n_ctx = 0;
     int n_embd = 0;
     int lanes = 0;
@@ -66,12 +71,12 @@ class LocalTransformerGraph {
     ggml_tensor* dec_uncond = nullptr;
     ggml_tensor* pos_emb = nullptr;
     ggml_tensor* prev_token = nullptr;
-    ggml_tensor* cache_state = nullptr;
     ggml_tensor* logits_cond = nullptr;
     ggml_tensor* logits_uncond = nullptr;
 
     int codebook_idx = -1;
     int seq_len = 0;
+    int batch = 1;
     bool pair = false;
 
     std::vector<float> logits_cond_data;
@@ -89,7 +94,7 @@ class LocalTransformerGraphBank {
     LocalTransformerGraphBank& operator=(LocalTransformerGraphBank&& other) noexcept;
 
     void reset();
-    bool beginFrame(const magpietts_model& model, bool pair);
+    bool beginFrame(const magpietts_model& model, bool pair, int batch = 1);
 
     std::vector<LocalTransformerGraph> single_graphs;
     std::vector<LocalTransformerGraph> pair_graphs;
@@ -97,6 +102,17 @@ class LocalTransformerGraphBank {
     DecoderKvCache cond_cache;
     DecoderKvCache uncond_cache;
     LocalTransformerCudaAttentionCache pair_cuda_attention_cache;
+    // Width the composed sampler chain was last built at, so a change forces a
+    // rebuild instead of replaying a graph shaped for another wave.
+    int sequence_batch = 0;
+    // The composed chain also captures the address of the hidden tensors it was
+    // built against, so a new pair invalidates it exactly like a new width.
+    const void* sequence_cond_ptr = nullptr;
+    const void* sequence_uncond_ptr = nullptr;
+    // Eager passes still owed before recomposing. ggml needs a couple of runs
+    // at a new shape before it can hand over a capturable graph template, and
+    // composing too early fails and disables the chain for the whole run.
+    int sequence_warmup_left = 0;
 };
 
 using local_transformer_graph = LocalTransformerGraph;
@@ -360,14 +376,13 @@ LocalTransformerCudaAttentionCache::operator=(LocalTransformerCudaAttentionCache
         ctx = other.ctx;
         buffer = other.buffer;
         layers = std::move(other.layers);
-        cache_states = std::move(other.cache_states);
-        slot_ids = other.slot_ids;
+        write_rows = std::move(other.write_rows);
+        masks = std::move(other.masks);
         n_ctx = other.n_ctx;
         n_embd = other.n_embd;
         lanes = other.lanes;
         other.ctx = nullptr;
         other.buffer = nullptr;
-        other.slot_ids = nullptr;
         other.n_ctx = 0;
         other.n_embd = 0;
         other.lanes = 0;
@@ -386,8 +401,8 @@ LocalTransformerCudaAttentionCache::reset() {
         ctx = nullptr;
     }
     layers.clear();
-    cache_states.clear();
-    slot_ids = nullptr;
+    write_rows.clear();
+    masks.clear();
     n_ctx = 0;
     n_embd = 0;
     lanes = 0;
@@ -399,15 +414,16 @@ LocalTransformerCudaAttentionCache::init(const magpietts_model& model, int lane_
     if (ctx) {
         if (n_ctx == h.lt_ctx && n_embd == h.lt_hidden && lanes == lane_count &&
             static_cast<int>(layers.size()) == h.lt_layers &&
-            static_cast<int>(cache_states.size()) == h.stacked_audio_codebooks()) {
+            static_cast<int>(write_rows.size()) == h.stacked_audio_codebooks()) {
             return true;
         }
         reset();
     }
 
     ggml_init_params params = {
+        // One arena per layer, plus an append row and a mask per codebook round.
         /*.mem_size   =*/ggml_tensor_overhead() *
-            static_cast<size_t>(h.lt_layers + h.stacked_audio_codebooks() + 1),
+            static_cast<size_t>(h.lt_layers + 2 * h.stacked_audio_codebooks() + 2),
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
@@ -425,14 +441,15 @@ LocalTransformerCudaAttentionCache::init(const magpietts_model& model, int lane_
         ggml_set_name(arena, name.c_str());
         layers.push_back(arena);
     }
-    slot_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, lane_count);
-    ggml_set_name(slot_ids, "magpietts_local_cuda_slot_ids");
-    cache_states.reserve(static_cast<size_t>(h.stacked_audio_codebooks()));
+    write_rows.reserve(static_cast<size_t>(h.stacked_audio_codebooks()));
+    masks.reserve(static_cast<size_t>(h.stacked_audio_codebooks()));
     for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
-        ggml_tensor* state_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, lane_count, 2);
-        const std::string name = "magpietts_local_cuda_cache_state_" + std::to_string(codebook);
-        ggml_set_name(state_tensor, name.c_str());
-        cache_states.push_back(state_tensor);
+        ggml_tensor* rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, lane_count);
+        ggml_set_name(rows, ("magpietts_local_cuda_rows_" + std::to_string(codebook)).c_str());
+        write_rows.push_back(rows);
+        ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, h.lt_ctx, kMagpieLocalKqMaskPad);
+        ggml_set_name(mask, ("magpietts_local_cuda_mask_" + std::to_string(codebook)).c_str());
+        masks.push_back(mask);
     }
 
     buffer = ggml_backend_alloc_ctx_tensors(ctx, model.backend);
@@ -441,18 +458,27 @@ LocalTransformerCudaAttentionCache::init(const magpietts_model& model, int lane_
         reset();
         return false;
     }
-    std::vector<int32_t> slots(static_cast<size_t>(lane_count));
-    for (int lane = 0; lane < lane_count; ++lane) slots[static_cast<size_t>(lane)] = lane;
-    ggml_backend_tensor_set(slot_ids, slots.data(), 0, slots.size() * sizeof(int32_t));
     for (ggml_tensor* arena : layers) {
         ggml_backend_tensor_memset(arena, 0, 0, ggml_nbytes(arena));
     }
-    std::vector<int32_t> state(static_cast<size_t>(lane_count) * 2);
+    std::vector<int64_t> rows(static_cast<size_t>(lane_count));
+    std::vector<ggml_fp16_t> mask_host(
+        static_cast<size_t>(h.lt_ctx) * kMagpieLocalKqMaskPad, ggml_fp32_to_fp16(-INFINITY));
     for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
-        std::fill(state.begin(), state.end(), codebook);
+        for (int lane = 0; lane < lane_count; ++lane) {
+            rows[static_cast<size_t>(lane)] =
+                static_cast<int64_t>(lane) * h.lt_ctx + std::min(codebook, h.lt_ctx - 1);
+        }
         ggml_backend_tensor_set(
-            cache_states[static_cast<size_t>(codebook)], state.data(), 0,
-            state.size() * sizeof(int32_t));
+            write_rows[static_cast<size_t>(codebook)], rows.data(), 0,
+            rows.size() * sizeof(int64_t));
+        std::fill(mask_host.begin(), mask_host.end(), ggml_fp32_to_fp16(-INFINITY));
+        for (int slot = 0; slot <= std::min(codebook, h.lt_ctx - 1); ++slot) {
+            mask_host[static_cast<size_t>(slot)] = ggml_fp32_to_fp16(0.0f);
+        }
+        ggml_backend_tensor_set(
+            masks[static_cast<size_t>(codebook)], mask_host.data(), 0,
+            mask_host.size() * sizeof(ggml_fp16_t));
     }
     n_ctx = h.lt_ctx;
     n_embd = h.lt_hidden;
@@ -479,7 +505,6 @@ LocalTransformerGraph::operator=(LocalTransformerGraph&& other) noexcept {
         dec_uncond = other.dec_uncond;
         pos_emb = other.pos_emb;
         prev_token = other.prev_token;
-        cache_state = other.cache_state;
         logits_cond = other.logits_cond;
         logits_uncond = other.logits_uncond;
         codebook_idx = other.codebook_idx;
@@ -495,7 +520,6 @@ LocalTransformerGraph::operator=(LocalTransformerGraph&& other) noexcept {
         other.dec_uncond = nullptr;
         other.pos_emb = nullptr;
         other.prev_token = nullptr;
-        other.cache_state = nullptr;
         other.logits_cond = nullptr;
         other.logits_uncond = nullptr;
         other.codebook_idx = -1;
@@ -520,7 +544,6 @@ LocalTransformerGraph::reset() {
     dec_uncond = nullptr;
     pos_emb = nullptr;
     prev_token = nullptr;
-    cache_state = nullptr;
     logits_cond = nullptr;
     logits_uncond = nullptr;
     codebook_idx = -1;
@@ -563,11 +586,18 @@ LocalTransformerGraphBank::reset() {
 }
 
 bool
-LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair) {
+LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair, int batch) {
     const auto& h = model.hparams;
+    batch = batch > 0 ? batch : 1;
     if (pair) {
         if (magpietts_fused_cached_attention_available(model.backend)) {
-            return pair_cuda_attention_cache.init(model, 2);
+            // Two guidance lanes per item, and one K/V history per lane: a
+            // batch item must not read another's codebook history.
+            return pair_cuda_attention_cache.init(model, 2 * batch);
+        }
+        if (batch > 1) {
+            fprintf(stderr, "batched local transformer requires the fused cached attention\n");
+            return false;
         }
         if (!cond_cache.init(
                 model.backend, h.lt_layers, h.lt_ctx, h.lt_hidden, "local conditional") ||
@@ -589,46 +619,59 @@ LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair) {
 static ggml_tensor*
 local_self_attention_cuda_cached_pair(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
-    LocalTransformerCudaAttentionCache& cache, int layer_index, ggml_tensor* cache_state,
-    ggml_tensor* x) {
-    constexpr int kCfgLanes = 2;
+    LocalTransformerCudaAttentionCache& cache, int layer_index, int codebook_idx, ggml_tensor* x) {
+    // Conditional columns for every item, then unconditional: 2B lanes, which
+    // is what the cache and its per-round rows are sized to.
+    const int64_t lanes = x->ne[1];
     const int64_t n_embd = tr.n_embd;
     const int64_t d_head = n_embd / tr.n_head;
-    ggml_tensor* qkv =
-        ggml_reshape_3d(ctx, linear(ctx, layer.self_qkv, x), 3 * n_embd, 1, kCfgLanes);
+    ggml_tensor* qkv = ggml_reshape_3d(ctx, linear(ctx, layer.self_qkv, x), 3 * n_embd, 1, lanes);
     const size_t element = ggml_element_size(qkv);
-    auto split_heads = [&](size_t offset) {
-        return ggml_view_4d(
-            ctx, qkv, d_head, 1, tr.n_head, kCfgLanes, qkv->nb[1],
-            static_cast<size_t>(d_head) * element, qkv->nb[2], offset);
+    // [d_head, n_q, n_head, lanes], which is the layout flash attention wants
+    // and what K/V below are permuted into. A permute here would transpose
+    // n_head against n_q and only happen to work at lt_heads == 1.
+    ggml_tensor* q = ggml_view_4d(
+        ctx, qkv, d_head, 1, tr.n_head, lanes, qkv->nb[1], static_cast<size_t>(d_head) * element,
+        qkv->nb[2], 0);
+
+    ggml_tensor* arena = cache.layers[static_cast<size_t>(layer_index)];
+    const size_t aes = ggml_element_size(arena);
+    // Round c writes slot c and reads slots 0..c, so both the append row and the
+    // mask are baked into this codebook's graph and never uploaded per step.
+    ggml_tensor* rows = cache.write_rows[static_cast<size_t>(codebook_idx)];
+    ggml_tensor* mask = cache.masks[static_cast<size_t>(codebook_idx)];
+    auto plane_rows = [&](int plane) {
+        return ggml_view_2d(
+            ctx, arena, n_embd, static_cast<int64_t>(lanes) * cache.n_ctx,
+            static_cast<size_t>(n_embd) * aes, static_cast<size_t>(plane) * arena->nb[2]);
     };
-    ggml_tensor* q = split_heads(0);
-    ggml_tensor* k = split_heads(static_cast<size_t>(n_embd) * element);
-    ggml_tensor* v = split_heads(static_cast<size_t>(2 * n_embd) * element);
-#if defined(NEMO_SPEECH_GGML_PATCHED)
-    ggml_tensor* heads = ggml_fused_attn_cached(
-        ctx, q, k, v, nullptr, cache.layers[static_cast<size_t>(layer_index)], cache.slot_ids,
-        cache_state, cache.n_ctx, 1.0f / std::sqrt(static_cast<float>(d_head)), true);
-#else
-    (void)q;
-    (void)k;
-    (void)v;
-    (void)cache;
-    (void)layer_index;
-    (void)cache_state;
-    ggml_tensor* heads = nullptr;
-    throw std::runtime_error("Magpie cached local attention requires patched ggml");
-#endif
-    ggml_tensor* merged =
-        ggml_reshape_2d(ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), n_embd, kCfgLanes);
-    return linear(ctx, layer.self_o, merged);
+    auto lane_rows = [&](size_t offset) {
+        return ggml_view_2d(ctx, qkv, n_embd, lanes, qkv->nb[1], offset);
+    };
+    ggml_tensor* k_plane =
+        ggml_set_rows(ctx, plane_rows(0), lane_rows(static_cast<size_t>(n_embd) * element), rows);
+    ggml_tensor* v_plane = ggml_set_rows(
+        ctx, plane_rows(1), lane_rows(static_cast<size_t>(2 * n_embd) * element), rows);
+    auto plane_heads = [&](ggml_tensor* plane) {
+        return ggml_permute(
+            ctx,
+            ggml_view_4d(
+                ctx, plane, d_head, tr.n_head, cache.n_ctx, lanes,
+                static_cast<size_t>(d_head) * aes, static_cast<size_t>(n_embd) * aes, arena->nb[1],
+                0),
+            0, 2, 1, 3);
+    };
+    ggml_tensor* heads = ggml_flash_attn_ext(
+        ctx, q, plane_heads(k_plane), plane_heads(v_plane), mask,
+        1.0f / std::sqrt(static_cast<float>(d_head)), 0.0f, 0.0f);
+    return linear(ctx, layer.self_o, ggml_reshape_2d(ctx, heads, n_embd, lanes));
 }
 
 static ggml_tensor*
 local_transformer_forward_cached_fixed_pos(
     ggml_context* ctx, ggml_cgraph* gf, const magpietts_transformer& tr, ggml_tensor* x,
     ggml_tensor* pos_emb, DecoderKvCache& cache, int n_past) {
-    pos_emb = ggml_cont(ctx, ggml_cast(ctx, pos_emb, GGML_TYPE_F32));
+    pos_emb = as_f32_contig(ctx, pos_emb);
     x = ggml_add(ctx, x, pos_emb);
 
     for (int il = 0; il < (int)tr.layers.size(); ++il) {
@@ -727,9 +770,8 @@ static ggml_tensor*
 local_transformer_forward_cached_pair_fixed_pos(
     ggml_context* ctx, ggml_cgraph* gf, const magpietts_transformer& tr, ggml_tensor* x,
     ggml_tensor* pos_emb, DecoderKvCache& cond_cache, DecoderKvCache& uncond_cache,
-    LocalTransformerCudaAttentionCache* cuda_attention_cache, ggml_tensor* cache_state,
-    int n_past) {
-    pos_emb = ggml_cont(ctx, ggml_cast(ctx, pos_emb, GGML_TYPE_F32));
+    LocalTransformerCudaAttentionCache* cuda_attention_cache, int cuda_codebook_idx, int n_past) {
+    pos_emb = as_f32_contig(ctx, pos_emb);
     x = ggml_add(ctx, x, pos_emb);
     for (int il = 0; il < static_cast<int>(tr.layers.size()); ++il) {
         const magpietts_layer& layer = tr.layers[static_cast<size_t>(il)];
@@ -737,7 +779,7 @@ local_transformer_forward_cached_pair_fixed_pos(
         ggml_tensor* cur = layer_norm(ctx, x, layer.norm_self);
         cur = cuda_attention_cache
                   ? local_self_attention_cuda_cached_pair(
-                        ctx, tr, layer, *cuda_attention_cache, il, cache_state, cur)
+                        ctx, tr, layer, *cuda_attention_cache, il, cuda_codebook_idx, cur)
                   : local_self_attention_cached_pair(
                         ctx, gf, tr, layer, cond_cache, uncond_cache, il, n_past, cur);
         x = ggml_add(ctx, residual, cur);
@@ -755,7 +797,7 @@ local_transformer_forward_cached_pair_fixed_pos(
 static bool
 local_transformer_graph_init(
     const magpietts_model& model, bool pair, int codebook_idx, local_transformer_graph_bank& bank,
-    local_transformer_graph& graph) {
+    local_transformer_graph& graph, int batch = 1) {
     const ggml_nvtx::range nvtx_range(
         pair ? "magpietts_local_transformer_pair_graph_init"
              : "magpietts_local_transformer_graph_init");
@@ -784,14 +826,11 @@ local_transformer_graph_init(
     graph.gf = ggml_new_graph_custom(graph.ctx, MAGPIETTS_MAX_NODES, false);
     graph.codebook_idx = codebook_idx;
     graph.seq_len = 1;
+    graph.batch = batch > 0 ? batch : 1;
     graph.pair = pair;
     const bool cuda_cached_attention =
         pair && magpietts_fused_cached_attention_available(model.backend);
 
-    if (cuda_cached_attention) {
-        graph.cache_state =
-            bank.pair_cuda_attention_cache.cache_states[static_cast<size_t>(codebook_idx)];
-    }
 
     if (!model.local.pos_emb || model.local.pos_emb->ne[0] != model.local.n_embd ||
         model.local.pos_emb->ne[1] <= codebook_idx) {
@@ -810,22 +849,24 @@ local_transformer_graph_init(
 
         ggml_tensor* input_cond = nullptr;
         ggml_tensor* input_uncond = nullptr;
+        const int batch_columns = graph.batch;
         if (codebook_idx == 0) {
-            graph.dec_cond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
+            graph.dec_cond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
             ggml_set_name(
                 graph.dec_cond, pair ? "magpietts_local_transformer_dec_cond"
                                      : "magpietts_local_transformer_dec_last");
             ggml_set_input(graph.dec_cond);
             input_cond = graph.dec_cond;
             if (pair) {
-                graph.dec_uncond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
+                graph.dec_uncond =
+                    ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
                 ggml_set_name(graph.dec_uncond, "magpietts_local_transformer_dec_uncond");
                 ggml_set_input(graph.dec_uncond);
                 input_uncond = graph.dec_uncond;
             }
         } else {
             const std::string name = "magpietts_local_transformer_prev_code";
-            graph.prev_token = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, 1);
+            graph.prev_token = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, batch_columns);
             ggml_set_name(graph.prev_token, name.c_str());
             ggml_set_input(graph.prev_token);
             ggml_tensor* emb = ggml_get_rows(
@@ -849,16 +890,17 @@ local_transformer_graph_init(
             ggml_tensor* out_pair = local_transformer_forward_cached_pair_fixed_pos(
                 graph.ctx, graph.gf, model.local, cur_pair, graph.pos_emb, bank.cond_cache,
                 bank.uncond_cache,
-                cuda_cached_attention ? &bank.pair_cuda_attention_cache : nullptr,
-                graph.cache_state, codebook_idx);
+                cuda_cached_attention ? &bank.pair_cuda_attention_cache : nullptr, codebook_idx,
+                codebook_idx);
             ggml_tensor* logits_pair = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_pair, model.lt_out_b[codebook_idx]);
-            logits_pair = ggml_cont(graph.ctx, ggml_cast(graph.ctx, logits_pair, GGML_TYPE_F32));
-            graph.logits_cond =
-                ggml_view_2d(graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1], 0);
+            logits_pair = as_f32_contig(graph.ctx, logits_pair);
+            graph.logits_cond = ggml_view_2d(
+                graph.ctx, logits_pair, h.audio_vocab_size, batch_columns, logits_pair->nb[1], 0);
             graph.logits_uncond = ggml_view_2d(
-                graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1],
-                cuda_cached_attention ? logits_pair->nb[1] : logits_pair->nb[2]);
+                graph.ctx, logits_pair, h.audio_vocab_size, batch_columns, logits_pair->nb[1],
+                cuda_cached_attention ? (size_t)batch_columns * logits_pair->nb[1]
+                                      : logits_pair->nb[2]);
             ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits_cond");
             ggml_set_name(graph.logits_uncond, "magpietts_local_transformer_logits_uncond");
             ggml_set_output(graph.logits_cond);
@@ -874,8 +916,7 @@ local_transformer_graph_init(
                 codebook_idx);
             graph.logits_cond = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_cond, model.lt_out_b[codebook_idx]);
-            graph.logits_cond =
-                ggml_cont(graph.ctx, ggml_cast(graph.ctx, graph.logits_cond, GGML_TYPE_F32));
+            graph.logits_cond = as_f32_contig(graph.ctx, graph.logits_cond);
             ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits");
             ggml_set_output(graph.logits_cond);
             ggml_build_forward_expand(graph.gf, graph.logits_cond);
@@ -1068,9 +1109,10 @@ local_transformer_graph_eval_cuda(
                 return false;
             }
             char error[256] = {};
+            const int batch = graph.batch > 0 ? graph.batch : 1;
             if (!magpietts_cuda_copy_sampled_code_to_device(
-                    cuda_sample.sampler, prev_code_count - 1, graph.prev_token->data, error,
-                    sizeof(error))) {
+                    cuda_sample.sampler, (prev_code_count - 1) * batch, batch,
+                    graph.prev_token->data, error, sizeof(error))) {
                 fprintf(
                     stderr, "CUDA local-transformer previous-token copy failed: %s\n",
                     error[0] ? error : "unknown error");
@@ -1121,10 +1163,16 @@ local_transformer_graph_eval_cuda(
     const float* logits_uncond =
         graph.pair ? (const float*)graph.logits_uncond->data + off : nullptr;
     char error[256] = {};
+    // One codebook per item. Codes are round-major -- round c occupies slots
+    // [c*B, c*B+B) -- so the next round's handoff is one contiguous copy, and
+    // the codebook offset seeding the RNG becomes c*B+b, distinct for every
+    // (round, item) pair. At batch one that expression is c, unchanged.
+    const int sample_batch = graph.batch > 0 ? graph.batch : 1;
     const bool ok = magpietts_cuda_sample_codebooks_device_configured(
-        cuda_sample.sampler, logits_cond, logits_uncond, 1, model.hparams.audio_vocab_size,
-        model.hparams.audio_codebook_size, model.hparams.audio_eos_id, codebook_idx, codebook_idx,
-        error, sizeof(error));
+        cuda_sample.sampler, logits_cond, logits_uncond, sample_batch,
+        model.hparams.audio_vocab_size, model.hparams.audio_codebook_size,
+        model.hparams.audio_eos_id, codebook_idx * sample_batch, codebook_idx * sample_batch, error,
+        sizeof(error));
     if (!ok) {
         fprintf(
             stderr, "CUDA local-transformer sampling failed: %s\n",
@@ -1165,17 +1213,20 @@ static bool
 local_transformer_graph_bank_eval_cuda(
     const magpietts_model& model, local_transformer_graph_bank& bank, bool use_cfg,
     const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
-    int prev_code_count, int codebook_idx, int threads,
-    magpietts_cuda_sample_request& cuda_sample) {
+    int prev_code_count, int codebook_idx, int threads, magpietts_cuda_sample_request& cuda_sample,
+    int batch) {
     std::vector<local_transformer_graph>& graphs = use_cfg ? bank.pair_graphs : bank.single_graphs;
     if ((int)graphs.size() <= codebook_idx) {
         graphs.resize((size_t)codebook_idx + 1);
     }
+    batch = batch > 0 ? batch : 1;
 
     local_transformer_graph& graph = graphs[(size_t)codebook_idx];
+    // The batch is part of the shape, so a wave of a different width rebuilds.
+    // Waves are hundreds of steps long, so that is once per wave.
     if (!graph.ctx || !graph.gf || !graph.allocr || graph.codebook_idx != codebook_idx ||
-        graph.pair != use_cfg) {
-        if (!local_transformer_graph_init(model, use_cfg, codebook_idx, bank, graph)) {
+        graph.pair != use_cfg || graph.batch != batch) {
+        if (!local_transformer_graph_init(model, use_cfg, codebook_idx, bank, graph, batch)) {
             return false;
         }
     }
@@ -1310,11 +1361,22 @@ sample_local_codebooks_cuda_impl(
     const magpietts_backend_tensor& uncond_hidden, bool use_cfg, float cfg_scale, float temperature,
     int top_k, bool forbid_audio_eos, int threads, local_transformer_graph_bank& local_graphs,
     magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes) {
+    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch) {
     const ggml_nvtx::range nvtx_range("magpietts_sample_local_codebooks_cuda");
     const auto& h = model.hparams;
-    if (!local_graphs.beginFrame(model, use_cfg)) {
+    batch = batch > 0 ? batch : 1;
+    if (!local_graphs.beginFrame(model, use_cfg, batch)) {
         return false;
+    }
+    const void* cond_ptr = cond_hidden.tensor ? cond_hidden.tensor->data : nullptr;
+    const void* uncond_ptr = uncond_hidden.tensor ? uncond_hidden.tensor->data : nullptr;
+    if (local_graphs.sequence_batch != batch || local_graphs.sequence_cond_ptr != cond_ptr ||
+        local_graphs.sequence_uncond_ptr != uncond_ptr) {
+        magpietts_cuda_sampler_sequence_invalidate(cuda_sampler);
+        local_graphs.sequence_batch = batch;
+        local_graphs.sequence_cond_ptr = cond_ptr;
+        local_graphs.sequence_uncond_ptr = uncond_ptr;
+        local_graphs.sequence_warmup_left = 3;
     }
     char stream_error[256] = {};
     if (!magpietts_cuda_sampler_bind_stream(
@@ -1350,7 +1412,7 @@ sample_local_codebooks_cuda_impl(
         for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             if (!local_transformer_graph_bank_eval_cuda(
                     model, local_graphs, use_cfg, cond_hidden, uncond_hidden, c, c, threads,
-                    cuda_sample)) {
+                    cuda_sample, batch)) {
                 return false;
             }
         }
@@ -1395,7 +1457,9 @@ sample_local_codebooks_cuda_impl(
     } else {
         chain_ok =
             magpietts_cuda_sampler_upload_config(cuda_sampler, error, sizeof(error)) && run_chain();
-        if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
+        if (local_graphs.sequence_warmup_left > 0) {
+            --local_graphs.sequence_warmup_left;
+        } else if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
             // Initialize the per-codebook graphs before composing them.
             magpietts_cuda_sampler_sequence_mark_warm(cuda_sampler);
         }
@@ -1406,12 +1470,12 @@ sample_local_codebooks_cuda_impl(
             error[0] ? error : "unknown error");
         return false;
     }
-    codes.assign((size_t)h.stacked_audio_codebooks(), 0);
-    argmax_codes.assign((size_t)h.stacked_audio_codebooks(), 0);
+    const int sampled_slots = h.stacked_audio_codebooks() * batch;
+    codes.assign((size_t)sampled_slots, 0);
+    argmax_codes.assign((size_t)sampled_slots, 0);
     error[0] = '\0';
     if (!magpietts_cuda_copy_sampled_codebooks(
-            cuda_sampler, h.stacked_audio_codebooks(), codes.data(), argmax_codes.data(), error,
-            sizeof(error))) {
+            cuda_sampler, sampled_slots, codes.data(), argmax_codes.data(), error, sizeof(error))) {
         fprintf(
             stderr, "CUDA local-transformer sampled-code host copy failed: %s\n",
             error[0] ? error : "unknown error");
@@ -1472,11 +1536,11 @@ LocalCodebookSampler::sampleCuda(
     const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
     bool use_cfg, float cfg_scale, float temperature, int top_k, bool forbid_audio_eos,
     magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes) {
+    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch) {
     return sample_local_codebooks_cuda_impl(
         model_, cond_hidden, uncond_hidden, use_cfg, cfg_scale, temperature, top_k,
         forbid_audio_eos, threads_, *graph_bank_, cuda_sampler, seed, frame_index, codes,
-        argmax_codes);
+        argmax_codes, batch);
 }
 #endif
 
