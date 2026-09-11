@@ -143,6 +143,31 @@ stock comparison therefore requires both a pristine ggml checkout and
   ReLU epilogues. This preserves the VoiceChat perception stem's native BF16
   behavior without adding standalone conversion kernels.
 
+- **0022-sve-vec-dot-f32-tail.patch** - fixes ggml_vec_dot_f32's predicated SVE
+  tail, which used svmad_f32_m. That intrinsic merges into its first operand,
+  so the inactive lanes of the accumulator took the zeroed lanes of the freshly
+  loaded x vector instead of keeping their running sums. Any dot product longer
+  than one SVE vector whose length is not a multiple of the vector width
+  silently lost work -- on a 128-bit implementation, 25%, 49% or 74% of the
+  result depending on the tail length. This is an upstream ggml bug and should
+  also be sent to ggml. `test-backend-ops -o CONV_TRANSPOSE_1D` already fails
+  on an SVE host because of it, but blames the wrong side: the harness scores
+  every backend against the CPU, so a bug in the CPU presents as the CUDA
+  kernel being wrong. The patch also carries `tests/test-vec-dot-f32.cpp`,
+  which checks the CPU against arithmetic and so names the culprit -- and is
+  the only one of the two that catches it at all in a CPU-only build, where
+  there is no second backend to disagree.
+
+- **0023-im2col-1d-coalesced-tiles.patch** - the generic im2col coalesces its
+  store but scatters its load, leaving warp neighbours far apart in the source
+  row. Staging each output tile through shared memory makes both sides
+  contiguous. Bit-identical output; the kernel goes from 74.3 ms to 61.3 ms
+  over the same 12,052 launches on a five-sentence paragraph. Extends the
+  existing im2col 1D cases in `tests/test-backend-ops.cpp`: those are either
+  too short to fill a tile (OW=18) or unit-stride and single-batch, so three
+  defect classes confined to the interior of a blocked kernel survive all
+  eleven of them.
+
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the
