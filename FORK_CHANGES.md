@@ -51,7 +51,9 @@ the linked Obsidian vault notes for the user-facing side of each story.
 - **Files:** `src/asr/diar/diar_pipeline.{h,cpp}`, `src/asr/recognizer.{h,cpp}`,
   `server/http/http_server.cpp`, `tests/cpp/asr/test_diar_speaker_change.cpp` (new),
   `tests/cpp/asr/test_diar_recognizer.cpp`, `tests/cpp/asr/CMakeLists.txt`,
-  `tests/integration/http_conformance_test.py`.
+  `tests/integration/http_conformance_test.py`,
+  `docs/superpowers/specs/2026-09-13-live-speaker-change-event-design.md` (new),
+  `docs/superpowers/plans/2026-09-13-live-speaker-change-event.md` (new).
 - **What:** `/v1/audio/transcriptions/realtime` only reported diarization
   results as word-level speaker tags on `.completed` events -- i.e. only once
   a client sent `input_audio_buffer.commit`. `NemoSpeech`'s client-side
@@ -64,8 +66,14 @@ the linked Obsidian vault notes for the user-facing side of each story.
   change instead.
 - **Fix:** see `docs/superpowers/specs/2026-09-13-live-speaker-change-event-design.md`
   for the full design.
-- **Verified against:** `tests/cpp/asr/test_diar_speaker_change.cpp` (pure
-  logic, synthetic segments), an extended `test_diar_recognizer.cpp` run
-  against a real multi-speaker fixture, and the extended
-  `tests/integration/http_conformance_test.py` WebSocket assertions.
+- **Verified against:** the pure `detect_speaker_change`/`SpeakerChangeTracker`
+  logic is unit-tested end to end in
+  `tests/cpp/asr/test_diar_speaker_change.cpp` (synthetic segments, no model
+  needed). The event's JSON schema, `--diar-model` gating, and the critical
+  0-based-to-1-based `+1` conversion were verified end-to-end against a real
+  running server (observed `"speaker": N` correctly on the wire). A genuine
+  mid-stream speaker transition was **not** verified against real audio,
+  because no multi-speaker fixture is available in either this repo or the
+  companion `NeMoSpeech` project (confirmed via md5sum: all committed wavs
+  are byte-identical duplicates).
 - **Upstreaming status:** not yet proposed to `NVIDIA/NeMo-Speech.cpp`.

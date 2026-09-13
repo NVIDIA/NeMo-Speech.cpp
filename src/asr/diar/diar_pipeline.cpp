@@ -349,7 +349,10 @@ nemo_speech::asr::diar_segments_from_probs(
             if (sg.second - sg.first >= cfg.min_duration_on)
                 out.push_back({sg.first, sg.second, s});
     }
-    std::sort(out.begin(), out.end(), [](const DiarSegment& a, const DiarSegment& b) {
+    // stable_sort: two segments can share an identical t0 (padding can clamp
+    // multiple speakers' segment starts to 0.0 at stream start), and their
+    // relative order should stay deterministic run to run.
+    std::stable_sort(out.begin(), out.end(), [](const DiarSegment& a, const DiarSegment& b) {
         return a.t0 < b.t0;
     });
     return out;

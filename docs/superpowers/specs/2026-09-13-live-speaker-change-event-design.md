@@ -101,14 +101,23 @@ ignores it, exactly as it already ignores unrecognized fields today.
    ```
 
    Implementation: if `diar_` is null, always return `nullopt`. Otherwise
-   call `diar_->segments()`, look at `.back()` (the most recent segment).
-   Track the last-reported speaker as a new private member
-   (`std::optional<int> last_reported_speaker_`). If the list is non-empty
-   and `segments().back().speaker != last_reported_speaker_`, update
-   `last_reported_speaker_` and return the change; otherwise `nullopt`.
-   Called once per `push()`, not per `next()` poll loop iteration, since
-   `segments()` re-derives its result from the whole retained timeline each
-   call and only needs to be checked once per new audio chunk.
+   delegate to a `SpeakerChangeTracker` (`src/asr/diar/diar_pipeline.h`)
+   owned as a private member, calling `tracker.observe(diar_->segments())`.
+   `SpeakerChangeTracker` wraps the pure `detect_speaker_change()` comparator
+   with a policy that comparator alone can't express: a stream's very first
+   confirmed segment is a baseline, not a "change" — there's no genuine
+   prior speaker for it to differ from. Firing on it anyway matters here
+   because `http_server.cpp` destroys and recreates `RecognitionStream`
+   (and therefore its tracker) on every `input_audio_buffer.commit`; combined
+   with the intended client behavior (commit immediately on receiving this
+   event), an always-fires-on-first-segment implementation produces a
+   self-sustaining commit loop roughly every 1.6-2.4s during continuous
+   single-speaker speech, defeating the feature's purpose. The tracker
+   swallows that first observation silently and reports every genuine
+   subsequent transition normally. Called once per `push()`, not per
+   `next()` poll loop iteration, since `segments()` re-derives its result
+   from the whole retained timeline each call and only needs to be checked
+   once per new audio chunk.
 
 2. **`http_server.cpp`'s realtime handler (`append_audio`, around line
    1079):** after the existing `stream->push(...)` /
@@ -133,6 +142,15 @@ surface as a `speaker_diarization.changed` event, and thus a commit, within
 roughly 1-2 seconds of the change happening — a large improvement over the
 current up-to-15-second worst case, though this should be measured against
 real audio during implementation rather than assumed.
+
+`start_time` and `speaker` are relative to and scoped to the current
+stream, not the whole session: since `http_server.cpp` destroys and
+recreates `RecognitionStream` on every commit, `start_time` restarts near
+0 after each commit, and a given `speaker` integer may refer to a
+different real person before vs. after a commit. This matches the
+existing `words[].start`/`speaker_tag` behavior already exposed by this
+same endpoint's `completed` event — not a new limitation this feature
+introduces.
 
 ## Testing
 
@@ -166,3 +184,17 @@ real audio during implementation rather than assumed.
   `run.py`'s two-pass workaround) — unrelated to the realtime WS handler.
 - The `NemoSpeech` overlay/debug-view UI redesign — separate, downstream
   work in that repo.
+
+## Known limitations
+
+`detect_speaker_change`/`SpeakerChangeTracker` compare against
+`segments().back()`, the most recently-*started* segment (segments are
+sorted by `t0`), not necessarily the currently-active speaker. Sortformer's
+sigmoid output allows genuinely overlapping segments, so a brief
+interjection can "stick" as `back()` even after the original speaker
+resumes and keeps talking, until the original speaker's next pause starts
+a fresh segment. This is a real gap for conversational audio with
+interjections; a proper fix would resolve the active speaker via
+`DiarStream::speaker_for_frames()`'s frontier-lookup instead, but that's a
+more involved change deserving its own dedicated pass rather than being
+folded into this event's initial implementation.

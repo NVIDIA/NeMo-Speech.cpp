@@ -385,10 +385,7 @@ std::optional<DiarSpeakerChange>
 RecognitionStream::poll_speaker_change() {
     if (!diar_)
         return std::nullopt;
-    auto change = detect_speaker_change(diar_->segments(), last_reported_speaker_);
-    if (change)
-        last_reported_speaker_ = change->speaker;
-    return change;
+    return speaker_change_tracker_.observe(diar_->segments());
 }
 
 Result

@@ -1174,6 +1174,10 @@ struct Server::Impl {
                         ensure_stream();
                         if (!emit(stream->finish()))
                             break;
+                        // poll_speaker_change() is deliberately not called after finish():
+                        // any speaker change confirmed only in the flushed tail goes
+                        // unreported by this event, but is still captured correctly by
+                        // the completed event's own word-level speaker tags above.
                         stream.reset();
                         audio_bytes = 0;
                         Value committed(Value::Object{});

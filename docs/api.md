@@ -90,7 +90,11 @@ discards buffered audio (`input_audio_buffer.cleared`).
 Server events: `session.created`, `session.updated`,
 `conversation.item.input_audio_transcription.delta` (partials), `.completed`
 (finals, with `words` when requested), `input_audio_buffer.committed`,
-`input_audio_buffer.cleared`, and `error`.
+`input_audio_buffer.cleared`, `conversation.item.speaker_diarization.changed`
+(emitted when diarization detects a confirmed speaker change, carrying
+`speaker` (1-based int) and `start_time` (seconds) fields; only emitted when
+`speaker_diarization: true` was set on the session and a diarizer model is
+loaded), and `error`.
 
 For backward compatibility, `/v1/realtime` serves this transcription protocol
 when VoiceChat is not loaded. Use the explicit audio-namespaced path for new

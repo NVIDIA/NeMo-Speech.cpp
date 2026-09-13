@@ -100,8 +100,7 @@ class RecognitionStream {
     std::unique_ptr<AsrRunner> runner_;
     // Optional sidecar over the same model-rate audio as ASR.
     std::unique_ptr<DiarStream> diar_;
-    // 0-based; matches DiarSegment::speaker. nullopt = nothing reported yet.
-    std::optional<int> last_reported_speaker_;
+    SpeakerChangeTracker speaker_change_tracker_;
     AsrRequestOptions opts_;
     int input_sample_rate_ = 0;
     std::unique_ptr<audio::AudioResampler> resampler_;
