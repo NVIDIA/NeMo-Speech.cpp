@@ -344,6 +344,10 @@ def main() -> None:
         completed = [
             event for event in events if event.get("type", "").endswith("transcription.completed")
         ]
+        speaker_changes = [
+            event for event in events
+            if event.get("type") == "conversation.item.speaker_diarization.changed"
+        ]
         require(completed and completed[-1].get("transcript", "").strip(), "WebSocket final")
         require("words" in completed[-1], "WebSocket word timestamps")
         if args.diar_model:
@@ -351,6 +355,13 @@ def main() -> None:
                 any(word.get("speaker", 0) > 0 for word in completed[-1]["words"]),
                 "WebSocket speaker tags",
             )
+        if args.diar_model:
+            require(speaker_changes, "WebSocket speaker-change event")
+            for change in speaker_changes:
+                require(isinstance(change.get("speaker"), int) and change["speaker"] > 0,
+                        "speaker-change event has a 1-based speaker id")
+                require(isinstance(change.get("start_time"), (int, float)),
+                        "speaker-change event has a start_time")
         require(
             any(event.get("type") == "input_audio_buffer.cleared" for event in events),
             "WebSocket clear acknowledgement",
