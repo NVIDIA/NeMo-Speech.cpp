@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -127,6 +128,22 @@ std::vector<DiarSegment> diar_segments_from_probs(
 int speaker_for_frame_range(
     const std::vector<float>& probs, int64_t probs_base, int n_spk, double sec_per_frame,
     const std::vector<DiarSegment>& frozen, int64_t start_frame, int64_t end_frame);
+
+// Speaker-change detection for the realtime WebSocket handler
+// (conversation.item.speaker_diarization.changed): compares the most
+// recent confirmed segment's speaker against `last_reported` (nullopt if
+// nothing has been reported yet for this stream) and returns the new
+// speaker + that segment's start time iff they differ. `segments` must be
+// sorted ascending by t0 (DiarStream::segments() already guarantees this).
+// Both `last_reported` and the returned `speaker` are 0-based, matching
+// DiarSegment::speaker -- callers convert to the wire's 1-based convention
+// themselves (see http_server.cpp's existing `segment.speaker + 1`).
+struct DiarSpeakerChange {
+    int speaker;
+    double start_time;
+};
+std::optional<DiarSpeakerChange> detect_speaker_change(
+    const std::vector<DiarSegment>& segments, std::optional<int> last_reported);
 
 // Per-stream streaming state + timeline.
 class DiarStream {
