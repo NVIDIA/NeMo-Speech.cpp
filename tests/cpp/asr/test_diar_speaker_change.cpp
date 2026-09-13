@@ -116,11 +116,12 @@ test_tracker_genuine_change_after_baseline_is_reported() {
 bool
 test_tracker_second_genuine_change_is_also_reported() {
     SpeakerChangeTracker tracker;
-    tracker.observe({{0.0, 2.0, 0}});                                        // baseline
-    tracker.observe({{0.0, 2.0, 0}, {2.0, 4.0, 1}});                         // first real change
+    tracker.observe({{0.0, 2.0, 0}});                 // baseline
+    tracker.observe({{0.0, 2.0, 0}, {2.0, 4.0, 1}});  // first real change
     const auto got = tracker.observe({{0.0, 2.0, 0}, {2.0, 4.0, 1}, {4.0, 6.0, 2}});
     if (!got || got->speaker != 2 || got->start_time != 4.0) {
-        std::fprintf(stderr, "[FAIL] expected speaker 2 reported at t=4.0 as a second real change\n");
+        std::fprintf(
+            stderr, "[FAIL] expected speaker 2 reported at t=4.0 as a second real change\n");
         return false;
     }
     return true;
@@ -139,7 +140,9 @@ test_tracker_empty_segments_never_reported_and_does_not_corrupt_state() {
     // should still be treated as the baseline and not reported.
     const auto got2 = tracker.observe({{0.0, 2.0, 0}});
     if (got2) {
-        std::fprintf(stderr, "[FAIL] expected the real first segment to still establish baseline silently\n");
+        std::fprintf(
+            stderr,
+            "[FAIL] expected the real first segment to still establish baseline silently\n");
         return false;
     }
     return true;

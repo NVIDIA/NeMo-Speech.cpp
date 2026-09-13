@@ -24,9 +24,10 @@ test_frozen_prefix_used_for_compacted_words() {
     // live window's edge.
     const std::vector<DiarSegment> frozen = {{0.0, 50.0, 1}};
     const std::vector<float> live = {0.9f, 0.1f};  // one frame, n_spk=2, favors speaker 0
-    const int got = speaker_for_frame_range(live, /*probs_base=*/100, /*n_spk=*/2,
-                                             /*sec_per_frame=*/1.0, frozen,
-                                             /*start_frame=*/20, /*end_frame=*/22);
+    const int got = speaker_for_frame_range(
+        live, /*probs_base=*/100, /*n_spk=*/2,
+        /*sec_per_frame=*/1.0, frozen,
+        /*start_frame=*/20, /*end_frame=*/22);
     if (got != 1) {
         std::fprintf(stderr, "[FAIL] expected frozen speaker 1, got %d\n", got);
         return false;
@@ -39,10 +40,12 @@ test_live_window_unaffected() {
     // A range fully inside the live window must still resolve exactly as
     // before: mean probability across the range, argmax.
     const std::vector<DiarSegment> frozen = {{0.0, 50.0, 1}};
-    const std::vector<float> live = {0.1f, 0.9f, 0.2f, 0.8f};  // 2 frames, n_spk=2, both favor speaker 1
-    const int got = speaker_for_frame_range(live, /*probs_base=*/100, /*n_spk=*/2,
-                                             /*sec_per_frame=*/1.0, frozen,
-                                             /*start_frame=*/100, /*end_frame=*/102);
+    const std::vector<float> live = {
+        0.1f, 0.9f, 0.2f, 0.8f};  // 2 frames, n_spk=2, both favor speaker 1
+    const int got = speaker_for_frame_range(
+        live, /*probs_base=*/100, /*n_spk=*/2,
+        /*sec_per_frame=*/1.0, frozen,
+        /*start_frame=*/100, /*end_frame=*/102);
     if (got != 1) {
         std::fprintf(stderr, "[FAIL] expected live-window speaker 1, got %d\n", got);
         return false;
@@ -57,9 +60,10 @@ test_gap_between_frozen_segments_falls_back_to_nearest() {
     // whichever neighbor is temporally closer.
     const std::vector<DiarSegment> frozen = {{0.0, 10.0, 0}, {20.0, 30.0, 1}};
     const std::vector<float> live = {0.5f, 0.5f};
-    const int got = speaker_for_frame_range(live, /*probs_base=*/100, /*n_spk=*/2,
-                                             /*sec_per_frame=*/1.0, frozen,
-                                             /*start_frame=*/12, /*end_frame=*/13);
+    const int got = speaker_for_frame_range(
+        live, /*probs_base=*/100, /*n_spk=*/2,
+        /*sec_per_frame=*/1.0, frozen,
+        /*start_frame=*/12, /*end_frame=*/13);
     if (got != 0) {
         std::fprintf(stderr, "[FAIL] expected nearest frozen speaker 0, got %d\n", got);
         return false;
