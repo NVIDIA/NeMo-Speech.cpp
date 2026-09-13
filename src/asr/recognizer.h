@@ -83,6 +83,11 @@ class RecognitionStream {
     std::optional<Result> next();
     // No more audio: flush the tail and return the end-of-stream final Result.
     Result finish();
+    // Poll for a confirmed speaker change since the last call (or since
+    // stream start, for the first call). Always returns nullopt if
+    // diarization isn't enabled for this stream. See detect_speaker_change()
+    // in diar_pipeline.h for the comparison semantics.
+    std::optional<DiarSpeakerChange> poll_speaker_change();
 
     const AsrRequestOptions& options() const { return opts_; }
 
@@ -95,6 +100,8 @@ class RecognitionStream {
     std::unique_ptr<AsrRunner> runner_;
     // Optional sidecar over the same model-rate audio as ASR.
     std::unique_ptr<DiarStream> diar_;
+    // 0-based; matches DiarSegment::speaker. nullopt = nothing reported yet.
+    std::optional<int> last_reported_speaker_;
     AsrRequestOptions opts_;
     int input_sample_rate_ = 0;
     std::unique_ptr<audio::AudioResampler> resampler_;

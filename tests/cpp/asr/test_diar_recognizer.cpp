@@ -72,6 +72,7 @@ main(int argc, char** argv) {
             for (const auto& w : r.alternatives[0].words) words.push_back(w);
     };
 
+    int speaker_changes = 0;
     const size_t push = 160 * 16;  // 160 ms
     for (size_t off = 0; off < audio.size(); off += push) {
         stream->push(audio.data() + off, std::min(push, audio.size() - off));
@@ -79,6 +80,12 @@ main(int argc, char** argv) {
             take(*r);
             if (!r->is_final)
                 break;
+        }
+        if (auto change = stream->poll_speaker_change()) {
+            speaker_changes++;
+            std::printf(
+                "[diar-rec] speaker change -> speaker %d at %.2fs\n", change->speaker + 1,
+                change->start_time);
         }
     }
     take(stream->finish());
@@ -119,7 +126,9 @@ main(int argc, char** argv) {
     for (const auto& [tag, n] : tag_counts)
         std::printf("[diar-rec]   speaker %d: %d words\n", tag, n);
 
-    if (words.empty() || untagged > 0 || static_cast<int>(tag_counts.size()) < min_speakers) {
+    std::printf("[diar-rec] %d speaker changes detected\n", speaker_changes);
+    if (words.empty() || untagged > 0 || static_cast<int>(tag_counts.size()) < min_speakers ||
+        (min_speakers > 1 && speaker_changes < 1)) {
         std::printf("[diar-rec] FAIL\n");
         return 1;
     }

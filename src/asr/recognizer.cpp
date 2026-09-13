@@ -381,6 +381,16 @@ RecognitionStream::force_endpoint() {
     runner_->force_eou();
 }
 
+std::optional<DiarSpeakerChange>
+RecognitionStream::poll_speaker_change() {
+    if (!diar_)
+        return std::nullopt;
+    auto change = detect_speaker_change(diar_->segments(), last_reported_speaker_);
+    if (change)
+        last_reported_speaker_ = change->speaker;
+    return change;
+}
+
 Result
 RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const {
     Result r;
