@@ -72,12 +72,9 @@ struct EncoderConfig {
     // 2 frames, giving cache_chunk_frames = 1 + R after the drop.
     int cache_drop_extra = 2;
 
-    // Causal subsampling starts at frame zero. Only subsequent chunks carry
-    // the sub+1 mel-frame overlap whose encoded prefix must be discarded.
-    int cache_chunk_mel_frames(bool first_chunk) const {
-        return first_chunk ? 1 + subsampling_factor * cache_right_ctx
-                           : subsampling_factor + 1 + subsampling_factor * cache_chunk_frames;
-    }
+    // Causal subsampling starts at frame zero, without a preceding overlap.
+    // Subsequent-chunk geometry remains owned by the runner.
+    int cache_first_chunk_mel_frames() const { return 1 + subsampling_factor * cache_right_ctx; }
 
     // Offline attention limits are independent of the streaming cache context.
     // -1 means unlimited; finite values preserve a model's trained attention window.

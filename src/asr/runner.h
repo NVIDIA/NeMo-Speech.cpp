@@ -276,6 +276,7 @@ class CacheStreamRunner final : public AsrRunner {
     RnntDecodeStats rnnt_decode_stats() const;
 
    private:
+    int next_chunk_mel_frames() const;
     void process_one_chunk(bool /*is_last*/);
     void finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future);
     void upload_attn_mask();

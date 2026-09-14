@@ -1415,7 +1415,7 @@ FastConformerEncoder::build_graph(
     // independently by each subsampling convolution. A shape-based distinction
     // also keeps concurrent first/steady-state streams in separate graph keys.
     const bool first_chunk =
-        input_tensors.get_tensor(0).tensor->ne[1] == cfg_.cache_chunk_mel_frames(true);
+        input_tensors.get_tensor(0).tensor->ne[1] == cfg_.cache_first_chunk_mel_frames();
     // Then drop the leading `cache_drop_extra` frames from the subsampled
     // output so the visible chunk length is exactly cache_chunk_frames
     // (= 1 + R). The dropped frames overlap with the tail of the previous

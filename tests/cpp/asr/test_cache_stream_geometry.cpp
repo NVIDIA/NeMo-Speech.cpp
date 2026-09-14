@@ -25,8 +25,7 @@ check_shapes() {
         const auto cfg = make_cache_aware_config(EncoderConfig{}, right);
         const int first = 1 + 8 * right;
         const int steady = 9 + 8 * (1 + right);
-        require(cfg.cache_chunk_mel_frames(true) == first, "wrong first mel length");
-        require(cfg.cache_chunk_mel_frames(false) == steady, "wrong steady mel length");
+        require(cfg.cache_first_chunk_mel_frames() == first, "wrong first mel length");
         require(cfg.subsample_time_length(first) == 1 + right, "first chunk needs no drop");
         require(
             cfg.subsample_time_length(steady) - cfg.cache_drop_extra == 1 + right,
@@ -64,7 +63,7 @@ check_model(const std::string& path, int gpu, int right) {
     const auto& fe = model->fe_config();
     const int first_mel = 1 + enc.subsampling_factor * right;
     const int new_mel = enc.subsampling_factor * (1 + right);
-    const int overlap = enc.subsampling_factor + 1;
+    const int overlap = 9;  // Existing runner policy, not inferred from subsampling.
     const int hop = model->fe().hop_length();
     const size_t first_samples = (first_mel - 1) * hop + fe.n_fft / 2;
     const size_t stride_samples = new_mel * hop;

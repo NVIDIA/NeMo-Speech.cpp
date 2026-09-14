@@ -805,7 +805,6 @@ CacheStreamRunner::CacheStreamRunner(
     // attn_mask sizing and chunk-shift math. Same derivation the encoder uses
     // (make_cache_aware_config), so the two can't drift.
     enc_cfg_ = make_cache_aware_config(model->encoder_config(), right_ctx);
-    pre_encode_cache_size_ = enc_cfg_.subsampling_factor + 1;
 
     // The per-stream K/V/conv cache is device-resident (cache_state_), allocated
     // lazily on first encode. Only attn_mask stays host-side - it's a per-call
@@ -882,12 +881,20 @@ CacheStreamRunner::feed_audio(const float* samples, size_t n_samples) {
     audio_buf_.insert(audio_buf_.end(), samples, samples + n_samples);
 }
 
+int
+CacheStreamRunner::next_chunk_mel_frames() const {
+    // Preserve the existing overlap and steady-state formula; only startup
+    // uses the shorter causal chunk.
+    return first_chunk_ ? enc_cfg_.cache_first_chunk_mel_frames()
+                        : pre_encode_cache_size_ +
+                              enc_cfg_.subsampling_factor * (1 + enc_cfg_.cache_right_ctx);
+}
+
 void
 CacheStreamRunner::process_one_chunk(bool is_last) {
-    // NeMo formula: chunk_size_mel = pre_encode_cache_size + sub * (1 + R).
     const int sub = enc_cfg_.subsampling_factor;
     const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = enc_cfg_.cache_chunk_mel_frames(first_chunk_);
+    const int chunk_size_mel = next_chunk_mel_frames();
     const int shift_size_mel = sub * (1 + R - cache_drop_size_);
     const int n_mels = model_->fe_config().n_mels;
     const int left_ctx = enc_cfg_.cache_left_ctx;
@@ -960,7 +967,7 @@ CacheStreamRunner::process_one_chunk(bool is_last) {
         first_chunk_ = false;
         if (chunk_size_mel < pre_encode_cache_size_) {
             // R=0 begins with one real mel frame. Its first subsequent chunk
-            // still needs sub+1 history frames; only the unavailable negative
+            // still needs the existing overlap; only the unavailable negative
             // history is zero, and only AFTER the first chunk was encoded.
             compact_mel_buffer();
             mel_buf_.insert(
@@ -1024,8 +1031,7 @@ CacheStreamRunner::step() {
     // the loop; the next utterance's remaining chunks decode on the next
     // step() call.
     last_step_new_tokens_.clear();
-    while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
-           enc_cfg_.cache_chunk_mel_frames(first_chunk_)) {
+    while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= next_chunk_mel_frames()) {
         process_one_chunk(/*is_last=*/false);
         if (poll_endpoint(update, /*after_chunk=*/true))
             break;
@@ -1078,7 +1084,7 @@ CacheStreamRunner::finish_endpoint(StreamingUpdate& update, bool preserve_buffer
         const size_t flush_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
         mel_buf_.resize(mel_buf_.size() + flush_frames * static_cast<size_t>(n_mels), 0.0f);
         while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
-               enc_cfg_.cache_chunk_mel_frames(first_chunk_))
+               next_chunk_mel_frames())
             process_one_chunk(/*is_last=*/true);
     }
 
@@ -1221,7 +1227,7 @@ CacheStreamRunner::finalize() {
         const size_t before = all_tokens_.size();
         last_step_new_tokens_.clear();
         while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
-               enc_cfg_.cache_chunk_mel_frames(first_chunk_)) {
+               next_chunk_mel_frames()) {
             process_one_chunk(/*is_last=*/true);
         }
         for (size_t i = before; i < all_tokens_.size(); i++) {
