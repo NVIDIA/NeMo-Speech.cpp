@@ -1410,11 +1410,17 @@ FastConformerEncoder::build_graph(
         pre.set_first_tensor(ggml_runtime::ggml_bf_tensor(x_scaled, x.buft));
     }
 
+    // Only subsequent chunks carry overlap. The shorter first-chunk shape
+    // already produces exactly cache_chunk_frames, with causal padding handled
+    // independently by each subsampling convolution. A shape-based distinction
+    // also keeps concurrent first/steady-state streams in separate graph keys.
+    const bool first_chunk =
+        input_tensors.get_tensor(0).tensor->ne[1] == cfg_.cache_chunk_mel_frames(true);
     // Then drop the leading `cache_drop_extra` frames from the subsampled
     // output so the visible chunk length is exactly cache_chunk_frames
     // (= 1 + R). The dropped frames overlap with the tail of the previous
     // chunk (handled by the K/V cache).
-    if (cfg_.cache_drop_extra > 0) {
+    if (!first_chunk && cfg_.cache_drop_extra > 0) {
         auto x = pre.get_tensor(0);
         auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(x.buft);
         auto x_view = ggml_view_4d(
