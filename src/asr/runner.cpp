@@ -881,12 +881,20 @@ CacheStreamRunner::feed_audio(const float* samples, size_t n_samples) {
     audio_buf_.insert(audio_buf_.end(), samples, samples + n_samples);
 }
 
+int
+CacheStreamRunner::next_chunk_mel_frames() const {
+    // Preserve the existing overlap and steady-state formula; only startup
+    // uses the shorter causal chunk.
+    return first_chunk_ ? enc_cfg_.cache_first_chunk_mel_frames()
+                        : pre_encode_cache_size_ +
+                              enc_cfg_.subsampling_factor * (1 + enc_cfg_.cache_right_ctx);
+}
+
 void
 CacheStreamRunner::process_one_chunk(bool is_last) {
-    // NeMo formula: chunk_size_mel = pre_encode_cache_size + sub * (1 + R).
     const int sub = enc_cfg_.subsampling_factor;
     const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
+    const int chunk_size_mel = next_chunk_mel_frames();
     const int shift_size_mel = sub * (1 + R - cache_drop_size_);
     const int n_mels = model_->fe_config().n_mels;
     const int left_ctx = enc_cfg_.cache_left_ctx;
@@ -955,8 +963,23 @@ CacheStreamRunner::process_one_chunk(bool is_last) {
 
     // Advance mel buffer: drop shift_size_mel; keep overlap_mel_frames at
     // the head so the next chunk's leading frames see the same context.
-    const size_t shift_floats = static_cast<size_t>(shift_size_mel) * n_mels;
-    mel_offset_ = std::min(mel_offset_ + shift_floats, mel_buf_.size());
+    if (first_chunk_) {
+        first_chunk_ = false;
+        if (chunk_size_mel < pre_encode_cache_size_) {
+            // R=0 begins with one real mel frame. Its first subsequent chunk
+            // still needs the existing overlap; only the unavailable negative
+            // history is zero, and only AFTER the first chunk was encoded.
+            compact_mel_buffer();
+            mel_buf_.insert(
+                mel_buf_.begin(),
+                static_cast<size_t>(pre_encode_cache_size_ - chunk_size_mel) * n_mels, 0.0f);
+        } else {
+            mel_offset_ += static_cast<size_t>(chunk_size_mel - pre_encode_cache_size_) * n_mels;
+        }
+    } else {
+        const size_t shift_floats = static_cast<size_t>(shift_size_mel) * n_mels;
+        mel_offset_ = std::min(mel_offset_ + shift_floats, mel_buf_.size());
+    }
 }
 
 StreamingUpdate
@@ -1003,24 +1026,12 @@ CacheStreamRunner::step() {
         total_mel_frames_produced_ = i_start + n;
     }
 
-    const int sub = enc_cfg_.subsampling_factor;
-    const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
-
     // Process every whole chunk available, polling the endpointer per chunk
     // so a silence gap interior to one large feed still fires. An EOU breaks
     // the loop; the next utterance's remaining chunks decode on the next
     // step() call.
     last_step_new_tokens_.clear();
-    while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel) {
-        if (!stream_zero_padded_) {
-            // First-chunk zero-pad so the encoder's unconditional
-            // cache_drop_extra eats zero-pad, not the leading 160 ms of real audio.
-            compact_mel_buffer();
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
+    while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= next_chunk_mel_frames()) {
         process_one_chunk(/*is_last=*/false);
         if (poll_endpoint(update, /*after_chunk=*/true))
             break;
@@ -1070,14 +1081,10 @@ CacheStreamRunner::finish_endpoint(StreamingUpdate& update, bool preserve_buffer
     const int real_chunks_processed = chunks_processed_;
     finalizing_ = true;
     if (!mel_buf_.empty()) {
-        if (!stream_zero_padded_) {
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
         const size_t flush_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
         mel_buf_.resize(mel_buf_.size() + flush_frames * static_cast<size_t>(n_mels), 0.0f);
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel)
+        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
+               next_chunk_mel_frames())
             process_one_chunk(/*is_last=*/true);
     }
 
@@ -1093,7 +1100,7 @@ CacheStreamRunner::finish_endpoint(StreamingUpdate& update, bool preserve_buffer
     std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
     mel_buf_ = std::move(next_mel);
     mel_offset_ = 0;
-    stream_zero_padded_ = false;
+    first_chunk_ = true;
     total_frames_emitted_ = real_frames_emitted;
     chunks_processed_ = real_chunks_processed;
     last_enc_out_.clear();
@@ -1212,15 +1219,6 @@ CacheStreamRunner::finalize() {
     const int shift_size_mel = sub * (1 + R - cache_drop_size_);
     const size_t buffered = (mel_buf_.size() - mel_offset_) / n_mels;
     if (buffered > 0) {
-        // A stream shorter than one chunk never entered step()'s chunk
-        // loop, so the start-of-stream zero-pad hasn't happened yet; apply
-        // it here or the encoder's cache_drop_extra eats the leading
-        // ~160 ms of real audio instead of pad.
-        if (!stream_zero_padded_) {
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
         // Tail flush: pad enough zero mel for the final real frame to
         // see a full right-context window AND for the RNNT predictor
         // to get at least one all-zero enc frame to commit pending tail tokens.
@@ -1228,7 +1226,8 @@ CacheStreamRunner::finalize() {
         mel_buf_.resize(mel_buf_.size() + flush_pad_frames * static_cast<size_t>(n_mels), 0.0f);
         const size_t before = all_tokens_.size();
         last_step_new_tokens_.clear();
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel) {
+        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
+               next_chunk_mel_frames()) {
             process_one_chunk(/*is_last=*/true);
         }
         for (size_t i = before; i < all_tokens_.size(); i++) {
@@ -1274,7 +1273,7 @@ CacheStreamRunner::reset() {
     last_enc_T_ = 0;
     finalized_ = false;
     finalizing_ = false;
-    stream_zero_padded_ = false;
+    first_chunk_ = true;
     zero_caches();
     std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
     if (head_)

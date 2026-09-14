@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-// Cache-aware streaming encoder: one shared, fixed-shape FastConformer encoder
+// Cache-aware streaming encoder: one shared FastConformer encoder
 // Session whose per-layer K/V caches are two planes of one persistent arena
 // and whose convolution cache is a persistent matrix, with one indexed row per
 // stream. A microbatch supplies stream IDs, gathers those rows, and scatters
@@ -65,8 +65,9 @@ class CacheAwareEncoder {
     int chunk_frames();
 
     // One cache-aware encoder step for the stream owning `state`. `mel` is
-    // (n_mels x n_mel_frames) frame-major (= pre_encode_cache_size + sub*(1+R)
-    // frames). The stream's K/V/conv cache lives in `state` (device-resident,
+    // (n_mels x n_mel_frames) frame-major: first chunk = 1+sub*R; subsequent
+    // chunks = pre_encode_cache_size+sub*(1+R). Both produce 1+R encoder frames.
+    // The stream's K/V/conv cache lives in `state` (device-resident,
     // updated in-graph). `enc_out` receives (output_dim x T_enc) flat-packed
     // (d_model without a tail); T_enc = 1 + R. Thread-safe.
     void encode(
