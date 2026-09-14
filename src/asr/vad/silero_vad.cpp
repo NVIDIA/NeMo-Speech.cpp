@@ -178,10 +178,12 @@ class SileroVadModule : public ggml_runtime::Module {
         ggml_runtime::TensorBag out;
         out.add_tensor(ggml_runtime::ggml_bf_tensor(probabilities, buft));
         // Commit the active recurrent-state rows in-graph.
-        out.add_tensor(ggml_runtime::ggml_bf_tensor(
-            ggml_set_rows(g, h_arena, ggml_cont(g, h_state), slot_ids.tensor), buft));
-        out.add_tensor(ggml_runtime::ggml_bf_tensor(
-            ggml_set_rows(g, c_arena, ggml_cont(g, c_state), slot_ids.tensor), buft));
+        out.add_tensor(
+            ggml_runtime::ggml_bf_tensor(
+                ggml_set_rows(g, h_arena, ggml_cont(g, h_state), slot_ids.tensor), buft));
+        out.add_tensor(
+            ggml_runtime::ggml_bf_tensor(
+                ggml_set_rows(g, c_arena, ggml_cont(g, c_state), slot_ids.tensor), buft));
         return out;
     }
 
