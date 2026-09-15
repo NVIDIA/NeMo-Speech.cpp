@@ -50,8 +50,8 @@ main(int argc, char** argv) {
         }
         size_t n_elems = 1;
         for (int64_t d : ne) n_elems *= static_cast<size_t>(d);
-        const size_t nbytes = ggml_row_size(type, n_elems / static_cast<size_t>(ne[0])) *
-            static_cast<size_t>(ne[0]);
+        const size_t nbytes =
+            ggml_row_size(type, n_elems / static_cast<size_t>(ne[0])) * static_cast<size_t>(ne[0]);
         if (nbytes == 0) {
             continue;
         }
@@ -71,12 +71,13 @@ main(int argc, char** argv) {
     }
 
     if (checked == 0) {
-        std::fprintf(stderr, "[FAIL] no tensor in %s had decodable extents to check\n",
-            model_path.c_str());
+        std::fprintf(
+            stderr, "[FAIL] no tensor in %s had decodable extents to check\n", model_path.c_str());
         return 1;
     }
 
-    std::fprintf(stdout, "[PASS] mmap'd %d/%lld tensors match buffered-read bytes\n", checked,
+    std::fprintf(
+        stdout, "[PASS] mmap'd %d/%lld tensors match buffered-read bytes\n", checked,
         (long long)n_tensors);
     return 0;
 }

@@ -3,11 +3,11 @@
 //
 // llama-mmap.cpp (reused by GGUFLoader) logs via LLAMA_LOG_*; this supplies
 // the one symbol it needs without linking llama-impl.cpp (format() clash).
-#include "llama-impl.h"
-#include "runtime.h"
-
 #include <cstdarg>
 #include <cstdio>
+
+#include "llama-impl.h"
+#include "runtime.h"
 
 void
 llama_log_internal(ggml_log_level level, const char* fmt, ...) {
