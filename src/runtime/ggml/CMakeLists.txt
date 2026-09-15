@@ -10,6 +10,20 @@
 # link time. NOT installed — internal implementation detail.
 file(GLOB RUNTIME_GGML_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
+# GGUFLoader reuses llama.cpp's llama_file/llama_mmap (vendored in
+# llama.cpp/src/llama-mmap.{h,cpp}) for mmap-backed, zero-copy-capable model
+# loading rather than reimplementing them. Only this one self-contained
+# source is compiled in directly, not the full `llama` CMake target, which
+# would drag in the unrelated model/vocab/sampler/grammar/context machinery.
+# llama-impl.cpp (llama-mmap.cpp's usual logging/format helper TU) is
+# deliberately NOT linked: its format(const char*, ...) collides at link
+# time with this runtime's own (logging.cpp), which llama-mmap.cpp's calls
+# resolve to instead; llama_log_shim.cpp (in RUNTIME_GGML_SOURCES via the
+# glob above) supplies the one other symbol it needs, llama_log_internal.
+list(APPEND RUNTIME_GGML_SOURCES
+    ${CMAKE_SOURCE_DIR}/llama.cpp/src/llama-mmap.cpp
+)
+
 add_library(nemo_speech_runtime_ggml STATIC ${RUNTIME_GGML_SOURCES})
 
 set_target_properties(nemo_speech_runtime_ggml PROPERTIES
@@ -25,6 +39,11 @@ target_include_directories(nemo_speech_runtime_ggml PUBLIC
 )
 target_include_directories(nemo_speech_runtime_ggml PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common
+)
+
+target_include_directories(nemo_speech_runtime_ggml PRIVATE
+    ${CMAKE_SOURCE_DIR}/llama.cpp/src
+    ${CMAKE_SOURCE_DIR}/llama.cpp/include
 )
 
 target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
