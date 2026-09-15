@@ -302,8 +302,17 @@ Session::load_weight(const std::string& gguf_key) {
     if (mem == disk) {
         // Verbatim: tensor was declared at the on-disk dtype, so ggml_nbytes
         // matches the on-disk byte size for any format (F32/F16/BF16/Q*).
-        const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);
-        ggml_backend_tensor_set(t.tensor, data, 0, mem_bytes);
+        if (t.tensor->data == nullptr) {
+            // Left unbound by TensorContainer::allocate_tensors_on_backend_buffers:
+            // this buft is mmap-zero-copy eligible and this tensor is
+            // GGUF-backed. Bind straight into the mapping instead of
+            // allocating + copying.
+            ggml_backend_buffer_t buf = model_tensor_container->mmap_buffer_for(t.buft);
+            ggml_backend_tensor_alloc(buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key));
+        } else {
+            const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);
+            ggml_backend_tensor_set(t.tensor, data, 0, mem_bytes);
+        }
     } else if (disk == GGML_TYPE_F32 && mem == GGML_TYPE_F16) {
         // Converter quirk: some Conv weights are F32 on disk but wanted F16 in
         // memory. On-disk is 2x the F16 byte size.
@@ -339,6 +348,7 @@ Session::setup() {
     // two-pass sizing used for activation graphs.
     model_tensor_container =
         std::make_unique<TensorContainer>(buft_list, TensorContainer::ArenaSizes{});
+    model_tensor_container->set_mmap_loader(gguf_loader);
     // State tensors (declared via create_state_tensor_*) live in this sibling
     // container, which is deliberately NEVER allocate_tensors_on_backend_buffers()'d:
     // each per-stream SessionState supplies their device backing per run. The

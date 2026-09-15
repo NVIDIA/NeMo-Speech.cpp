@@ -24,6 +24,55 @@ device_main_buft(const buft_list_t& buft_list) {
     return buft_list.back().second;  // CPU main is always last
 }
 
+// Places `tensors` into a single fresh buffer via ggml_tallocr, packing them
+// tightly (aligned) rather than one buffer per tensor. Shared by the
+// sched_managed named-tensor path and the mmap leftover-tensor path below.
+static ggml_backend_buffer_t
+alloc_tensor_subset(ggml_backend_buffer_type_t buft, const std::vector<ggml_tensor*>& tensors) {
+    if (tensors.empty()) {
+        return nullptr;
+    }
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t total = 0;
+    for (ggml_tensor* t : tensors) {
+        const size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
+        total += (sz + align - 1) / align * align;
+    }
+    if (total == 0) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
+    if (!buf) {
+        const char* buft_name = ggml_backend_buft_name(buft);
+        throw std::runtime_error(
+            std::string("failed to allocate tensor buffer for buffer type ") +
+            (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
+    }
+    ggml_tallocr ta = ggml_tallocr_new(buf);
+    for (ggml_tensor* t : tensors) {
+        if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error(std::string("failed to place tensor ") + t->name);
+        }
+    }
+    return buf;
+}
+
+// A buft is eligible for zero-copy mmap binding only when it's the default
+// buffer type of a device that supports buffer_from_host_ptr — mirrors
+// llama.cpp's own gate (llama-model.cpp). CPU and Metal (Apple Silicon
+// unified memory) qualify; CUDA reports buffer_from_host_ptr=false, so it
+// transparently keeps using the existing allocate-then-copy path below.
+static bool
+buft_supports_mmap_zero_copy(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
+        return false;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    return props.caps.buffer_from_host_ptr;
+}
+
 TensorBag::TensorBag() {
     tensors = std::vector<ggml_bf_tensor>();
 }
@@ -229,46 +278,82 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
             by_buft[kv.second.buft].push_back(t);
         }
         for (auto& kv : by_buft) {
-            ggml_backend_buffer_type_t buft = kv.first;
-            const size_t align = ggml_backend_buft_get_alignment(buft);
-            size_t total = 0;
-            for (ggml_tensor* t : kv.second) {
-                const size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
-                total += (sz + align - 1) / align * align;
+            ggml_backend_buffer_t buf = alloc_tensor_subset(kv.first, kv.second);
+            if (buf) {
+                backend_buffers.emplace_back(buf);
             }
-            if (total == 0) {
-                continue;
-            }
-            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
-            if (!buf) {
-                const char* buft_name = ggml_backend_buft_name(buft);
-                throw std::runtime_error(
-                    std::string("failed to allocate named-tensor buffer for buffer type ") +
-                    (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
-            }
-            ggml_tallocr ta = ggml_tallocr_new(buf);
-            for (ggml_tensor* t : kv.second) {
-                if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
-                    throw std::runtime_error(
-                        std::string("failed to place named tensor ") + t->name);
-                }
-            }
-            backend_buffers.emplace_back(buf);
         }
         return;
     }
     for (auto& p : ctx_map) {
         ggml_backend_buffer_type_t buft = p.first;
         ggml_bf_context bf_ctx = p.second;
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(bf_ctx.ctx, buft);
-        if (!buf) {
-            const char* buft_name = ggml_backend_buft_name(buft);
-            throw std::runtime_error(
-                std::string("failed to allocate backend buffer for buffer type ") +
-                (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
+
+        // Split this buft's tensors into GGUF-backed ones eligible for
+        // zero-copy mmap binding and everything else (e.g. RNNT decoder
+        // state tensors declared alongside weights on the same buft, which
+        // have no on-disk representation). Only the former can be
+        // satisfied without a real allocation.
+        std::vector<ggml_tensor*> mmap_tensors;
+        std::vector<ggml_tensor*> other_tensors;
+        const bool try_mmap =
+            mmap_loader_ && mmap_loader_->is_mmapped() && buft_supports_mmap_zero_copy(buft);
+        for (ggml_tensor* t = ggml_get_first_tensor(bf_ctx.ctx); t != nullptr;
+             t = ggml_get_next_tensor(bf_ctx.ctx, t)) {
+            if (try_mmap && mmap_loader_->has_tensor(t->name)) {
+                mmap_tensors.push_back(t);
+            } else {
+                other_tensors.push_back(t);
+            }
         }
-        backend_buffers.emplace_back(buf);
+
+        if (mmap_tensors.empty()) {
+            // Unchanged fast path: no zero-copy candidates on this buft.
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(bf_ctx.ctx, buft);
+            if (!buf) {
+                const char* buft_name = ggml_backend_buft_name(buft);
+                throw std::runtime_error(
+                    std::string("failed to allocate backend buffer for buffer type ") +
+                    (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
+            }
+            backend_buffers.emplace_back(buf);
+            continue;
+        }
+
+        uint64_t first = UINT64_MAX;
+        uint64_t last = 0;
+        for (ggml_tensor* t : mmap_tensors) {
+            const uint64_t off = mmap_loader_->get_tensor_offset(t->name);
+            first = std::min(first, off);
+            last = std::max(last, off + ggml_nbytes(t));
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        void* base = mmap_loader_->mapped_base();
+        const size_t max_tensor_size = ggml_get_max_tensor_size(bf_ctx.ctx);
+        ggml_backend_buffer_t mmap_buf = ggml_backend_dev_buffer_from_host_ptr(
+            dev, static_cast<char*>(base) + first, last - first, max_tensor_size);
+        if (!mmap_buf) {
+            throw std::runtime_error(
+                std::string("failed to create mmap-backed buffer for buffer type ") +
+                ggml_backend_buft_name(buft));
+        }
+        backend_buffers.emplace_back(mmap_buf);
+        mmap_bufs_[buft] = mmap_buf;
+        // mmap_tensors are intentionally left with data == nullptr here;
+        // Session::load_weight binds each individually into this buffer via
+        // ggml_backend_tensor_alloc once the model's weight-loading pass runs.
+
+        ggml_backend_buffer_t other_buf = alloc_tensor_subset(buft, other_tensors);
+        if (other_buf) {
+            backend_buffers.emplace_back(other_buf);
+        }
     }
+}
+
+ggml_backend_buffer_t
+TensorContainer::mmap_buffer_for(ggml_backend_buffer_type_t buft) const {
+    auto it = mmap_bufs_.find(buft);
+    return it == mmap_bufs_.end() ? nullptr : it->second;
 }
 
 size_t
