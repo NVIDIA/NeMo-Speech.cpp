@@ -288,10 +288,8 @@ Session::dump_schedule(std::ostream& out, const std::string& session_label) cons
 void
 Session::bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key) {
     if (t.tensor->data == nullptr) {
-        // Left unbound by TensorContainer::allocate_tensors_on_backend_buffers:
-        // this buft is mmap-zero-copy eligible and this tensor is
-        // GGUF-backed. Bind straight into the mapping instead of
-        // allocating + copying.
+        // Left unbound for zero-copy (see
+        // TensorContainer::allocate_tensors_on_backend_buffers); bind directly.
         ggml_backend_buffer_t buf = model_tensor_container->mmap_buffer_for(t.buft);
         ggml_backend_tensor_alloc(buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key));
     } else {

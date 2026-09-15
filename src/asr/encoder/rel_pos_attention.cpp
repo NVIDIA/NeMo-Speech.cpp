@@ -110,10 +110,8 @@ RelPositionalEncoding::set_data(Session* session) {
     // Prefer GGUF-embedded PE (produced by convert_model.py). Fall back
     // to external pe.bin for legacy tdt-0.6b flow.
     if (session->gguf_loader != nullptr && session->gguf_loader->has_tensor(name + ".pe")) {
-        // Goes through bind_or_copy_tensor (not a direct
-        // get_tensor_file_data + ggml_backend_tensor_set) because this
-        // tensor's buft may have been left unallocated for zero-copy mmap
-        // binding — see TensorContainer::allocate_tensors_on_backend_buffers.
+        // May be left unallocated for zero-copy mmap binding — see
+        // TensorContainer::allocate_tensors_on_backend_buffers.
         session->bind_or_copy_tensor(pe_tensor, name + ".pe");
         return;
     }

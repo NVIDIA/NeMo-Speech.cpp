@@ -1,12 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// llama.cpp's llama-mmap.cpp (reused as-is by GGUFLoader, see loader.cpp)
-// logs via the LLAMA_LOG_* macros, which call llama_log_internal. Its usual
-// home, llama-impl.cpp, is deliberately not linked here: it also redefines
-// format(const char*, ...), which collides at link time with this runtime's
-// own definition (logging.cpp) that llama-mmap.cpp's format() calls resolve
-// to instead. This is the one remaining symbol llama-mmap.cpp needs.
+// llama-mmap.cpp (reused by GGUFLoader) logs via LLAMA_LOG_*; this supplies
+// the one symbol it needs without linking llama-impl.cpp (format() clash).
 #include "llama-impl.h"
 #include "runtime.h"
 
