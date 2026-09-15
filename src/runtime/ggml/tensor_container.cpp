@@ -40,19 +40,22 @@ alloc_tensor_subset(ggml_backend_buffer_type_t buft, const std::vector<ggml_tens
     if (total == 0) {
         return nullptr;
     }
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, total);
-    if (!buf) {
+    ggml_backend_buffer_ptr owned(ggml_backend_buft_alloc_buffer(buft, total));
+    if (!owned) {
         const char* buft_name = ggml_backend_buft_name(buft);
         throw std::runtime_error(
             std::string("failed to allocate tensor buffer for buffer type ") +
             (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
     }
+    ggml_backend_buffer_t buf = owned.get();
     ggml_tallocr ta = ggml_tallocr_new(buf);
     for (ggml_tensor* t : tensors) {
         if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+            // owned's destructor frees buf here.
             throw std::runtime_error(std::string("failed to place tensor ") + t->name);
         }
     }
+    owned.release();
     return buf;
 }
 
@@ -293,7 +296,11 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
             mmap_loader_ && mmap_loader_->is_mmapped() && buft_supports_mmap_zero_copy(buft);
         for (ggml_tensor* t = ggml_get_first_tensor(bf_ctx.ctx); t != nullptr;
              t = ggml_get_next_tensor(bf_ctx.ctx, t)) {
-            if (try_mmap && mmap_loader_->has_tensor(t->name)) {
+            // Type must match exactly: a dtype-converting weight (e.g.
+            // F32-on-disk/F16-in-memory) needs load_weight's copy-and-convert
+            // path, not a zero-copy bind into the raw on-disk bytes.
+            if (try_mmap && mmap_loader_->has_tensor(t->name) &&
+                mmap_loader_->get_tensor_type(t->name) == t->type) {
                 mmap_tensors.push_back(t);
             } else {
                 other_tensors.push_back(t);
