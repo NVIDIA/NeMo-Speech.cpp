@@ -32,14 +32,17 @@ main(int argc, char** argv) {
         return 1;
     }
 
-    const auto names = loader.tensor_names();
-    if (names.empty()) {
+    struct gguf_init_params params = {/*no_alloc=*/true, /*ctx=*/nullptr};
+    gguf_context_ptr ctx(gguf_init_from_file(model_path.c_str(), params));
+    const int64_t n_tensors = ctx ? gguf_get_n_tensors(ctx.get()) : 0;
+    if (n_tensors == 0) {
         std::fprintf(stderr, "[FAIL] GGUF has no tensors: %s\n", model_path.c_str());
         return 1;
     }
 
     int checked = 0;
-    for (const auto& name : names) {
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const std::string name = gguf_get_tensor_name(ctx.get(), i);
         const ggml_type type = loader.get_tensor_type(name);
         const auto ne = loader.get_tensor_ne(name);
         if (ne.empty()) {
@@ -73,7 +76,7 @@ main(int argc, char** argv) {
         return 1;
     }
 
-    std::fprintf(stdout, "[PASS] mmap'd %d/%zu tensors match buffered-read bytes\n", checked,
-        names.size());
+    std::fprintf(stdout, "[PASS] mmap'd %d/%lld tensors match buffered-read bytes\n", checked,
+        (long long)n_tensors);
     return 0;
 }
