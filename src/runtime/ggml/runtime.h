@@ -79,12 +79,10 @@ class GGUFLoader {
     bool has_tensor(const std::string& tensor_name) const;
     std::vector<std::string> tensor_names() const;
 
-    // True when the file is mmap'd (see llama_mmap::SUPPORTED); callers may
-    // use mapped_tensor_ptr()/mapped_base() for zero-copy tensor binding.
+    // True when the file is mmap'd; see mapped_tensor_ptr()/mapped_base().
     bool is_mmapped() const;
     uint64_t get_tensor_offset(const std::string& tensor_name) const;
-    // Pointer directly into the mapping at this tensor's on-disk bytes.
-    // Only valid while this GGUFLoader (and its mapping) is alive.
+    // Pointer into the mapping; valid only while this GGUFLoader lives.
     void* mapped_tensor_ptr(const std::string& tensor_name) const;
     void* mapped_base() const;
 
@@ -254,17 +252,11 @@ class TensorContainer {
     void allocate_tensors_on_backend_buffers();
     void free_temp_ctx();
 
-    // Opt in to zero-copy weight binding: tensors whose name matches a
-    // GGUFLoader-mmap'd tensor, on a buft whose device supports
-    // buffer_from_host_ptr, are left unallocated here so
-    // Session::load_weight can bind them directly into the mapping instead
-    // of allocating a separate backend buffer. Not called for
-    // state_tensor_container (never GGUF-backed, never allocated here) or
-    // sched_managed containers (per-run activation arenas).
+    // Opt in to zero-copy weight binding for GGUF-backed tensors on
+    // eligible bufts; see allocate_tensors_on_backend_buffers.
     void set_mmap_loader(GGUFLoader* loader) { mmap_loader_ = loader; }
-    // Non-null once allocate_tensors_on_backend_buffers() has created a
-    // zero-copy mmap buffer for this buft. Session::load_weight uses this to
-    // bind individual tensors via ggml_backend_tensor_alloc.
+    // Non-null once allocate_tensors_on_backend_buffers() built a
+    // zero-copy buffer for this buft.
     ggml_backend_buffer_t mmap_buffer_for(ggml_backend_buffer_type_t buft) const;
     ggml_bf_tensor get_tensor_by_name(const std::string& name);
     bool has_tensor_by_name(const std::string& name);
@@ -329,15 +321,8 @@ class Session {
     // Allows exact dtype copies and F32-to-F16 conversion.
     void load_weight(const std::string& gguf_key);
 
-    // Verbatim (no dtype conversion) bind-or-copy of a GGUF tensor into an
-    // already-declared tensor, for modules whose set_data() reads a GGUF
-    // tensor directly instead of going through load_weight() (e.g. a
-    // fallback-path tensor with a non-GGUF alternate source). If `t` was
-    // left unallocated for zero-copy (see
-    // TensorContainer::allocate_tensors_on_backend_buffers), binds directly
-    // into the mmap mapping; otherwise copies, same as load_weight's
-    // same-dtype path. `t` must be exactly ggml_nbytes(t.tensor) bytes on
-    // disk at `gguf_key`.
+    // Verbatim bind-or-copy of a GGUF tensor, for set_data() overrides that
+    // read GGUF directly instead of going through load_weight().
     void bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key);
 
     // Import a model tensor whose storage is owned by the embedding pipeline. Call only from
