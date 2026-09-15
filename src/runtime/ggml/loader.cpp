@@ -158,16 +158,6 @@ GGUFLoader::has_tensor(const std::string& tensor_name) const {
     return m_tensor_infos.find(tensor_name) != m_tensor_infos.end();
 }
 
-std::vector<std::string>
-GGUFLoader::tensor_names() const {
-    std::vector<std::string> names;
-    names.reserve(m_tensor_infos.size());
-    for (const auto& kv : m_tensor_infos) {
-        names.push_back(kv.first);
-    }
-    return names;
-}
-
 int
 GGUFLoader::get_tensor_n_dims(const std::string& tensor_name) const {
     auto it = m_tensor_n_dims.find(tensor_name);
