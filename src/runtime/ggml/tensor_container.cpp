@@ -24,9 +24,8 @@ device_main_buft(const buft_list_t& buft_list) {
     return buft_list.back().second;  // CPU main is always last
 }
 
-// Places `tensors` into a single fresh buffer via ggml_tallocr, packing them
-// tightly (aligned) rather than one buffer per tensor. Shared by the
-// sched_managed named-tensor path and the mmap leftover-tensor path below.
+// Packs `tensors` tightly into one fresh buffer via ggml_tallocr. Shared by
+// the sched_managed and mmap-leftover paths below.
 static ggml_backend_buffer_t
 alloc_tensor_subset(ggml_backend_buffer_type_t buft, const std::vector<ggml_tensor*>& tensors) {
     if (tensors.empty()) {
@@ -57,11 +56,8 @@ alloc_tensor_subset(ggml_backend_buffer_type_t buft, const std::vector<ggml_tens
     return buf;
 }
 
-// A buft is eligible for zero-copy mmap binding only when it's the default
-// buffer type of a device that supports buffer_from_host_ptr — mirrors
-// llama.cpp's own gate (llama-model.cpp). CPU and Metal (Apple Silicon
-// unified memory) qualify; CUDA reports buffer_from_host_ptr=false, so it
-// transparently keeps using the existing allocate-then-copy path below.
+// Eligible only for a device's default buft that supports
+// buffer_from_host_ptr (CPU/Metal); CUDA reports false and is unaffected.
 static bool
 buft_supports_mmap_zero_copy(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -289,11 +285,8 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
         ggml_backend_buffer_type_t buft = p.first;
         ggml_bf_context bf_ctx = p.second;
 
-        // Split this buft's tensors into GGUF-backed ones eligible for
-        // zero-copy mmap binding and everything else (e.g. RNNT decoder
-        // state tensors declared alongside weights on the same buft, which
-        // have no on-disk representation). Only the former can be
-        // satisfied without a real allocation.
+        // Split into GGUF-backed zero-copy candidates vs. everything else
+        // (e.g. RNNT decoder state tensors sharing this buft, no on-disk form).
         std::vector<ggml_tensor*> mmap_tensors;
         std::vector<ggml_tensor*> other_tensors;
         const bool try_mmap =
@@ -339,9 +332,8 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
         }
         backend_buffers.emplace_back(mmap_buf);
         mmap_bufs_[buft] = mmap_buf;
-        // mmap_tensors are intentionally left with data == nullptr here;
-        // Session::load_weight binds each individually into this buffer via
-        // ggml_backend_tensor_alloc once the model's weight-loading pass runs.
+        // mmap_tensors are left with data == nullptr; Session::load_weight
+        // binds each one via ggml_backend_tensor_alloc.
 
         ggml_backend_buffer_t other_buf = alloc_tensor_subset(buft, other_tensors);
         if (other_buf) {
