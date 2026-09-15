@@ -328,6 +328,17 @@ class Session {
     // Allows exact dtype copies and F32-to-F16 conversion.
     void load_weight(const std::string& gguf_key);
 
+    // Verbatim (no dtype conversion) bind-or-copy of a GGUF tensor into an
+    // already-declared tensor, for modules whose set_data() reads a GGUF
+    // tensor directly instead of going through load_weight() (e.g. a
+    // fallback-path tensor with a non-GGUF alternate source). If `t` was
+    // left unallocated for zero-copy (see
+    // TensorContainer::allocate_tensors_on_backend_buffers), binds directly
+    // into the mmap mapping; otherwise copies, same as load_weight's
+    // same-dtype path. `t` must be exactly ggml_nbytes(t.tensor) bytes on
+    // disk at `gguf_key`.
+    void bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key);
+
     // Import a model tensor whose storage is owned by the embedding pipeline. Call only from
     // Module::define_tensors(); the tensor and its backend buffer must outlive this Session.
     ggml_bf_tensor import_model_tensor(const std::string& name, ggml_tensor* tensor);
