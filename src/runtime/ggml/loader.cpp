@@ -21,9 +21,8 @@
 #include <io.h>
 #endif
 
-// llama_file/llama_mmap are llama.cpp's (vendored in llama.cpp/src/llama-mmap.{h,cpp}),
-// reused as-is rather than reimplemented: they already give us mmap-backed,
-// zero-copy-capable loading on every platform this runtime supports.
+// llama_file/llama_mmap are llama.cpp's own (vendored), reused as-is
+// instead of reimplemented.
 
 namespace ggml_runtime {
 
@@ -79,12 +78,8 @@ GGUFLoader::GGUFLoader(const std::string& path) {
     GGMLF_LOG_INFO("Max tensor size: %zu MB\n", static_cast<size_t>(tensor_size_mb));
     m_tensor_buffer.resize((tensor_size_mb + 1) * 1024 * 1024);
 
-    // Lazily-faulted mmap of the whole file (prefetch=0): tensor pages land in
-    // the OS page cache as clean, evictable memory and, where the backend
-    // supports it (see TensorContainer::allocate_tensors_on_backend_buffers),
-    // are bound directly with zero copy instead of duplicated into a malloc'd
-    // backend buffer. Falls back to the fread path above on unsupported
-    // platforms.
+    // Lazily-faulted mmap (prefetch=0): clean, evictable pages instead of a
+    // malloc'd copy. Falls back to the fread path above where unsupported.
     if (llama_mmap::SUPPORTED) {
         m_mapping = std::make_unique<llama_mmap>(m_file.get(), /*prefetch=*/0, /*numa=*/false);
     }
@@ -92,11 +87,8 @@ GGUFLoader::GGUFLoader(const std::string& path) {
 
 void
 GGUFLoader::release_file_resources() {
-    // m_mapping is NOT released here: any tensor bound zero-copy (see
-    // TensorContainer::allocate_tensors_on_backend_buffers /
-    // Session::load_weight) points directly into these pages for the
-    // lifetime of the model. Closing the FILE* is safe independent of that —
-    // the mapping keeps the underlying pages valid after the fd is closed.
+    // m_mapping is kept: zero-copy tensors point into it for the model's
+    // lifetime. Closing the fd here is safe independent of that.
     m_file.reset();
     std::vector<char>().swap(m_tensor_buffer);
 }

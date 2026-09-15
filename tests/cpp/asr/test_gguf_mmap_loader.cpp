@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-// GGUFLoader mmap smoke test: confirms is_mmapped() is true on this
-// platform and that every tensor's mapped_tensor_ptr() bytes are identical
-// to what the buffered-fread path (get_tensor_file_data) reads for the same
-// tensor -- the check that would fail if the mmap offset/base arithmetic in
-// TensorContainer::allocate_tensors_on_backend_buffers / Session's zero-copy
-// bind were wrong.
+// GGUFLoader mmap smoke test: mapped_tensor_ptr() bytes must match the
+// buffered-fread path for every tensor.
 // Usage: ./test_gguf_mmap_loader <model.gguf>   (skips if no model arg)
 #include <cstdio>
 #include <cstring>
