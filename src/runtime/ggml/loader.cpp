@@ -6,6 +6,7 @@
 // Licensed under the MIT License. See THIRD_PARTY_NOTICES.md.
 #include <algorithm>
 
+#include "llama-mmap.h"
 #include "runtime.h"
 
 #if defined(_WIN32)
@@ -20,202 +21,9 @@
 #include <io.h>
 #endif
 
-struct llama_file {
-#if defined(_WIN32)
-    FILE* fp;
-    HANDLE fp_win32;
-    size_t size;
-
-   private:
-    std::string GetErrorMessageWin32(DWORD error_code) const {
-        std::string ret;
-        LPSTR lpMsgBuf = NULL;
-        DWORD bufLen = FormatMessageA(
-            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL, error_code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&lpMsgBuf, 0, NULL);
-        if (!bufLen) {
-            ret = format("Win32 error code: %lx", error_code);
-        } else {
-            ret = lpMsgBuf;
-            LocalFree(lpMsgBuf);
-        }
-
-        return ret;
-    }
-
-   public:
-    llama_file(const char* fname, const char* mode) {
-        fp = ggml_fopen(fname, mode);
-        if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
-        }
-        fp_win32 = (HANDLE)_get_osfhandle(_fileno(fp));
-        seek(0, SEEK_END);
-        size = tell();
-        seek(0, SEEK_SET);
-    }
-
-    size_t tell() const {
-        LARGE_INTEGER li;
-        li.QuadPart = 0;
-        BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
-        if (!ret) {
-            throw std::runtime_error(
-                format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-        }
-
-        return li.QuadPart;
-    }
-
-    void seek(size_t offset, int whence) const {
-        // SEEK_* and FILE_* must remain interchangeable here.
-        static_assert(SEEK_SET == FILE_BEGIN, "SEEK_SET != FILE_BEGIN");
-        static_assert(SEEK_CUR == FILE_CURRENT, "SEEK_CUR != FILE_CURRENT");
-        static_assert(SEEK_END == FILE_END, "SEEK_END != FILE_END");
-
-        LARGE_INTEGER li;
-        li.QuadPart = offset;
-        BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
-        if (!ret) {
-            throw std::runtime_error(
-                format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-        }
-    }
-
-    void read_raw(void* ptr, size_t len) const {
-        // Some Windows configurations reject ReadFile requests larger than 64 MiB.
-        size_t bytes_read = 0;
-        while (bytes_read < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_read, 64 * 1024 * 1024);
-            DWORD chunk_read = 0;
-            BOOL result = ReadFile(
-                fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
-            if (!result) {
-                throw std::runtime_error(
-                    format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-            }
-            if (chunk_read < chunk_size || chunk_read == 0) {
-                throw std::runtime_error("unexpectedly reached end of file");
-            }
-
-            bytes_read += chunk_read;
-        };
-    }
-
-    uint32_t read_u32() const {
-        uint32_t val;
-        read_raw(&val, sizeof(val));
-        return val;
-    }
-
-    void write_raw(const void* ptr, size_t len) const {
-        // Match the conservative ReadFile chunk limit.
-        size_t bytes_written = 0;
-        while (bytes_written < len) {
-            size_t chunk_size = std::min<size_t>(len - bytes_written, 64 * 1024 * 1024);
-            DWORD chunk_written = 0;
-            BOOL result = WriteFile(
-                fp_win32, reinterpret_cast<char const*>(ptr) + bytes_written, chunk_size,
-                &chunk_written, NULL);
-            if (!result) {
-                throw std::runtime_error(
-                    format("write error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
-            }
-            if (chunk_written < chunk_size || chunk_written == 0) {
-                throw std::runtime_error("unexpectedly failed to write bytes");
-            }
-
-            bytes_written += chunk_written;
-        }
-    }
-
-    void write_u32(std::uint32_t val) const { write_raw(&val, sizeof(val)); }
-
-    ~llama_file() {
-        if (fp) {
-            std::fclose(fp);
-        }
-    }
-#else
-    FILE* fp;
-    size_t size;
-
-    llama_file(const char* fname, const char* mode) {
-        fp = ggml_fopen(fname, mode);
-        if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
-        }
-        seek(0, SEEK_END);
-        size = tell();
-        seek(0, SEEK_SET);
-    }
-
-    size_t tell() const {
-#ifdef _WIN32
-        __int64 ret = _ftelli64(fp);
-#else
-        long ret = std::ftell(fp);
-#endif
-        if (ret == -1) {
-            throw std::runtime_error(format("ftell error: %s", strerror(errno)));
-        }
-
-        return (size_t)ret;
-    }
-
-    void seek(size_t offset, int whence) const {
-#ifdef _WIN32
-        int ret = _fseeki64(fp, (__int64)offset, whence);
-#else
-        int ret = std::fseek(fp, (long)offset, whence);
-#endif
-        if (ret != 0) {
-            throw std::runtime_error(format("seek error: %s", strerror(errno)));
-        }
-    }
-
-    void read_raw(void* ptr, size_t len) const {
-        if (len == 0) {
-            return;
-        }
-        errno = 0;
-        std::size_t ret = std::fread(ptr, len, 1, fp);
-        if (ferror(fp)) {
-            throw std::runtime_error(format("read error: %s", strerror(errno)));
-        }
-        if (ret != 1) {
-            throw std::runtime_error("unexpectedly reached end of file");
-        }
-    }
-
-    uint32_t read_u32() const {
-        uint32_t ret;
-        read_raw(&ret, sizeof(ret));
-        return ret;
-    }
-
-    void write_raw(const void* ptr, size_t len) const {
-        if (len == 0) {
-            return;
-        }
-        errno = 0;
-        size_t ret = std::fwrite(ptr, len, 1, fp);
-        if (ret != 1) {
-            throw std::runtime_error(format("write error: %s", strerror(errno)));
-        }
-    }
-
-    void write_u32(std::uint32_t val) const { write_raw(&val, sizeof(val)); }
-
-    ~llama_file() {
-        if (fp) {
-            std::fclose(fp);
-        }
-    }
-#endif
-};
-
+// llama_file/llama_mmap are llama.cpp's (vendored in llama.cpp/src/llama-mmap.{h,cpp}),
+// reused as-is rather than reimplemented: they already give us mmap-backed,
+// zero-copy-capable loading on every platform this runtime supports.
 
 namespace ggml_runtime {
 
@@ -244,7 +52,7 @@ GGUFLoader::GGUFLoader(const std::string& path) {
     }
 
     m_file = std::make_unique<llama_file>(path.c_str(), "rb");
-    GGMLF_LOG_INFO("GGUF file size: %ld\n", m_file->size);
+    GGMLF_LOG_INFO("GGUF file size: %ld\n", (long)m_file->size());
 
     auto n_tensors = gguf_get_n_tensors(m_context.get());
     GGMLF_LOG_INFO("GGUF has %d tensors\n", n_tensors);
@@ -264,18 +72,60 @@ GGUFLoader::GGUFLoader(const std::string& path) {
         }
         last_tensor_offset = tensor_offset;
     }
-    if (m_file->size > last_tensor_offset) {
-        max_tensor_size = std::max(max_tensor_size, m_file->size - last_tensor_offset);
+    if (m_file->size() > last_tensor_offset) {
+        max_tensor_size = std::max(max_tensor_size, m_file->size() - last_tensor_offset);
     }
     const uint64_t tensor_size_mb = max_tensor_size / 1024 / 1024;
     GGMLF_LOG_INFO("Max tensor size: %zu MB\n", static_cast<size_t>(tensor_size_mb));
     m_tensor_buffer.resize((tensor_size_mb + 1) * 1024 * 1024);
+
+    // Lazily-faulted mmap of the whole file (prefetch=0): tensor pages land in
+    // the OS page cache as clean, evictable memory and, where the backend
+    // supports it (see TensorContainer::allocate_tensors_on_backend_buffers),
+    // are bound directly with zero copy instead of duplicated into a malloc'd
+    // backend buffer. Falls back to the fread path above on unsupported
+    // platforms.
+    if (llama_mmap::SUPPORTED) {
+        m_mapping = std::make_unique<llama_mmap>(m_file.get(), /*prefetch=*/0, /*numa=*/false);
+    }
 }
 
 void
 GGUFLoader::release_file_resources() {
+    // m_mapping is NOT released here: any tensor bound zero-copy (see
+    // TensorContainer::allocate_tensors_on_backend_buffers /
+    // Session::load_weight) points directly into these pages for the
+    // lifetime of the model. Closing the FILE* is safe independent of that —
+    // the mapping keeps the underlying pages valid after the fd is closed.
     m_file.reset();
     std::vector<char>().swap(m_tensor_buffer);
+}
+
+bool
+GGUFLoader::is_mmapped() const {
+    return m_mapping != nullptr;
+}
+
+uint64_t
+GGUFLoader::get_tensor_offset(const std::string& tensor_name) const {
+    auto it = m_tensor_infos.find(tensor_name);
+    if (it == m_tensor_infos.end()) {
+        throw std::runtime_error("Tensor not found: " + tensor_name);
+    }
+    return std::get<1>(it->second);
+}
+
+void*
+GGUFLoader::mapped_tensor_ptr(const std::string& tensor_name) const {
+    if (!m_mapping) {
+        throw std::logic_error("mapped_tensor_ptr() called without an active mmap mapping");
+    }
+    return static_cast<char*>(m_mapping->addr()) + get_tensor_offset(tensor_name);
+}
+
+void*
+GGUFLoader::mapped_base() const {
+    return m_mapping ? m_mapping->addr() : nullptr;
 }
 
 const char*
@@ -290,7 +140,7 @@ GGUFLoader::get_tensor_file_data(const std::string& tensor_name, size_t size) {
     auto tensor_info = it->second;
     auto tensor_offset = std::get<1>(tensor_info);
 
-    if (tensor_offset + size > m_file->size) {
+    if (tensor_offset + size > m_file->size()) {
         throw std::runtime_error("Tensor data out of range: " + tensor_name);
     }
     if (size > m_tensor_buffer.size()) {
