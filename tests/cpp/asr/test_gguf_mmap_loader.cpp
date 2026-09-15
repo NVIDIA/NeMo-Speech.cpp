@@ -50,8 +50,8 @@ main(int argc, char** argv) {
         }
         size_t n_elems = 1;
         for (int64_t d : ne) n_elems *= static_cast<size_t>(d);
-        const size_t nbytes =
-            ggml_row_size(type, n_elems / static_cast<size_t>(ne[0])) * static_cast<size_t>(ne[0]);
+        const size_t n_rows = n_elems / static_cast<size_t>(ne[0]);
+        const size_t nbytes = ggml_row_size(type, static_cast<size_t>(ne[0])) * n_rows;
         if (nbytes == 0) {
             continue;
         }
