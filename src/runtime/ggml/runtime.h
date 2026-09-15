@@ -77,6 +77,7 @@ class GGUFLoader {
     // fully described by metadata keys) use this when declaring weights.
     std::vector<int64_t> get_tensor_ne(const std::string& tensor_name) const;
     bool has_tensor(const std::string& tensor_name) const;
+    std::vector<std::string> tensor_names() const;
 
     // True when the file is mmap'd (see llama_mmap::SUPPORTED); callers may
     // use mapped_tensor_ptr()/mapped_base() for zero-copy tensor binding.
