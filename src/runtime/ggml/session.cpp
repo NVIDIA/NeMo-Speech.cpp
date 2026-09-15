@@ -286,6 +286,22 @@ Session::dump_schedule(std::ostream& out, const std::string& session_label) cons
 
 
 void
+Session::bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key) {
+    if (t.tensor->data == nullptr) {
+        // Left unbound by TensorContainer::allocate_tensors_on_backend_buffers:
+        // this buft is mmap-zero-copy eligible and this tensor is
+        // GGUF-backed. Bind straight into the mapping instead of
+        // allocating + copying.
+        ggml_backend_buffer_t buf = model_tensor_container->mmap_buffer_for(t.buft);
+        ggml_backend_tensor_alloc(buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key));
+    } else {
+        const size_t mem_bytes = ggml_nbytes(t.tensor);
+        const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);
+        ggml_backend_tensor_set(t.tensor, data, 0, mem_bytes);
+    }
+}
+
+void
 Session::load_weight(const std::string& gguf_key) {
     ggml_bf_tensor t = model_tensor_container->get_tensor_by_name(gguf_key);
     const ggml_type mem = t.tensor->type;
@@ -302,17 +318,7 @@ Session::load_weight(const std::string& gguf_key) {
     if (mem == disk) {
         // Verbatim: tensor was declared at the on-disk dtype, so ggml_nbytes
         // matches the on-disk byte size for any format (F32/F16/BF16/Q*).
-        if (t.tensor->data == nullptr) {
-            // Left unbound by TensorContainer::allocate_tensors_on_backend_buffers:
-            // this buft is mmap-zero-copy eligible and this tensor is
-            // GGUF-backed. Bind straight into the mapping instead of
-            // allocating + copying.
-            ggml_backend_buffer_t buf = model_tensor_container->mmap_buffer_for(t.buft);
-            ggml_backend_tensor_alloc(buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key));
-        } else {
-            const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);
-            ggml_backend_tensor_set(t.tensor, data, 0, mem_bytes);
-        }
+        bind_or_copy_tensor(t, gguf_key);
     } else if (disk == GGML_TYPE_F32 && mem == GGML_TYPE_F16) {
         // Converter quirk: some Conv weights are F32 on disk but wanted F16 in
         // memory. On-disk is 2x the F16 byte size.
