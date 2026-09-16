@@ -14,6 +14,9 @@
 #include <vector>
 
 #include "ggml-alloc.h"
+#if defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -71,8 +74,25 @@ struct nc_res_block {
     nc_conv skip_conv;
 };
 
+// The three kernel-size branches of a residual stage batched into one fused op per conv slot:
+// weights of the branches packed back to back, biases / snake parameters concatenated.
+struct nc_grouped_conv {
+    ggml_tensor* w = nullptr;      // F16 [cin_pad, cout_pad, sum K_g]
+    ggml_tensor* b = nullptr;      // F32 [groups * cout]
+    ggml_tensor* alpha = nullptr;  // F32 [groups * snake] or nullptr
+    ggml_tensor* alpha_inv = nullptr;
+    int groups = 0;
+    int K[3] = {1, 1, 1};
+    int d[3] = {1, 1, 1};
+    int cout = 0;
+    int snake = 0;
+};
 struct nc_res_layer {
     std::vector<std::vector<nc_res_block>> by_kernel;
+    // grouped fused path (CUDA): one op per residual-block slot across the kernel-size branches
+    std::vector<nc_grouped_conv> grouped_in;    // input convs of block d (d = dilation index)
+    std::vector<nc_grouped_conv> grouped_skip;  // skip convs of block d
+    bool grouped = false;
 };
 
 struct nc_model {
@@ -87,6 +107,9 @@ struct nc_model {
     ggml_backend_buffer_t aux_buffer = nullptr;
     ggml_context* pack_ctx = nullptr;  // fused-conv packed weights
     ggml_backend_buffer_t pack_buffer = nullptr;
+    ggml_context* group_ctx =
+        nullptr;  // grouped fused-conv tensors (weights, biases, snake params)
+    ggml_backend_buffer_t group_buffer = nullptr;
     bool fused_conv = false;
 
     nc_conv pre_conv;
@@ -199,6 +222,120 @@ load_conv(const nc_model& model, const std::string& prefix, int stride = 1, int 
     return conv;
 }
 
+// Batch the kernel-size branches of every residual stage: for each block slot d, the input convs
+// of the G branches become one grouped op (and likewise the skip convs), so a stage runs 2*D
+// launches instead of 2*D*G, each with G times the tiles. Requires the per-conv packed weights.
+static void
+nc_pack_grouped_convs(nc_model& model, bool verbose) {
+    struct plan_item {
+        nc_grouped_conv* out;
+        std::vector<const nc_conv*> convs;
+        std::vector<const nc_activation*> acts;
+    };
+    std::vector<plan_item> items;
+    for (nc_res_layer& layer : model.res_layers) {
+        const size_t G = layer.by_kernel.size();
+        if (G < 1 || G > 3)
+            continue;
+        const size_t D = layer.by_kernel[0].size();
+        bool ok = D > 0;
+        for (const auto& stack : layer.by_kernel) ok = ok && stack.size() == D;
+        if (!ok)
+            continue;
+        for (const auto& stack : layer.by_kernel)
+            for (const nc_res_block& blk : stack)
+                ok = ok && blk.input_conv.w_packed && blk.skip_conv.w_packed &&
+                     blk.input_act.alpha && blk.skip_act.alpha &&
+                     blk.input_conv.w_packed->ne[0] == blk.skip_conv.w_packed->ne[0];
+        if (!ok)
+            continue;
+        layer.grouped_in.assign(D, nc_grouped_conv{});
+        layer.grouped_skip.assign(D, nc_grouped_conv{});
+        for (size_t d = 0; d < D; ++d) {
+            plan_item in{&layer.grouped_in[d], {}, {}}, sk{&layer.grouped_skip[d], {}, {}};
+            for (size_t g = 0; g < G; ++g) {
+                const nc_res_block& blk = layer.by_kernel[g][d];
+                in.convs.push_back(&blk.input_conv);
+                in.acts.push_back(&blk.input_act);
+                sk.convs.push_back(&blk.skip_conv);
+                sk.acts.push_back(&blk.skip_act);
+            }
+            items.push_back(in);
+            items.push_back(sk);
+        }
+        layer.grouped = true;
+    }
+    if (items.empty())
+        return;
+    ggml_init_params params = {ggml_tensor_overhead() * (items.size() * 4 + 1), nullptr, true};
+    model.group_ctx = ggml_init(params);
+    for (plan_item& it : items) {
+        const int G = (int)it.convs.size();
+        const int64_t cin_pad = it.convs[0]->w_packed->ne[0];
+        const int64_t cout_pad = it.convs[0]->w_packed->ne[1];
+        int64_t ksum = 0;
+        for (int g = 0; g < G; ++g) {
+            it.out->K[g] = (int)it.convs[g]->w_packed->ne[2];
+            it.out->d[g] = it.convs[g]->dilation;
+            ksum += it.out->K[g];
+        }
+        it.out->groups = G;
+        it.out->cout = (int)it.convs[0]->w->ne[2];
+        it.out->snake = (int)it.acts[0]->alpha->ne[1];
+        it.out->w = ggml_new_tensor_3d(model.group_ctx, GGML_TYPE_F16, cin_pad, cout_pad, ksum);
+        it.out->b = ggml_new_tensor_1d(model.group_ctx, GGML_TYPE_F32, (int64_t)G * it.out->cout);
+        it.out->alpha =
+            ggml_new_tensor_1d(model.group_ctx, GGML_TYPE_F32, (int64_t)G * it.out->snake);
+        it.out->alpha_inv =
+            ggml_new_tensor_1d(model.group_ctx, GGML_TYPE_F32, (int64_t)G * it.out->snake);
+    }
+    model.group_buffer = ggml_backend_alloc_ctx_tensors(model.group_ctx, model.backend);
+    if (!model.group_buffer) {
+        fprintf(
+            stderr,
+            "warning: could not allocate grouped NanoCodec conv tensors; using per-branch convs\n");
+        ggml_free(model.group_ctx);
+        model.group_ctx = nullptr;
+        for (nc_res_layer& layer : model.res_layers) layer.grouped = false;
+        return;
+    }
+    std::vector<ggml_fp16_t> wbuf;
+    std::vector<float> fbuf;
+    for (plan_item& it : items) {
+        const int G = (int)it.convs.size();
+        size_t off = 0;
+        for (int g = 0; g < G; ++g) {
+            const ggml_tensor* src = it.convs[g]->w_packed;
+            const size_t n = (size_t)ggml_nelements(src);
+            wbuf.resize(n);
+            ggml_backend_tensor_get(src, wbuf.data(), 0, n * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(
+                it.out->w, wbuf.data(), off * sizeof(ggml_fp16_t), n * sizeof(ggml_fp16_t));
+            off += n;
+        }
+        auto concat_f32 = [&](ggml_tensor* dst, auto getter, int64_t per) {
+            fbuf.resize((size_t)per);
+            for (int g = 0; g < G; ++g) {
+                const ggml_tensor* src = getter(g);
+                if ((int64_t)ggml_nelements(src) != per) {
+                    throw std::runtime_error("nanocodec grouped conv: inconsistent branch shapes");
+                }
+                ggml_backend_tensor_get(src, fbuf.data(), 0, (size_t)per * sizeof(float));
+                ggml_backend_tensor_set(
+                    dst, fbuf.data(), (size_t)g * per * sizeof(float), (size_t)per * sizeof(float));
+            }
+        };
+        concat_f32(it.out->b, [&](int g) { return it.convs[g]->b; }, it.out->cout);
+        concat_f32(it.out->alpha, [&](int g) { return it.acts[g]->alpha; }, it.out->snake);
+        concat_f32(it.out->alpha_inv, [&](int g) { return it.acts[g]->alpha_inv; }, it.out->snake);
+    }
+    if (verbose) {
+        fprintf(
+            stderr, "nanocodec: grouped residual-branch convolutions enabled (%zu ops)\n",
+            items.size());
+    }
+}
+
 // Repack the stride-1 convolution weights ([K, Cin, Cout] F16, ne0 = K) into the fused CUDA
 // conv layout [cout_pad, cin_pad, K] (ne0 = cout, both channel paddings multiples of 16, zero
 // filled) when the backend supports ggml_conv1d_fused. NANOCODEC_FUSED_CONV=0 disables.
@@ -288,6 +425,7 @@ nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
             stderr, "nanocodec: fused tensor-core convolutions enabled for %zu layers\n",
             pending.size());
     }
+    nc_pack_grouped_convs(model, verbose);
 }
 
 static bool
@@ -335,6 +473,14 @@ nc_model_load(
     if (!model.backend || force_cpu) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
+#if defined(GGML_USE_CUDA)
+    if (model.backend && ggml_backend_is_cuda(model.backend)) {
+        // Above default-priority side streams (longform chunk prefetch) and below the
+        // latency-critical Magpie decoder stream, so codec blocks are scheduled ahead of
+        // background work and the codec cannot fall behind the producer.
+        ggml_backend_cuda_set_stream_priority(model.backend, -2);
+    }
+#endif
     if (!model.backend) {
         fprintf(stderr, "failed to initialize ggml backend\n");
         return false;
@@ -484,6 +630,14 @@ nc_model_load(
 
 static void
 nc_model_free(nc_model& model) {
+    if (model.group_buffer) {
+        ggml_backend_buffer_free(model.group_buffer);
+        model.group_buffer = nullptr;
+    }
+    if (model.group_ctx) {
+        ggml_free(model.group_ctx);
+        model.group_ctx = nullptr;
+    }
     if (model.pack_buffer) {
         ggml_backend_buffer_free(model.pack_buffer);
         model.pack_buffer = nullptr;
@@ -947,6 +1101,41 @@ nc_stream_causal_conv_transpose1d(
     return ggml_add(ctx, current, conv.b);
 }
 
+// Grouped fused conv over the branches of a residual stage (see nc_grouped_conv). One streaming
+// cache of the largest receptive field serves every branch; the kernel reads each branch's suffix.
+static ggml_tensor*
+nc_stream_grouped_conv(
+    ggml_context* ctx, ggml_tensor* x, bool shared_input, const nc_grouped_conv& gc,
+    ggml_tensor* residual, bool residual_shared, nc_stream_state& state, nc_stream_graph_io& io) {
+    int max_pad = 0;
+    for (int g = 0; g < gc.groups; ++g) max_pad = std::max(max_pad, (gc.K[g] - 1) * gc.d[g]);
+    const int64_t T = x->ne[0];
+    const int64_t C = x->ne[1];
+    ggml_tensor* cache = nullptr;
+    if (max_pad > 0) {
+        const size_t cache_index = state.conv_pos++;
+        cache =
+            nc_stream_cache_tensor(ctx, state, io, NC_STREAM_CACHE_CONV, cache_index, max_pad, C);
+    }
+    ggml_tensor* y = ggml_conv1d_fused_grouped(
+        ctx, x, cache, gc.w, gc.b, gc.alpha, gc.alpha_inv, residual, gc.groups, gc.K, gc.d, gc.cout,
+        gc.snake, 0.01f, shared_input, residual_shared);
+    if (cache) {
+        ggml_tensor* next = nullptr;
+        if (T >= max_pad) {
+            next = ggml_view_3d(
+                ctx, x, max_pad, C, 1, x->nb[1], x->nb[2], (size_t)(T - max_pad) * x->nb[0]);
+        } else {
+            ggml_tensor* kept = ggml_view_3d(
+                ctx, cache, max_pad - T, C, 1, cache->nb[1], cache->nb[2],
+                (size_t)T * cache->nb[0]);
+            next = ggml_concat(ctx, kept, x, 0);
+        }
+        nc_stream_add_cache_writeback(ctx, io, next, cache);
+    }
+    return y;
+}
+
 static ggml_tensor*
 nc_stream_residual_block(
     ggml_context* ctx, ggml_tensor* x, const nc_res_block& block, nc_stream_state& state,
@@ -971,6 +1160,28 @@ static ggml_tensor*
 nc_stream_hifigan_reslayer(
     ggml_context* ctx, ggml_tensor* x, const nc_res_layer& layer, nc_stream_state& state,
     nc_stream_graph_io& io) {
+    if (layer.grouped) {
+        // y_g <- x; for each block d: y_g <- y_g + skip_g(act(input_g(act(y_g)))); out = mean_g y_g
+        const int64_t T = x->ne[0];
+        const int64_t C = x->ne[1];
+        ggml_tensor* y3 = nullptr;
+        for (size_t d = 0; d < layer.grouped_in.size(); ++d) {
+            ggml_tensor* a = nc_stream_grouped_conv(
+                ctx, d == 0 ? x : y3, /*shared_input=*/d == 0, layer.grouped_in[d], nullptr, false,
+                state, io);
+            y3 = nc_stream_grouped_conv(
+                ctx, a, false, layer.grouped_skip[d], d == 0 ? x : y3, /*residual_shared=*/d == 0,
+                state, io);
+        }
+        const int G = layer.grouped_in[0].groups;
+        ggml_tensor* sum = nullptr;
+        for (int g = 0; g < G; ++g) {
+            ggml_tensor* part =
+                ggml_view_3d(ctx, y3, T, C, 1, y3->nb[1], y3->nb[2], (size_t)g * C * y3->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, part) : part;
+        }
+        return ggml_scale(ctx, sum, 1.0f / (float)G);
+    }
     ggml_tensor* sum = nullptr;
     for (const auto& stack : layer.by_kernel) {
         ggml_tensor* y = nc_stream_hifigan_resblock_stack(ctx, x, stack, state, io);

@@ -196,6 +196,15 @@ stock comparison therefore requires both a pristine ggml checkout and
   `[K][cout][cin]`. Replaces the im2col + cuBLAS decomposition in the NanoCodec
   decoder; a CPU reference implementation is included for testing.
 
+- **0026-cuda-backend-graphs-toggle.patch** - adds
+  `ggml_backend_cuda_set_graphs_enabled()`: a per-backend opt-out of CUDA graph
+  capture/replay for backends that compute one-shot graphs (capture and
+  instantiate hold the driver lock and stall launches on other threads).
+- **0027-cuda-block-reduce-barrier.patch** - `block_reduce()` synchronizes the
+  block before writing its shared-memory slot: consecutive reductions on the same
+  buffer (soft_max: max then sum) otherwise race and give scheduling-dependent
+  results when the SM is shared with a co-resident kernel.
+
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the

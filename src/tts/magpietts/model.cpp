@@ -129,6 +129,25 @@ BackendTensor::alloc2d(
         ggml_set_name(tensor, name);
         return true;
     }
+    // Grow-only: a smaller or equal shape reuses the existing device buffer (cudaFree/cudaMalloc
+    // pairs on the streaming path stall other threads' launches).
+    if (buffer && ctx &&
+        ggml_backend_buffer_get_size(buffer) >= ggml_row_size(type, ne0) * (size_t)ne1) {
+        ggml_free(ctx);
+        ggml_init_params view_params = {
+            /*.mem_size   =*/ggml_tensor_overhead(),
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        ctx = ggml_init(view_params);
+        if (ctx) {
+            tensor = ggml_new_tensor_2d(ctx, type, ne0, ne1);
+            ggml_set_name(tensor, name);
+            ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+            return true;
+        }
+        tensor = nullptr;
+    }
 
     reset();
     ggml_init_params params = {
@@ -1400,11 +1419,16 @@ compute_graph(
     const magpietts_model& model, ggml_context* ctx, ggml_cgraph* gf,
     const std::vector<std::pair<std::string, std::vector<int32_t>>>& i32_inputs,
     const std::vector<std::pair<std::string, std::vector<float>>>& f32_inputs, int threads,
-    ggml_gallocr_t* keep_allocr) {
+    ggml_gallocr_t* keep_allocr, ggml_backend_t backend) {
     const ggml_nvtx::range nvtx_range("magpietts_compute_graph");
     tag_graph_first_node(gf);
+    if (!backend) {
+        backend = model.backend;
+    }
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    const bool owned = !(keep_allocr && *keep_allocr);
+    ggml_gallocr_t allocr =
+        owned ? ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)) : *keep_allocr;
     if (!allocr) {
         fprintf(stderr, "failed to create graph allocator\n");
         return false;
@@ -1422,7 +1446,9 @@ compute_graph(
             ggml_tensor* t = ggml_graph_get_tensor(gf, it.first.c_str());
             if (!t) {
                 fprintf(stderr, "missing graph input: %s\n", it.first.c_str());
-                ggml_gallocr_free(allocr);
+                if (owned) {
+                    ggml_gallocr_free(allocr);
+                }
                 return false;
             }
             magpietts_backend_tensor_set_staged(
@@ -1432,7 +1458,9 @@ compute_graph(
             ggml_tensor* t = ggml_graph_get_tensor(gf, it.first.c_str());
             if (!t) {
                 fprintf(stderr, "missing graph input: %s\n", it.first.c_str());
-                ggml_gallocr_free(allocr);
+                if (owned) {
+                    ggml_gallocr_free(allocr);
+                }
                 return false;
             }
             magpietts_backend_tensor_set_staged(
@@ -1440,18 +1468,20 @@ compute_graph(
         }
     }
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
+    if (ggml_backend_is_cpu(backend)) {
+        ggml_backend_cpu_set_n_threads(backend, threads);
     }
 
     ggml_status status = GGML_STATUS_FAILED;
     {
         const ggml_nvtx::range nvtx_compute("magpietts_graph_compute");
-        status = ggml_backend_graph_compute(model.backend, gf);
+        status = ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ggml graph compute failed: %s\n", ggml_status_to_string(status));
-        ggml_gallocr_free(allocr);
+        if (owned) {
+            ggml_gallocr_free(allocr);
+        }
         return false;
     }
 
