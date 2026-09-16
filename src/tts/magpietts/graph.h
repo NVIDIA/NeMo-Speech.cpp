@@ -46,7 +46,10 @@ bool compute_graph(
     const magpietts_model& model, ggml_context* ctx, ggml_cgraph* gf,
     const std::vector<std::pair<std::string, std::vector<int32_t>>>& i32_inputs,
     const std::vector<std::pair<std::string, std::vector<float>>>& f32_inputs, int threads,
-    ggml_gallocr_t* keep_allocr = nullptr);
+    ggml_gallocr_t* keep_allocr = nullptr, ggml_backend_t backend = nullptr);
+// keep_allocr: when it already holds an allocator that one is reused (its buffer grows on
+// demand) and handed back, so repeated graphs do not malloc/free per call. backend: overrides
+// model.backend for allocation and compute (a side stream for background work).
 std::vector<int32_t> positions(int n);
 std::vector<int32_t> positions_range(int start, int n);
 

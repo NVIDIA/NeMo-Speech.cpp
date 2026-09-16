@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <vector>
 
 #include "model.h"
 
@@ -61,6 +63,27 @@ class DecoderCrossKvCache {
     int n_layers = 0;
     int n_cross_dim = 0;
     bool valid = false;
+};
+
+// Unconditional-lane prefill of the baked context (zero context embedding + BOS frame, no text):
+// identical for every text chunk of a decoder, so it is computed once and copied afterwards.
+struct magpietts_uncond_prefill_cache {
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor* k = nullptr;       // [n_layers * n_tokens * n_embd] f32
+    ggml_tensor* v = nullptr;       // [n_layers * n_tokens * n_embd] f32
+    ggml_tensor* hidden = nullptr;  // [n_embd] hidden state of the last prefilled row
+    int n_tokens = 0;
+    int n_layers = 0;
+    int n_embd = 0;
+    std::vector<int32_t> codes;  // stacked audio codes the prefill was built from
+    std::atomic<bool> ready{false};
+
+    magpietts_uncond_prefill_cache() = default;
+    ~magpietts_uncond_prefill_cache();
+    magpietts_uncond_prefill_cache(const magpietts_uncond_prefill_cache&) = delete;
+    magpietts_uncond_prefill_cache& operator=(const magpietts_uncond_prefill_cache&) = delete;
+    void reset();
 };
 
 struct decoder_result {
@@ -131,11 +154,36 @@ class MagpieDecoder {
         DecoderCrossKvCache* cond_cross_kv = nullptr,
         const magpietts_decoder_attention* attention = nullptr) const;
 
+    // Longform chunk prefetch. prefillPair runs the eager baked-context prefill of a future text
+    // chunk (audio = BOS only) into caller-owned caches on `backend` (a side stream) without
+    // touching the persistent runtime; it may run on another thread while this decoder keeps
+    // generating. adoptPrefill then makes a prefetched prefill the current chunk's state: the
+    // persistent runtime is seeded straight from the prefetched caches (or the rows are copied
+    // into the live caches) and the live cross cache takes the prefetched K/V.
+    bool prefillPair(
+        const std::vector<float>& text_cond, int text_len,
+        const std::vector<std::vector<int32_t>>& audio_codes, int speaker, int threads,
+        DecoderKvCache& cond_kv, DecoderKvCache& uncond_kv,
+        const magpietts_backend_tensor* text_cond_device, magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out, DecoderCrossKvCache* cond_cross_kv,
+        const magpietts_decoder_attention* attention, MagpiePinnedHostScratch& staging,
+        ggml_backend_t backend, ggml_gallocr_t* keep_allocr,
+        ggml_gallocr_t* cross_allocr = nullptr) const;
+    // Finish a deferred alignment readback (see magpietts_decoder_attention::defer_alignment);
+    // a no-op when nothing is pending.
+    bool completeAlignment(const magpietts_decoder_attention* attention) const;
+    bool adoptPrefill(
+        const DecoderKvCache& prefetched_cond_kv, const DecoderKvCache& prefetched_uncond_kv,
+        const DecoderCrossKvCache& prefetched_cross_kv, DecoderKvCache& cond_kv,
+        DecoderKvCache& uncond_kv, DecoderCrossKvCache& cond_cross_kv, int text_len,
+        int stacked_position_budget) const;
+
    private:
     class PersistentDecoderRuntime;
 
     const magpietts_model& model_;
     mutable MagpiePinnedHostScratch output_staging_;
+    mutable magpietts_uncond_prefill_cache uncond_prefill_cache_;
     mutable std::unique_ptr<PersistentDecoderRuntime> persistent_runtime_;
     mutable bool persistent_owns_kv_ = false;  // KV contents live in the persistent arena
 };

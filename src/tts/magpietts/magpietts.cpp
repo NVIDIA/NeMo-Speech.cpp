@@ -25,6 +25,8 @@
 #include "audio_pp.h"
 #include "decoder.h"
 #include "encoder.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml_log_filter.h"
 #include "lt.h"
 #include "nvtx_utils.h"
@@ -265,6 +267,55 @@ class MagpieStreamingWorkspace {
     DecoderCrossKvCache cond_cross_kv;
     nc::NanoCodecStreamState codec_stream_state;
     std::map<int, nc::NanoCodecStreamGraph> codec_stream_graphs;
+
+    // Longform chunk prefetch: the next text chunk's encoder pass, cross K/V and baked-context
+    // prefill run on this side backend (own CUDA stream, default priority) from a helper thread
+    // while the current chunk is being generated (see stream_magpie_to_audio).
+    ggml_backend_t prefetch_backend = nullptr;
+    DecoderKvCache prefetch_cond_kv;
+    DecoderKvCache prefetch_uncond_kv;
+    DecoderCrossKvCache prefetch_cross_kv;
+    magpietts_backend_tensor prefetch_text_cond_device;
+    magpietts_backend_tensor prefetch_cond_hidden;
+    magpietts_backend_tensor prefetch_uncond_hidden;
+    MagpiePinnedHostScratch prefetch_staging;
+    ggml_gallocr_t prefetch_encoder_allocr = nullptr;
+    ggml_gallocr_t prefetch_prefill_allocr = nullptr;
+    ggml_gallocr_t prefetch_cross_allocr = nullptr;
+
+    bool ensurePrefetchBackend() {
+        if (prefetch_backend) {
+            return true;
+        }
+        if (!magpietts_backend_is_cuda(magpie_.backend)) {
+            return false;
+        }
+        ggml_backend_dev_t device = ggml_backend_get_device(magpie_.backend);
+        if (!device) {
+            return false;
+        }
+        prefetch_backend = ggml_backend_dev_init(device, nullptr);
+#if defined(GGML_USE_CUDA)
+        if (prefetch_backend)
+            ggml_backend_cuda_set_graphs_enabled(prefetch_backend, false);  // one-shot graphs
+#endif
+        return prefetch_backend != nullptr;
+    }
+
+    ~MagpieStreamingWorkspace() {
+        if (prefetch_encoder_allocr) {
+            ggml_gallocr_free(prefetch_encoder_allocr);
+        }
+        if (prefetch_prefill_allocr) {
+            ggml_gallocr_free(prefetch_prefill_allocr);
+        }
+        if (prefetch_cross_allocr) {
+            ggml_gallocr_free(prefetch_cross_allocr);
+        }
+        if (prefetch_backend) {
+            ggml_backend_free(prefetch_backend);
+        }
+    }
 
    private:
     MagpieModel local_transformer_cpu_model;
@@ -1214,11 +1265,168 @@ stream_magpie_to_audio(
     int history_text_context_len = 0;
     MagpiePinnedHostScratch text_context_staging;
 
+    // Longform chunk prefetch: while chunk k is being generated, a helper thread runs chunk k+1's
+    // encoder pass, cross K/V build and baked-context prefill on the workspace's side backend.
+    // Everything it needs is known ahead except the text history length, which depends on where
+    // the attention prior leaves chunk k; it is speculated with the default window and verified
+    // at the boundary (any mismatch falls back to the regular synchronous path).
+    struct chunk_prefetch_state {
+        std::thread thread;
+        bool launched = false;
+        bool ok = false;
+        size_t chunk_index = 0;
+        int text_len = 0;
+        std::vector<int32_t> text_window;
+        std::vector<float> text_cond;
+        std::vector<float> prior;
+        bool collect_alignment = false;
+        std::vector<float> alignment;
+        void join() {
+            if (launched) {
+                thread.join();
+                launched = false;
+            }
+        }
+        ~chunk_prefetch_state() { join(); }
+    } chunk_prefetch;
+    const char* prefetch_env = std::getenv("MAGPIETTS_CHUNK_PREFETCH");
+    const bool prefetch_enabled =
+        longform_active && use_cuda_sampling && params.use_local_transformer && params.use_cfg &&
+        params.use_kv_cache && token_chunks.size() > 1 &&
+        !(prefetch_env && prefetch_env[0] == '0') && workspace.ensurePrefetchBackend();
+    int prefetch_max_window = 0;
+    if (longform_active && params.use_kv_cache) {
+        // Size the cross caches once for the widest text window so the persistent decoder
+        // runtime (built on the cross cache buffer) survives every chunk transition.
+        int max_window = 0;
+        size_t seen = 0;
+        for (const auto& chunk : token_chunks) {
+            const int cur = (int)chunk.size();
+            const int hist = std::min<int>(
+                {(int)std::min<size_t>(seen, (size_t)1 << 30), cur, 20,
+                 std::max(0, h.n_ctx - cur)});
+            max_window = std::max(max_window, hist + cur);
+            seen += chunk.size();
+        }
+        if (max_window > 0 && !cond_cross_kv.init(magpie, max_window)) {
+            return cancel_worker();
+        }
+        if (prefetch_enabled && max_window > 0 &&
+            !workspace.prefetch_cross_kv.init(magpie, max_window)) {
+            return cancel_worker();
+        }
+        prefetch_max_window = max_window;
+    }
+    int absolute_token_offset = 0;
+    auto start_chunk_prefetch = [&](size_t next_index, const std::vector<int32_t>& current_tokens) {
+        if (!prefetch_enabled || chunk_prefetch.launched || next_index >= token_chunks.size()) {
+            return;
+        }
+        const std::vector<int32_t>& next_tokens = token_chunks[next_index];
+        if (next_tokens.empty() || (int)next_tokens.size() > h.n_ctx) {
+            return;
+        }
+        // Speculate the history with the default window (mirrors the chunk loop with
+        // required_history = 0, its usual value).
+        const size_t prior_size = prior_text_tokens.size() + current_tokens.size();
+        const int max_history = std::max(0, h.n_ctx - (int)next_tokens.size());
+        const int history_len = std::min<int>(
+            {(int)std::min<size_t>(prior_size, (size_t)1 << 30), (int)next_tokens.size(), 20,
+             max_history});
+        const int left_offset = absolute_token_offset + (int)current_tokens.size() - history_len;
+        std::vector<int32_t> window;
+        window.reserve((size_t)history_len + next_tokens.size());
+        if (history_len > 0) {
+            const int from_current = std::min<int>(history_len, (int)current_tokens.size());
+            const int from_prior = history_len - from_current;
+            if (from_prior > 0) {
+                window.insert(
+                    window.end(), prior_text_tokens.end() - from_prior, prior_text_tokens.end());
+            }
+            window.insert(window.end(), current_tokens.end() - from_current, current_tokens.end());
+        }
+        window.insert(window.end(), next_tokens.begin(), next_tokens.end());
+        const int text_len = (int)window.size();
+        MagpieLongformAttentionPriorState speculative;
+        speculative.beginChunk(h, left_offset, text_len, (int)next_tokens.size(), false);
+        chunk_prefetch.chunk_index = next_index;
+        chunk_prefetch.text_len = text_len;
+        chunk_prefetch.text_window = window;
+        chunk_prefetch.prior.clear();
+        if (const std::vector<float>* prior = speculative.priorForStep(h, text_len)) {
+            chunk_prefetch.prior = *prior;
+        }
+        chunk_prefetch.collect_alignment = speculative.shouldCollect(h, 0, text_len);
+        chunk_prefetch.alignment.clear();
+        chunk_prefetch.ok = false;
+        std::vector<float> history_context = history_text_context;
+        const int history_context_len = history_text_context_len;
+        const int current_len = (int)next_tokens.size();
+        const int speaker = params.speaker;
+        const int threads = params.threads;
+        chunk_prefetch.thread = std::thread([&, window, history_context, history_context_len,
+                                             current_len, text_len, speaker, threads]() {
+            const ggml_nvtx::range nvtx_range("magpietts_stream_chunk_prefetch");
+            MagpieStreamingWorkspace& ws = workspace;
+            // pinned staging sized once for the widest window (cudaMallocHost holds the driver
+            // lock)
+            ws.prefetch_staging.reserve(
+                magpie,
+                (size_t)h.n_embd * (size_t)std::max(text_len, prefetch_max_window) * sizeof(float));
+            if (!encoder.evalDevice(
+                    window, threads, ws.prefetch_text_cond_device, ws.prefetch_backend,
+                    &ws.prefetch_encoder_allocr)) {
+                return;
+            }
+            std::vector<float>& cond = chunk_prefetch.text_cond;
+            cond.resize((size_t)h.n_embd * (size_t)text_len);
+            magpietts_backend_tensor_get_staged(
+                magpie, ws.prefetch_staging, ws.prefetch_text_cond_device.tensor, cond.data(), 0,
+                cond.size() * sizeof(float));
+            if (!splice_longform_history_context(
+                    cond, text_len, current_len, h.n_embd, history_context, history_context_len)) {
+                return;
+            }
+            if (text_len > current_len) {
+                magpietts_backend_tensor_set_staged(
+                    magpie, ws.prefetch_staging, ws.prefetch_text_cond_device.tensor, cond.data(),
+                    0, cond.size() * sizeof(float));
+            }
+            if (!ws.prefetch_cond_hidden.alloc2d(
+                    magpie, GGML_TYPE_F32, h.n_embd, 1, "prefetch_hidden_cond") ||
+                !ws.prefetch_uncond_hidden.alloc2d(
+                    magpie, GGML_TYPE_F32, h.n_embd, 1, "prefetch_hidden_uncond")) {
+                return;
+            }
+            std::vector<std::vector<int32_t>> bos_codes((size_t)h.audio_codebooks);
+            for (auto& codes : bos_codes) {
+                codes.assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
+            }
+            magpietts_decoder_attention attention;
+            attention.prior = chunk_prefetch.prior.empty() ? nullptr : &chunk_prefetch.prior;
+            attention.alignment_scores =
+                chunk_prefetch.collect_alignment ? &chunk_prefetch.alignment : nullptr;
+            ws.prefetch_cross_kv.clear();
+            chunk_prefetch.ok = decoder.prefillPair(
+                cond, text_len, bos_codes, speaker, threads, ws.prefetch_cond_kv,
+                ws.prefetch_uncond_kv, &ws.prefetch_text_cond_device, &ws.prefetch_cond_hidden,
+                &ws.prefetch_uncond_hidden, &ws.prefetch_cross_kv,
+                (attention.prior || attention.alignment_scores) ? &attention : nullptr,
+                ws.prefetch_staging, ws.prefetch_backend, &ws.prefetch_prefill_allocr,
+                &ws.prefetch_cross_allocr);
+        });
+        chunk_prefetch.launched = true;
+    };
+    // Diagnostic: MAGPIETTS_DUMP_CODES=<path> writes the sampled codes of every step (chunk, step,
+    // codes...) -- the cheapest way to compare two runs for bit-identical generation.
+    FILE* dump_codes = nullptr;
+    if (const char* dump_path = std::getenv("MAGPIETTS_DUMP_CODES"))
+        dump_codes = fopen(dump_path, "w");
+
     const int64_t t_start = ggml_time_us();
     metrics.decoder.begin(t_start);
     {
         const ggml_nvtx::range nvtx_loop("magpietts_stream_generation_loop");
-        int absolute_token_offset = 0;
         for (size_t chunk_index = 0; chunk_index < token_chunks.size(); ++chunk_index) {
             const std::vector<int32_t>& current_tokens = token_chunks[chunk_index];
             if (current_tokens.empty()) {
@@ -1279,7 +1487,46 @@ stream_magpie_to_audio(
                 h, left_offset, text_len, (int)current_tokens.size(), first_text_chunk);
 
             const int64_t encoder_start_us = ggml_time_us();
-            if (use_cuda_sampling) {
+            bool adopted_prefetch = false;
+            if (chunk_prefetch.launched) {
+                chunk_prefetch.join();
+                const std::vector<float>* live_prior = attention_prior.priorForStep(h, text_len);
+                const bool prior_matches = live_prior ? (*live_prior == chunk_prefetch.prior)
+                                                      : chunk_prefetch.prior.empty();
+                adopted_prefetch = chunk_prefetch.ok && chunk_prefetch.chunk_index == chunk_index &&
+                                   chunk_prefetch.text_window == text_window && prior_matches &&
+                                   chunk_prefetch.collect_alignment ==
+                                       attention_prior.shouldCollect(h, 0, text_len);
+                if (params.verbose) {
+                    fprintf(
+                        stderr, "%s text chunk %zu/%zu prefetch %s\n", label, chunk_index + 1,
+                        token_chunks.size(),
+                        adopted_prefetch
+                            ? "adopted"
+                            : (chunk_prefetch.ok ? "discarded (history/prior differ)" : "failed"));
+                }
+            }
+            if (adopted_prefetch) {
+                text_cond = chunk_prefetch.text_cond;
+                if (!text_cond_device.alloc2d(
+                        magpie, GGML_TYPE_F32, h.n_embd, text_len, "text_cond_device")) {
+                    return cancel_worker();
+                }
+                ggml_backend_tensor_copy_async(
+                    magpie.backend, magpie.backend, workspace.prefetch_text_cond_device.tensor,
+                    text_cond_device.tensor);
+                if (params.use_local_transformer) {
+                    if (!cond_hidden_device.alloc2d(
+                            magpie, GGML_TYPE_F32, h.n_embd, 1, "decoder_hidden_cond_device")) {
+                        return cancel_worker();
+                    }
+                    if (params.use_cfg &&
+                        !uncond_hidden_device.alloc2d(
+                            magpie, GGML_TYPE_F32, h.n_embd, 1, "decoder_hidden_uncond_device")) {
+                        return cancel_worker();
+                    }
+                }
+            } else if (use_cuda_sampling) {
                 if (!encoder.evalDevice(text_window, params.threads, text_cond_device)) {
                     return cancel_worker();
                 }
@@ -1304,7 +1551,7 @@ stream_magpie_to_audio(
                 return cancel_worker();
             }
             if (longform_active) {
-                if (!first_text_chunk) {
+                if (!first_text_chunk && !adopted_prefetch) {
                     if (!splice_longform_history_context(
                             text_cond, text_len, (int)current_tokens.size(), h.n_embd,
                             history_text_context, history_text_context_len)) {
@@ -1329,6 +1576,11 @@ stream_magpie_to_audio(
                 (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
             for (int step = 0; step < max_decoder_positions; ++step) {
                 const ggml_nvtx::range nvtx_step("magpietts_stream_generation_step");
+                if (step == 3 && !final_text_chunk) {
+                    // Past the first audio chunk (TTFA); the prefetch shares the GPU with the
+                    // decoder steps, so keep it off the very first ones.
+                    start_chunk_prefetch(chunk_index + 1, current_tokens);
+                }
                 const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
                 if (frames_remaining <= 0) {
                     break;
@@ -1353,6 +1605,9 @@ stream_magpie_to_audio(
                 std::vector<float> alignment_scores;
                 magpietts_decoder_attention decoder_attention;
                 decoder_attention.prior = attention_prior.priorForStep(h, text_len);
+                // the alignment feeds the NEXT step's prior only: read it back after the sampler
+                decoder_attention.defer_alignment =
+                    use_cuda_sampling && params.use_local_transformer;
                 if (attention_prior.shouldCollect(h, step, text_len)) {
                     decoder_attention.alignment_scores = &alignment_scores;
                 }
@@ -1364,30 +1619,58 @@ stream_magpie_to_audio(
 
                 if (use_cuda_sampling) {
                     if (params.use_local_transformer) {
-                        const bool decode_ok =
-                            params.use_cfg
-                                ? (params.use_kv_cache
-                                       ? decoder.evalCachedPair(
-                                             text_cond, text_len, audio_codes, params.speaker,
-                                             params.threads, cond_kv, uncond_kv, cond, uncond,
-                                             max_decoder_positions, nullptr, &text_cond_device,
-                                             &cond_hidden_device, &uncond_hidden_device,
-                                             &cond_cross_kv, decoder_attention_arg)
-                                       : decoder.evalPair(
-                                             text_cond, text_len, audio_codes, params.speaker,
-                                             params.threads, cond, uncond, nullptr,
-                                             &text_cond_device, &cond_hidden_device,
-                                             &uncond_hidden_device, decoder_attention_arg))
-                                : (params.use_kv_cache
-                                       ? decoder.evalCached(
-                                             text_cond, text_len, audio_codes, params.speaker, true,
-                                             params.threads, cond_kv, cond, nullptr,
-                                             &text_cond_device, &cond_hidden_device, &cond_cross_kv,
-                                             decoder_attention_arg)
-                                       : decoder.eval(
-                                             text_cond, text_len, audio_codes, params.speaker, true,
-                                             params.threads, cond, nullptr, &text_cond_device,
-                                             &cond_hidden_device, decoder_attention_arg));
+                        bool decode_ok = false;
+                        if (adopted_prefetch && step == 0) {
+                            // The prefetched baked-context prefill is this chunk's first step.
+                            decode_ok = decoder.adoptPrefill(
+                                workspace.prefetch_cond_kv, workspace.prefetch_uncond_kv,
+                                workspace.prefetch_cross_kv, cond_kv, uncond_kv, cond_cross_kv,
+                                text_len, max_decoder_positions);
+                            if (decode_ok) {
+                                ggml_backend_tensor_copy_async(
+                                    magpie.backend, magpie.backend,
+                                    workspace.prefetch_cond_hidden.tensor,
+                                    cond_hidden_device.tensor);
+                                ggml_backend_tensor_copy_async(
+                                    magpie.backend, magpie.backend,
+                                    workspace.prefetch_uncond_hidden.tensor,
+                                    uncond_hidden_device.tensor);
+                                if (decoder_attention.alignment_scores) {
+                                    alignment_scores = chunk_prefetch.alignment;
+                                }
+                            } else if (params.verbose) {
+                                fprintf(
+                                    stderr, "%s prefetched prefill rejected; running it inline\n",
+                                    label);
+                            }
+                        }
+                        if (!decode_ok) {
+                            decode_ok =
+                                params.use_cfg
+                                    ? (params.use_kv_cache
+                                           ? decoder.evalCachedPair(
+                                                 text_cond, text_len, audio_codes, params.speaker,
+                                                 params.threads, cond_kv, uncond_kv, cond, uncond,
+                                                 max_decoder_positions, nullptr, &text_cond_device,
+                                                 &cond_hidden_device, &uncond_hidden_device,
+                                                 &cond_cross_kv, decoder_attention_arg)
+                                           : decoder.evalPair(
+                                                 text_cond, text_len, audio_codes, params.speaker,
+                                                 params.threads, cond, uncond, nullptr,
+                                                 &text_cond_device, &cond_hidden_device,
+                                                 &uncond_hidden_device, decoder_attention_arg))
+                                    : (params.use_kv_cache
+                                           ? decoder.evalCached(
+                                                 text_cond, text_len, audio_codes, params.speaker,
+                                                 true, params.threads, cond_kv, cond, nullptr,
+                                                 &text_cond_device, &cond_hidden_device,
+                                                 &cond_cross_kv, decoder_attention_arg)
+                                           : decoder.eval(
+                                                 text_cond, text_len, audio_codes, params.speaker,
+                                                 true, params.threads, cond, nullptr,
+                                                 &text_cond_device, &cond_hidden_device,
+                                                 decoder_attention_arg));
+                        }
                         if (!decode_ok) {
                             return cancel_worker();
                         }
@@ -1397,6 +1680,10 @@ stream_magpie_to_audio(
                                 h.cfg_scale, h.temperature, h.top_k, forbid_eos,
                                 workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
                                 sample_frame_index, next_codes, argmax_codes)) {
+                            return cancel_worker();
+                        }
+                        if (decoder_attention_arg &&
+                            !decoder.completeAlignment(decoder_attention_arg)) {
                             return cancel_worker();
                         }
 #else
@@ -1560,6 +1847,11 @@ stream_magpie_to_audio(
                     }
                 }
 
+                if (dump_codes) {
+                    fprintf(dump_codes, "%zu %d", chunk_index, step);
+                    for (int32_t v : next_codes) fprintf(dump_codes, " %d", v);
+                    fprintf(dump_codes, "\n");
+                }
                 std::vector<std::vector<int32_t>> codec_frames;
                 if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
                     fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
@@ -1673,6 +1965,8 @@ stream_magpie_to_audio(
             absolute_token_offset += (int)current_tokens.size();
         }
     }
+    if (dump_codes)
+        fclose(dump_codes);
     metrics.decoder.finish(
         metrics.decoder.last_event_us > 0 ? metrics.decoder.last_event_us : ggml_time_us());
 

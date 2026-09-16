@@ -1,0 +1,67 @@
+diff --git a/include/ggml-cuda.h b/include/ggml-cuda.h
+index 166ef8c1..5bf7c32e 100644
+--- a/include/ggml-cuda.h
++++ b/include/ggml-cuda.h
+@@ -30,6 +30,10 @@ GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+ // Set the CUDA stream priority used by this backend's streams (0 default; negative = higher,
+ // clamped to the device range). Streams already created are recreated.
+ GGML_BACKEND_API void ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int priority);
++// Enable/disable CUDA graph capture and replay for this backend's graph_compute (default on).
++// Side backends running one-shot graphs should turn it off: capture/instantiate hold the driver
++// lock and stall kernel launches issued by other threads.
++GGML_BACKEND_API void ggml_backend_cuda_set_graphs_enabled(ggml_backend_t backend, bool enabled);
+ 
+ // Returns the backend-owned native CUDA/HIP graph template for a stable GGML graph after its
+ // normal warm-up/capture has completed. The opaque handle is borrowed and is intended for runtime
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index fa09cd6b..895ee058 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1398,6 +1398,10 @@ struct ggml_backend_cuda_context {
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+ 
+     int curr_stream_no = 0;
++    // Per-backend opt-out of CUDA graph capture/replay (ggml_backend_cuda_set_graphs_enabled):
++    // one-shot graphs computed on a side backend gain nothing from capture, and the capture and
++    // instantiate calls hold the driver lock long enough to stall launches on other threads.
++    bool graphs_enabled = true;
+ 
+ #ifdef USE_CUDA_GRAPH
+     // The structural signature separates batch shapes and graph topologies even
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 0a9d67fe..e2cd19f0 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -5372,7 +5372,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (graph->is_enabled() && cuda_ctx->graphs_enabled) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
+@@ -5446,7 +5446,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+ 
+ #ifdef USE_CUDA_GRAPH
+     const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
+-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
++    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key) && cuda_ctx->graphs_enabled;
+ #else
+     const bool use_cuda_graph = false;
+     GGML_UNUSED(cuda_ctx);
+@@ -5739,6 +5739,14 @@ void ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int priority)
+     }
+ }
+ 
++void ggml_backend_cuda_set_graphs_enabled(ggml_backend_t backend, bool enabled) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return;
++    }
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    cuda_ctx->graphs_enabled = enabled;
++}
++
+ void * ggml_backend_cuda_get_graph_template(
+     ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+     if (!ggml_backend_is_cuda(backend) || cgraph == nullptr) {

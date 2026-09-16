@@ -10,33 +10,9 @@
 #include <cstring>
 #include <vector>
 
+#include "magpietts_chain_common.cuh"
 #include "magpietts_cuda_sampling_device.cuh"
 #include "magpietts_lt_fused.h"
-
-// ggml type ids (ggml.h): F32 = 0, F16 = 1, Q8_0 = 8.
-static constexpr int LTF_TYPE_F32 = 0;
-static constexpr int LTF_TYPE_F16 = 1;
-static constexpr int LTF_TYPE_Q8_0 = 8;
-static constexpr int LTF_LANES = 2;
-#ifndef LTF_THREADS_OVERRIDE
-#define LTF_THREADS_OVERRIDE 256
-#endif
-#ifndef LTF_ROWS_PER_WARP_OVERRIDE
-#define LTF_ROWS_PER_WARP_OVERRIDE 4
-#endif
-static constexpr int LTF_THREADS = LTF_THREADS_OVERRIDE;
-static constexpr int LTF_WARPS = LTF_THREADS / 32;
-static constexpr int LTF_MAX_EMBD = 1024;  // max LayerNorm width
-static constexpr int LTF_MAX_K = 3072;     // max GEMV input width (FFN hidden)
-static constexpr int LTF_MAX_POS = 32;
-
-// Planar Q8 matrix: quants int8 [N][K] (16-byte aligned rows since K % 64 == 0) and f16
-// scales [N][K/32]; repacked once from ggml Q8_0 (34-byte interleaved blocks) so the GEMV
-// streams whole 32-byte sectors with two uint4 loads per block instead of ten 4-byte loads.
-struct ltf_q8p {
-    const int8_t* qs = nullptr;
-    const __half* d = nullptr;
-};
 
 struct ltf_layer {
     const void* qkv;
@@ -47,6 +23,9 @@ struct ltf_layer {
     const float* norm_ff;
     int qkv_type, o_type, ff1_type, ff2_type;
     ltf_q8p qkv_p, o_p, ff1_p, ff2_p;
+    // LayerNorm fold constants for the chain kernel: c[r] = sum_k gamma_k * W[r][k]
+    const float* qkv_c = nullptr;  // [3*n_embd] with norm_self
+    const float* ff1_c = nullptr;  // [n_ff] with norm_ff
 };
 
 struct magpietts_lt_fused {
@@ -64,6 +43,14 @@ struct magpietts_lt_fused {
     float* ctx = nullptr;     // [2][n_embd]
     float* ff = nullptr;      // [2][n_ff]
     float* logits = nullptr;  // [2][vocab]
+    // producer-quantized activations for the chain kernel (int8 + per-group scales)
+    int8_t* ctx_q = nullptr;  // [2][n_embd], groups of 32 (written by the attention tail)
+    float* ctx_d = nullptr;   // [2][n_embd/32]
+    int8_t* ff_q = nullptr;   // [2][n_ff], groups of 16 (written by the ff1 epilogue)
+    float* ff_d = nullptr;    // [2][n_ff/16]
+    int8_t* h_q = nullptr;    // [2][n_embd] residual stream (times the next LN gamma), groups of 4
+    float* h_d = nullptr;     // [2][n_embd/4]
+    float* stats = nullptr;  // [2 lanes][sum, sumsq][LTF_CHAIN_MAX_GRID] per-block partial LN stats
     float* kcache = nullptr;  // [layers][2][pos_rows][n_embd]
     float* vcache = nullptr;
     int* sample_counters = nullptr;  // [n_rounds] last-block-done counters
@@ -76,240 +63,9 @@ struct magpietts_lt_fused {
     bool l2_window = false;  // persisting-L2 window enabled for the arena
 };
 
-static void
-ltf_set_error(char* error, size_t size, const char* msg, cudaError_t err = cudaSuccess) {
-    if (!error || size == 0)
-        return;
-    if (err == cudaSuccess)
-        snprintf(error, size, "%s", msg);
-    else
-        snprintf(error, size, "%s: %s", msg, cudaGetErrorString(err));
-}
-
-// ---------------------------------------------------------------------------------------
-// device helpers
-// ---------------------------------------------------------------------------------------
-static __device__ __forceinline__ float
-ltf_warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-
-static __device__ __forceinline__ float
-ltf_gelu(float x) {
-    const float GELU_COEF_A = 0.044715f;
-    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
-    return 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
-}
-
-static __device__ __forceinline__ float
-ltf_load_scalar(const void* base, int type, size_t index) {
-    if (type == LTF_TYPE_F16)
-        return __half2float(reinterpret_cast<const __half*>(base)[index]);
-    return reinterpret_cast<const float*>(base)[index];
-}
-
-// ---------------------------------------------------------------------------------------
-// GEMV building blocks (M = 2 CFG lanes). One warp computes ROWS_PER_WARP output rows at a
-// time; a block handles LTF_WARPS * ROWS_PER_WARP rows. Q8_0 weights are combined with
-// activations quantized once per block to symmetric int8 (32-element blocks, like ggml's
-// Q8_1 path) using dp4a; F16 weights use f32 activations.
-// ---------------------------------------------------------------------------------------
-static constexpr int LTF_ROWS_PER_WARP = LTF_ROWS_PER_WARP_OVERRIDE;
-static constexpr int LTF_ROWS_PER_BLOCK = LTF_WARPS * LTF_ROWS_PER_WARP;
-
-static __device__ __forceinline__ int
-ltf_dp4a(int a, int b, int c) {
-    return __dp4a(a, b, c);
-}
-
-// Register-prefetched Q8 path: each lane owns up to MB blocks per row (blocks = K/32 <= 32*MB).
-// Phase A loads every weight word before the activation prologue; phase B does the dp4a.
-template <int R, int MB>
-struct ltf_q8_prefetch {
-    int q[R][MB][8];
-    float d[R][MB];
-};
-
-template <int R, int MB>
-static __device__ __forceinline__ void
-ltf_prefetch_q8(
-    const int8_t* Wq, const __half* Wd, int K, int N, int row0, int lane,
-    ltf_q8_prefetch<R, MB>& pf) {
-    const int blocks = K >> 5;
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const bool valid = row0 + r < N;
-        const int row = valid ? row0 + r : 0;
-        const uint4* qrow = reinterpret_cast<const uint4*>(Wq + (size_t)row * K);
-        const __half* drow = Wd + (size_t)row * blocks;
-#pragma unroll
-        for (int m = 0; m < MB; ++m) {
-            const int b = lane + m * 32;
-            if (valid && b < blocks) {
-                const uint4 lo = __ldg(qrow + b * 2);
-                const uint4 hi = __ldg(qrow + b * 2 + 1);
-                pf.q[r][m][0] = (int)lo.x;
-                pf.q[r][m][1] = (int)lo.y;
-                pf.q[r][m][2] = (int)lo.z;
-                pf.q[r][m][3] = (int)lo.w;
-                pf.q[r][m][4] = (int)hi.x;
-                pf.q[r][m][5] = (int)hi.y;
-                pf.q[r][m][6] = (int)hi.z;
-                pf.q[r][m][7] = (int)hi.w;
-                pf.d[r][m] = __half2float(drow[b]);
-            } else {
-                pf.d[r][m] = 0.f;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) pf.q[r][m][i] = 0;
-            }
-        }
-    }
-}
-
-template <int R, int MB>
-static __device__ __forceinline__ void
-ltf_dot_q8_prefetched(
-    const ltf_q8_prefetch<R, MB>& pf, int K, const int* xq0, const int* xq1, const float* xd0,
-    const float* xd1, int lane, float (&acc0)[R], float (&acc1)[R]) {
-    const int blocks = K >> 5;
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        acc0[r] = 0.f;
-        acc1[r] = 0.f;
-    }
-#pragma unroll
-    for (int m = 0; m < MB; ++m) {
-        const int b = lane + m * 32;
-        if (b < blocks) {
-            const int* u0 = xq0 + b * 8;
-            const int* u1 = xq1 + b * 8;
-            int x0[8], x1[8];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                x0[i] = u0[i];
-                x1[i] = u1[i];
-            }
-            const float e0 = xd0[b];
-            const float e1 = xd1[b];
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                int s0 = 0, s1 = 0;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    s0 = ltf_dp4a(pf.q[r][m][i], x0[i], s0);
-                    s1 = ltf_dp4a(pf.q[r][m][i], x1[i], s1);
-                }
-                acc0[r] += pf.d[r][m] * e0 * (float)s0;
-                acc1[r] += pf.d[r][m] * e1 * (float)s1;
-            }
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        acc0[r] = ltf_warp_sum(acc0[r]);
-        acc1[r] = ltf_warp_sum(acc1[r]);
-    }
-}
-
-// F16 weights x f32 activations (xn0/xn1 in shared memory, 16-byte aligned).
-static __device__ __forceinline__ void
-ltf_rows_dot_f16(
-    const __half* W, int K, int row0, int row1, const float* xn0, const float* xn1, int lane,
-    float& acc00, float& acc01, float& acc10, float& acc11) {
-    const int chunks = K >> 3;
-    const uint4* r0 = reinterpret_cast<const uint4*>(W + (size_t)row0 * K);
-    const uint4* r1 = row1 >= 0 ? reinterpret_cast<const uint4*>(W + (size_t)row1 * K) : nullptr;
-    float a00 = 0.f, a01 = 0.f, a10 = 0.f, a11 = 0.f;
-    for (int c = lane; c < chunks; c += 32) {
-        const uint4 p0 = __ldg(r0 + c);
-        uint4 p1 = make_uint4(0, 0, 0, 0);
-        if (r1)
-            p1 = __ldg(r1 + c);
-        const int k = c * 8;
-        const float4 x0a = *reinterpret_cast<const float4*>(xn0 + k);
-        const float4 x0b = *reinterpret_cast<const float4*>(xn0 + k + 4);
-        const float4 x1a = *reinterpret_cast<const float4*>(xn1 + k);
-        const float4 x1b = *reinterpret_cast<const float4*>(xn1 + k + 4);
-        const __half2* h0 = reinterpret_cast<const __half2*>(&p0);
-        const __half2* h1 = reinterpret_cast<const __half2*>(&p1);
-        float w[8], v[8];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 f0 = __half22float2(h0[i]);
-            const float2 f1 = __half22float2(h1[i]);
-            w[2 * i] = f0.x;
-            w[2 * i + 1] = f0.y;
-            v[2 * i] = f1.x;
-            v[2 * i + 1] = f1.y;
-        }
-        const float xa[8] = {x0a.x, x0a.y, x0a.z, x0a.w, x0b.x, x0b.y, x0b.z, x0b.w};
-        const float xb[8] = {x1a.x, x1a.y, x1a.z, x1a.w, x1b.x, x1b.y, x1b.z, x1b.w};
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            a00 += w[i] * xa[i];
-            a01 += w[i] * xb[i];
-            a10 += v[i] * xa[i];
-            a11 += v[i] * xb[i];
-        }
-    }
-    acc00 = ltf_warp_sum(a00);
-    acc01 = ltf_warp_sum(a01);
-    acc10 = ltf_warp_sum(a10);
-    acc11 = ltf_warp_sum(a11);
-}
-
-// Block-wide LayerNorm of two lanes of K values (x in shared, result xn in shared); one
-// reduction pass over sum and sum of squares.
-static __device__ __forceinline__ void
-ltf_block_layernorm(const float* x, float* xn, const float* weight, int K, float eps, float* red) {
-    const int tid = threadIdx.x;
-    float s0 = 0.f, s1 = 0.f, q0 = 0.f, q1 = 0.f;
-#pragma unroll 4
-    for (int k = tid; k < K; k += LTF_THREADS) {
-        const float a = x[k];
-        const float b = x[K + k];
-        s0 += a;
-        q0 += a * a;
-        s1 += b;
-        q1 += b * b;
-    }
-    s0 = ltf_warp_sum(s0);
-    s1 = ltf_warp_sum(s1);
-    q0 = ltf_warp_sum(q0);
-    q1 = ltf_warp_sum(q1);
-    if ((tid & 31) == 0) {
-        red[(tid >> 5) * 4 + 0] = s0;
-        red[(tid >> 5) * 4 + 1] = s1;
-        red[(tid >> 5) * 4 + 2] = q0;
-        red[(tid >> 5) * 4 + 3] = q1;
-    }
-    __syncthreads();
-    float S0 = 0.f, S1 = 0.f, Q0 = 0.f, Q1 = 0.f;
-#pragma unroll
-    for (int w = 0; w < LTF_WARPS; ++w) {
-        S0 += red[w * 4 + 0];
-        S1 += red[w * 4 + 1];
-        Q0 += red[w * 4 + 2];
-        Q1 += red[w * 4 + 3];
-    }
-    const float m0 = S0 / (float)K;
-    const float m1 = S1 / (float)K;
-    const float r0 = rsqrtf(fmaxf(Q0 / (float)K - m0 * m0, 0.f) + eps);
-    const float r1 = rsqrtf(fmaxf(Q1 / (float)K - m1 * m1, 0.f) + eps);
-#pragma unroll 4
-    for (int k = tid; k < K; k += LTF_THREADS) {
-        xn[k] = (x[k] - m0) * r0 * weight[k];
-        xn[K + k] = (x[K + k] - m1) * r1 * weight[k];
-    }
-    __syncthreads();
-}
-
 // ---------------------------------------------------------------------------------------
 // kernels
 // ---------------------------------------------------------------------------------------
-enum ltf_epilogue { LTF_EPI_STORE = 0, LTF_EPI_RESIDUAL = 1, LTF_EPI_GELU = 2, LTF_EPI_BIAS = 3 };
 
 struct ltf_gemv_args {
     const float* x;       // [2][K] input (residual stream or activations)
@@ -711,18 +467,12 @@ ltf_attention_kernel(
 // next prologue instead of a kernel ramp-up. Co-residency of all blocks is verified at create
 // time (occupancy query), so the spin barrier cannot deadlock.
 // ---------------------------------------------------------------------------------------
-static constexpr int LTF_MAX_LAYERS = 4;
-static constexpr int LTF_MAX_ROUNDS = LTF_MAX_POS;
-static constexpr int LTF_STAGE_BYTES = 24576;  // max tile quants: 32 rows x 768 or 8 rows x 3072
-static constexpr int LTF_STAGE_SCALES = 768;   // max tile scale count (rows x K/32)
-#ifndef LTF_BARRIER_SLEEP_NS
-#define LTF_BARRIER_SLEEP_NS 200
-#endif
-
 struct ltf_chain_layer {
     ltf_q8p qkv, o, ff1, ff2;
     const float* norm_self;
     const float* norm_ff;
+    const float* qkv_c;  // LN fold constants (see ltf_ln_fold_kernel)
+    const float* ff1_c;
 };
 
 struct ltf_chain_args {
@@ -743,6 +493,13 @@ struct ltf_chain_args {
     float* logits;
     float* kcache;
     float* vcache;
+    int8_t* ctx_q;
+    float* ctx_d;
+    int8_t* ff_q;
+    float* ff_d;
+    int8_t* h_q;
+    float* h_d;
+    float* stats;
     unsigned int* barrier;
     const magpietts_cuda_sampling_config* sample_config;
     int32_t* codes;
@@ -752,370 +509,6 @@ struct ltf_chain_args {
     int sample_codebook_size;
     int sample_eos_id;
 };
-
-// Shared memory of the chain kernel. The GEMV scratch and the sampler scratch are never live in
-// the same phase and alias each other.
-struct ltf_chain_gemv_smem {
-    __align__(16) int s_q[LTF_LANES * (LTF_MAX_K / 4)];
-    float s_d[LTF_LANES * (LTF_MAX_K / 32)];
-    float s_red[4 * LTF_WARPS];
-    __align__(
-        16) float s_x[LTF_LANES * LTF_MAX_EMBD];  // staged input (LN phases) / attention output
-};
-union ltf_chain_smem_union {
-    ltf_chain_gemv_smem g;
-    magpietts_sample_fast_shared samp;
-};
-struct ltf_chain_smem {
-    __align__(16) int8_t s_w[LTF_STAGE_BYTES];
-    __align__(16) __half s_wd[LTF_STAGE_SCALES];
-    ltf_chain_smem_union u;
-};
-
-// Weights are streamed once per round (17 MB/round vs a 6 MB L2), so they are fetched with an
-// evict-first L2 policy; the small activation buffers and the K/V cache then stay L2-resident
-// across rounds instead of being flushed by the weight stream.
-static __device__ __forceinline__ unsigned long long
-ltf_evict_first_policy() {
-    unsigned long long policy;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
-    return policy;
-}
-static __device__ __forceinline__ void
-ltf_cp_async16(void* smem, const void* gmem, unsigned long long policy) {
-    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
-    asm volatile(
-        "cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
-        "l"(policy));
-}
-static __device__ __forceinline__ void
-ltf_cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-static __device__ __forceinline__ void
-ltf_cp_async_wait_all() {
-    asm volatile("cp.async.wait_all;\n" ::);
-}
-
-static __device__ __forceinline__ void
-ltf_grid_barrier(unsigned int* counter, unsigned int& target, unsigned int nblocks) {
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        target += nblocks;
-        __threadfence();
-        atomicAdd(counter, 1u);
-        while (*reinterpret_cast<volatile unsigned int*>(counter) < target) {
-#ifndef LTF_BARRIER_NO_SLEEP
-            __nanosleep(LTF_BARRIER_SLEEP_NS);
-#endif
-        }
-        __threadfence();
-    }
-    __syncthreads();
-}
-
-// Arrival election for the current phase: every block increments a monotonic counter (reset per
-// launch; a grid barrier separates uses). Returns this block's arrival rank in [0, nblocks); the
-// blocks with rank >= nblocks - n_tail spin until all blocks have arrived and then own the tail
-// work (e.g. attention over the just-completed K/V rows) in parallel.
-static __device__ __forceinline__ int
-ltf_chain_arrival_rank(unsigned int* counter, unsigned int nblocks, int n_tail, int* s_flag) {
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        __threadfence();
-        const unsigned int prev = atomicAdd(counter, 1u);
-        const unsigned int rank = prev % nblocks;
-        const unsigned int done_value = prev - rank + nblocks;
-        if ((int)rank >= (int)nblocks - n_tail) {
-            while (*reinterpret_cast<volatile unsigned int*>(counter) < done_value) {
-            }
-            __threadfence();
-        }
-        *s_flag = (int)rank;
-    }
-    __syncthreads();
-    return *s_flag;
-}
-
-// Stage this block's tile (rows [tile*ROWS, +ROWS) of W, contiguous in the planar layout) into
-// shared memory asynchronously. Callers must have finished reading the previous stage
-// (__syncthreads) before issuing.
-template <int R>
-static __device__ __forceinline__ void
-ltf_chain_stage(const ltf_q8p& W, int K, int N, int tile, ltf_chain_smem& sm) {
-    constexpr int ROWS = LTF_WARPS * R;
-    const int row_begin = tile * ROWS;
-    if (row_begin >= N)
-        return;
-    const int rows = min(ROWS, N - row_begin);
-    const int blocks = K >> 5;
-    const int qbytes = rows * K;
-    const int dbytes = (rows * blocks * 2 + 15) & ~15;
-    const int8_t* gq = W.qs + (size_t)row_begin * K;
-    const int8_t* gd = reinterpret_cast<const int8_t*>(W.d + (size_t)row_begin * blocks);
-    int8_t* sd = reinterpret_cast<int8_t*>(sm.s_wd);
-    const unsigned long long policy = ltf_evict_first_policy();
-    for (int i = threadIdx.x * 16; i < qbytes; i += LTF_THREADS * 16)
-        ltf_cp_async16(sm.s_w + i, gq + i, policy);
-    for (int i = threadIdx.x * 16; i < dbytes; i += LTF_THREADS * 16)
-        ltf_cp_async16(sd + i, gd + i, policy);
-    ltf_cp_async_commit();
-}
-
-// Load this warp's rows of the staged tile into the register prefetch struct.
-template <int R, int MB>
-static __device__ __forceinline__ void
-ltf_chain_load_staged(
-    const ltf_chain_smem& sm, int K, int rows_valid, int wrow0, int lane,
-    ltf_q8_prefetch<R, MB>& pf) {
-    const int blocks = K >> 5;
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const int row = wrow0 + r;
-        const bool valid = row < rows_valid;
-#pragma unroll
-        for (int m = 0; m < MB; ++m) {
-            const int b = lane + m * 32;
-            if (valid && b < blocks) {
-                const uint4* q = reinterpret_cast<const uint4*>(sm.s_w + (size_t)row * K + b * 32);
-                const uint4 lo = q[0];
-                const uint4 hi = q[1];
-                pf.q[r][m][0] = (int)lo.x;
-                pf.q[r][m][1] = (int)lo.y;
-                pf.q[r][m][2] = (int)lo.z;
-                pf.q[r][m][3] = (int)lo.w;
-                pf.q[r][m][4] = (int)hi.x;
-                pf.q[r][m][5] = (int)hi.y;
-                pf.q[r][m][6] = (int)hi.z;
-                pf.q[r][m][7] = (int)hi.w;
-                pf.d[r][m] = __half2float(sm.s_wd[row * blocks + b]);
-            } else {
-                pf.d[r][m] = 0.f;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) pf.q[r][m][i] = 0;
-            }
-        }
-    }
-}
-
-struct ltf_chain_phase_args {
-    const float* x;       // [2][K] global input (ignored when x_smem or assemble)
-    const float* x_smem;  // [2][K] shared-memory input (attention output), or nullptr
-    const float* norm_w;  // LayerNorm weight or nullptr
-    int N, K;
-    float* out;         // [2][N]
-    const float* bias;  // [N] or nullptr
-    // round-start input assembly
-    int assemble;
-    const float* h_in;
-    const void* emb_row;  // embedding row of the previous code (F16/F32), or nullptr for round 0
-    const void* pos_row;  // positional row
-    int emb_type, pos_type;
-    float* x_store;  // residual stream initialized by tile 0 when assembling
-    float ln_eps;
-    // K/V cache write (qkv phase)
-    float* kcache;
-    float* vcache;
-    int pos_rows, cache_pos;
-};
-
-static __device__ __forceinline__ float
-ltf_chain_input(const ltf_chain_phase_args& a, int l, int k) {
-    if (a.x_smem)
-        return a.x_smem[(size_t)l * a.K + k];
-    if (!a.assemble)
-        return a.x[(size_t)l * a.K + k];
-    const float p = ltf_load_scalar(a.pos_row, a.pos_type, (size_t)k);
-    if (!a.emb_row)
-        return a.h_in[(size_t)l * a.K + k] + p;
-    return ltf_load_scalar(a.emb_row, a.emb_type, (size_t)k) + p;
-}
-
-// One GEMV phase on this block's staged tile: prologue (optional assembly + LayerNorm stats +
-// int8 quantization of both lanes), dp4a dot, epilogue. Leaves the block synchronized so the
-// caller may immediately restage the shared weight buffer.
-template <int EPI, int R, int MB>
-static __device__ __forceinline__ void
-ltf_chain_gemv(const ltf_chain_phase_args& a, int tile, ltf_chain_smem& sm) {
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    const int K = a.K;
-    const int blocks = K >> 5;
-    constexpr int ROWS = LTF_WARPS * R;
-    ltf_chain_gemv_smem& g = sm.u.g;
-    if (tile * ROWS >= a.N)
-        return;  // block-uniform: no rows for this block
-    const int rows_valid = min(ROWS, a.N - tile * ROWS);
-    const int wrow0 = warp * R;
-    const int row0 = tile * ROWS + wrow0;
-    const bool staged = a.norm_w != nullptr;  // LN phases stage the input in shared memory
-
-    // Residual/bias operands for this warp's rows, loaded early to hide their latency.
-    float res0[R], res1[R], bia[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const int row = row0 + r;
-        res0[r] = res1[r] = bia[r] = 0.f;
-        if (lane == 0 && row < a.N) {
-            if (EPI == LTF_EPI_RESIDUAL) {
-                res0[r] = a.out[row];
-                res1[r] = a.out[a.N + row];
-            }
-            if (a.bias)
-                bia[r] = a.bias[row];
-        }
-    }
-
-    float m0 = 0.f, m1 = 0.f, r0 = 1.f, r1 = 1.f;
-    if (staged) {
-        float s0 = 0.f, s1 = 0.f, q0 = 0.f, q1 = 0.f;
-#pragma unroll 3
-        for (int k = tid; k < K; k += LTF_THREADS) {
-            const float x0 = ltf_chain_input(a, 0, k);
-            const float x1 = ltf_chain_input(a, 1, k);
-            g.s_x[k] = x0;
-            g.s_x[K + k] = x1;
-            if (a.assemble && tile == 0) {
-                a.x_store[k] = x0;
-                a.x_store[K + k] = x1;
-            }
-            s0 += x0;
-            q0 += x0 * x0;
-            s1 += x1;
-            q1 += x1 * x1;
-        }
-        s0 = ltf_warp_sum(s0);
-        s1 = ltf_warp_sum(s1);
-        q0 = ltf_warp_sum(q0);
-        q1 = ltf_warp_sum(q1);
-        if (lane == 0) {
-            g.s_red[warp * 4 + 0] = s0;
-            g.s_red[warp * 4 + 1] = s1;
-            g.s_red[warp * 4 + 2] = q0;
-            g.s_red[warp * 4 + 3] = q1;
-        }
-        __syncthreads();
-        float S0 = 0.f, S1 = 0.f, Q0 = 0.f, Q1 = 0.f;
-#pragma unroll
-        for (int w = 0; w < LTF_WARPS; ++w) {
-            S0 += g.s_red[w * 4 + 0];
-            S1 += g.s_red[w * 4 + 1];
-            Q0 += g.s_red[w * 4 + 2];
-            Q1 += g.s_red[w * 4 + 3];
-        }
-        m0 = S0 / (float)K;
-        m1 = S1 / (float)K;
-        r0 = rsqrtf(fmaxf(Q0 / (float)K - m0 * m0, 0.f) + a.ln_eps);
-        r1 = rsqrtf(fmaxf(Q1 / (float)K - m1 * m1, 0.f) + a.ln_eps);
-    } else if (a.assemble && tile == 0) {
-#pragma unroll 3
-        for (int k = tid; k < K; k += LTF_THREADS) {
-            a.x_store[k] = ltf_chain_input(a, 0, k);
-            a.x_store[K + k] = ltf_chain_input(a, 1, k);
-        }
-    }
-    {
-        const int group = lane >> 3;
-        const int sub = lane & 7;
-        const int total = 2 * blocks;
-        constexpr int PF = 4;
-        for (int base = warp * 4 + group; base < total; base += LTF_WARPS * 4 * PF) {
-            float4 v[PF];
-#pragma unroll
-            for (int j = 0; j < PF; ++j) {
-                const int idx = base + j * LTF_WARPS * 4;
-                if (idx < total) {
-                    const int l = idx / blocks;
-                    const int b = idx - l * blocks;
-                    const int k0 = b * 32 + sub * 4;
-                    if (staged) {
-                        v[j] = *reinterpret_cast<const float4*>(g.s_x + (size_t)l * K + k0);
-                    } else if (a.x_smem) {
-                        v[j] = *reinterpret_cast<const float4*>(a.x_smem + (size_t)l * K + k0);
-                    } else if (!a.assemble) {
-                        v[j] = __ldg(reinterpret_cast<const float4*>(a.x + (size_t)l * K + k0));
-                    } else {
-                        v[j] = make_float4(
-                            ltf_chain_input(a, l, k0), ltf_chain_input(a, l, k0 + 1),
-                            ltf_chain_input(a, l, k0 + 2), ltf_chain_input(a, l, k0 + 3));
-                    }
-                } else {
-                    v[j] = make_float4(0.f, 0.f, 0.f, 0.f);
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < PF; ++j) {
-                const int idx = base + j * LTF_WARPS * 4;
-                if (idx >= total)
-                    break;
-                const int l = idx / blocks;
-                const int b = idx - l * blocks;
-                const int k0 = b * 32 + sub * 4;
-                float4 x = v[j];
-                if (staged) {
-                    const float m = l == 0 ? m0 : m1;
-                    const float r = l == 0 ? r0 : r1;
-                    const float4 w4 = *reinterpret_cast<const float4*>(a.norm_w + k0);
-                    x.x = (x.x - m) * r * w4.x;
-                    x.y = (x.y - m) * r * w4.y;
-                    x.z = (x.z - m) * r * w4.z;
-                    x.w = (x.w - m) * r * w4.w;
-                }
-                float amax = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
-                const float inv = amax > 0.f ? 127.f / amax : 0.f;
-                const int q0 = __float2int_rn(x.x * inv) & 0xff;
-                const int q1 = __float2int_rn(x.y * inv) & 0xff;
-                const int q2 = __float2int_rn(x.z * inv) & 0xff;
-                const int q3 = __float2int_rn(x.w * inv) & 0xff;
-                g.s_q[((size_t)l * (K >> 2)) + b * 8 + sub] =
-                    q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
-                if (sub == 0)
-                    g.s_d[l * blocks + b] = amax / 127.f;
-            }
-        }
-    }
-    ltf_cp_async_wait_all();
-    __syncthreads();
-
-    float acc0[R], acc1[R];
-    if (wrow0 < rows_valid) {
-        ltf_q8_prefetch<R, MB> pf;
-        ltf_chain_load_staged<R, MB>(sm, K, rows_valid, wrow0, lane, pf);
-        ltf_dot_q8_prefetched<R, MB>(
-            pf, K, g.s_q, g.s_q + (K >> 2), g.s_d, g.s_d + blocks, lane, acc0, acc1);
-    }
-    if (lane == 0 && wrow0 < rows_valid) {
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const int row = row0 + r;
-            if (row >= a.N)
-                break;
-            float v0 = acc0[r] + bia[r];
-            float v1 = acc1[r] + bia[r];
-            if (EPI == LTF_EPI_GELU) {
-                v0 = ltf_gelu(v0);
-                v1 = ltf_gelu(v1);
-            }
-            if (EPI == LTF_EPI_RESIDUAL) {
-                v0 += res0[r];
-                v1 += res1[r];
-            }
-            a.out[row] = v0;
-            a.out[a.N + row] = v1;
-            if (a.kcache && row >= K) {
-                float* cache = row < 2 * K ? a.kcache : a.vcache;
-                const int f = row < 2 * K ? row - K : row - 2 * K;
-                cache[((size_t)0 * a.pos_rows + a.cache_pos) * K + f] = v0;
-                cache[((size_t)1 * a.pos_rows + a.cache_pos) * K + f] = v1;
-            }
-        }
-    }
-    __syncthreads();  // all warps done with the staged weights and the scratch
-}
 
 // Cached self-attention for (head h, CFG lane l), split over LTF_ATTN_SPLIT warps of one block:
 // warp `chunk` scores positions [chunk*CH, +CH) (each lane owns two features, so every K/V row
@@ -1131,9 +524,9 @@ struct ltf_attn_partial {
 };
 static __device__ __forceinline__ void
 ltf_chain_attention_split(
-    const float* qkv, const float* kcache, const float* vcache, float* ctx_out, int K, int pos_rows,
-    int pos, float scale, int h, int l, int chunk, int lane, ltf_attn_partial& part,
-    int task_warp0) {
+    const float* qkv, const float* kcache, const float* vcache, float* ctx_out, int8_t* ctx_q,
+    float* ctx_d, int K, int pos_rows, int pos, float scale, int h, int l, int chunk, int lane,
+    ltf_attn_partial& part, int task_warp0) {
     const int d_head = 64;
     const int d0 = h * d_head + lane * 2;
     const float2 q2 = *reinterpret_cast<const float2*>(qkv + (size_t)l * 3 * K + d0);
@@ -1188,13 +581,30 @@ ltf_chain_attention_split(
             a1 += w * part.acc[c][lane * 2 + 1];
         }
         const float inv = 1.0f / S;
-        *reinterpret_cast<float2*>(ctx_out + (size_t)l * K + d0) = make_float2(a0 * inv, a1 * inv);
+        const float c0 = a0 * inv, c1 = a1 * inv;
+        if (ctx_q) {
+            // int8 in groups of 32 features: lanes 0-15 hold features 0-31 of this head.
+            float amax = fmaxf(fabsf(c0), fabsf(c1));
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            const float qinv = amax > 0.f ? 127.f / amax : 0.f;
+            const int q0 = __float2int_rn(c0 * qinv) & 0xff;
+            const int q1 = __float2int_rn(c1 * qinv) & 0xff;
+            *reinterpret_cast<int16_t*>(ctx_q + (size_t)l * K + d0) = (int16_t)(q0 | (q1 << 8));
+            if ((lane & 15) == 0)
+                ctx_d[(size_t)l * (K / 32) + d0 / 32] = amax / 127.f;
+        } else {
+            *reinterpret_cast<float2*>(ctx_out + (size_t)l * K + d0) = make_float2(c0, c1);
+        }
     }
 }
 
 static __global__ void
-__launch_bounds__(LTF_THREADS, 2) ltf_chain_kernel(const ltf_chain_args a) {
-    __shared__ ltf_chain_smem sm;
+__maxnreg__(LTF_CHAIN_MAX_REGS) ltf_chain_kernel(const ltf_chain_args a) {
+    // Dynamic shared memory: the staged weight tile can exceed the 48 KB static limit.
+    extern __shared__ __align__(16) unsigned char ltf_chain_dyn_smem[];
+    ltf_chain_smem& sm = *reinterpret_cast<ltf_chain_smem*>(ltf_chain_dyn_smem);
     __shared__ int s_flag;
     const int tile = blockIdx.x;
     const int warp = threadIdx.x >> 5;
@@ -1206,42 +616,73 @@ __launch_bounds__(LTF_THREADS, 2) ltf_chain_kernel(const ltf_chain_args a) {
     const size_t pos_elem = a.pos_type == LTF_TYPE_F16 ? 2 : 4;
     const size_t emb_elem = a.emb_type == LTF_TYPE_F16 ? 2 : 4;
 
-    auto sync = [&]() { ltf_grid_barrier(a.barrier, target, nblocks); };
+    int phase = 0;
+#ifdef LTF_CHAIN_TIMING
+    int detail_phase = -1;  // phase index within round 8, else -1
+#endif
+    auto sync = [&]() {
+        LTF_STAMP(2 + phase * 2);
+#ifdef LTF_CHAIN_TIMING
+        LTF_ARRIVE(detail_phase);
+#endif
+        ltf_grid_barrier(a.barrier, target, nblocks);
+        LTF_STAMP(2 + phase * 2 + 1);
+        ++phase;
+#ifdef LTF_CHAIN_TIMING
+        if (detail_phase >= 0)
+            ++detail_phase;
+        if (tile == 0 && threadIdx.x == 0)
+            g_ltf_chain_detail_phase = detail_phase;
+        __syncthreads();
+#endif
+    };
+    LTF_STAMP(0);
 
-    ltf_chain_stage<4>(a.layers[0].qkv, K, 3 * K, tile, sm);
+    ltf_chain_stage(a.layers[0].qkv, K, 3 * K, tile, sm);
     for (int c = 0; c < a.n_rounds; ++c) {
+#ifdef LTF_CHAIN_TIMING
+        phase = c * LTF_TIMING_PHASES;
+        detail_phase = c == LTF_TIMING_DETAIL_ROUND ? 0 : -1;
+        if (tile == 0 && threadIdx.x == 0)
+            g_ltf_chain_detail_phase = detail_phase;
+        __syncthreads();
+#endif
         for (int il = 0; il < a.n_layers; ++il) {
             const ltf_chain_layer& L = a.layers[il];
             float* kc = a.kcache + il * layer_cache;
             float* vc = a.vcache + il * layer_cache;
-            {  // LN(norm_self) + qkv (+ input assembly on layer 0) + K/V cache write
+            {  // LN(norm_self) + qkv + K/V cache write. Round 0 of layer 0 assembles the host
+               // input and normalizes in-block; every other case reads q(h*gamma) and the
+               // partial LN statistics written by the producer (ff2 epilogue / sampler block).
                 ltf_chain_phase_args g{};
-                g.x = a.h;
-                g.norm_w = L.norm_self;
                 g.N = 3 * K;
                 g.K = K;
                 g.out = a.qkv;
                 g.ln_eps = a.ln_eps;
-                if (il == 0) {
+                if (il == 0 && c == 0) {
+                    g.x = a.h;
+                    g.norm_w = L.norm_self;
                     g.assemble = 1;
                     g.h_in = a.h_in;
-                    if (c > 0) {
-                        const int code = a.codes[c - 1];
-                        g.emb_row = reinterpret_cast<const char*>(a.audio_emb[c - 1]) +
-                                    (size_t)code * K * emb_elem;
-                    }
-                    g.pos_row = reinterpret_cast<const char*>(a.pos) + (size_t)c * K * pos_elem;
+                    g.pos_row = reinterpret_cast<const char*>(a.pos);
                     g.emb_type = a.emb_type;
                     g.pos_type = a.pos_type;
                     g.x_store = a.h;
+                } else {
+                    g.xq = a.h_q;
+                    g.xd = a.h_d;
+                    g.xgroup = 4;
+                    g.stats = a.stats;
+                    g.ln_c = L.qkv_c;
                 }
                 g.kcache = kc;
                 g.vcache = vc;
-                g.pos_rows = a.P;
-                g.cache_pos = c;
-                ltf_chain_gemv<LTF_EPI_STORE, 4, 1>(g, tile, sm);
+                g.kv_lane_stride = (size_t)a.P * K;
+                g.kv_row_stride = (size_t)K;
+                g.kv_row = c;
+                ltf_chain_gemv<LTF_EPI_STORE, LTF_R_QKV, 1>(g, tile, sm);
             }
-            ltf_chain_stage<1>(L.o, K, K, tile, sm);
+            ltf_chain_stage(L.o, K, K, tile, sm);
             // attention by the last blocks to finish their qkv rows (K/V of position c complete):
             // LTF_ATTN_SPLIT warps per (head, lane) task, LTF_ATTN_TASKS_PER_BLOCK tasks per block
             {
@@ -1257,8 +698,8 @@ __launch_bounds__(LTF_THREADS, 2) ltf_chain_kernel(const ltf_chain_args a) {
                     ltf_attn_partial* parts = reinterpret_cast<ltf_attn_partial*>(sm.u.g.s_x);
                     if (task < n_tasks) {
                         ltf_chain_attention_split(
-                            a.qkv, kc, vc, a.ctx, K, a.P, c, a.attn_scale, task >> 1, task & 1,
-                            warp % LTF_ATTN_SPLIT, lane, parts[local_task],
+                            a.qkv, kc, vc, a.ctx, a.ctx_q, a.ctx_d, K, a.P, c, a.attn_scale,
+                            task >> 1, task & 1, warp % LTF_ATTN_SPLIT, lane, parts[local_task],
                             local_task * LTF_ATTN_SPLIT);
                     } else {
                         __syncthreads();  // matches the barrier inside the split attention
@@ -1267,54 +708,83 @@ __launch_bounds__(LTF_THREADS, 2) ltf_chain_kernel(const ltf_chain_args a) {
                 }
             }
             sync();
-            {  // o + residual
+            {  // o + residual (input: ctx quantized by the attention tail); produces the f32
+               // residual, q(h*gamma_ff) and partial LN stats for the ff1 phase
                 ltf_chain_phase_args g{};
-                g.x = a.ctx;
+                g.xq = a.ctx_q;
+                g.xd = a.ctx_d;
+                g.xgroup = 32;
                 g.N = K;
                 g.K = K;
                 g.out = a.h;
-                ltf_chain_gemv<LTF_EPI_RESIDUAL, 1, 3>(g, tile, sm);
+                g.out_q = a.h_q;
+                g.out_d = a.h_d;
+                g.out_group = 4;
+                g.out_keep_f32 = 1;
+                g.out_gamma = L.norm_ff;
+                g.out_stats = a.stats;
+                ltf_chain_gemv<LTF_EPI_RESIDUAL, LTF_R_O, 1>(g, tile, sm);
             }
-            ltf_chain_stage<4>(L.ff1, K, a.NFF, tile, sm);
+            ltf_chain_stage(L.ff1, K, a.NFF, tile, sm);
             sync();
-            {  // LN(norm_ff) + ff1 + gelu
+            {  // LN(norm_ff) + ff1 + gelu (LN folded), output quantized in groups of 16 for ff2
                 ltf_chain_phase_args g{};
-                g.x = a.h;
-                g.norm_w = L.norm_ff;
+                g.xq = a.h_q;
+                g.xd = a.h_d;
+                g.xgroup = 4;
+                g.stats = a.stats;
+                g.ln_c = L.ff1_c;
                 g.N = a.NFF;
                 g.K = K;
                 g.out = a.ff;
+                g.out_q = a.ff_q;
+                g.out_d = a.ff_d;
+                g.out_group = 16;
                 g.ln_eps = a.ln_eps;
-                ltf_chain_gemv<LTF_EPI_GELU, 4, 1>(g, tile, sm);
+                ltf_chain_gemv<LTF_EPI_GELU, LTF_R_FF1, 1>(g, tile, sm);
             }
-            ltf_chain_stage<1>(L.ff2, a.NFF, K, tile, sm);
+            ltf_chain_stage(L.ff2, a.NFF, K, tile, sm);
             sync();
-            {  // ff2 + residual
+            {  // ff2 + residual (input: gelu output quantized by the ff1 epilogue); produces the
+               // f32 residual plus q(h*gamma_self[next]) + stats for the next layer's qkv, or
+               // q(h) for the output projection after the last layer
                 ltf_chain_phase_args g{};
-                g.x = a.ff;
+                g.xq = a.ff_q;
+                g.xd = a.ff_d;
+                g.xgroup = 16;
                 g.N = K;
                 g.K = a.NFF;
                 g.out = a.h;
-                ltf_chain_gemv<LTF_EPI_RESIDUAL, 1, 3>(g, tile, sm);
+                g.out_q = a.h_q;
+                g.out_d = a.h_d;
+                g.out_group = 4;
+                g.out_keep_f32 = 1;
+                if (il + 1 < a.n_layers) {
+                    g.out_gamma = a.layers[il + 1].norm_self;
+                    g.out_stats = a.stats;
+                }
+                ltf_chain_gemv<LTF_EPI_RESIDUAL, LTF_R_O, 3>(g, tile, sm);
             }
             if (il + 1 < a.n_layers) {
-                ltf_chain_stage<4>(a.layers[il + 1].qkv, K, 3 * K, tile, sm);
+                ltf_chain_stage(a.layers[il + 1].qkv, K, 3 * K, tile, sm);
             } else {
-                ltf_chain_stage<4>(a.out_w[c], K, a.vocab, tile, sm);
+                ltf_chain_stage(a.out_w[c], K, a.vocab, tile, sm);
             }
             sync();
         }
-        {  // output projection + bias -> logits
+        {  // output projection + bias -> logits (input: q(h) from the last ff2 epilogue)
             ltf_chain_phase_args g{};
-            g.x = a.h;
+            g.xq = a.h_q;
+            g.xd = a.h_d;
+            g.xgroup = 4;
             g.N = a.vocab;
             g.K = K;
             g.out = a.logits;
             g.bias = a.out_b[c];
-            ltf_chain_gemv<LTF_EPI_BIAS, 4, 1>(g, tile, sm);
+            ltf_chain_gemv<LTF_EPI_BIAS, LTF_R_OUT, 1>(g, tile, sm);
         }
         if (c + 1 < a.n_rounds) {
-            ltf_chain_stage<4>(a.layers[0].qkv, K, 3 * K, tile, sm);
+            ltf_chain_stage(a.layers[0].qkv, K, 3 * K, tile, sm);
         }
         // sampling by the last block to finish its logit rows
         if (ltf_chain_arrival_rank(a.barrier + 1, nblocks, 1, &s_flag) == (int)nblocks - 1) {
@@ -1326,54 +796,73 @@ __launch_bounds__(LTF_THREADS, 2) ltf_chain_kernel(const ltf_chain_args a) {
                 k = MAGPIETTS_CUDA_MAX_FAST_TOPK;
             magpietts_sample_codebook_fast_block<MAGPIETTS_CUDA_SMALL_ITEMS_PER_THREAD>(
                 a.logits, a.logits + a.vocab, a.vocab, a.sample_codebook_size, a.sample_eos_id,
-                config, c, k, a.top_ids, a.top_vals, a.codes + c, a.argmax + c, sm.u.samp);
+                config, c, k, nullptr, nullptr, a.codes + c, a.argmax + c, sm.u.samp);
+            __syncthreads();
+            if (c + 1 < a.n_rounds) {
+                // Next round's layer-0 input for every block: x = emb[code] + pos[c+1] (same for
+                // both CFG lanes). Write the f32 residual, LN statistics (as the single non-zero
+                // partial) and q(x * gamma_self[0]) in groups of 4.
+                const int code = a.codes[c];  // written by this block above
+                const char* emb_row =
+                    reinterpret_cast<const char*>(a.audio_emb[c]) + (size_t)code * K * emb_elem;
+                const char* pos_row =
+                    reinterpret_cast<const char*>(a.pos) + (size_t)(c + 1) * K * pos_elem;
+                const float* gamma = a.layers[0].norm_self;
+                float sv = 0.f, sq = 0.f;
+                const int tid = (int)threadIdx.x;
+                for (int k4 = tid * 4; k4 < K; k4 += LTF_THREADS * 4) {
+                    float x[4];
+                    float amax = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        x[i] = ltf_load_scalar(emb_row, a.emb_type, (size_t)(k4 + i)) +
+                               ltf_load_scalar(pos_row, a.pos_type, (size_t)(k4 + i));
+                        a.h[k4 + i] = x[i];
+                        a.h[K + k4 + i] = x[i];
+                        sv += x[i];
+                        sq += x[i] * x[i];
+                        x[i] *= gamma[k4 + i];
+                        amax = fmaxf(amax, fabsf(x[i]));
+                    }
+                    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+                    int packed = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        packed |= (__float2int_rn(x[i] * inv) & 0xff) << (8 * i);
+                    *reinterpret_cast<int*>(a.h_q + k4) = packed;
+                    *reinterpret_cast<int*>(a.h_q + K + k4) = packed;
+                    a.h_d[k4 / 4] = amax / 127.f;
+                    a.h_d[K / 4 + k4 / 4] = amax / 127.f;
+                }
+                sv = ltf_warp_sum(sv);
+                sq = ltf_warp_sum(sq);
+                if (lane == 0) {
+                    sm.u.g.s_red[warp * 2] = sv;
+                    sm.u.g.s_red[warp * 2 + 1] = sq;
+                }
+                __syncthreads();
+                const int nb = (int)nblocks;
+                for (int i = tid; i < 4 * nb; i += LTF_THREADS) {
+                    float v = 0.f;
+                    if ((i % nb) == 0) {
+                        const int grp = i / nb;  // 0: l0 sum, 1: l0 sq, 2: l1 sum, 3: l1 sq
+                        for (int w2 = 0; w2 < LTF_WARPS; ++w2)
+                            v += sm.u.g.s_red[w2 * 2 + (grp & 1)];
+                    }
+                    a.stats[i] = v;
+                }
+            }
         }
         if (c + 1 < a.n_rounds) {
             sync();
         }
     }
+    LTF_STAMP(1);
 }
 
 // ---------------------------------------------------------------------------------------
 // host
 // ---------------------------------------------------------------------------------------
-// Repack a ggml Q8_0 device tensor [N rows][K] into planar quants/scales device buffers.
-static bool
-ltf_repack_q8(const void* w, int N, int K, std::vector<void*>& owned, ltf_q8p& out) {
-    const int blocks = K / 32;
-    const size_t src_bytes = (size_t)N * blocks * 34;
-    std::vector<uint8_t> host(src_bytes);
-    if (cudaMemcpy(host.data(), w, src_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
-        return false;
-    std::vector<int8_t> qs((size_t)N * K);
-    std::vector<uint16_t> d((size_t)N * blocks);
-    for (int n = 0; n < N; ++n) {
-        for (int b = 0; b < blocks; ++b) {
-            const uint8_t* blk = host.data() + ((size_t)n * blocks + b) * 34;
-            uint16_t scale;
-            memcpy(&scale, blk, 2);
-            d[(size_t)n * blocks + b] = scale;
-            memcpy(qs.data() + (size_t)n * K + (size_t)b * 32, blk + 2, 32);
-        }
-    }
-    int8_t* d_qs = nullptr;
-    __half* d_d = nullptr;
-    if (cudaMalloc(&d_qs, qs.size()) != cudaSuccess)
-        return false;
-    owned.push_back(d_qs);
-    if (cudaMalloc(&d_d, d.size() * sizeof(uint16_t)) != cudaSuccess)
-        return false;
-    owned.push_back(d_d);
-    if (cudaMemcpy(d_qs, qs.data(), qs.size(), cudaMemcpyHostToDevice) != cudaSuccess)
-        return false;
-    if (cudaMemcpy(d_d, d.data(), d.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) !=
-        cudaSuccess)
-        return false;
-    out.qs = d_qs;
-    out.d = d_d;
-    return true;
-}
-
 static bool
 ltf_type_ok(int t) {
     return t == LTF_TYPE_F16 || t == LTF_TYPE_Q8_0;
@@ -1397,26 +886,45 @@ ltf_chain_setup(magpietts_lt_fused* f) {
     const int K = w.n_embd;
     if ((K >> 5) > 32 || (w.n_ff >> 5) > 96)
         return;  // R=4 tiles need MB=1, ff2 tiles MB<=3
-    if (LTF_WARPS * 4 * K > LTF_STAGE_BYTES || LTF_WARPS * 1 * w.n_ff > LTF_STAGE_BYTES ||
-        LTF_WARPS * 4 * (K >> 5) > LTF_STAGE_SCALES || LTF_WARPS * (w.n_ff >> 5) > LTF_STAGE_SCALES)
-        return;
-    auto tiles = [](int N, int R) { return (N + LTF_WARPS * R - 1) / (LTF_WARPS * R); };
-    int grid = tiles(3 * K, 4);
-    grid = std::max(grid, tiles(K, 1));
-    grid = std::max(grid, tiles(w.n_ff, 4));
-    grid = std::max(grid, tiles(w.vocab, 4));
-    grid = std::max(grid, (w.n_head * LTF_LANES + LTF_WARPS - 1) / LTF_WARPS);
     int device = 0, sms = 0, per_sm = 0;
     if (cudaGetDevice(&device) != cudaSuccess)
         return;
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
         return;
-    const cudaError_t occ_err =
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ltf_chain_kernel, LTF_THREADS, 0);
-    if (occ_err != cudaSuccess)
+    if (cudaFuncSetAttribute(
+            ltf_chain_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)sizeof(ltf_chain_smem)) != cudaSuccess)
         return;
-    if (per_sm * sms < grid)
+    // Ask for the largest shared-memory carveout so a codec block fits beside the chain block.
+    cudaFuncSetAttribute(
+        ltf_chain_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared);
+    const cudaError_t occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_sm, ltf_chain_kernel, LTF_THREADS, sizeof(ltf_chain_smem));
+    if (occ_err != cudaSuccess || per_sm < LTF_CHAIN_BLOCKS_PER_SM)
         return;
+    // A fixed number of resident blocks per SM: every SM carries the same rows in every phase.
+    const int grid = LTF_CHAIN_BLOCKS_PER_SM * sms;
+    if (grid < LTF_CHAIN_MIN_GRID)
+        return;
+    auto rows_per_block = [grid](int N) { return (N + grid - 1) / grid; };
+    auto fits = [&](int N, int Kdim, int R) {
+        return rows_per_block(N) <= LTF_WARPS * R && rows_per_block(N) * Kdim <= LTF_STAGE_BYTES &&
+               rows_per_block(N) * (Kdim >> 5) <= LTF_STAGE_SCALES;
+    };
+    if (!fits(3 * K, K, LTF_R_QKV) || !fits(K, K, LTF_R_O) || !fits(w.n_ff, K, LTF_R_FF1) ||
+        !fits(K, w.n_ff, LTF_R_O) || !fits(w.vocab, K, LTF_R_OUT))
+        return;
+    if ((w.n_head * LTF_LANES + LTF_ATTN_TASKS_PER_BLOCK - 1) / LTF_ATTN_TASKS_PER_BLOCK > grid)
+        return;
+    // producer-side quantization: every block's ff1 rows form whole groups of 16, its residual
+    // rows whole groups of 4; head dim 64; per-block LN partials fit the stats buffer
+    if (w.n_ff % grid != 0 || (w.n_ff / grid) % 16 != 0 || K % grid != 0 || (K / grid) % 4 != 0 ||
+        K / w.n_head != 64 || grid > LTF_CHAIN_MAX_GRID)
+        return;
+    for (int i = 0; i < w.n_layers; ++i)
+        if (!f->layers[i].qkv_c || !f->layers[i].ff1_c)
+            return;
     f->chain_grid = grid;
     // Pin the activation arena (~0.5 MB) in L2 while the 17 MB/round weight stream passes.
     {
@@ -1491,6 +999,12 @@ magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size
                 ok = ok && ltf_repack_q8(L.ff1, w.n_ff, w.n_embd, f->planar_buffers, L.ff1_p);
             if (L.ff2_type == LTF_TYPE_Q8_0)
                 ok = ok && ltf_repack_q8(L.ff2, w.n_embd, w.n_ff, f->planar_buffers, L.ff2_p);
+            if (ok && L.qkv_type == LTF_TYPE_Q8_0)
+                ok = ltf_ln_fold_constants(
+                    L.qkv_p, L.norm_self, 3 * w.n_embd, w.n_embd, f->planar_buffers, L.qkv_c);
+            if (ok && L.ff1_type == LTF_TYPE_Q8_0)
+                ok = ltf_ln_fold_constants(
+                    L.ff1_p, L.norm_ff, w.n_ff, w.n_embd, f->planar_buffers, L.ff1_c);
         }
         for (int r = 0; r < w.n_rounds && ok; ++r) {
             if (w.out_type == LTF_TYPE_Q8_0)
@@ -1518,7 +1032,12 @@ magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size
                  off_qkv = reserve(LTF_LANES * 3 * K), off_ctx = reserve(LTF_LANES * K),
                  off_ff = reserve(LTF_LANES * (size_t)w.n_ff),
                  off_logits = reserve(LTF_LANES * (size_t)w.vocab), off_k = reserve(cache),
-                 off_v = reserve(cache);
+                 off_v = reserve(cache), off_ctx_q = reserve(LTF_LANES * K / 4),
+                 off_ctx_d = reserve(LTF_LANES * K / 32),
+                 off_ff_q = reserve(LTF_LANES * (size_t)w.n_ff / 4),
+                 off_ff_d = reserve(LTF_LANES * (size_t)w.n_ff / 16),
+                 off_h_q = reserve(LTF_LANES * K / 4), off_h_d = reserve(LTF_LANES * K / 4),
+                 off_stats = reserve(LTF_LANES * 2 * LTF_CHAIN_MAX_GRID);
     err = cudaMalloc(&f->arena, total);
     if (err == cudaSuccess)
         err = cudaMemset(f->arena, 0, total);
@@ -1533,6 +1052,13 @@ magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size
         f->logits = reinterpret_cast<float*>(base + off_logits);
         f->kcache = reinterpret_cast<float*>(base + off_k);
         f->vcache = reinterpret_cast<float*>(base + off_v);
+        f->ctx_q = reinterpret_cast<int8_t*>(base + off_ctx_q);
+        f->ctx_d = reinterpret_cast<float*>(base + off_ctx_d);
+        f->ff_q = reinterpret_cast<int8_t*>(base + off_ff_q);
+        f->ff_d = reinterpret_cast<float*>(base + off_ff_d);
+        f->h_q = reinterpret_cast<int8_t*>(base + off_h_q);
+        f->h_d = reinterpret_cast<float*>(base + off_h_d);
+        f->stats = reinterpret_cast<float*>(base + off_stats);
     }
     if (err == cudaSuccess)
         err = cudaMalloc(&f->sample_counters, (size_t)w.n_rounds * sizeof(int));
@@ -1796,7 +1322,7 @@ ltf_enqueue_chain(
     a.attn_scale = 1.0f / sqrtf((float)(a.K / a.H));
     for (int i = 0; i < a.n_layers; ++i) {
         const ltf_layer& L = f->layers[i];
-        a.layers[i] = {L.qkv_p, L.o_p, L.ff1_p, L.ff2_p, L.norm_self, L.norm_ff};
+        a.layers[i] = {L.qkv_p, L.o_p, L.ff1_p, L.ff2_p, L.norm_self, L.norm_ff, L.qkv_c, L.ff1_c};
     }
     a.pos = f->w.pos_emb;
     a.pos_type = f->w.pos_type;
@@ -1814,6 +1340,13 @@ ltf_enqueue_chain(
     a.logits = f->logits;
     a.kcache = f->kcache;
     a.vcache = f->vcache;
+    a.ctx_q = f->ctx_q;
+    a.ctx_d = f->ctx_d;
+    a.ff_q = f->ff_q;
+    a.ff_d = f->ff_d;
+    a.h_q = f->h_q;
+    a.h_d = f->h_d;
+    a.stats = f->stats;
     a.barrier = f->barrier;
     a.sample_config = reinterpret_cast<const magpietts_cuda_sampling_config*>(sampler->config);
     a.codes = sampler->codes;
@@ -1836,7 +1369,7 @@ ltf_enqueue_chain(
         attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
     }
-    ltf_chain_kernel<<<f->chain_grid, LTF_THREADS, 0, stream>>>(a);
+    ltf_chain_kernel<<<f->chain_grid, LTF_THREADS, sizeof(ltf_chain_smem), stream>>>(a);
     if (f->l2_window) {
         cudaStreamAttrValue none{};
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &none);

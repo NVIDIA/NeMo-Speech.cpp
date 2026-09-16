@@ -170,16 +170,34 @@ sample_from_topk(
 // Exact top-k (k <= MAGPIETTS_CUDA_MAX_FAST_TOPK) temperature sampling of one codebook by a
 // full 256-thread block. Shared buffers are provided by the caller (see
 // magpietts_sample_fast_shared). Writes codes_out[out_index] / argmax_out[out_index].
+//
+// Latency-oriented: this runs on one block while the rest of a persistent kernel waits, so the
+// number of block-wide synchronizations is what matters. Radix select with double-buffered
+// histograms (2 syncs per pass), no sort of the selected set (the sampler is order-independent,
+// argmax is a separate min-key reduction), and warp-shuffle reductions/scans for the Boltzmann
+// weights instead of a shared-memory tree.
 struct magpietts_sample_fast_shared {
-    double s_sums[MAGPIETTS_CUDA_BLOCK_SIZE];
-    double s_exps[MAGPIETTS_CUDA_MAX_FAST_TOPK];
-    int s_hist[256];
+    int s_hist[2][256];  // double-buffered so a pass can clear the next pass's histogram
     int s_scan[MAGPIETTS_CUDA_BLOCK_SIZE / 32];
     int s_ctrl[4];
+    unsigned int s_minkey;
+    int s_argmax;
     unsigned long long s_sel[MAGPIETTS_CUDA_MAX_FAST_TOPK];
-    float s_top_vals[MAGPIETTS_CUDA_MAX_FAST_TOPK];
-    int32_t s_top_ids[MAGPIETTS_CUDA_MAX_FAST_TOPK];
+    float s_fsum[MAGPIETTS_CUDA_BLOCK_SIZE / 32];
+    int s_pick;
+    unsigned long long s_best;  // Gumbel-max fast path: (key of the best score) << 32 | id
 };
+
+// Per-item uniform in (0, 1] for the Gumbel draw: counter-based on (seed, frame, codebook, id),
+// so runs are reproducible and every item's draw is independent of the others.
+static __device__ __forceinline__ float
+gumbel_u01(uint64_t seed, int frame_index, int codebook, int id) {
+    uint64_t state = seed ^ (0xd1b54a32d192ed03ULL * (uint64_t)(frame_index + 1)) ^
+                     (0xabc98388fb8fac03ULL * (uint64_t)(codebook + 1)) ^
+                     (0x9e3779b97f4a7c15ULL * (uint64_t)(id + 1));
+    const uint64_t r = splitmix64_next(state);
+    return (float)((r >> 40) + 1) * (1.0f / 16777217.0f);
+}
 
 #ifdef MAGPIETTS_SAMPLER_DBG
 __device__ unsigned long long g_sampler_dbg[8];
@@ -203,9 +221,14 @@ magpietts_sample_codebook_fast_block(
     magpietts_sample_fast_shared& sh) {
     constexpr int block = MAGPIETTS_CUDA_BLOCK_SIZE;
     const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    (void)top_ids;
+    (void)top_vals;
     SAMPLER_STAMP(0);
     float thread_vals[items_per_thread];
     uint32_t keys[items_per_thread];
+    uint32_t minkey = 0xffffffffu;
 #pragma unroll
     for (int item = 0; item < items_per_thread; ++item) {
         const int id = tid * items_per_thread + item;
@@ -216,6 +239,84 @@ magpietts_sample_codebook_fast_block(
                       config.use_cfg != 0, config.cfg_scale, config.forbid_audio_eos != 0)
                 : -INFINITY;
         keys[item] = descending_key(thread_vals[item]);
+        minkey = min(minkey, keys[item]);
+    }
+    // argmax = smallest key (ties -> smallest id, which is the first item holding that key)
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        minkey = min(minkey, __shfl_xor_sync(0xffffffffu, minkey, offset));
+    sh.s_hist[0][tid] = 0;
+    sh.s_hist[1][tid] = 0;
+    if (tid == 0) {
+        sh.s_minkey = 0xffffffffu;
+        sh.s_argmax = 0x7fffffff;
+    }
+    __syncthreads();
+    if (lane == 0)
+        atomicMin(&sh.s_minkey, minkey);
+    // ---- Fast path: Gumbel-max over the whole distribution, accepted when the draw lies in the
+    // top-k set. A softmax sample conditioned on falling inside the top-k set IS the top-k
+    // truncated softmax, so this is exact; it costs one max and one count reduction instead of
+    // four radix-select passes. Rejections (mass outside the top-k, rare at k = 80) fall through
+    // to the exact radix path below.
+    if (config.temperature > 0.0f && k < vocab_size) {
+        const float inv_t = 1.0f / config.temperature;
+        unsigned long long best = ~0ull;
+#pragma unroll
+        for (int item = 0; item < items_per_thread; ++item) {
+            const int id = tid * items_per_thread + item;
+            const float v = thread_vals[item];
+            if (isfinite(v)) {
+                const float u = gumbel_u01(config.seed, config.frame_index, rng_codebook, id);
+                const float g = v * inv_t - __logf(-__logf(u));
+                const unsigned long long packed =
+                    ((unsigned long long)descending_key(g) << 32) | (uint32_t)id;
+                best = min(best, packed);
+            }
+            if (keys[item] == minkey)  // candidates for the argmax (smallest id among maxima)
+                atomicMin(&sh.s_argmax, id);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            best = min(best, __shfl_xor_sync(0xffffffffu, best, offset));
+        if (tid == 0)
+            sh.s_best = ~0ull;
+        __syncthreads();  // s_minkey final, s_best initialized
+        if (lane == 0)
+            atomicMin(&sh.s_best, best);
+        __syncthreads();
+        const unsigned long long sel = sh.s_best;
+        if (sel != ~0ull) {
+            const int cand = (int)(uint32_t)sel;
+            const uint32_t cand_key = descending_key(sampled_logit(
+                logits_cond, logits_uncond, 0, cand, audio_codebook_size, audio_eos_id,
+                config.use_cfg != 0, config.cfg_scale, config.forbid_audio_eos != 0));
+            int n_better = 0;
+#pragma unroll
+            for (int item = 0; item < items_per_thread; ++item) {
+                const int id = tid * items_per_thread + item;
+                n_better +=
+                    (keys[item] < cand_key || (keys[item] == cand_key && id < cand)) ? 1 : 0;
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                n_better += __shfl_xor_sync(0xffffffffu, n_better, offset);
+            if (lane == 0)
+                sh.s_scan[warp] = n_better;
+            __syncthreads();
+            int rank = 0;
+#pragma unroll
+            for (int w = 0; w < block / 32; ++w) rank += sh.s_scan[w];
+            if (rank < k) {
+                if (tid == 0) {
+                    *code_out = cand;
+                    *argmax_out = sh.s_argmax;  // final: all argmax atomics preceded the sync
+                }
+                SAMPLER_STAMP(5);
+                return;
+            }
+            __syncthreads();  // s_scan is reused by the exact path's block scan
+        }
     }
     uint32_t prefix = 0;
     uint32_t mask = 0;
@@ -224,8 +325,7 @@ magpietts_sample_codebook_fast_block(
 #pragma unroll 1
     for (int pass = 0; pass < 4; ++pass) {
         const int shift = 24 - 8 * pass;
-        sh.s_hist[tid] = 0;
-        __syncthreads();
+        int* hist = sh.s_hist[pass & 1];
 #pragma unroll
         for (int item = 0; item < items_per_thread; ++item) {
             // Warp-aggregated histogram update: logits share most high-order key bits, so plain
@@ -233,8 +333,8 @@ magpietts_sample_codebook_fast_block(
             const bool active = (keys[item] & mask) == prefix;
             const int bin = active ? (int)((keys[item] >> shift) & 0xffu) : -1;
             const unsigned peers = __match_any_sync(0xffffffffu, bin);
-            if (active && (peers & (1u << (tid & 31))) && (__ffs(peers) - 1) == (tid & 31)) {
-                atomicAdd(&sh.s_hist[bin], __popc(peers));
+            if (active && (__ffs(peers) - 1) == lane) {
+                atomicAdd(&hist[bin], __popc(peers));
             }
         }
         __syncthreads();
@@ -243,7 +343,7 @@ magpietts_sample_codebook_fast_block(
             int local = 0;
 #pragma unroll
             for (int b = 0; b < 8; ++b) {
-                bins[b] = sh.s_hist[tid * 8 + b];
+                bins[b] = hist[tid * 8 + b];
                 local += bins[b];
             }
             int inclusive = local;
@@ -265,12 +365,17 @@ magpietts_sample_codebook_fast_block(
                 }
             }
         }
+        // The other histogram buffer is free now: clear it for the next pass while warp 0 scans.
+        if (pass + 1 < 4)
+            sh.s_hist[(pass + 1) & 1][tid] = 0;
         __syncthreads();
         prefix |= (uint32_t)sh.s_ctrl[0] << shift;
         mask |= 0xffu << shift;
         remaining = sh.s_ctrl[1];
     }
     SAMPLER_STAMP(2);
+    // Compact the k selected (key, id) pairs: all keys below the threshold plus the first
+    // `remaining` keys equal to it (ascending id).
     const uint32_t threshold = prefix;
     const int need_equal = remaining;
     int n_less = 0;
@@ -298,29 +403,71 @@ magpietts_sample_codebook_fast_block(
                 sh.s_sel[total_less + equal_rank] = packed;
             ++equal_rank;
         }
+        if (keys[item] == sh.s_minkey)
+            atomicMin(&sh.s_argmax, id);  // argmax: smallest id among the maximal logits
     }
     __syncthreads();
     SAMPLER_STAMP(3);
-    for (int i = tid; i < k; i += block) {
-        const unsigned long long mine = sh.s_sel[i];
-        int rank = 0;
-        for (int j = 0; j < k; ++j) rank += sh.s_sel[j] < mine ? 1 : 0;
-        const float value = descending_key_to_float((uint32_t)(mine >> 32));
-        const int32_t id = (int32_t)(uint32_t)mine;
-        sh.s_top_vals[rank] = value;
-        sh.s_top_ids[rank] = id;
-        if (top_vals)
-            top_vals[rank] = value;
-        if (top_ids)
-            top_ids[rank] = id;
+    // Temperature sampling over the k selected logits: one candidate per thread (k <= block).
+    const float max_logit = descending_key_to_float(sh.s_minkey);
+    float e = 0.0f;
+    int my_id = -1;
+    if (tid < k) {
+        const unsigned long long mine = sh.s_sel[tid];
+        const float v = descending_key_to_float((uint32_t)(mine >> 32));
+        my_id = (int32_t)(uint32_t)mine;
+        // Boltzmann weights and their scan in f32: FP64 runs at 1/64 rate on consumer Ampere and
+        // dominated this tail. k <= 256 terms in (0, 1] keep the f32 prefix sums well conditioned.
+        if (config.temperature > 0.0f)
+            e = isfinite(v) ? __expf((v - max_logit) / config.temperature) : 0.0f;
     }
+    SAMPLER_STAMP(6);
+    // Inclusive scan of e over the block (warp shuffles + one cross-warp step).
+    float incl = e;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const float other = __shfl_up_sync(0xffffffffu, incl, offset);
+        if (lane >= offset)
+            incl += other;
+    }
+    // exclusive prefix = the previous lane's inclusive value (monotone by construction)
+    const float prev_incl = __shfl_up_sync(0xffffffffu, incl, 1);
+    if (lane == 31)
+        sh.s_fsum[warp] = incl;
     __syncthreads();
-    SAMPLER_STAMP(4);
-    const int sampled = sample_from_topk(
-        sh.s_top_vals, sh.s_top_ids, k, config, rng_codebook, sh.s_exps, sh.s_sums);
-    SAMPLER_STAMP(5);
-    if (tid == 0) {
-        *code_out = sampled;
-        *argmax_out = sh.s_top_ids[0];
+    float warp_offset = 0.0f, total = 0.0f;
+#pragma unroll
+    for (int w = 0; w < block / 32; ++w) {
+        const float t = sh.s_fsum[w];
+        if (w < warp)
+            warp_offset += t;
+        total += t;
     }
+    incl += warp_offset;
+    const float excl = lane == 0 ? warp_offset : prev_incl + warp_offset;
+    if (tid == 0)
+        sh.s_pick = -1;
+    __syncthreads();
+    SAMPLER_STAMP(7);
+    if (config.temperature > 0.0f && total > 0.0f) {
+        const float target =
+            (float)(uniform01(config.seed, config.frame_index, rng_codebook) * (double)total);
+        // The inclusive prefix is monotone and excl is the previous candidate's inclusive value,
+        // so exactly one candidate satisfies excl < target <= incl when target <= total; if
+        // rounding leaves none, the last candidate takes it.
+        if (tid < k && excl < target && target <= incl)
+            sh.s_pick = my_id;
+        __syncthreads();
+        if (tid == k - 1 && sh.s_pick < 0)
+            sh.s_pick = my_id;
+        __syncthreads();
+    }
+    SAMPLER_STAMP(4);
+    if (tid == 0) {
+        const int argmax = sh.s_argmax;
+        const int sampled = sh.s_pick >= 0 ? sh.s_pick : argmax;
+        *code_out = sampled;
+        *argmax_out = argmax;
+    }
+    SAMPLER_STAMP(5);
 }
