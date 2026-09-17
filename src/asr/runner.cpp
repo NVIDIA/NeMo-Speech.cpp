@@ -91,8 +91,7 @@ normalize_per_feature(std::vector<float>& feats, int n_mels, int n_frames, doubl
 // Shared mid-stream EOU fire for both runners. Order is load-bearing:
 // finalize() commits a beam head's in-flight hypothesis and word timings, so
 // it precedes the transcript/words capture; the per-utterance clears come
-// last. This helper performs the decoder's soft utterance reset; a runner that
-// requires a hard model-state boundary resets the decoder again after capture.
+// last. Only per-utterance output is reset; model context belongs to the stream.
 void
 fire_eou(
     Decoder* head, const AsrRequestOptions& opts, std::vector<int>& all_tokens,
@@ -738,12 +737,6 @@ OfflineRunner::finalize() {
         decoder = owned_decoder.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
-        // Full-utterance Recognize presents every encoder frame in this one
-        // call. The EOU punctuation floor is designed for the short trailing
-        // chunk of a streaming flush; enabling it here biases '.', '?', and
-        // '!' by +7.5 at *every* frame, changing early greedy decisions and in
-        // some cases truncating the hypothesis. HF/NeMo offline greedy decode
-        // applies no such bias, and this model already self-punctuates.
         const auto decode_begin = std::chrono::steady_clock::now();
         int64_t frame_offset = 0;
         for (const auto& [off, len] : segments) {
@@ -882,7 +875,7 @@ CacheStreamRunner::feed_audio(const float* samples, size_t n_samples) {
 }
 
 void
-CacheStreamRunner::process_one_chunk(bool is_last) {
+CacheStreamRunner::process_one_chunk() {
     // NeMo formula: chunk_size_mel = pre_encode_cache_size + sub * (1 + R).
     const int sub = enc_cfg_.subsampling_factor;
     const int R = enc_cfg_.cache_right_ctx;
@@ -916,9 +909,6 @@ CacheStreamRunner::process_one_chunk(bool is_last) {
     // If a head is attached (RNNT path), drive greedy decoding on this
     // chunk's encoder output. Accumulate emitted tokens + maintain transcript.
     if (head_ && last_enc_T_ > 0) {
-        // is_last marks the end-of-utterance flush so the head can apply its
-        // EOU punctuation floor (commits a marginal terminal '.'/'?').
-        head_->set_finalizing(is_last);
         // RnntModel returns joint.enc-projected features, not the wider raw
         // encoder representation. This projection is computed once for the
         // whole chunk (after optional prompt fusion) and reused by every symbol
@@ -1021,7 +1011,7 @@ CacheStreamRunner::step() {
                 mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
             stream_zero_padded_ = true;
         }
-        process_one_chunk(/*is_last=*/false);
+        process_one_chunk();
         if (poll_endpoint(update, /*after_chunk=*/true))
             break;
     }
@@ -1041,69 +1031,14 @@ CacheStreamRunner::step() {
     return update;
 }
 
-void
-CacheStreamRunner::finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future) {
-    compact_mel_buffer();
-    const int n_mels = model_->fe_config().n_mels;
-    const int sub = enc_cfg_.subsampling_factor;
-    const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
-    const int shift_size_mel = sub * (1 + R - cache_drop_size_);
-
-    // After a decoded chunk, mel_buf_ starts with the encoder overlap. Frames
-    // beyond it have not been decoded and belong to the next utterance when
-    // endpointing fired automatically. A forced EOU instead commits all audio
-    // already supplied by the caller.
-    std::vector<float> next_mel;
-    if (preserve_buffered_future) {
-        const int overlap_frames = chunk_size_mel - shift_size_mel;
-        const size_t split = std::min(
-            mel_buf_.size(), static_cast<size_t>(overlap_frames) * static_cast<size_t>(n_mels));
-        next_mel.assign(mel_buf_.begin() + split, mel_buf_.end());
-        mel_buf_.resize(split);
-    }
-
-    // Flush the acoustic tail through the same EOS path as finalize(). The
-    // synthetic frames may commit terminal punctuation, but they must not
-    // advance the stream clock used by the next utterance.
-    const int64_t real_frames_emitted = total_frames_emitted_;
-    const int real_chunks_processed = chunks_processed_;
-    finalizing_ = true;
-    if (!mel_buf_.empty()) {
-        if (!stream_zero_padded_) {
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
-        const size_t flush_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
-        mel_buf_.resize(mel_buf_.size() + flush_frames * static_cast<size_t>(n_mels), 0.0f);
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel)
-            process_one_chunk(/*is_last=*/true);
-    }
-
-    fire_eou(head_.get(), opts_, all_tokens_, transcript_, update);
-
-    // An EOU is a decoder boundary, not a new audio stream. Reset model state
-    // and segment-local buffers while retaining global FE/VAD cursors and the
-    // absolute encoder-frame clock.
-    if (head_)
-        head_->reset();
-    zero_caches();
-    cache_filled_frames_ = 0;
-    std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
-    mel_buf_ = std::move(next_mel);
-    mel_offset_ = 0;
-    stream_zero_padded_ = false;
-    total_frames_emitted_ = real_frames_emitted;
-    chunks_processed_ = real_chunks_processed;
-    last_enc_out_.clear();
-    last_enc_T_ = 0;
-    finalizing_ = false;
-}
-
 bool
 CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
     if (!endpointer_ || finalizing_)
+        return false;
+    // A client-forced boundary publishes after all currently decodable audio,
+    // not after the first chunk of a larger request. Keep any lookahead for
+    // subsequent audio; only actual end-of-stream may synthesize an EOS tail.
+    if (force_eou_pending_ && after_chunk)
         return false;
     const int sample_rate = model_->fe_config().sample_rate;
     const int hop = model_->fe().hop_length();
@@ -1123,17 +1058,20 @@ CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
                              ? 0.0
                              : static_cast<double>(vad_speech_seen_frame_ + 1) * mel_ms;
     } else {
-        // Token-silence: time since the decoder's last token emission frame.
+        // Sentence punctuation must not prolong silence or re-arm an endpoint.
         const double frame_ms = model_->ms_per_enc_frame();
         now_ms = static_cast<double>(total_frames_emitted_) * frame_ms;
-        const int64_t lef = head_ ? head_->last_emit_frame() : -1;
+        const int64_t lef = head_ ? head_->last_speech_frame() : -1;
         last_speech_ms = (lef < 0) ? 0.0 : static_cast<double>(lef + 1) * frame_ms;
     }
     if (!endpointer_->poll(now_ms, last_speech_ms))
         return false;
-    const bool preserve_buffered_future = after_chunk && !force_eou_pending_;
     force_eou_pending_ = false;
-    finish_endpoint(update, preserve_buffered_future);
+    // EOU publishes a hypothesis; it does not end the acoustic stream. Keep
+    // encoder caches, predictor state, mel overlap and the absolute clock.
+    // Flushing synthetic EOS frames and resetting here changes recognition
+    // after every pause and can delete words from the next utterance.
+    fire_eou(head_.get(), opts_, all_tokens_, transcript_, update);
     return true;
 }
 
@@ -1229,7 +1167,7 @@ CacheStreamRunner::finalize() {
         const size_t before = all_tokens_.size();
         last_step_new_tokens_.clear();
         while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel) {
-            process_one_chunk(/*is_last=*/true);
+            process_one_chunk();
         }
         for (size_t i = before; i < all_tokens_.size(); i++) {
             update.new_token_ids.push_back(all_tokens_[i]);

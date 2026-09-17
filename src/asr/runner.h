@@ -276,15 +276,14 @@ class CacheStreamRunner final : public AsrRunner {
     RnntDecodeStats rnnt_decode_stats() const;
 
    private:
-    void process_one_chunk(bool /*is_last*/);
-    void finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future);
+    void process_one_chunk();
     void upload_attn_mask();
     void zero_caches();
     // Poll the endpointer on the decode clock (now = encoder frames emitted;
     // last speech = VAD bits over decoded mel frames, or the decoder's
-    // last_emit_frame). Called after each processed chunk. On EOU it runs the
-    // normal EOS path, then starts the next utterance with fresh encoder and
-    // predictor state. The chunk loop breaks when this returns true.
+    // last_speech_frame). EOU publishes the utterance without changing acoustic
+    // or predictor state. A forced EOU waits for all currently decodable chunks.
+    // The chunk loop breaks when this returns true.
     bool poll_endpoint(StreamingUpdate& update, bool after_chunk);
     // Drop the audio prefix that FE and VAD have both consumed.
     void trim_buffers();
@@ -323,8 +322,7 @@ class CacheStreamRunner final : public AsrRunner {
 
     // Always constructed so force_eou() works with threshold endpointing off. Polled
     // after each chunk; on fire the runner emits is_final and resets
-    // per-utterance state. Encoder and predictor state are reset at the
-    // boundary so delayed tokens cannot leak into the next utterance.
+    // per-utterance output state, preserving encoder and predictor context.
     std::unique_ptr<VadEndpointer> endpointer_;
     bool force_eou_pending_ = false;
     // VAD-driven EOU scan state: next global mel frame to scan, and the last

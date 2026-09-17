@@ -22,6 +22,7 @@ target_link_libraries(test_vad PRIVATE nemo_speech_asr)
 
 add_executable(test_endpointer test_endpointer.cpp)
 target_link_libraries(test_endpointer PRIVATE nemo_speech_asr)
+add_test(NAME endpointer_policy COMMAND test_endpointer)
 
 add_executable(test_postproc test_postproc.cpp)
 target_link_libraries(test_postproc PRIVATE nemo_speech_asr Threads::Threads)
@@ -34,6 +35,7 @@ target_link_libraries(test_audio_decoder PRIVATE nemo_speech_common)
 
 add_executable(test_decoders test_decoders.cpp)
 target_link_libraries(test_decoders PRIVATE nemo_speech_asr)
+add_test(NAME decoders COMMAND test_decoders)
 
 # Do not link sentencepiece directly; it is provided by nemo_speech_asr.
 add_executable(test_oov_boost test_oov_boost.cpp)

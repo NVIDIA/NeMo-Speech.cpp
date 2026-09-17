@@ -13,6 +13,23 @@
 
 namespace nemo_speech::asr {
 
+namespace {
+ggml_tensor*
+conv_1d_frames(
+    ggml_context* ctx, ggml_tensor* weight, ggml_tensor* input, int stride, int padding) {
+    // Keep frame batches separate: columns are (kernel*channels, time, frame).
+    // Flatten only time/frame for the GEMM, then restore (time, channels, frame).
+    // A direct reshape of (time*frame, channels) interleaves frames and channels.
+    auto* columns =
+        ggml_im2col(ctx, weight, input, stride, 0, padding, 0, 1, 0, false, GGML_TYPE_F16);
+    auto* product = ggml_mul_mat(
+        ctx, ggml_reshape_2d(ctx, weight, weight->ne[0] * weight->ne[1], weight->ne[2]),
+        ggml_reshape_2d(ctx, columns, columns->ne[0], columns->ne[1] * columns->ne[2]));
+    product = ggml_reshape_3d(ctx, product, weight->ne[2], columns->ne[1], columns->ne[2]);
+    return ggml_cont(ctx, ggml_permute(ctx, product, 1, 0, 2, 3));
+}
+}  // namespace
+
 // SileroVadModule - the ggml graph. Consecutive windows and streams share one
 // graph run, with one probability emitted per window_size frame.
 //
@@ -101,7 +118,7 @@ class SileroVadModule : public ggml_runtime::Module {
         const int stft_hop = cfg_.stft_filter_length / 2;  // = 128
         ggml_tensor* padded =
             ggml_pad_reflect_1d(g, frame.tensor, cfg_.context_size, cfg_.context_size);
-        ggml_tensor* stft = ggml_conv_1d(g, basis, padded, stft_hop, /*padding=*/0, /*d0=*/1);
+        ggml_tensor* stft = conv_1d_frames(g, basis, padded, stft_hop, /*padding=*/0);
 
         const int w = static_cast<int>(stft->ne[0]);  // STFT frames (=4)
         const int cutoff = cfg_.stft_n_basis / 2;     // n_freqs (=129)
@@ -123,7 +140,7 @@ class SileroVadModule : public ggml_runtime::Module {
         for (int i = 0; i < cfg_.n_encoder_layers; i++) {
             ggml_tensor* wt = mtc->get_tensor_by_name(enc_w(i)).tensor;
             ggml_tensor* b = mtc->get_tensor_by_name(enc_b(i)).tensor;
-            cur = ggml_conv_1d(g, wt, cur, cfg_.enc_strides[i], /*padding=*/1, /*d0=*/1);
+            cur = conv_1d_frames(g, wt, cur, cfg_.enc_strides[i], /*padding=*/1);
             cur = ggml_add(g, cur, ggml_reshape_3d(g, b, 1, cfg_.enc_out_channels[i], 1));
             cur = ggml_relu(g, cur);
         }

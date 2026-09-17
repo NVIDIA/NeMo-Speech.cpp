@@ -51,34 +51,7 @@ RnntGreedyDecoder::RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cf
     : engine_(engine), bias_alpha_cfg_(static_cast<float>(cfg.boosting_tree_alpha)),
       bias_depth_scaling_(static_cast<float>(cfg.boosting_depth_scaling)),
       bias_max_boost_(cfg.boosting_max_boost) {
-    build_punct_bias();
     reset();
-}
-
-// Identify the sentence-terminator tokens and their end-of-utterance floor.
-// riva's PunctBiasHelper uses bump 1.5 for '.'/'?' (and ▁-prefixed) with an EOU
-// floor of PUNCT_BIAS_EOS_STALL_FLOOR (5) * bump = 7.5; we reuse that floor.
-// Comma is mid-sentence (the model emits it on its own) and is not floored.
-void
-RnntGreedyDecoder::build_punct_bias() {
-    const auto& vocab = engine_->vocab();
-    // The vocabulary vector may omit the terminal blank entry even though the
-    // joint output includes it, so size the graph input from RNNT metadata.
-    punct_bias_.assign(static_cast<size_t>(engine_->rnnt_config().vocab_size), 0.0f);
-    has_punct_bias_ = false;
-    constexpr float kFloor = 5.0f * 1.5f;
-    for (int id = 0; id < static_cast<int>(vocab.size()); ++id) {
-        const std::string& p = vocab[id];
-        // Sentence terminators get the EOU floor so the marginal trailing one
-        // wins over blank on the flush. Multilingual models also terminate with
-        // '!' and the Devanagari danda U+0964 (Hindi etc.); floor those too so
-        // the model's natural terminal wins instead of a spurious '.'/'?'.
-        if (p == "." || p == "?" || p == "!" || p == "\xE0\xA5\xA4" || p == "\xE2\x96\x81." ||
-            p == "\xE2\x96\x81?") {
-            punct_bias_[static_cast<size_t>(id)] = kFloor;
-            has_punct_bias_ = true;
-        }
-    }
 }
 
 void
@@ -146,10 +119,13 @@ RnntGreedyDecoder::reset() {
     token_ids_.clear();
     stats_ = {};
     last_emit_frame_ = -1;
+    last_speech_frame_ = -1;
     words_.clear();
     cur_open_ = false;
     cur_ = WordTiming{};
-    finalizing_ = false;
+    utterance_has_content_ = false;
+    last_presented_punctuation_ = false;
+    pending_word_boundary_ = false;
     bias_node_ = ContextBiasingTree::kRoot;
 }
 
@@ -164,6 +140,45 @@ RnntGreedyDecoder::flush_word() {
 void
 RnntGreedyDecoder::finalize() {
     flush_word();
+}
+
+bool
+RnntGreedyDecoder::present_token(int token, int64_t frame) {
+    const auto& vocab = engine_->vocab();
+    const bool valid = token >= 0 && token < static_cast<int>(vocab.size());
+    const std::string piece = valid ? vocab[token] : std::string();
+    const std::string text = sp_piece_text(piece);
+    const bool punctuation = sp_is_punctuation(piece);
+    const bool whitespace = text.find_first_not_of(" \t\r\n") == std::string::npos;
+    const bool special = !text.empty() && text.front() == '<' && text.back() == '>';
+    const bool content = !whitespace && !punctuation && !special;
+    if (content) {
+        last_speech_frame_ = frame;
+        utterance_has_content_ = true;
+        last_presented_punctuation_ = false;
+    }
+    if (punctuation) {
+        if (!utterance_has_content_ || last_presented_punctuation_)
+            return false;
+        last_presented_punctuation_ = true;
+    }
+    if (compute_ts_ && valid && whitespace)
+        pending_word_boundary_ = true;
+    if (compute_ts_ && valid && !whitespace) {
+        if (((sp_starts_new_word(piece) || pending_word_boundary_) && !punctuation) || !cur_open_) {
+            flush_word();
+            cur_open_ = true;
+            cur_.start_frame = frame;
+            cur_.confidence = 1.0f;
+        }
+        cur_.word += text;
+        // Punctuation attaches to a word without extending its speech duration.
+        if (!punctuation) {
+            cur_.end_frame = frame + 1;
+            pending_word_boundary_ = false;
+        }
+    }
+    return true;
 }
 
 std::vector<int>
@@ -184,7 +199,6 @@ RnntGreedyDecoder::step_impl(
     const float* enc_out, const ggml_runtime::DeviceTensor* device_enc_out, int d_model, int T,
     int64_t frame_offset) {
     std::vector<int> emitted;
-    const auto& vocab = engine_->vocab();
     const auto& cfg = engine_->rnnt_config();
     const int blank_id = cfg.blank_id;
     const int max_sym = cfg.max_symbols_per_step;
@@ -208,7 +222,6 @@ RnntGreedyDecoder::step_impl(
     int symbols_at_frame = 0;
     while (t < T) {
         const int remaining = T - t;
-        const float* logit_bias = (finalizing_ && has_punct_bias_) ? punct_bias_.data() : nullptr;
         const float* boost_bias = nullptr;
         if (bias_on_) {
             // NeMo/riva semantics (rnnt_label_looping.py): blank vs non-blank is
@@ -220,10 +233,7 @@ RnntGreedyDecoder::step_impl(
             // frame run: the match state only changes on a non-blank commit,
             // which starts a fresh round.
             const ContextBiasingTree::StepBoost sb = bias_tree_.step_boost(bias_node_);
-            if (logit_bias != nullptr)
-                bias_scratch_.assign(punct_bias_.begin(), punct_bias_.end());
-            else
-                bias_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
+            bias_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
             for (const auto& sp : sb.specials) {
                 if (sp.first != blank_id && sp.first >= 0 && sp.first < cfg.vocab_size)
                     bias_scratch_[static_cast<size_t>(sp.first)] +=
@@ -236,7 +246,7 @@ RnntGreedyDecoder::step_impl(
         if (!predictor_valid_ && device_enc_out != nullptr && boost_bias == nullptr) {
             engine_->predict_and_joint_rnnt_argmax_device(
                 *stream_state_, prev_token_, active_bank_, *device_enc_out, t, d_model, remaining,
-                token_ids_.data(), logit_bias);
+                token_ids_.data());
             ++stats_.predictor_calls;
             ++stats_.joint_calls;
             stats_.joint_frames += static_cast<uint64_t>(remaining);
@@ -248,19 +258,16 @@ RnntGreedyDecoder::step_impl(
             predictor_valid_ = true;
         }
 
-        // Apply the release branch's end-of-utterance punctuation floor in the
-        // staged joint graph, before its device-side argmax. Keeping this as an
-        // optional dense bias preserves the vectorized blank-run path and avoids
-        // copying full logits back to the host.
+        // Silence and stream closure do not imply sentence completion. Keep
+        // native punctuation logits unchanged, including on the EOS tail.
         if (!joint_complete) {
             if (device_enc_out != nullptr) {
                 engine_->joint_argmax_device(
-                    *stream_state_, *device_enc_out, t, d_model, remaining, token_ids_.data(),
-                    logit_bias);
+                    *stream_state_, *device_enc_out, t, d_model, remaining, token_ids_.data());
             } else {
                 engine_->joint_argmax(
                     *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model, remaining,
-                    token_ids_.data(), logit_bias);
+                    token_ids_.data());
             }
             ++stats_.joint_calls;
             stats_.joint_frames += static_cast<uint64_t>(remaining);
@@ -303,21 +310,10 @@ RnntGreedyDecoder::step_impl(
         t += first_emit;
         const int token = token_ids_[static_cast<size_t>(first_emit)];
 
-        emitted.push_back(token);
         ++stats_.emitted_tokens;
         last_emit_frame_ = frame_offset + t;
-        if (compute_ts_ && token >= 0 && token < (int)vocab.size()) {
-            const int64_t f = frame_offset + t;
-            const std::string& piece = vocab[token];
-            if (sp_starts_new_word(piece) || !cur_open_) {
-                flush_word();
-                cur_open_ = true;
-                cur_.start_frame = f;
-                cur_.confidence = 1.0f;  // RNNT greedy emits no per-token posterior
-            }
-            cur_.word += sp_piece_text(piece);
-            cur_.end_frame = f + 1;
-        }
+        if (present_token(token, frame_offset + t))
+            emitted.push_back(token);
 
         // A non-blank commits the candidate prediction state. The newly
         // emitted token becomes the next predictor input, invalidating every
