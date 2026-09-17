@@ -172,7 +172,8 @@ python3 convert_model.py nvidia/Nemotron-3-Diarization \
 Enable either model with `--diar-model MODEL.gguf`. With no geometry overrides,
 the runtime selects the matching low-latency preset: V2 uses
 `spkcache=160, fifo=80, chunk=20`, while V3 uses
-`spkcache=264, fifo=188, chunk=6, update=144, lc=1, rc=7`. These values are on
+`spkcache=264, fifo=80, chunk=13, update=40, lc=0, rc=1` (1.04 s chunks with
+80 ms right context). These values are on
 the shared coarse 80 ms AOSC grid. V3 emits public speaker probabilities every
 10 ms; V2 emits them every 80 ms. Explicit `--diar-preset` choices are
 `streaming`, `offline`, `v3-streaming`, and `v3-offline` (see

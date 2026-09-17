@@ -17,13 +17,15 @@ constexpr float kPosInf = std::numeric_limits<float>::infinity();
 // NeMo's placeholder for disabled top-k picks (sortformer_modules.max_index).
 constexpr int64_t kMaxIndex = 99999;
 
+// Channel-birth gate thresholds on the 10 ms output grid: a channel is
+// established after 4 clean handoff frames or 8 fading handoff frames.
 constexpr float kBirthSpeech = 0.30f;
-constexpr float kBirthClean = 0.95f;
-constexpr float kEstablishedQuiet = 0.02f;
-constexpr float kBirthFading = 0.90f;
-constexpr float kEstablishedFading = 0.15f;
+constexpr float kBirthClean = 0.50f;
+constexpr float kEstablishedQuiet = 0.10f;
+constexpr float kBirthFading = 0.65f;
+constexpr float kEstablishedFading = 0.30f;
 constexpr int kBirthCleanFrames = 4;
-constexpr int kBirthFadingFrames = 20;
+constexpr int kBirthFadingFrames = 8;
 constexpr int kBirthEpisodeGapFrames = 25;
 constexpr int kBirthRevisionFrames = 128;
 

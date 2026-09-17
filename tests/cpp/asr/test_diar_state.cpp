@@ -85,7 +85,7 @@ test_geometry_and_word_cadence() {
     auto g = resolve(false);
     require(g.chunk_len == 20 && g.spkcache_len == 160 && g.fifo_len == 80, "V2 defaults");
     g = resolve(true);
-    require(g.chunk_len == 6 && g.spkcache_len == 264 && g.chunk_left_context == 1, "V3 defaults");
+    require(g.chunk_len == 13 && g.spkcache_len == 264 && g.chunk_left_context == 0, "V3 defaults");
     for (int chunk : {20, 9}) {
         bool consumed = false;
         const auto value = std::to_string(chunk);
@@ -95,8 +95,8 @@ test_geometry_and_word_cadence() {
         g = resolve(true);
         require(g.chunk_len == chunk, "explicit chunk must survive resolution");
         require(
-            g.spkcache_len == 264 && g.fifo_len == 188 && g.spkcache_update_period == 144 &&
-                g.chunk_left_context == 1 && g.chunk_right_context == 7,
+            g.spkcache_len == 264 && g.fifo_len == 80 && g.spkcache_update_period == 40 &&
+                g.chunk_left_context == 0 && g.chunk_right_context == 1,
             "inherit V3 fields");
     }
     bool consumed = false;
@@ -114,7 +114,7 @@ test_geometry_and_word_cadence() {
     auto direct = DiarGeometry{};
     direct.chunk_len = 20;
     require(
-        direct.resolved(true).chunk_len == 20 && direct.resolved(true).fifo_len == 188,
+        direct.resolved(true).chunk_len == 20 && direct.resolved(true).fifo_len == 80,
         "direct overrides");
     SortformerModelConfig model;
     require(model.word_anchor_frames() == 2, "V2 word anchor must remain two frames");

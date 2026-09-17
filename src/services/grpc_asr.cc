@@ -303,7 +303,12 @@ class StreamingAsrSession {
     void append_partial(
         const std::optional<asr::Result>& result,
         std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
-        nr_asr::StreamingRecognizeResponse response;
+        // One audio request gets one response, including any endpoint finals
+        // and the following partial. Sending a separate empty acknowledgement
+        // after a final breaks the official client's send/receive pairing.
+        if (responses.empty())
+            responses.emplace_back();
+        auto& response = responses.back();
         if (result && interim_results_) {
             const std::string& transcript = result->alternatives.front().transcript;
             if (!transcript.empty() && transcript != last_emitted_transcript_) {
@@ -319,12 +324,13 @@ class StreamingAsrSession {
             }
         }
         add_request_id(response);
-        responses.push_back(std::move(response));
     }
 
     void append_final(
         const asr::Result& result, std::vector<nr_asr::StreamingRecognizeResponse>& responses) {
-        nr_asr::StreamingRecognizeResponse response;
+        if (responses.empty())
+            responses.emplace_back();
+        auto& response = responses.back();
         auto* proto_result = response.add_results();
         proto_result->set_is_final(true);
         proto_result->set_stability(result.stability);
@@ -336,7 +342,6 @@ class StreamingAsrSession {
                 any_final_);
         }
         add_request_id(response);
-        responses.push_back(std::move(response));
         last_emitted_transcript_.clear();
         any_final_ = true;
     }

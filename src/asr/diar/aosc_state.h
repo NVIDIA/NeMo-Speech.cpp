@@ -35,7 +35,9 @@ struct DiarGeometry {
     // The "offline" preset still uses AOSC streaming with larger chunks and caches.
     static DiarGeometry riva_streaming() { return {160, 80, 20, 80, 0, 0}; }
     static DiarGeometry riva_offline() { return {312, 100, 100, 100, 0, 0}; }
-    static DiarGeometry v3_streaming() { return {264, 188, 6, 144, 1, 7}; }
+    // Low-latency V3 streaming default: 1.04 s center chunk, no left context,
+    // 80 ms right context, speaker cache 264, FIFO 80, refresh 40 (80 ms grid).
+    static DiarGeometry v3_streaming() { return {264, 80, 13, 40, 0, 1}; }
     static DiarGeometry v3_offline() { return {264, 0, 264, 188, 1, 1}; }
     DiarGeometry resolved(bool is_v3) const;
     // Throws std::invalid_argument for unknown names.
