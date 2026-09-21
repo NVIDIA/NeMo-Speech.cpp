@@ -28,31 +28,18 @@ s2s:
 nemo-speech serve --config config/voicechat.yaml
 ```
 
-`s2s.max_streams` is a state-reservation ceiling, not a throughput target.
-Set it to `1` for a single-conversation deployment. Incoming requests are
-batched dynamically; conversation, sampler, and generated-audio state remain
-isolated per stream.
-
-`s2s.max_streams` is also the server's only concurrent-session admission
-control, and the two roles share one number: it caps how many resident
-conversation states fit in memory, and it is the hard limit past which a new
-session is refused. The WebSocket handshake itself always succeeds — the
-server sends `session.created` unconditionally — but the moment a session
-past the ceiling sends its first `session.update` or audio chunk, the server
-emits an `error` event (`code: inference_error`, message `"maximum
-concurrent streams reached"`) and force-closes that socket. Sessions already
-admitted are unaffected; the rejection happens before the new session
-touches inference.
-
-Because both roles share one number, sizing for memory headroom alone is not
-enough: `s2s.max_streams` is also the ceiling past which generation for
-*every* admitted session slows down, since the dynamic batcher schedules all
-admitted streams together without ever shedding load once they're in (see
-`S2S_BATCH_QUEUE_DELAY_US` below). Measure the largest concurrency that still
-generates audio at real-time pace for your GPU and model profile, and set
-`s2s.max_streams` to that number rather than to the largest count that merely
-fits in GPU memory — sessions above your compute-safe number are then
-refused outright instead of silently degrading the sessions already running.
+`s2s.max_streams` is a state-reservation ceiling, not a throughput target,
+and doubles as the server's only concurrent-session admission control.
+Incoming requests are batched dynamically and per-stream state stays
+isolated, but the dynamic batcher schedules all admitted streams together
+without shedding load, so past this ceiling every admitted session's
+generation slows down (see `S2S_BATCH_QUEUE_DELAY_US` below). The WebSocket
+handshake always succeeds, but a session past the limit gets an `error`
+event on its first `session.update` or audio chunk (`code:
+inference_error`, message `"maximum concurrent streams reached"`) and is
+force-closed; already-admitted sessions are unaffected. Set
+`s2s.max_streams` to the largest concurrency that still generates audio at
+real-time pace for your GPU and model, not just what fits in memory.
 
 When `nemo-speech serve` chooses its default HTTP worker count, it reserves
 enough workers for the configured VoiceChat stream ceiling. An explicitly set

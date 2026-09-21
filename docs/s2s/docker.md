@@ -53,14 +53,6 @@ docker run --rm --gpus all --name nemo-voicechat \
   --s2s-max-streams 1
 ```
 
-`--user` runs the server as the host user instead of the image's baked-in
-`uid 1000`. On some NFS exports, read access to a bind-mounted model
-directory is restricted to its owning UID (and root) regardless of file
-mode bits, so a mismatched in-image UID gets `Permission denied` reading the
-GGUF files even when they are world-readable. Matching the host UID avoids
-that; it is harmless on local disk too, where it simply keeps any files the
-container writes owned by the host user instead of root.
-
 Although the server listens on all interfaces inside the container, this port
 mapping makes it reachable only from the Docker host. For remote access, place
 it behind a TLS reverse proxy that authenticates clients; do not expose this
