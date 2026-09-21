@@ -240,8 +240,8 @@ class OfflineRunner final : public AsrRunner {
 
 bool exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int input_sample_rate);
 
-// Drives a fixed-shape encoder graph (chunk_size_mel in, chunk_enc_frames
-// out) with per-layer K/V/conv caches threaded across chunks in a
+// Drives first/steady-state encoder shapes (each producing chunk_enc_frames)
+// with per-layer K/V/conv caches threaded across chunks in a
 // device-resident indexed cache row. Audio is buffered until at least one chunk's
 // worth of mel frames is ready; each step uploads mel + a small validity mask
 // and downloads only the joint-projected encoder output.
@@ -276,6 +276,7 @@ class CacheStreamRunner final : public AsrRunner {
     RnntDecodeStats rnnt_decode_stats() const;
 
    private:
+    int next_chunk_mel_frames() const;
     void process_one_chunk(bool /*is_last*/);
     void finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future);
     void upload_attn_mask();
@@ -295,7 +296,8 @@ class CacheStreamRunner final : public AsrRunner {
     // GGUF-pinned cache-aware mel-frame geometry. These are NeMo's
     // CacheAwareStreamingConfig chunk_size / shift_size in mel frames
     // (setup_streaming_params, conformer_encoder.py):
-    //   chunk_size_mel = pre_encode_cache_size + subsampling_factor*(1 + R)
+    //   first_chunk_mel = 1 + subsampling_factor*R
+    //   subsequent_chunk_mel = pre_encode_cache_size + subsampling_factor*(1 + R)
     //   shift_size_mel = subsampling_factor*(1 + R - cache_drop_size)
     // These values are fixed by the model.
     int pre_encode_cache_size_ = 9;  // overlap, mel frames
@@ -358,11 +360,9 @@ class CacheStreamRunner final : public AsrRunner {
     bool finalized_ = false;
     // True once finalize() begins, so its internal drain step() doesn't fire EOU.
     bool finalizing_ = false;
-    // Tracks whether we've prepended pre_encode_cache_size zero mel frames at
-    // start-of-stream. NeMo's CacheAwareStreamingAudioBuffer does this once
-    // per stream so the encoder's drop_extra_pre_encoded behaviour throws
-    // away zero-pad rather than the leading ~160 ms of real audio.
-    bool stream_zero_padded_ = false;
+    // Reset at an encoder-state boundary, independently of the absolute stream
+    // frame clock. The first chunk has no pre-encoder overlap to discard.
+    bool first_chunk_ = true;
 
     // Encoder output from most recent chunk (column-major (d_model, T_out)).
     std::vector<float> last_enc_out_;
