@@ -45,18 +45,13 @@ docker run --rm -it \
       --outfile models/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF"
 ```
 
-Mounting the repository checkout into the container makes `convert_model.py`
-and `requirements.txt` visible and writes `--outfile` output back to the
-host. `--user` runs the container as the host user instead of root: on a
-checkout backed by NFS or another root-squashing filesystem, root inside the
-container cannot write into the mounted `.git` directory, and conversion
-fails applying the llama.cpp compatibility patches. `HOME` must point
-somewhere writable by that user (the container's default `HOME` is owned by
-root) since `pip install --user` needs it. Without a mounted Hugging Face
-cache, each run re-downloads the checkpoint into that same `HOME`; mount an
-existing cache with `-v /path/with/space:/tmp/nemo-speech-convert-home/.cache/huggingface`
-to persist it across runs. Run `hf auth login` inside the container first if
-the checkpoint is gated.
+The repo mount exposes `convert_model.py` and `requirements.txt` and writes
+`--outfile` back to the host. `--user` avoids running as root, which can't
+write into a mounted `.git` on NFS or another root-squashing filesystem, and
+`HOME` must point somewhere writable since the container's default `HOME` is
+root-owned. Mount an existing Hugging Face cache with
+`-v /path/with/space:/tmp/nemo-speech-convert-home/.cache/huggingface` to
+avoid re-downloading the checkpoint on every run.
 
 Architecture detection selects S2S automatically. The converter initializes
 the pinned llama.cpp submodule when needed, applies the repository's patches,
