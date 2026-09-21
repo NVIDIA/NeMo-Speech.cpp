@@ -58,12 +58,6 @@ existing cache with `-v /path/with/space:/tmp/nemo-speech-convert-home/.cache/hu
 to persist it across runs. Run `hf auth login` inside the container first if
 the checkpoint is gated.
 
-Conversion runs fine on CPU; add `--gpus all` only if GPU-accelerated
-conversion is wanted. A quantized profile still requires Git, CMake,
-Ninja or Make, and a C++ compiler — the NVIDIA PyTorch image includes a
-compiler toolchain, but `--no-build-quantizer` with a host-built
-`llama-quantize` remains available as a fallback.
-
 Architecture detection selects S2S automatically. The converter initializes
 the pinned llama.cpp submodule when needed, applies the repository's patches,
 and builds or reuses `llama-quantize` for quantized profiles.
