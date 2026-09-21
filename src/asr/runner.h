@@ -277,15 +277,15 @@ class CacheStreamRunner final : public AsrRunner {
 
    private:
     void process_one_chunk(bool /*is_last*/);
-    void finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future);
+    // Mid-stream EOU: a reporting checkpoint, not a decoder reset -- encoder
+    // cache and predictor state carry on so the next segment stays in
+    // context (see fire_eou's Decoder::reset_utterance()).
+    void finish_endpoint(StreamingUpdate& update);
     void upload_attn_mask();
     void zero_caches();
-    // Poll the endpointer on the decode clock (now = encoder frames emitted;
-    // last speech = VAD bits over decoded mel frames, or the decoder's
-    // last_emit_frame). Called after each processed chunk. On EOU it runs the
-    // normal EOS path, then starts the next utterance with fresh encoder and
-    // predictor state. The chunk loop breaks when this returns true.
-    bool poll_endpoint(StreamingUpdate& update, bool after_chunk);
+    // Poll the endpointer on the decode clock. On EOU, reports via
+    // finish_endpoint. Chunk loop breaks when this returns true.
+    bool poll_endpoint(StreamingUpdate& update);
     // Drop the audio prefix that FE and VAD have both consumed.
     void trim_buffers();
     void compact_mel_buffer();
@@ -321,12 +321,8 @@ class CacheStreamRunner final : public AsrRunner {
     // GLOBAL sample count already fed to vad_.
     size_t audio_fed_to_vad_ = 0;
 
-    // Always constructed so force_eou() works with threshold endpointing off. Polled
-    // after each chunk; on fire the runner emits is_final and resets
-    // per-utterance state. Encoder and predictor state are reset at the
-    // boundary so delayed tokens cannot leak into the next utterance.
+    // Always constructed so force_eou() works with threshold endpointing off.
     std::unique_ptr<VadEndpointer> endpointer_;
-    bool force_eou_pending_ = false;
     // VAD-driven EOU scan state: next global mel frame to scan, and the last
     // speech mel frame seen at or before the decode cursor.
     int64_t vad_scan_frame_ = 0;
