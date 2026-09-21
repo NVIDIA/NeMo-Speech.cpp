@@ -28,10 +28,18 @@ s2s:
 nemo-speech serve --config config/voicechat.yaml
 ```
 
-`s2s.max_streams` is a state-reservation ceiling, not a throughput target.
-Set it to `1` for a single-conversation deployment. Incoming requests are
-batched dynamically; conversation, sampler, and generated-audio state remain
-isolated per stream.
+`s2s.max_streams` is a state-reservation ceiling, not a throughput target,
+and doubles as the server's only concurrent-session admission control.
+Incoming requests are batched dynamically and per-stream state stays
+isolated, but the dynamic batcher schedules all admitted streams together
+without shedding load, so past this ceiling every admitted session's
+generation slows down (see `S2S_BATCH_QUEUE_DELAY_US` below). The WebSocket
+handshake always succeeds, but a session past the limit gets an `error`
+event on its first `session.update` or audio chunk (`code:
+inference_error`, message `"maximum concurrent streams reached"`) and is
+force-closed; already-admitted sessions are unaffected. Set
+`s2s.max_streams` to the largest concurrency that still generates audio at
+real-time pace for your GPU and model, not just what fits in memory.
 
 When `nemo-speech serve` chooses its default HTTP worker count, it reserves
 enough workers for the configured VoiceChat stream ceiling. An explicitly set

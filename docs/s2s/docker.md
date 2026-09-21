@@ -44,6 +44,7 @@ the host's loopback interface only:
 
 ```bash
 docker run --rm --gpus all --name nemo-voicechat \
+  --user "$(id -u):$(id -g)" \
   -p 127.0.0.1:9000:9000 \
   -v "$PWD/models/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF:/models/voicechat:ro" \
   nemo-speech-voicechat \

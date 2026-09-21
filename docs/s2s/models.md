@@ -24,6 +24,35 @@ If the model repository requires authentication, accept its terms and run
 cache, so rerunning conversion does not download unchanged files again. A
 downloaded model directory can be supplied instead of the repository ID.
 
+### Alternative: convert inside a container
+
+Installing `requirements.txt` into a host venv can still collide with other
+locally installed packages or force a specific Python version. To avoid
+touching the host Python environment entirely, run the same conversion
+inside an [NVIDIA PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
+(`26.08-py3` is the latest tag at the time of writing; check the
+[tag list](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags)
+for a newer release):
+
+```bash
+docker run --rm -it \
+  -v "$PWD:/workspace" -w /workspace \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp/nemo-speech-convert-home \
+  nvcr.io/nvidia/pytorch:26.08-py3 \
+  bash -c "pip install --user -r requirements.txt && \
+    python convert_model.py \
+      nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
+      --outfile models/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF"
+```
+
+The repo mount exposes `convert_model.py` and `requirements.txt` and writes
+`--outfile` back to the host. `--user` avoids running as root, which can't
+write into a mounted `.git` on NFS or another root-squashing filesystem, and
+`HOME` must point somewhere writable since the container's default `HOME` is
+root-owned. Mount an existing Hugging Face cache with
+`-v /path/with/space:/tmp/nemo-speech-convert-home/.cache/huggingface` to
+avoid re-downloading the checkpoint on every run.
+
 Architecture detection selects S2S automatically. The converter initializes
 the pinned llama.cpp submodule when needed, applies the repository's patches,
 and builds or reuses `llama-quantize` for quantized profiles.
