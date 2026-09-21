@@ -100,6 +100,27 @@ validate_config(const MagpieRuntimeConfig& config) {
 
 }  // namespace
 
+void
+apply_tts_device_policy(MagpieRuntimeConfig& config, TtsCliDevice device) {
+    switch (device) {
+        case TtsCliDevice::Cpu:
+            config.lt_backend = MagpieBackendPreference::Cpu;
+            config.sampling_backend = MagpieBackendPreference::Cpu;
+            config.magpie_cpu = true;
+            config.codec_cpu = true;
+            break;
+        case TtsCliDevice::Cuda:
+            config.lt_backend = MagpieBackendPreference::Cuda;
+            config.magpie_cpu = false;
+            break;
+        case TtsCliDevice::Accelerator:
+            config.lt_backend = MagpieBackendPreference::Cpu;
+            config.sampling_backend = MagpieBackendPreference::Cpu;
+            config.magpie_cpu = false;
+            break;
+    }
+}
+
 class MagpieTtsRuntime::Impl {
    public:
     explicit Impl(MagpieRuntimeConfig config) : config_(std::move(config)) {
