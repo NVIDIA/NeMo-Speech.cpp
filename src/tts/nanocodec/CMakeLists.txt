@@ -15,6 +15,14 @@ set(NANOCODEC_TARGETS
     nemo_speech_tts_nanocodec_obj
 )
 
+# The fused causal-conv op (ggml_conv1d_fused*) exists only in the patched ggml
+# series; stock ggml builds (CPU/Vulkan presets, stock CUDA) keep the im2col path.
+if(NEMO_SPEECH_GGML_PATCHED)
+    foreach(target ${NANOCODEC_TARGETS})
+        target_compile_definitions(${target} PRIVATE NEMO_SPEECH_GGML_PATCHED=1)
+    endforeach()
+endif()
+
 if(GGML_CUDA)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND AND CUDAToolkit_INCLUDE_DIRS)

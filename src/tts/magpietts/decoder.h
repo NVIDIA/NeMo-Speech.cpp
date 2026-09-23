@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "model.h"
@@ -78,6 +79,7 @@ struct magpietts_uncond_prefill_cache {
     int n_embd = 0;
     std::vector<int32_t> codes;  // stacked audio codes the prefill was built from
     std::atomic<bool> ready{false};
+    std::mutex fill_mutex;  // the main thread and the chunk-prefetch thread may both try to fill
 
     magpietts_uncond_prefill_cache() = default;
     ~magpietts_uncond_prefill_cache();

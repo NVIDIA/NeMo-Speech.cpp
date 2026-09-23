@@ -28,6 +28,7 @@ struct magpietts_cuda_sampler {
     bool sequence_warm = false;
     bool sequence_build_active = false;
     bool sequence_disabled = false;
+    uint64_t sequence_key = 0;
 };
 
 bool
@@ -582,6 +583,28 @@ magpietts_cuda_sampler_sequence_disable(magpietts_cuda_sampler* sampler) {
     }
     sampler->sequence_tail = nullptr;
     sampler->sequence_disabled = true;
+}
+
+uint64_t
+magpietts_cuda_sampler_sequence_key(const magpietts_cuda_sampler* sampler) {
+    return sampler ? sampler->sequence_key : 0;
+}
+
+void
+magpietts_cuda_sampler_sequence_set_key(magpietts_cuda_sampler* sampler, uint64_t key) {
+    if (sampler)
+        sampler->sequence_key = key;
+}
+
+void
+magpietts_cuda_sampler_sequence_reset(magpietts_cuda_sampler* sampler) {
+    if (!sampler)
+        return;
+    const bool disabled = sampler->sequence_disabled;
+    magpietts_cuda_sampler_sequence_disable(sampler);
+    sampler->sequence_disabled = disabled;
+    sampler->sequence_warm = false;
+    sampler->sequence_key = 0;
 }
 
 bool

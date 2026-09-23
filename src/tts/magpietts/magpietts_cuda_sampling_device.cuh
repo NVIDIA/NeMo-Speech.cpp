@@ -199,18 +199,6 @@ gumbel_u01(uint64_t seed, int frame_index, int codebook, int id) {
     return (float)((r >> 40) + 1) * (1.0f / 16777217.0f);
 }
 
-#ifdef MAGPIETTS_SAMPLER_DBG
-__device__ unsigned long long g_sampler_dbg[8];
-#define SAMPLER_STAMP(i)                  \
-    do {                                  \
-        if (threadIdx.x == 0)             \
-            g_sampler_dbg[i] = clock64(); \
-    } while (0)
-#else
-#define SAMPLER_STAMP(i) \
-    do {                 \
-    } while (0)
-#endif
 
 template <int items_per_thread>
 static __device__ __forceinline__ void
@@ -225,7 +213,6 @@ magpietts_sample_codebook_fast_block(
     const int warp = tid >> 5;
     (void)top_ids;
     (void)top_vals;
-    SAMPLER_STAMP(0);
     float thread_vals[items_per_thread];
     uint32_t keys[items_per_thread];
     uint32_t minkey = 0xffffffffu;
@@ -273,18 +260,22 @@ magpietts_sample_codebook_fast_block(
                     ((unsigned long long)descending_key(g) << 32) | (uint32_t)id;
                 best = min(best, packed);
             }
-            if (keys[item] == minkey)  // candidates for the argmax (smallest id among maxima)
-                atomicMin(&sh.s_argmax, id);
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             best = min(best, __shfl_xor_sync(0xffffffffu, best, offset));
         if (tid == 0)
             sh.s_best = ~0ull;
-        __syncthreads();  // s_minkey final, s_best initialized
+        __syncthreads();  // s_minkey final (block-wide max logit), s_best initialized
         if (lane == 0)
             atomicMin(&sh.s_best, best);
-        __syncthreads();
+#pragma unroll
+        for (int item = 0; item < items_per_thread; ++item) {
+            // argmax = smallest id holding the block-wide maximum (same rule as the exact path)
+            if (keys[item] == sh.s_minkey)
+                atomicMin(&sh.s_argmax, tid * items_per_thread + item);
+        }
+        __syncthreads();  // s_best and s_argmax final
         const unsigned long long sel = sh.s_best;
         if (sel != ~0ull) {
             const int cand = (int)(uint32_t)sel;
@@ -312,7 +303,6 @@ magpietts_sample_codebook_fast_block(
                     *code_out = cand;
                     *argmax_out = sh.s_argmax;  // final: all argmax atomics preceded the sync
                 }
-                SAMPLER_STAMP(5);
                 return;
             }
             __syncthreads();  // s_scan is reused by the exact path's block scan
@@ -321,7 +311,6 @@ magpietts_sample_codebook_fast_block(
     uint32_t prefix = 0;
     uint32_t mask = 0;
     int remaining = k;
-    SAMPLER_STAMP(1);
 #pragma unroll 1
     for (int pass = 0; pass < 4; ++pass) {
         const int shift = 24 - 8 * pass;
@@ -332,10 +321,16 @@ magpietts_sample_codebook_fast_block(
             // shared atomics would serialize thousands of updates on a few bins.
             const bool active = (keys[item] & mask) == prefix;
             const int bin = active ? (int)((keys[item] >> shift) & 0xffu) : -1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+            if (active) {  // __match_any_sync needs sm_70
+                atomicAdd(&hist[bin], 1);
+            }
+#else
             const unsigned peers = __match_any_sync(0xffffffffu, bin);
             if (active && (__ffs(peers) - 1) == lane) {
                 atomicAdd(&hist[bin], __popc(peers));
             }
+#endif
         }
         __syncthreads();
         if (tid < 32) {
@@ -373,7 +368,6 @@ magpietts_sample_codebook_fast_block(
         mask |= 0xffu << shift;
         remaining = sh.s_ctrl[1];
     }
-    SAMPLER_STAMP(2);
     // Compact the k selected (key, id) pairs: all keys below the threshold plus the first
     // `remaining` keys equal to it (ascending id).
     const uint32_t threshold = prefix;
@@ -407,7 +401,6 @@ magpietts_sample_codebook_fast_block(
             atomicMin(&sh.s_argmax, id);  // argmax: smallest id among the maximal logits
     }
     __syncthreads();
-    SAMPLER_STAMP(3);
     // Temperature sampling over the k selected logits: one candidate per thread (k <= block).
     const float max_logit = descending_key_to_float(sh.s_minkey);
     float e = 0.0f;
@@ -421,7 +414,6 @@ magpietts_sample_codebook_fast_block(
         if (config.temperature > 0.0f)
             e = isfinite(v) ? __expf((v - max_logit) / config.temperature) : 0.0f;
     }
-    SAMPLER_STAMP(6);
     // Inclusive scan of e over the block (warp shuffles + one cross-warp step).
     float incl = e;
 #pragma unroll
@@ -448,7 +440,6 @@ magpietts_sample_codebook_fast_block(
     if (tid == 0)
         sh.s_pick = -1;
     __syncthreads();
-    SAMPLER_STAMP(7);
     if (config.temperature > 0.0f && total > 0.0f) {
         const float target =
             (float)(uniform01(config.seed, config.frame_index, rng_codebook) * (double)total);
@@ -462,12 +453,10 @@ magpietts_sample_codebook_fast_block(
             sh.s_pick = my_id;
         __syncthreads();
     }
-    SAMPLER_STAMP(4);
     if (tid == 0) {
         const int argmax = sh.s_argmax;
         const int sampled = sh.s_pick >= 0 ? sh.s_pick : argmax;
         *code_out = sampled;
         *argmax_out = argmax;
     }
-    SAMPLER_STAMP(5);
 }

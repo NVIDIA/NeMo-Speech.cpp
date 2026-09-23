@@ -828,7 +828,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
 
         const bool has_alignment = module_.alignment_count() > 0;
 #if defined(GGML_USE_CUDA)
-        if (fused_ && !fused_compare_) {
+        if (fused_) {
             std::vector<float> fused_alignment;
             const bool want_alignment = has_alignment && attention && attention->alignment_scores;
             const bool defer = want_alignment && attention->defer_alignment;
@@ -867,42 +867,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
             model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
         ggml_backend_tensor_copy_async(
             model_.backend, model_.backend, uncond_device.tensor, uncond_hidden_out->tensor);
-#if defined(GGML_USE_CUDA)
-        if (fused_ && fused_compare_) {
-            // Run the fused step into scratch and compare with the graph's outputs.
-            char* dbase = (char*)fused_dev_;
-            float* d_scratch = (float*)(dbase + 64) + 3 * (size_t)text_capacity_;
-            std::vector<float> fused_alignment;
-            const int E = model_.decoder.n_embd;
-            if (run_fused(
-                    tokens, position, log_prior, pad_mask, d_scratch, d_scratch + E,
-                    has_alignment ? &fused_alignment : nullptr)) {
-                std::vector<float> g(2 * (size_t)E), f(2 * (size_t)E);
-                ggml_backend_tensor_get(cond_hidden_out->tensor, g.data(), 0, E * sizeof(float));
-                ggml_backend_tensor_get(
-                    uncond_hidden_out->tensor, g.data() + E, 0, E * sizeof(float));
-                cudaMemcpy(
-                    f.data(), d_scratch, 2 * (size_t)E * sizeof(float), cudaMemcpyDeviceToHost);
-                double mx = 0, ma = 0, ref = 0;
-                for (size_t i = 0; i < f.size(); ++i) {
-                    const double d = fabs((double)g[i] - f[i]);
-                    mx = std::max(mx, d);
-                    ma += d;
-                    ref += fabs((double)g[i]);
-                }
-                double mal = 0;
-                for (size_t i = 0; i < fused_alignment.size() && i < (size_t)text_len_; ++i)
-                    mal = std::max(mal, (double)fabs(alignment[i] - fused_alignment[i]));
-                if (fused_steps_ < 8 || mx > 0.25)
-                    fprintf(
-                        stderr,
-                        "fused decoder compare step %d: hidden max|diff| %.4f mean %.5f (mean|ref| "
-                        "%.4f), alignment max|diff| %.5f\n",
-                        fused_steps_, mx, ma / f.size(), ref / f.size(), mal);
-            }
-            ++fused_steps_;
-        }
-#endif
 
         if (attention && attention->alignment_scores) {
             attention->alignment_scores->assign(alignment.begin(), alignment.begin() + text_len_);
@@ -920,15 +884,11 @@ class MagpieDecoder::PersistentDecoderRuntime {
 
    private:
     // Single-launch CUDA decoder step (magpietts_decoder_fused.cu) replacing the ggml graph
-    // when the projections are Q8_0 and the shapes fit. MAGPIETTS_DECODER_FUSED=0 keeps the
-    // graph; MAGPIETTS_DECODER_FUSED_COMPARE=1 runs both and reports the differences.
+    // whenever the projections are Q8_0, the shapes fit and the GPU supports it.
     void init_fused() {
 #if defined(GGML_USE_CUDA)
-        const char* env = getenv("MAGPIETTS_DECODER_FUSED");
-        if ((env && atoi(env) == 0) || !model_.backend || !ggml_backend_is_cuda(model_.backend))
+        if (!model_.backend || !ggml_backend_is_cuda(model_.backend))
             return;
-        const char* cmp = getenv("MAGPIETTS_DECODER_FUSED_COMPARE");
-        fused_compare_ = cmp && atoi(cmp) != 0;
         const magpietts_hparams& h = model_.hparams;
         const magpietts_transformer& tr = model_.decoder;
         if (!tr.has_cross || tr.n_cross_head != 1)
@@ -999,15 +959,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
         char error[256] = {};
         fused_ = magpietts_decoder_fused_create(w, cache, error, sizeof(error));
         if (!fused_) {
-            fprintf(
-                stderr, "MagpieTTS decoder: fused CUDA step unavailable (%s); using the graph\n",
-                error);
+            fprintf(stderr, "MagpieTTS decoder: using the ggml graph (%s)\n", error);
             return;
         }
-        // device + pinned host staging: tokens, prior, mask, alignment (+ compare scratch)
+        // device + pinned host staging: tokens, prior, mask, alignment
         const size_t n_tok = (size_t)h.stacked_audio_codebooks();
-        const size_t floats =
-            2 * (size_t)text_capacity_ + (size_t)text_capacity_ + 2 * (size_t)tr.n_embd;
+        const size_t floats = 3 * (size_t)text_capacity_;
         const size_t dev_bytes = n_tok * sizeof(int32_t) + floats * sizeof(float) + 256;
         if (cudaMalloc(&fused_dev_, dev_bytes) != cudaSuccess ||
             cudaMallocHost(&fused_host_, dev_bytes) != cudaSuccess) {
@@ -1018,9 +975,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
         fprintf(
             stderr,
-            "MagpieTTS decoder: fused single-launch CUDA step enabled (%d layers, %d blocks)%s\n",
-            w.n_layers, magpietts_decoder_fused_grid(fused_),
-            fused_compare_ ? ", compare mode" : "");
+            "MagpieTTS decoder: fused single-launch CUDA step enabled (%d layers, %d blocks)\n",
+            w.n_layers, magpietts_decoder_fused_grid(fused_));
 #endif
     }
 
@@ -1028,6 +984,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // Runs the fused step. hidden_*: device outputs; alignment (host, text_len_) filled when
     // requested.
    public:
+    // Drop a deferred alignment readback that was never completed (the step that enqueued it
+    // was aborted); called at the start of every decoder step.
+    void discardPendingAlignment() { alignment_pending_ = false; }
+
     // Deferred alignment: the readback into pinned memory is enqueued by run_fused and read by
     // completeAlignment once the stream has been synchronized by the caller (or here).
     bool completeAlignment(std::vector<float>* out) {
@@ -1102,8 +1062,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
     magpietts_decoder_fused* fused_ = nullptr;
     void* fused_dev_ = nullptr;
     void* fused_host_ = nullptr;
-    bool fused_compare_ = false;
-    int fused_steps_ = 0;
 #endif
     const magpietts_model& model_;
     const DecoderCrossKvCache* cross_kv_ = nullptr;
@@ -1171,6 +1129,11 @@ MagpieDecoder::evalCachedPair(
     magpietts_cuda_sample_request* cuda_sample, const magpietts_backend_tensor* text_cond_device,
     magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out,
     DecoderCrossKvCache* cond_cross_kv, const magpietts_decoder_attention* attention) const {
+#if defined(GGML_USE_CUDA)
+    if (persistent_runtime_) {
+        persistent_runtime_->discardPendingAlignment();
+    }
+#endif
     // A runtime built for another text chunk (different text length or cross cache) is stale.
     // Drop it before choosing the path: the chunk loop has already cleared the KV caches, so
     // this costs nothing here, whereas noticing it after the new chunk's eager prefill (inside
@@ -1918,6 +1881,11 @@ MagpieDecoder::adoptPrefill(
     DecoderKvCache& uncond_kv, DecoderCrossKvCache& cond_cross_kv, int text_len,
     int stacked_position_budget) const {
     const ggml_nvtx::range nvtx_range("magpietts_decoder_adopt_prefill");
+#if defined(GGML_USE_CUDA)
+    if (persistent_runtime_) {
+        persistent_runtime_->discardPendingAlignment();
+    }
+#endif
     const int n_tokens = prefetched_cond_kv.n_tokens;
     if (n_tokens <= 0 || prefetched_uncond_kv.n_tokens != n_tokens ||
         !prefetched_cross_kv.validFor(model_, text_len)) {
@@ -2259,20 +2227,26 @@ decoder_eval_cached_pair_impl(
         const size_t rows = (size_t)total_len * uncond_kv.n_embd;
         const size_t kv_layer_bytes = (size_t)uncond_kv.n_ctx * uncond_kv.n_embd * sizeof(float);
         if (fill_uncond_cache) {
-            uncond_cache->reset();
-            ggml_init_params cache_params = {
-                /*.mem_size   =*/ggml_tensor_overhead() * 3,
-                /*.mem_buffer =*/nullptr,
-                /*.no_alloc   =*/true,
-            };
-            uncond_cache->ctx = ggml_init(cache_params);
-            const int64_t n = (int64_t)uncond_kv.n_layers * total_len * uncond_kv.n_embd;
-            uncond_cache->k = ggml_new_tensor_1d(uncond_cache->ctx, GGML_TYPE_F32, n);
-            uncond_cache->v = ggml_new_tensor_1d(uncond_cache->ctx, GGML_TYPE_F32, n);
-            uncond_cache->hidden = ggml_new_tensor_1d(uncond_cache->ctx, GGML_TYPE_F32, h.n_embd);
-            uncond_cache->buffer = ggml_backend_alloc_ctx_tensors(uncond_cache->ctx, model.backend);
-            if (!uncond_cache->buffer || !uncond_hidden_last) {
+            // Fill once: the chunk-prefetch thread and the main thread can both see !ready.
+            std::lock_guard<std::mutex> fill_lock(uncond_cache->fill_mutex);
+            if (!uncond_cache->ready.load(std::memory_order_acquire)) {
                 uncond_cache->reset();
+                ggml_init_params cache_params = {
+                    /*.mem_size   =*/ggml_tensor_overhead() * 3,
+                    /*.mem_buffer =*/nullptr,
+                    /*.no_alloc   =*/true,
+                };
+                uncond_cache->ctx = ggml_init(cache_params);
+                const int64_t n = (int64_t)uncond_kv.n_layers * total_len * uncond_kv.n_embd;
+                uncond_cache->k = ggml_new_tensor_1d(uncond_cache->ctx, GGML_TYPE_F32, n);
+                uncond_cache->v = ggml_new_tensor_1d(uncond_cache->ctx, GGML_TYPE_F32, n);
+                uncond_cache->hidden =
+                    ggml_new_tensor_1d(uncond_cache->ctx, GGML_TYPE_F32, h.n_embd);
+                uncond_cache->buffer =
+                    ggml_backend_alloc_ctx_tensors(uncond_cache->ctx, model.backend);
+                if (!uncond_cache->buffer || !uncond_hidden_last) {
+                    uncond_cache->reset();
+                }
             } else {
                 for (int il = 0; il < uncond_kv.n_layers; ++il) {
                     for (int plane = 0; plane < 2; ++plane) {

@@ -1,0 +1,139 @@
+diff --git a/src/ggml-cuda/conv1d-fused.cu b/src/ggml-cuda/conv1d-fused.cu
+index e66928b3..62306312 100644
+--- a/src/ggml-cuda/conv1d-fused.cu
++++ b/src/ggml-cuda/conv1d-fused.cu
+@@ -27,6 +27,7 @@ constexpr int CF_PF      = 16;   // window elements per thread: CF_BK * 128 / 12
+ constexpr int CF_STAGES  = 2;
+ 
+ struct conv1d_fused_params {
++    const half * activated; // optional [group][cache_len+T][cin_pad], prepared once
+     const float * x;
+     const float * cache;
+     const half  * w;
+@@ -62,6 +63,29 @@ __device__ __forceinline__ void mma_16816(float (&c)[4], const unsigned (&a)[4],
+         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+ }
+ 
++// Pack and activate once per element, instead of once per output-channel tile.
++__global__ void conv1d_activate_pack(conv1d_fused_params p, half * dst) {
++    const int ci = blockIdx.x * blockDim.x + threadIdx.x;
++    const int t = blockIdx.y;
++    const int grp = blockIdx.z;
++    if (ci >= p.cin_pad) return;
++    float v = 0.0f;
++    if (ci < p.cin) {
++        const int cb = (p.shared_input ? 0 : grp * p.cin) + ci;
++        v = t < p.cache_len ? p.cache[(size_t)cb * p.cs + t]
++                            : p.x[(size_t)cb * p.xs + t - p.cache_len];
++        if (p.alpha) {
++            if (ci < p.snake_ch) {
++                const float sn = __sinf(p.alpha[grp * p.snake_ch + ci] * v);
++                v = v + sn * sn * p.inv_b[grp * p.snake_ch + ci];
++            } else {
++                v = v > 0.f ? v : v * p.slope;
++            }
++        }
++    }
++    dst[((size_t)grp * (p.cache_len + p.T) + t) * p.cin_pad + ci] = __float2half(v);
++}
++
+ constexpr int CF_MAX_REGS = 168;
+ // __maxnreg__ is a CUDA 12.4+ toolkit macro; older toolkits and HIP get plain launch bounds.
+ #if defined(__maxnreg__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -70,7 +94,7 @@ constexpr int CF_MAX_REGS = 168;
+ #define CF_LAUNCH_BOUNDS __launch_bounds__(CF_THREADS)
+ #endif
+ 
+-template <int BM>
++template <int BM, bool PACKED = false>
+ // 128 threads x <= 168 registers (21.5K) fit beside a resident MagpieTTS persistent kernel block
+ // (168 x 256 = 43K) in the 64K-register file, so codec blocks co-schedule instead of serializing.
+ __global__ void CF_LAUNCH_BOUNDS conv1d_fused_kernel(const conv1d_fused_params p) {
+@@ -215,12 +239,32 @@ __global__ void CF_LAUNCH_BOUNDS conv1d_fused_kernel(const conv1d_fused_params p
+             }
+         }
+     };
++    auto stage_packed = [&](int c, int buf) {
++        if (c < c_end) {
++            for (int e = tid; e < win * 2; e += CF_THREADS) {
++                const int u = e >> 1, seg = e & 1;
++                half * dst = s_win + buf * W_CHUNK + u * CF_LDW + seg * 8;
++                const int t = cache_col0 + t0 + u;
++                if (t < p.cache_len + p.T) {
++                    const half * src = p.activated + ((size_t)grp * (p.cache_len + p.T) + t) * p.cin_pad + c * CF_BK + seg * 8;
++                    cp_async16(dst, src);
++                } else {
++                    *reinterpret_cast<uint4 *>(dst) = make_uint4(0,0,0,0);
++                }
++            }
++        }
++        cp_async_commit();
++    };
+     float pf0[CF_PF], pf1[CF_PF];
+     for (int q = 0; q < CF_STAGES - 1; ++q) stage_b(c_begin + q, q);
+-    fetch_window(c_begin + 0, pf0);
+-    fetch_window(c_begin + 1, pf1);
+-    stage_act(c_begin + 0, 0);
+-    stage_act(c_begin + 1, 1);
++    if constexpr (PACKED) {
++        stage_packed(c_begin, 0);
++    } else {
++        fetch_window(c_begin + 0, pf0);
++        fetch_window(c_begin + 1, pf1);
++        stage_act(c_begin + 0, 0);
++        stage_act(c_begin + 1, 1);
++    }
+     __syncthreads();
+ 
+     const int a_row = lane >> 2;
+@@ -229,12 +273,18 @@ __global__ void CF_LAUNCH_BOUNDS conv1d_fused_kernel(const conv1d_fused_params p
+         const int c = c_begin + it;
+         const int slot = it % CF_STAGES;
+         const int wbuf = it & 1;
+-        if (it & 1) store_window(c, pf1, wbuf); else store_window(c, pf0, wbuf);
++        if constexpr (!PACKED) {
++            if (it & 1) store_window(c, pf1, wbuf); else store_window(c, pf0, wbuf);
++        }
+         cp_async_wait<CF_STAGES - 2>();
+         __syncthreads();
+         stage_b(c + CF_STAGES - 1, (it + CF_STAGES - 1) % CF_STAGES);
+-        if (it & 1) fetch_window(c + 2, pf1); else fetch_window(c + 2, pf0);
+-        stage_act(c + 2, wbuf);  // chunk it's params were consumed by store_window above (before the sync)
++        if constexpr (PACKED) {
++            stage_packed(c + 1, wbuf ^ 1);
++        } else {
++            if (it & 1) fetch_window(c + 2, pf1); else fetch_window(c + 2, pf0);
++            stage_act(c + 2, wbuf);
++        }  // chunk it's params were consumed by store_window above (before the sync)
+         const half * bcur = s_b + slot * B_CHUNK;
+         const half * wcur = s_win + wbuf * W_CHUNK;
+         for (int k = 0; k < K; ++k) {
+@@ -393,6 +443,8 @@ static conv1d_fused_scratch & conv1d_fused_get_scratch(int device) {
+         CUDA_CHECK(cudaMemset(sc.counters, 0, CF_MAX_TILES * sizeof(int)));
+         CUDA_CHECK(cudaFuncSetAttribute(conv1d_fused_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
+         CUDA_CHECK(cudaFuncSetAttribute(conv1d_fused_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
++        CUDA_CHECK(cudaFuncSetAttribute(conv1d_fused_kernel<64, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
++        CUDA_CHECK(cudaFuncSetAttribute(conv1d_fused_kernel<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
+     }
+     return sc;
+ }
+@@ -471,7 +523,17 @@ void ggml_cuda_op_conv1d_fused(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     p.counters = sc.counters;
+     cudaStream_t stream = ctx.stream();
+     dim3 grid(g.tiles_m, g.tiles_n, g.splits);
+-    if (g.BM == 64) conv1d_fused_kernel<64><<<grid, CF_THREADS, g.smem, stream>>>(p);
+-    else            conv1d_fused_kernel<32><<<grid, CF_THREADS, g.smem, stream>>>(p);
++    // Grouped problems with several cout tiles re-activate the same input per tile: pack and
++    // activate it once instead (bit-identical results; grid.y bounds the time extent).
++    if (p.groups > 1 && p.tiles_n > 1 && p.cache_len + p.T <= 65535) {
++        ggml_cuda_pool_alloc<half> activated(ctx.pool(), (size_t)p.groups * (p.cache_len + p.T) * p.cin_pad);
++        p.activated = activated.get();
++        conv1d_activate_pack<<<dim3((p.cin_pad+127)/128, p.cache_len+p.T, p.groups),128,0,stream>>>(p,activated.get());
++        if (g.BM == 64) conv1d_fused_kernel<64, true><<<grid, CF_THREADS, g.smem, stream>>>(p);
++        else            conv1d_fused_kernel<32, true><<<grid, CF_THREADS, g.smem, stream>>>(p);
++    } else {
++        if (g.BM == 64) conv1d_fused_kernel<64><<<grid, CF_THREADS, g.smem, stream>>>(p);
++        else            conv1d_fused_kernel<32><<<grid, CF_THREADS, g.smem, stream>>>(p);
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }

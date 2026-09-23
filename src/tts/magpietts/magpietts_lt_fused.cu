@@ -600,8 +600,8 @@ ltf_chain_attention_split(
     }
 }
 
-static __global__ void
-__maxnreg__(LTF_CHAIN_MAX_REGS) ltf_chain_kernel(const ltf_chain_args a) {
+static __global__ void LTF_CHAIN_LAUNCH_BOUNDS
+ltf_chain_kernel(const ltf_chain_args a) {
     // Dynamic shared memory: the staged weight tile can exceed the 48 KB static limit.
     extern __shared__ __align__(16) unsigned char ltf_chain_dyn_smem[];
     ltf_chain_smem& sm = *reinterpret_cast<ltf_chain_smem*>(ltf_chain_dyn_smem);
@@ -903,9 +903,11 @@ ltf_chain_setup(magpietts_lt_fused* f) {
         &per_sm, ltf_chain_kernel, LTF_THREADS, sizeof(ltf_chain_smem));
     if (occ_err != cudaSuccess || per_sm < LTF_CHAIN_BLOCKS_PER_SM)
         return;
-    // A fixed number of resident blocks per SM: every SM carries the same rows in every phase.
-    const int grid = LTF_CHAIN_BLOCKS_PER_SM * sms;
-    if (grid < LTF_CHAIN_MIN_GRID)
+    // The phase tiling (rows per warp, staged bytes, quantization groups) is sized for exactly
+    // LTF_CHAIN_MIN_GRID resident blocks, one per SM. Larger GPUs run the same grid and leave
+    // the remaining SMs to the codec; smaller ones keep the per-round path.
+    const int grid = LTF_CHAIN_MIN_GRID;
+    if (LTF_CHAIN_BLOCKS_PER_SM * sms < grid)
         return;
     auto rows_per_block = [grid](int N) { return (N + grid - 1) / grid; };
     auto fits = [&](int N, int Kdim, int R) {
@@ -944,6 +946,12 @@ ltf_chain_setup(magpietts_lt_fused* f) {
 
 magpietts_lt_fused*
 magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size_t error_size) {
+    if (!ltf_kernel_arch_supported(reinterpret_cast<const void*>(ltf_chain_kernel))) {
+        ltf_set_error(
+            error, error_size,
+            "fused local transformer: needs compute capability 8.0+ and an sm_80+ build");
+        return nullptr;
+    }
     if (w.n_embd <= 0 || w.n_embd > LTF_MAX_EMBD || (w.n_embd % 64) != 0 || w.n_head <= 0 ||
         (w.n_embd / w.n_head) != 64 || w.n_ff <= 0 || (w.n_ff % 64) != 0 || w.n_ff > LTF_MAX_K ||
         w.n_layers <= 0 || w.vocab <= 0 || w.n_rounds <= 0 || w.pos_rows <= 0 ||
