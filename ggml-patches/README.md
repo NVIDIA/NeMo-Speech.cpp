@@ -172,6 +172,11 @@ stock comparison therefore requires both a pristine ggml checkout and
   `GGML_SKINNY_Q8_GELU=0` disables it. Covered by `test-backend-ops -o
   Q8_GELU_ERF_FUSION`.
 
+- **0023-cuda-skinny-q8-cache-lifetime.patch** - drops skinny-Q8 cache entries,
+  and any planes they own, when their CUDA weight buffer is freed or cleared.
+  The cache was keyed only by device address, so weights later allocated at a
+  reused address were treated as already repacked.
+
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the

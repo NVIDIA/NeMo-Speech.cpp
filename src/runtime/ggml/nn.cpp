@@ -24,10 +24,15 @@ ggml_tensor*
 cached_q8_input(
     Session* session, TensorContainer* session_tensor_container, const ggml_bf_tensor& weight,
     ggml_tensor* input) {
+#ifdef NEMO_SPEECH_GGML_PATCHED
     static const bool enabled = [] {
         const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16");
         return value != nullptr && value[0] != '0';
     }();
+#else
+    // Stock ggml has no Q8_0 x F16 matmul; the cast would leave no backend.
+    constexpr bool enabled = false;
+#endif
     static const int min_columns = [] {
         const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
         const int parsed = value != nullptr ? std::atoi(value) : 128;
