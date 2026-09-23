@@ -218,6 +218,11 @@ class Decoder {
     // an extra per-frame argmax it would otherwise run only to feed this signal.
     virtual void set_track_speech_frame(bool /*on*/) {}
 
+    // Returns and clears sentence punctuation emitted after an endpoint but
+    // before the next word; it belongs to the already-published utterance.
+    // A mark still waiting for the next word is released only at end of stream.
+    virtual std::string take_late_punctuation(bool /*end_of_stream*/ = false) { return {}; }
+
     // Utterance confidence. Greedy CTC returns the mean emitted-token posterior;
     // heads without a usable posterior return 1.0.
     virtual float confidence() const { return 1.0f; }

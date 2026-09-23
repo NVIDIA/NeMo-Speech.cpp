@@ -66,6 +66,9 @@ struct Result {  // proto: Streaming/SpeechRecognitionResult
     float stability = 0.0f;
     int32_t channel_tag = 1;       // mono channel
     float audio_processed = 0.0f;  // seconds (proto audio_processed)
+    // Streaming only: sentence punctuation emitted after the previous final's
+    // endpoint. Append it to that final; it is not part of this result's text.
+    std::string late_punctuation;
 };
 
 }  // namespace nemo_speech::asr

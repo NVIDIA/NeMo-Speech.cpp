@@ -9,11 +9,6 @@ if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR)
 
     add_executable(bench_asr_batching bench_asr_batching.cpp)
     target_link_libraries(bench_asr_batching PRIVATE nemo_speech_asr Threads::Threads)
-
-    add_executable(bench_diar bench_diar.cpp)
-    target_link_libraries(bench_diar PRIVATE nemo_speech_asr Threads::Threads)
-    add_executable(eval_diarization eval_diarization.cpp)
-    target_link_libraries(eval_diarization PRIVATE nemo_speech_asr Threads::Threads)
     if(GGML_CUDA)
         target_compile_definitions(bench_asr_batching PRIVATE GGML_USE_CUDA)
         target_link_libraries(bench_asr_batching PRIVATE CUDA::cudart)

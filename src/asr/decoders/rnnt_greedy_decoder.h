@@ -23,6 +23,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "context_biasing.h"  // ContextBiasingTree (RNNT word boosting)
@@ -145,6 +146,8 @@ class RnntGreedyDecoder : public Decoder {
     // Also resets the context-biasing match position so phrase
     // matching restarts cleanly.
     void reset_utterance() override {
+        // Punctuation before the next word can still end this utterance.
+        late_punctuation_open_ = utterance_has_content_ && !last_presented_punctuation_;
         words_.clear();
         cur_ = WordTiming{};
         cur_open_ = false;
@@ -169,6 +172,11 @@ class RnntGreedyDecoder : public Decoder {
     void finalize() override;  // flush the trailing in-progress word
     int64_t last_emit_frame() const override { return last_emit_frame_; }
     int64_t last_speech_frame() const override { return last_speech_frame_; }
+    std::string take_late_punctuation(bool end_of_stream = false) override {
+        if (end_of_stream && !late_punctuation_pending_.empty())
+            late_punctuation_ = std::exchange(late_punctuation_pending_, {});
+        return std::exchange(late_punctuation_, {});
+    }
     const RnntDecodeStats& stats() const { return stats_; }
 
    private:
@@ -197,6 +205,12 @@ class RnntGreedyDecoder : public Decoder {
     bool utterance_has_content_ = false;
     bool last_presented_punctuation_ = false;
     bool pending_word_boundary_ = false;
+    // Previous utterance ended unpunctuated and no word has followed yet;
+    // punctuation emitted now belongs to it.
+    bool late_punctuation_open_ = false;
+    // Held until the next word shows whether a new sentence started.
+    std::string late_punctuation_pending_;
+    std::string late_punctuation_;
 
     // Word-timestamp accumulation (only when compute_ts_); grouped on the ▁
     // boundary, same convention as GreedyCtcDecoder.

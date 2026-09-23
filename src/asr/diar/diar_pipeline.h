@@ -128,18 +128,18 @@ class DiarStream {
     void finish();
     void reset();
 
-    // On-demand diarization (riva ProcessOnDemandDiarization): label
-    // already-arrived audio early - with truncated right context - until the
-    // timeline covers `target_frame` or no whole encoder frame of new mel
-    // remains. Called by the recognizer when a final's words end past the
-    // diarized frontier, so word tags there come from real predictions
-    // instead of last-frame extrapolation. Chunks stay on the coarse 80 ms
-    // encoder grid; the public timeline uses the model's native cadence.
+    // Label arrived audio toward target_frame using a temporary state copy.
+    // Preserve the full right context; the next complete chunk replaces this
+    // preview without changing the persistent cache or chunk boundaries.
+    // target_frame and the public timeline use the model's native cadence.
     void flush_available(int64_t target_frame);
 
     // Total emitted native-cadence frames (monotonic; includes frames whose raw
     // probabilities were compacted away, see below).
     int64_t n_frames() const { return probs_base_ + static_cast<int64_t>(probs_.size()) / n_spk_; }
+    // Frames before this frontier cannot be revised. V2 additionally excludes
+    // its birth-gate history; V3 uses native probabilities with no birth gate.
+    int64_t stable_frames() const;
     // Retained per-frame speaker probabilities, frame-major, covering frames
     // [frame_probs_base(), n_frames()). For streams below the compaction
     // horizon frame_probs_base() is 0 and this is the whole timeline.
@@ -176,9 +176,8 @@ class DiarStream {
     std::vector<Segment> segments(const DiarSegmentationCfg& cfg = DiarSegmentationCfg()) const;
 
    private:
-    // Run the next chunk if possible. force = accept a partial chunk (fewer
-    // than chunk_len new frames, truncated right context); final_flush
-    // additionally accepts the sub-frame tail remainder at end-of-stream.
+    // Forced non-final chunks are previews only; only full chunks and the
+    // final flush advance persistent model/feature state.
     bool run_one_chunk(bool force, bool final_flush);
     void run_ready_chunks(bool end_of_stream);
     void ensure_mel();
@@ -203,7 +202,8 @@ class DiarStream {
         return mel_base_ + static_cast<int64_t>(mel_buf_.size()) / n_mels_;
     }
     int n_mels_ = 0;
-    int64_t mel_consumed_ = 0;  // mel frames consumed = start of the next chunk
+    int64_t mel_consumed_ = 0;        // mel frames consumed = start of the next chunk
+    int64_t provisional_frames_ = 0;  // native-cadence tail replaced on replay
     bool finished_ = false;
 
     std::vector<float> probs_;              // retained timeline tail (see frame_probs_base)

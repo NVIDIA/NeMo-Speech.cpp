@@ -469,6 +469,60 @@ test_rnnt_stalls_do_not_inject_punctuation() {
 }
 
 void
+test_rnnt_late_punctuation_returns_to_previous_final() {
+    MockRnntEngine eng;
+    RnntGreedyDecoder dec(&eng);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> enc(4, 0.0f);
+    auto step = [&](std::vector<int> round, int64_t frame) {
+        eng.rounds = {std::move(round), {blank}};
+        return dec.step(enc.data(), 4, 1, frame);
+    };
+
+    step({3}, 0);
+    check(
+        dec.take_late_punctuation().empty(),
+        "rnnt: leading punctuation at stream start is dropped");
+
+    step({0}, 1);
+    dec.reset_utterance();
+    check(step({3}, 2).empty(), "rnnt: late punctuation is not part of the next utterance");
+    check(dec.take_late_punctuation().empty(), "rnnt: late punctuation waits for the next word");
+    eng.set_piece(
+        1,
+        "\xE2\x96\x81"
+        "B");
+    step({1}, 3);
+    check(
+        dec.take_late_punctuation() == "?",
+        "rnnt: late punctuation before a capitalized word returns to the previous final");
+    check(dec.take_late_punctuation().empty(), "rnnt: late punctuation is delivered once");
+
+    dec.reset_utterance();
+    step({3}, 4);
+    step({2}, 5);
+    check(
+        dec.take_late_punctuation().empty(),
+        "rnnt: a late sentence mark before a lowercase word is dropped");
+
+    step({3}, 6);
+    step({0}, 7);
+    check(dec.take_late_punctuation().empty(), "rnnt: punctuation inside an utterance is not late");
+
+    dec.reset_utterance();
+    step({3}, 8);
+    check(
+        dec.take_late_punctuation(/*end_of_stream=*/true) == "?",
+        "rnnt: end of stream releases a waiting late mark");
+
+    step({0}, 9);
+    dec.reset_utterance();
+    step({3}, 10);
+    dec.reset();
+    check(dec.take_late_punctuation().empty(), "rnnt: hard reset discards late punctuation");
+}
+
+void
 test_rnnt_endpoint_punctuation_continuity() {
     MockRnntEngine eng;
     RnntGreedyDecoder dec(&eng);
@@ -760,6 +814,7 @@ main() {
     test_rnnt_max_symbols_cap();
     test_rnnt_finalization_preserves_native_punctuation();
     test_rnnt_stalls_do_not_inject_punctuation();
+    test_rnnt_late_punctuation_returns_to_previous_final();
     test_rnnt_endpoint_punctuation_continuity();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();

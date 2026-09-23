@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
+
 
 using namespace nemo_speech::asr;
 
@@ -109,6 +111,7 @@ DiarStream::reset() {
     mel_buf_.clear();
     mel_base_ = 0;
     mel_consumed_ = 0;
+    provisional_frames_ = 0;
     finished_ = false;
     probs_.clear();
     probs_base_ = 0;
@@ -163,9 +166,8 @@ DiarStream::finish() {
 
 // Chunk scheduler, the streaming counterpart of NeMo's streaming_feat_loader:
 // the next chunk covers mel [mel_consumed_, mel_consumed_ + hop) plus lc/rc
-// context, clamped at the stream edges (riva feeds exact-length tails - no
-// pad+mask). Forced (on-demand) chunks may be shorter than a full hop but
-// stay on the 80 ms encoder-frame grid so frames are labeled exactly once.
+// context, clamped at stream edges. Forced on-demand chunks are temporary
+// predictions; they must not alter the persistent 80 ms-grid chunk schedule.
 bool
 DiarStream::run_one_chunk(bool force, bool final_flush) {
     const int hop_mel = geo_.chunk_len * sub_;
@@ -174,19 +176,26 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
 
     const int64_t stt = mel_consumed_;
     int64_t end = stt + hop_mel;
+    const bool provisional = force && !final_flush;
     if (!force) {
         // Run only when the full window incl. right context is covered.
         if (end + rc_mel_max > mel_produced())
             return false;
-    } else {
+    } else if (final_flush) {
         end = std::min(end, mel_produced());
-        if (!final_flush)
-            end = stt + ((end - stt) / sub_) * sub_;  // whole encoder frames only
+        if (end <= stt)
+            return false;
+    } else {
+        if (mel_produced() - stt < rc_mel_max + sub_)
+            return false;
+        end = std::min(end, mel_produced() - rc_mel_max);
+        end = stt + ((end - stt) / sub_) * sub_;
         if (end <= stt)
             return false;
     }
     const int64_t lc_mel = std::min<int64_t>(lc_mel_max, stt);
-    const int64_t rc_mel = std::min<int64_t>(rc_mel_max, mel_produced() - end);
+    const int64_t rc_mel =
+        provisional ? rc_mel_max : std::min<int64_t>(rc_mel_max, mel_produced() - end);
     const int64_t w0 = stt - lc_mel;
     const int t_mel = static_cast<int>(end + rc_mel - w0);
     if (t_mel <= 0)
@@ -196,15 +205,19 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
         throw std::runtime_error("DiarStream: mel window trimmed too aggressively");
     const float* mel = mel_buf_.data() + (w0 - mel_base_) * m_.fe().n_mels();
 
+    std::optional<AoscState> preview_state;
+    if (provisional)
+        preview_state.emplace(state_);
+    auto& run_state = preview_state ? *preview_state : state_;
     auto out = m_.model().run_chunk(
-        mel, t_mel, state_.spkcache_frames() ? state_.spkcache().data() : nullptr,
-        state_.spkcache_frames(), state_.fifo_frames() ? state_.fifo().data() : nullptr,
-        state_.fifo_frames());
+        mel, t_mel, run_state.spkcache_frames() ? run_state.spkcache().data() : nullptr,
+        run_state.spkcache_frames(), run_state.fifo_frames() ? run_state.fifo().data() : nullptr,
+        run_state.fifo_frames());
 
     const int lc_enc = static_cast<int>(std::lround(lc_mel / static_cast<double>(sub_)));
     const int rc_enc = static_cast<int>(std::ceil(rc_mel / static_cast<double>(sub_)));
-    auto coarse_emitted =
-        state_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
+    auto emitted =
+        run_state.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
     if (m_.cfg().is_v3()) {
         const int native_factor = m_.cfg().upsample_factor;
         const int state_frames = out.total_frames - out.chunk_frames;
@@ -221,10 +234,30 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
         // channel during a continuous handoff and fold it into an established
         // speaker, permanently merging the two speakers.  Keep the native V3
         // channel probabilities exactly as NeMo emits them.
-        probs_.insert(probs_.end(), begin, begin + static_cast<size_t>(native_count) * n_spk_);
+        emitted.assign(begin, begin + static_cast<size_t>(native_count) * n_spk_);
+    }
+    if (emitted.empty())
+        return false;
+
+    const size_t preview_values = static_cast<size_t>(provisional_frames_) * n_spk_;
+    if (preview_values > probs_.size())
+        throw std::runtime_error("DiarStream: inconsistent provisional probability tail");
+    probs_.resize(probs_.size() - preview_values);
+    provisional_frames_ = 0;
+    if (m_.cfg().is_v3()) {
+        probs_.insert(probs_.end(), emitted.begin(), emitted.end());
+    } else if (provisional) {
+        ChannelBirthGate preview_gate = birth_gate_;
+        std::vector<float> preview_probs;
+        preview_gate.append(emitted, preview_probs);
+        probs_.insert(probs_.end(), preview_probs.begin(), preview_probs.end());
     } else {
         // V2 can transiently redraw channels and still needs the legacy gate.
-        birth_gate_.append(coarse_emitted, probs_);
+        birth_gate_.append(emitted, probs_);
+    }
+    if (provisional) {
+        provisional_frames_ = static_cast<int64_t>(emitted.size()) / n_spk_;
+        return true;
     }
     maybe_compact();
     mel_consumed_ = end;
@@ -255,8 +288,18 @@ DiarStream::run_ready_chunks(bool end_of_stream) {
 
 void
 DiarStream::flush_available(int64_t target_frame) {
-    while (n_frames() < target_frame && run_one_chunk(/*force=*/true, /*final_flush=*/false)) {
-    }
+    if (!finished_ && n_frames() < target_frame)
+        run_one_chunk(/*force=*/true, /*final_flush=*/false);
+}
+
+int64_t
+DiarStream::stable_frames() const {
+    if (finished_)
+        return n_frames();
+    const int64_t committed = std::max<int64_t>(0, n_frames() - provisional_frames_);
+    if (m_.cfg().is_v3())
+        return committed;
+    return std::clamp<int64_t>(birth_gate_.settled_frames(), 0, committed);
 }
 
 int

@@ -63,6 +63,9 @@ struct StreamingUpdate {
     float confidence = 1.0f;
     // Seconds of audio processed.
     float audio_processed_sec = 0.0f;
+    // Punctuation for the previous final (Decoder::take_late_punctuation);
+    // not part of this update's text.
+    std::string late_punctuation;
 };
 
 // Runner methods are single-threaded. Independent runners may execute

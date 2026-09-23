@@ -71,17 +71,21 @@ produce an error with a conversion command.
 ### Transcribe a microphone live
 
 ```bash
-nemo-speech transcribe --live \
-  --backend auto \
-  --endpointing
+nemo-speech transcribe --live --backend auto
+nemo-speech transcribe --live --diarize --diar-model ./models/Nemotron-3-Diarization.q8_0.gguf
 ```
 
-The command captures the system's default microphone and prints interim
-transcripts to stderr while you speak. With `--endpointing`, trailing silence
-also finalizes utterances without ending the capture. Press Ctrl-C once to
+The command captures the system's default microphone and shows a live preview
+on stderr. Endpointing is on by default for `--live`, so trailing silence
+finalizes utterances without ending capture; `--endpointing=false` disables it.
+Press Ctrl-C once to
 stop; the stream is flushed and the complete final transcript is written to
 stdout. Use `--output transcript.txt` to write it to a file, or select `json`,
 `srt`, or `vtt` with `--format`.
+
+With `--diarize`, the preview shows speaker turns. Speaker labels can change
+until the diarizer confirms them, which can take up to 10 s with V2. Set
+`NO_COLOR=1` to disable colors.
 
 Live capture is compiled directly into the CLI through miniaudio and uses the
 native host audio API: CoreAudio on macOS, WASAPI on Windows, and ALSA or
@@ -153,9 +157,8 @@ For ASR plus speaker labels without the other stages:
 nemo-speech transcribe meeting.wav --diarize --json
 ```
 
-Speaker capacity comes from the loaded Sortformer model (four for V2, eight
-for supported V3). Diarization enables
-word timestamps automatically and places a 1-based `speaker` value on each
+V2 supports up to four speakers and V3 up to eight. Diarization enables word
+timestamps automatically and places a 1-based `speaker` value on each
 word in JSON output.
 
 ## Diarize audio
@@ -171,15 +174,13 @@ nemo-speech diarize recordings/ \
 
 Directory inputs load one shared model and dynamically batch compatible steps.
 Relative paths are preserved. A stateful streaming pass is the default and is
-appropriate for long recordings. The default geometry is a runtime preset
-selected by model version, not the checkpoint's stored streaming geometry.
-Explicit `--preset streaming|offline` selects V2 geometry;
-`--preset v3-streaming|v3-offline` selects V3 geometry. The `offline` presets
-still use streaming state with larger chunks/caches. Use `--offline` for one
-full-attention pass over a short recording; use streaming for long audio.
+appropriate for long recordings. `--preset offline` (V2) or `--preset v3-offline`
+(V3) selects larger streaming chunks and caches; it does not enable full
+attention. Use `--offline` for one full-attention pass over a short recording.
+The model's positional table limits that path to about 6.6 minutes, so use the
+default streaming pass for longer audio.
 
-Sortformer V2 returns 80 ms probabilities and supported high-resolution V3
-returns 10 ms probabilities. Segmentation thresholds
+V2 supports up to four speakers and V3 up to eight. Segmentation thresholds
 are dataset-dependent; use `--onset`, `--offset`, `--pad-onset`, `--pad-offset`,
 `--min-duration-on`, and `--min-duration-off` when applying a checkpoint's
 published postprocessing configuration.

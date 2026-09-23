@@ -36,7 +36,10 @@ if(NEMO_SPEECH_BUILD_ASR)
                 "ASR CLI microphone capture requires the vendored miniaudio header; "
                 "run: git submodule update --init llama.cpp")
         endif()
-        target_sources(nemo_speech_cli PRIVATE microphone_capture.cpp)
+        target_sources(nemo_speech_cli PRIVATE
+            live_terminal.cpp
+            live_transcript.cpp
+            microphone_capture.cpp)
         target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_LIVE=1)
         target_include_directories(nemo_speech_cli PRIVATE
             ${CMAKE_SOURCE_DIR}/llama.cpp/vendor/miniaudio)

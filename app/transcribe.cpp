@@ -11,12 +11,14 @@
 #include <cstdio>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "audio_file.h"
@@ -24,6 +26,8 @@
 #include "commands.h"
 #include "engine_registry.h"
 #if defined(NEMO_SPEECH_CLI_LIVE)
+#include "live_terminal.h"
+#include "live_transcript.h"
 #include "microphone_capture.h"
 #endif
 #include "model_utils.h"
@@ -123,6 +127,11 @@ parse_options(int argc, char** argv) {
     for (int i = 0; i < argc; ++i) {
         if (std::string(argv[i]) == "--config")
             o.config_file = required_value(i, argc, argv, "--config");
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        // Live default; YAML and later flags still override.
+        else if (std::string(argv[i]) == "--live")
+            o.engine.endpointing.enable = true;
+#endif
     }
     if (!o.config_file.empty())
         engine_parser.ApplyYaml(o.config_file);
@@ -237,9 +246,13 @@ asr::AsrRequestOptions
 make_request_options(const Options& options) {
     asr::AsrRequestOptions request = options.request;
     request.language_code = options.language;
-    request.enable_word_time_offsets = options.word_times || options.format == OutputFormat::Json ||
-                                       options.format == OutputFormat::Srt ||
-                                       options.format == OutputFormat::Vtt || options.diarize;
+    bool need_word_times = options.word_times || options.format == OutputFormat::Json ||
+                           options.format == OutputFormat::Srt ||
+                           options.format == OutputFormat::Vtt || options.diarize;
+#if defined(NEMO_SPEECH_CLI_LIVE)
+    need_word_times = need_word_times || options.live;
+#endif
+    request.enable_word_time_offsets = need_word_times;
     request.enable_automatic_punctuation = options.punctuation;
     request.verbatim_transcripts = options.verbatim;
     request.enable_speaker_diarization = options.diarize;
@@ -248,15 +261,25 @@ make_request_options(const Options& options) {
     return request;
 }
 
+// Punctuation the model emitted after an endpoint closes the previous final.
+void
+append_late_punctuation(Transcript& transcript, const std::string& punctuation) {
+    if (punctuation.empty() || transcript.text.empty())
+        return;
+    transcript.text += punctuation;
+    if (!transcript.words.empty())
+        transcript.words.back().text += punctuation;
+}
+
 void
 append_result(Transcript& transcript, const asr::Result& result) {
+    append_late_punctuation(transcript, result.late_punctuation);
     if (result.alternatives.empty())
         return;
     const auto& alternative = result.alternatives.front();
     if (!alternative.transcript.empty()) {
-        if (!transcript.text.empty() && alternative.transcript.front() != '.' &&
-            alternative.transcript.front() != ',' && alternative.transcript.front() != '!' &&
-            alternative.transcript.front() != '?')
+        if (!transcript.text.empty() &&
+            !nemo_speech::subtitle::attaches_to_previous(alternative.transcript))
             transcript.text += ' ';
         transcript.text += alternative.transcript;
     }
@@ -266,9 +289,13 @@ append_result(Transcript& transcript, const asr::Result& result) {
         if (std::find(transcript.languages.begin(), transcript.languages.end(), language) ==
             transcript.languages.end())
             transcript.languages.push_back(language);
-    for (const auto& word : alternative.words)
+    for (const auto& word : alternative.words) {
+        int speaker = word.speaker_tag;
+        if (!transcript.words.empty() && nemo_speech::subtitle::attaches_to_previous(word.word))
+            speaker = transcript.words.back().speaker;
         transcript.words.push_back(
-            {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag});
+            {word.word, word.start_time, word.end_time, word.confidence, speaker});
+    }
 }
 
 Transcript
@@ -289,10 +316,12 @@ transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::pa
             const size_t count = std::min(chunk, audio.samples.size() - offset);
             stream->push(audio.samples.data() + offset, count, audio.sample_rate);
             while (auto result = stream->next()) {
-                if (result->is_final)
+                if (result->is_final) {
                     append_result(transcript, *result);
-                else
+                } else {
+                    append_late_punctuation(transcript, result->late_punctuation);
                     break;
+                }
             }
         }
         append_result(transcript, stream->finish());
@@ -326,40 +355,117 @@ class SignalHandlerGuard {
 Transcript
 transcribe_live(asr::Recognizer& recognizer, const Options& options) {
     auto stream = recognizer.streaming_recognize(make_request_options(options), options.language);
+    // Only the diarized presenter reads interim words and speaker tags.
+    stream->set_interim_words(options.diarize);
     nemo_speech::cli::MicrophoneCapture microphone;
     microphone.start();
-
-    if (!cli_quiet() && !cli_json())
-        std::fprintf(
-            stderr, "[live] listening on \"%s\" at %d Hz; press Ctrl-C to stop\n",
-            microphone.device_name().c_str(), microphone.sample_rate());
+    nemo_speech::cli::LiveTerminal terminal(!cli_quiet() && !cli_json(), options.diarize);
+    terminal.start(microphone.device_name(), microphone.sample_rate());
 
     live_running = 1;
     SignalHandlerGuard signal_guard;
     Transcript transcript;
     std::string last_interim;
     size_t captured_samples = 0;
+    nemo_speech::cli::LiveTranscriptPresenter presenter(options.diarize);
+    nemo_speech::cli::LiveDiarizationBuffer diar_finals;
+    asr::Result diar_interim;
+
+    auto emit_turns = [&](const std::vector<nemo_speech::subtitle::SpeakerTurn>& turns,
+                          double fallback_seconds) {
+        for (const auto& turn : turns) terminal.final_turn(turn, fallback_seconds);
+    };
+
+    auto commit_final = [&](asr::Result& result) {
+        if (options.diarize)
+            stream->refresh_speaker_tags(result);
+        append_result(transcript, result);
+        last_interim.clear();
+        // Even an empty non-diarized endpoint settles the interim line. For
+        // diarization, render the complete preview once after all queued
+        // updates; an intermediate current-turn redraw can flash an old label.
+        if (!options.diarize)
+            terminal.clear_interim();
+        emit_turns(presenter.present_final(result), result.audio_processed);
+    };
+
+    auto update_diar_finals = [&](bool finished = false) {
+        const double stable_time =
+            finished ? std::numeric_limits<double>::infinity() : stream->stable_speaker_time();
+        for (auto& result : diar_finals.update(
+                 stable_time, [&](asr::Result& result) { stream->refresh_speaker_tags(result); }))
+            commit_final(result);
+        stream->refresh_speaker_tags(diar_interim);
+    };
+
+    auto show_diar_preview = [&](double audio_processed) {
+        const auto* partial =
+            diar_interim.alternatives.empty() ? nullptr : &diar_interim.alternatives.front();
+        auto presentation = diar_finals.preview(presenter, partial, stream->stable_speaker_time());
+        if (partial)
+            terminal.partial_turns(presentation.turns, audio_processed);
+        else
+            terminal.current_turns(presentation.turns, audio_processed);
+    };
+
+    auto emit_final = [&](asr::Result result) {
+        if (options.diarize) {
+            const double audio_processed = result.audio_processed;
+            diar_interim = {};
+            diar_finals.push(std::move(result));
+            update_diar_finals();
+            // Words are final, labels are not. Keep the entire revisable suffix
+            // visible after silence without freezing its speaker assignments.
+            show_diar_preview(audio_processed);
+            return;
+        }
+        commit_final(result);
+    };
+
+    // Attach late punctuation once: to the buffered diarized final if any, else
+    // to the transcript and the presenter's open turn. Printed lines stay as is.
+    auto attach_late_punctuation = [&](asr::Result& result) {
+        auto punctuation = std::exchange(result.late_punctuation, {});
+        if (punctuation.empty())
+            return;
+        if (options.diarize && diar_finals.attach_late_punctuation(punctuation))
+            return;
+        append_late_punctuation(transcript, punctuation);
+        if (!presenter.attach_late_punctuation(punctuation))
+            terminal.amend_last_final(punctuation);
+    };
 
     auto drain_results = [&] {
-        while (auto result = stream->next()) {
+        while (true) {
+            auto result = stream->next();
+            if (result)
+                attach_late_punctuation(*result);
+            if (!result) {
+                if (options.diarize) {
+                    update_diar_finals();
+                    show_diar_preview(
+                        captured_samples / static_cast<double>(microphone.sample_rate()));
+                }
+                break;
+            }
             if (result->is_final) {
-                append_result(transcript, *result);
-                last_interim.clear();
-                if (!cli_quiet() && !cli_json() && !result->alternatives.empty() &&
-                    !result->alternatives.front().transcript.empty())
-                    std::fprintf(
-                        stderr, "[live final @ %.2fs] %s\n", result->audio_processed,
-                        result->alternatives.front().transcript.c_str());
+                emit_final(std::move(*result));
                 continue;
             }
             if (!result->alternatives.empty()) {
-                const std::string& text = result->alternatives.front().transcript;
-                if (!text.empty() && text != last_interim) {
-                    if (!cli_quiet() && !cli_json())
-                        std::fprintf(
-                            stderr, "[live partial @ %.2fs] %s\n", result->audio_processed,
-                            text.c_str());
-                    last_interim = text;
+                const auto& alternative = result->alternatives.front();
+                if (options.diarize) {
+                    diar_interim = *result;
+                    update_diar_finals();
+                    // Redraw label-only revisions too. These are previews, not
+                    // irreversible finals; a later result owns the full text.
+                    show_diar_preview(result->audio_processed);
+                } else {
+                    auto presentation = presenter.present_partial(alternative);
+                    if (!presentation.text.empty() && presentation.text != last_interim) {
+                        terminal.partial(presentation.text);
+                        last_interim = std::move(presentation.text);
+                    }
                 }
             }
             // By contract, an interim is the last result until more audio is pushed.
@@ -385,12 +491,22 @@ transcribe_live(asr::Recognizer& recognizer, const Options& options) {
         stream->push(tail.data(), tail.size(), microphone.sample_rate());
         drain_results();
     }
-    append_result(transcript, stream->finish());
+    auto final_result = stream->finish();
+    attach_late_punctuation(final_result);
+    const double final_audio_processed = final_result.audio_processed;
+    // Always render the canonical final, including corrections made by flush.
+    if (options.diarize) {
+        diar_finals.push(std::move(final_result));
+        update_diar_finals(/*finished=*/true);
+    } else {
+        commit_final(final_result);
+    }
+    last_interim.clear();
+    terminal.clear_interim();
+    emit_turns(presenter.finish(), final_audio_processed);
     transcript.audio_seconds = std::max(
         transcript.audio_seconds, captured_samples / static_cast<float>(microphone.sample_rate()));
-    if (!cli_quiet() && !cli_json())
-        std::fprintf(
-            stderr, "[live] stopped after %.2fs of captured audio\n", transcript.audio_seconds);
+    terminal.stopped(transcript.audio_seconds);
     return transcript;
 }
 #endif
@@ -493,7 +609,8 @@ print_transcribe_help(const char* program) {
         "  -m, --model MODEL         ASR GGUF path or indexed HF repo\n"
         "                            (default: nvidia/nemotron-3.5-asr-streaming-0.6b)\n"
 #if defined(NEMO_SPEECH_CLI_LIVE)
-        "  --live                    Transcribe the default microphone until Ctrl-C\n"
+        "  --live                    Transcribe the default microphone until Ctrl-C;\n"
+        "                            endpointing is enabled by default\n"
 #endif
         "  -l, --language CODE       Language code or prompt\n"
         "  --device, --backend DEVICE\n"
@@ -517,7 +634,12 @@ print_transcribe_help(const char* program) {
         "  --no-punctuation          Disable automatic punctuation\n"
         "  --verbatim                Disable ordinary ITN\n"
         "  --stream                  Stream chunks from a recorded WAV input\n"
-        "  --endpointing             Finalize streaming utterances on silence\n"
+        "  --endpointing[=BOOL]      Finalize streaming utterances on silence\n"
+#if defined(NEMO_SPEECH_CLI_LIVE)
+        "                            (default: enabled with --live)\n"
+#else
+        "                            (default: disabled)\n"
+#endif
         "  --stop-history-eou-ms N   Endpoint silence threshold (default 800)\n"
         "  --max-alternatives N      Request N-best; current decoders return one\n"
         "  --speech-context PHRASE   Add a decoder boost phrase (repeatable)\n"

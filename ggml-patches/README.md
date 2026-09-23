@@ -166,36 +166,11 @@ stock comparison therefore requires both a pristine ggml checkout and
   fusion costs 26%. Covered by
   `tests/cpp/tts/test_nanocodec_half_snake_fusion.cpp`.
 
-- **0022-cuda-q8-gelu-fusion.patch** - combines broadcast bias, exact `GELU_ERF`,
-  and an optional F16 output cast into one post-GEMM CUDA kernel for the cached-F16
-  Q8 cuBLAS path. FP32 accumulation is retained. This deliberately does not use
-  cuBLASLt's approximate GELU epilogue: the fused and unfused graphs must implement
-  the same activation. Eligibility requires contiguous projections, a contiguous
-  row bias, supported Q8 weight geometry, and no externally consumed intermediate.
-  Unsupported graphs retain their ordinary operations. The existing cached-F16
-  path remains opt-in (`GGML_SKINNY_Q8_CUBLAS_F16=1`); disable only this fusion with
-  `GGML_SKINNY_Q8_GELU=0` before process start. Validate both switch settings with
-  the same model, geometry, batch size, and real cuBLAS library. This optimization
-  removes elementwise launches and intermediate memory traffic; it does not
-  change the GEMM algorithm or use an approximate activation.
-
-  Regression cases live in ggml's existing `test-backend-ops` executable:
-
-  ```sh
-  cmake -S ggml -B build/ggml-fusion-check -DGGML_CUDA=ON -DGGML_BUILD_TESTS=ON
-  cmake --build build/ggml-fusion-check --target test-backend-ops
-  for enabled in 0 1; do
-      GGML_SKINNY_Q8_CUBLAS_F16=1 GGML_SKINNY_Q8_INPLACE=0 \
-      GGML_SKINNY_Q8_OUTER_BATCH=1 GGML_SKINNY_Q8_GELU=$enabled \
-          build/ggml-fusion-check/bin/test-backend-ops -o Q8_GELU_ERF_FUSION -b CUDA0
-  done
-  ```
-
-  These isolate exact activation semantics from quantization error with zero
-  Q8 weights and biases spanning the nonlinear region, and cover F32/F16 output,
-  outer batches, and an externally consumed intermediate that prevents fusion.
-  Cached-F16 execution requires an SM80+ GPU; unsupported paths are not evidence
-  that the optimized kernel was exercised.
+- **0022-cuda-q8-gelu-fusion.patch** - fuses the bias add, exact `GELU_ERF`,
+  and optional F16 cast after the cached-F16 Q8 cuBLAS GEMM into one CUDA
+  kernel. Active only with `GGML_SKINNY_Q8_CUBLAS_F16=1` on SM80+ GPUs;
+  `GGML_SKINNY_Q8_GELU=0` disables it. Covered by `test-backend-ops -o
+  Q8_GELU_ERF_FUSION`.
 
 ## Regenerating after editing ggml
 

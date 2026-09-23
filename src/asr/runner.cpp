@@ -1027,6 +1027,8 @@ CacheStreamRunner::step() {
         poll_endpoint(update, /*after_chunk=*/false);
     if (!update.is_final && opts_.needs_word_timings() && head_)
         update.words = head_->word_timings();
+    if (head_)
+        update.late_punctuation = head_->take_late_punctuation();
     trim_buffers();
     return update;
 }
@@ -1186,6 +1188,8 @@ CacheStreamRunner::finalize() {
         static_cast<float>(audio_base_ + audio_buf_.size()) /
             static_cast<float>(model_->fe_config().sample_rate),
         opts_.max_alternatives);
+    if (head_)
+        update.late_punctuation = head_->take_late_punctuation(/*end_of_stream=*/true);
     return update;
 }
 

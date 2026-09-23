@@ -17,7 +17,7 @@ constexpr float kPosInf = std::numeric_limits<float>::infinity();
 // NeMo's placeholder for disabled top-k picks (sortformer_modules.max_index).
 constexpr int64_t kMaxIndex = 99999;
 
-// Channel-birth gate thresholds on the 10 ms output grid: a channel is
+// V2 channel-birth thresholds on the 80 ms output grid: a channel is
 // established after 4 clean handoff frames or 8 fading handoff frames.
 constexpr float kBirthSpeech = 0.30f;
 constexpr float kBirthClean = 0.50f;
@@ -27,7 +27,6 @@ constexpr float kEstablishedFading = 0.30f;
 constexpr int kBirthCleanFrames = 4;
 constexpr int kBirthFadingFrames = 8;
 constexpr int kBirthEpisodeGapFrames = 25;
-constexpr int kBirthRevisionFrames = 128;
 
 // Indices of the k largest values in column `spk` of `scores` (n x n_spk).
 // Ties break toward the lower frame index (deterministic; torch's order for
@@ -119,7 +118,7 @@ ChannelBirthGate::relabel(float* probs) const {
 void
 ChannelBirthGate::push_raw(const float* probs) {
     raw_ring_.insert(raw_ring_.end(), probs, probs + n_spk_);
-    const size_t cap = static_cast<size_t>(kBirthRevisionFrames) * n_spk_;
+    const size_t cap = static_cast<size_t>(revision_frames) * n_spk_;
     if (raw_ring_.size() > cap)
         raw_ring_.erase(raw_ring_.begin(), raw_ring_.begin() + n_spk_);
 }
@@ -151,6 +150,21 @@ ChannelBirthGate::append(const std::vector<float>& raw, std::vector<float>& time
 bool
 ChannelBirthGate::is_established(int speaker) const {
     return speaker >= 0 && speaker < n_spk_ && established_[speaker];
+}
+
+int64_t
+ChannelBirthGate::settled_frames() const {
+    const int64_t ring_frames = static_cast<int64_t>(raw_ring_.size()) / n_spk_;
+    for (int64_t i = 0; i < ring_frames; i++) {
+        const float* probs = raw_ring_.data() + static_cast<size_t>(i) * n_spk_;
+        int winner = 0;
+        for (int s = 1; s < n_spk_; s++)
+            if (probs[s] > probs[winner])
+                winner = s;
+        if (!established_[winner] && probs[winner] >= kBirthSpeech)
+            return frame_ - ring_frames + i;
+    }
+    return frame_;
 }
 
 DiarGeometry

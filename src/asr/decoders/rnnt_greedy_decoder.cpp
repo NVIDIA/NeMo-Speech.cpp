@@ -126,6 +126,9 @@ RnntGreedyDecoder::reset() {
     utterance_has_content_ = false;
     last_presented_punctuation_ = false;
     pending_word_boundary_ = false;
+    late_punctuation_open_ = false;
+    late_punctuation_pending_.clear();
+    late_punctuation_.clear();
     bias_node_ = ContextBiasingTree::kRoot;
 }
 
@@ -156,9 +159,28 @@ RnntGreedyDecoder::present_token(int token, int64_t frame) {
         last_speech_frame_ = frame;
         utterance_has_content_ = true;
         last_presented_punctuation_ = false;
+        late_punctuation_open_ = false;
+        if (!late_punctuation_pending_.empty()) {
+            // A sentence mark followed by a lowercase word did not end the sentence.
+            const bool terminator =
+                late_punctuation_pending_.find_first_of(".?!") != std::string::npos;
+            const bool lowercase = text[0] >= 'a' && text[0] <= 'z';
+            if (!(terminator && lowercase))
+                late_punctuation_ = late_punctuation_pending_;
+            late_punctuation_pending_.clear();
+        }
     }
     if (punctuation) {
-        if (!utterance_has_content_ || last_presented_punctuation_)
+        if (!utterance_has_content_) {
+            // The model often punctuates only once the next word starts, after the
+            // endpoint published the sentence. Return it there; never lead with it.
+            if (late_punctuation_open_) {
+                late_punctuation_pending_ = text;
+                late_punctuation_open_ = false;
+            }
+            return false;
+        }
+        if (last_presented_punctuation_)
             return false;
         last_presented_punctuation_ = true;
     }

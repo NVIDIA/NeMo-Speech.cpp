@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Dump NeMo Sortformer V2/V3 reference tensors for ggml parity tests.
+"""Dump NeMo streaming Sortformer reference tensors for ggml parity tests.
 
-With --steady-state, capture cold, FIFO-only, and full-cache neural steps for
-either version. Geometry and array shapes are stored in the same NERB-compatible
-NPZ format as the V2 streaming reference; no external fixture generator is needed.
-
-Without --steady-state, replays the V2 sync streaming loop (forward_streaming with
+Replays the sync streaming loop (SortformerEncLabelModel.forward_streaming with
 async_streaming=False) chunk by chunk, capturing every intermediate the C++
 port needs to check against:
 
@@ -16,8 +12,8 @@ port needs to check against:
              mean_sil_emb/n_sil_frames), compression flag.
   stream:    full mel sequence, final concatenated chunk preds.
 
-Default geometry uses the V2 runtime streaming preset; pass V3 geometry explicitly.
-Deep intermediates (fc-encoder output, transformer output) are stored for the first
+Default geometry uses the runtime streaming preset. Deep intermediates
+(fc-encoder output, transformer output) are stored for the first
 --deep-chunks chunks and for every compression chunk.
 
 Usage:
@@ -37,61 +33,6 @@ import soundfile as sf
 import torch
 
 
-def dump_neural_steps(model, mel, args):
-    """Capture exact-length neural boundaries independently of the state update."""
-    sub = model.encoder.subsampling_factor
-    frames = (args.chunk + args.lc + args.rc) * sub
-    if mel.shape[-1] < frames:
-        raise ValueError(f"audio must provide at least {frames} mel frames")
-    chunk = mel[:, :, :frames].transpose(1, 2).contiguous()
-    lengths = torch.tensor([frames], device=mel.device, dtype=torch.int64)
-    embeddings, embedding_lengths = model._call_pre_encode(chunk, lengths)
-    dim = embeddings.shape[-1]
-    rng = torch.Generator(device=mel.device).manual_seed(0)
-    output = {
-        "n_cases": np.array([3], dtype=np.int64),
-        "output_factor": np.array([model.upsample_factor], dtype=np.int64),
-        "geometry": np.array(
-            [args.chunk, args.lc, args.rc, args.fifo, args.spkcache, args.update_period],
-            dtype=np.int64,
-        ),
-    }
-    for index, (cache_frames, fifo_frames) in enumerate(
-        [(0, 0), (0, args.fifo), (args.spkcache, args.fifo)]
-    ):
-        cache = torch.randn((1, cache_frames, dim), device=mel.device, generator=rng) * 0.01
-        fifo = torch.randn((1, fifo_frames, dim), device=mel.device, generator=rng) * 0.01
-        packed, packed_lengths = model.sortformer_modules.concat_and_pad(
-            [cache, fifo, embeddings],
-            [
-                lengths.new_tensor([cache_frames]),
-                lengths.new_tensor([fifo_frames]),
-                embedding_lengths,
-            ],
-            output_length=cache_frames + fifo_frames + embeddings.shape[1],
-        )
-        encoded, encoded_lengths = model.frontend_encoder(
-            processed_signal=packed, processed_signal_length=packed_lengths, bypass_pre_encode=True
-        )
-        native = model.forward_infer(encoded, encoded_lengths)
-        coarse = (
-            model.sortformer_modules.downsample_preds(native, model.upsample_factor)
-            if model.high_resolution
-            else native
-        )
-        prefix = f"case{index:03d}/"
-        for name, tensor in {
-            "mel_window": chunk,
-            "spkcache": cache,
-            "fifo": fifo,
-            "pre_encode": embeddings,
-            "preds_full": coarse,
-            "preds_native": native,
-        }.items():
-            output[prefix + name] = tensor[0].float().cpu().numpy()
-    return output
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt", help=".nemo checkpoint path")
@@ -99,9 +40,6 @@ def main() -> int:
     ap.add_argument("out", help="output .npz path")
     ap.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     ap.add_argument("--max-sec", type=float, default=40.0)
-    ap.add_argument(
-        "--steady-state", action="store_true", help="V2/V3 cold, FIFO, and full-cache graph parity"
-    )
     # Defaults = the runtime streaming preset (DiarGeometry, aosc_state.h) for
     # convenience only: the chosen geometry is recorded in the dump and the
     # parity test reads it from there, so any values make a valid reference.
@@ -121,15 +59,10 @@ def main() -> int:
 
     from nemo.collections.asr.models import SortformerEncLabelModel
 
-    # Reference tensors must not inherit a container's TF32 defaults.
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
     device = torch.device(args.device)
     model = SortformerEncLabelModel.restore_from(restore_path=args.ckpt, map_location=device)
     model.eval()
     model.to(device)
-    if model.high_resolution and not args.steady_state:
-        ap.error("V3 reference generation requires --steady-state; the full-stream dump is V2-only")
 
     sm = model.sortformer_modules
     sm.chunk_len = args.chunk
@@ -157,13 +90,6 @@ def main() -> int:
         # Streaming mode: no max-normalization (SortformerEncLabelModel.
         # process_signal only rescales when streaming_mode is off).
         mel, mel_len = model.preprocessor(input_signal=sig, length=sig_len)
-
-        if args.steady_state:
-            output = dump_neural_steps(model, mel[:, :, : int(mel_len[0])], args)
-            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(args.out, **output)
-            print(f"[dump] 3 neural-step cases -> {args.out}")
-            return 0
 
         out: dict[str, np.ndarray] = {
             "audio": audio,
