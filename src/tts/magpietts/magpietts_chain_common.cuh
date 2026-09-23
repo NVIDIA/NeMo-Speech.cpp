@@ -21,25 +21,23 @@ static constexpr int LTF_TYPE_F32 = 0;
 static constexpr int LTF_TYPE_F16 = 1;
 static constexpr int LTF_TYPE_Q8_0 = 8;
 static constexpr int LTF_LANES = 2;
-#ifndef LTF_THREADS_OVERRIDE
-#define LTF_THREADS_OVERRIDE 256
-#endif
+static constexpr int LTF_THREADS = 256;
 // Resident blocks per SM. Fewer, fatter blocks mean fewer barrier participants and a smaller
 // spread of per-block latency chains at each barrier; more blocks mean more warps per SM to
 // hide latency within a phase.
-#ifndef LTF_CHAIN_BLOCKS_PER_SM
-#define LTF_CHAIN_BLOCKS_PER_SM 1
-#endif
+static constexpr int LTF_CHAIN_BLOCKS_PER_SM = 1;
 // Register cap for the chain kernel. The kernel is resident on every SM for the whole step;
 // leaving registers (and shared memory, see the carveout in setup) free lets the concurrent
 // NanoCodec kernels co-schedule on the same SMs instead of serializing behind the chain.
-#ifndef LTF_CHAIN_MAX_REGS
 #define LTF_CHAIN_MAX_REGS 168
+// Persistent kernels cap registers (not blocks) so NanoCodec blocks can co-reside on each SM.
+// __maxnreg__ is a CUDA 12.4+ toolkit macro; older toolkits get plain launch bounds (same
+// results, the register cap is then left to the compiler).
+#if defined(__maxnreg__)
+#define LTF_CHAIN_LAUNCH_BOUNDS __maxnreg__(LTF_CHAIN_MAX_REGS)
+#else
+#define LTF_CHAIN_LAUNCH_BOUNDS __launch_bounds__(LTF_THREADS, 1)
 #endif
-#ifndef LTF_ROWS_PER_WARP_OVERRIDE
-#define LTF_ROWS_PER_WARP_OVERRIDE 4
-#endif
-static constexpr int LTF_THREADS = LTF_THREADS_OVERRIDE;
 static constexpr int LTF_WARPS = LTF_THREADS / 32;
 static constexpr int LTF_MAX_EMBD = 1024;  // max LayerNorm width
 static constexpr int LTF_MAX_K = 3072;     // max GEMV input width (FFN hidden)
@@ -53,6 +51,26 @@ struct ltf_q8p {
     const __half* d = nullptr;
 };
 
+
+// The persistent kernels (cp.async staging, L2 cache hints, grid barriers) are tuned and validated
+// on compute capability 8.0+. Require an sm_80+ device AND an sm_80+ kernel image: a build whose
+// only image for this device is older PTX (e.g. 75-virtual JIT-compiled on Ampere) would run the
+// compatibility fallbacks, which are correct but untuned. Callers fall back to the ggml graphs.
+static inline bool
+ltf_kernel_arch_supported(const void* kernel) {
+    int device = 0, major = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    cudaFuncAttributes attr{};
+    if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return major >= 8 && attr.ptxVersion >= 80;
+}
 
 static inline void
 ltf_set_error(char* error, size_t size, const char* msg, cudaError_t err = cudaSuccess) {
@@ -94,14 +112,23 @@ ltf_load_scalar(const void* base, int type, size_t index) {
 // activations quantized once per block to symmetric int8 (32-element blocks, like ggml's
 // Q8_1 path) using dp4a; F16 weights use f32 activations.
 // ---------------------------------------------------------------------------------------
-static constexpr int LTF_ROWS_PER_WARP = LTF_ROWS_PER_WARP_OVERRIDE;
+static constexpr int LTF_ROWS_PER_WARP = 4;
 static constexpr int LTF_ROWS_PER_BLOCK = LTF_WARPS * LTF_ROWS_PER_WARP;
 
 enum ltf_epilogue { LTF_EPI_STORE = 0, LTF_EPI_RESIDUAL = 1, LTF_EPI_GELU = 2, LTF_EPI_BIAS = 3 };
 
+// Architecture notes: the persistent kernels are enabled only on sm_80+ devices running an
+// sm_80+ kernel image (ltf_kernel_arch_supported). The pre-sm_80 branches below exist so every
+// target in ggml's default multi-architecture lists still compiles and JIT-loads.
 static __device__ __forceinline__ int
 ltf_dp4a(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+    const int8_t* x = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* y = reinterpret_cast<const int8_t*>(&b);
+    return c + x[0] * y[0] + x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
+#else
     return __dp4a(a, b, c);
+#endif
 }
 
 // Register-prefetched Q8 path: each lane owns up to MB blocks per row (blocks = K/32 <= 32*MB).
@@ -387,7 +414,7 @@ ltf_block_layernorm(const float* x, float* xn, const float* weight, int K, float
 
 static constexpr int LTF_MAX_LAYERS = 4;
 static constexpr int LTF_MAX_ROUNDS = LTF_MAX_POS;
-// Rows per warp of each GEMV phase. The grid is two blocks per SM (>= LTF_CHAIN_MIN_GRID blocks),
+// Rows per warp of each GEMV phase. The grid is LTF_CHAIN_MIN_GRID blocks (one per SM),
 // so a phase of N rows gives each block ceil(N / grid) rows spread over LTF_WARPS warps; setup
 // verifies these bounds for the actual shapes and grid.
 static constexpr int LTF_CHAIN_MIN_GRID = 64 * LTF_CHAIN_BLOCKS_PER_SM;
@@ -547,24 +574,37 @@ struct ltf_chain_smem {
 // across rounds instead of being flushed by the weight stream.
 static __device__ __forceinline__ unsigned long long
 ltf_evict_first_policy() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return 0ull;
+#else
     unsigned long long policy;
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
     return policy;
+#endif
 }
 static __device__ __forceinline__ void
 ltf_cp_async16(void* smem, const void* gmem, unsigned long long policy) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    (void)policy;
+    *reinterpret_cast<int4*>(smem) = *reinterpret_cast<const int4*>(gmem);  // synchronous copy
+#else
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile(
         "cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
         "l"(policy));
+#endif
 }
 static __device__ __forceinline__ void
 ltf_cp_async_commit() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 static __device__ __forceinline__ void
 ltf_cp_async_wait_all() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_all;\n" ::);
+#endif
 }
 
 static __device__ __forceinline__ void
@@ -574,6 +614,13 @@ ltf_grid_barrier(unsigned int* counter, unsigned int& target, unsigned int nbloc
         target += nblocks;
         // Release this block's writes with the arrival, acquire everyone else's with the poll
         // (no fences, no back-off: measured ~7% faster per step than fence + atomic + nanosleep).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+        __threadfence();
+        atomicAdd(counter, 1u);
+        while (*reinterpret_cast<volatile unsigned int*>(counter) < target) {
+        }
+        __threadfence();
+#else
         asm volatile("red.release.gpu.global.add.u32 [%0], 1;" ::"l"(counter) : "memory");
         unsigned int seen;
         do {
@@ -582,6 +629,7 @@ ltf_grid_barrier(unsigned int* counter, unsigned int& target, unsigned int nbloc
                          : "l"(counter)
                          : "memory");
         } while (seen < target);
+#endif
     }
     __syncthreads();
 }

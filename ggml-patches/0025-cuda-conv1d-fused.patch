@@ -93,10 +93,10 @@ index 0c570639..f20b8bcb 100644
          case GGML_OP_CPY:
 diff --git a/src/ggml-cuda/conv1d-fused.cu b/src/ggml-cuda/conv1d-fused.cu
 new file mode 100644
-index 00000000..5979a239
+index 00000000..e66928b3
 --- /dev/null
 +++ b/src/ggml-cuda/conv1d-fused.cu
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,477 @@
 +#include "conv1d-fused.cuh"
 +
 +// Fused causal 1-D convolution as an implicit GEMM on tensor cores (mma.sync m16n8k16, F16 in,
@@ -162,13 +162,20 @@ index 00000000..5979a239
 +}
 +
 +constexpr int CF_MAX_REGS = 168;
++// __maxnreg__ is a CUDA 12.4+ toolkit macro; older toolkits and HIP get plain launch bounds.
++#if defined(__maxnreg__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#define CF_LAUNCH_BOUNDS __maxnreg__(CF_MAX_REGS)
++#else
++#define CF_LAUNCH_BOUNDS __launch_bounds__(CF_THREADS)
++#endif
 +
 +template <int BM>
 +// 128 threads x <= 168 registers (21.5K) fit beside a resident MagpieTTS persistent kernel block
 +// (168 x 256 = 43K) in the 64K-register file, so codec blocks co-schedule instead of serializing.
-+__global__ void __maxnreg__(CF_MAX_REGS) conv1d_fused_kernel(const conv1d_fused_params p) {
++__global__ void CF_LAUNCH_BOUNDS conv1d_fused_kernel(const conv1d_fused_params p) {
 +#if defined(GGML_USE_HIP) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800)
 +    GGML_UNUSED(p);
++    NO_DEVICE_CODE;  // unreachable: ggml_cuda_conv1d_fused_supported() requires Ampere code
 +#else
 +    constexpr int WARPS_M = 2;                  // 4 warps: 2x2 (BM 64: 32x16 warp tiles; BM 32: 16x16)
 +    constexpr int WARPS_N = 4 / WARPS_M;
@@ -330,7 +337,7 @@ index 00000000..5979a239
 +        const half * bcur = s_b + slot * B_CHUNK;
 +        const half * wcur = s_win + wbuf * W_CHUNK;
 +        for (int k = 0; k < K; ++k) {
-+            const int shift = k * p.d;
++            const int shift = k * dil;  // per-group dilation (grouped problems)
 +            unsigned bfrag[FN][2];
 +#pragma unroll
 +            for (int j = 0; j < FN; ++j) {
@@ -441,7 +448,10 @@ index 00000000..5979a239
 +
 +}  // namespace
 +
-+bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op) {
++bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op, int cc) {
++    // mma.sync m16n8k16 + cp.async: needs an NVIDIA sm_80+ device running sm_80+ device code
++    // (a 75-virtual-only build JIT-compiled on Ampere gets the pre-Ampere stub).
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) return false;
 +    const ggml_tensor * x = op->src[0];
 +    const ggml_tensor * w = op->src[1];
 +    const ggml_tensor * cache = op->src[3];
@@ -566,16 +576,16 @@ index 00000000..5979a239
 +}
 diff --git a/src/ggml-cuda/conv1d-fused.cuh b/src/ggml-cuda/conv1d-fused.cuh
 new file mode 100644
-index 00000000..de102812
+index 00000000..97bb27e1
 --- /dev/null
 +++ b/src/ggml-cuda/conv1d-fused.cuh
 @@ -0,0 +1,4 @@
 +#include "common.cuh"
 +
-+bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op);
++bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op, int cc);
 +void ggml_cuda_op_conv1d_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 0a5c2657..0a9d67fe 100644
+index 9dad7391..e3647155 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -26,6 +26,7 @@
@@ -596,12 +606,12 @@ index 0a5c2657..0a9d67fe 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -6354,6 +6358,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6376,6 +6380,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FUSED_ATTN:
              return (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0;  // d_k power of two
 +        case GGML_OP_CONV1D_FUSED:
-+            return ggml_cuda_conv1d_fused_supported(op);
++            return ggml_cuda_conv1d_fused_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:

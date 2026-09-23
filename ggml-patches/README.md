@@ -189,12 +189,17 @@ stock comparison therefore requires both a pristine ggml checkout and
   threads; the generic kernel strides across channels and re-reads every input
   `KW` times. Layered on 0020, which also edits `im2col.cu`.
 
-- **0025-cuda-conv1d-fused.patch** - adds the `ggml_conv1d_fused` op: a causal
-  1D convolution over an F16 cache-prefix plus current input, computed as an
-  implicit GEMM with `mma.sync` tensor-core fragments (F16 inputs, F32
-  accumulation, split-K, fused bias epilogue) from weights pre-packed as
-  `[K][cout][cin]`. Replaces the im2col + cuBLAS decomposition in the NanoCodec
-  decoder; a CPU reference implementation is included for testing.
+- **0025-cuda-conv1d-fused.patch** - adds the `ggml_conv1d_fused` and
+  `ggml_conv1d_fused_grouped` ops: a causal 1D convolution over an F32
+  streaming-cache prefix plus the current input, with the snake/leaky-ReLU
+  activation applied on load, computed as an implicit GEMM with `mma.sync`
+  tensor-core fragments (F16 operands, F32 accumulation, split-K, fused bias and
+  residual epilogue) from F16 weights pre-packed as `[K][cout][cin]`. The
+  grouped form runs several kernel-size branches in one launch. CUDA only: the
+  op is reported supported only for NVIDIA devices with sm_80+ device code in
+  the build, the CPU backend reports it unsupported, and other backends reject
+  it, so callers keep their unfused path. Replaces the im2col + cuBLAS
+  decomposition in the NanoCodec decoder.
 
 - **0026-cuda-backend-graphs-toggle.patch** - adds
   `ggml_backend_cuda_set_graphs_enabled()`: a per-backend opt-out of CUDA graph
@@ -204,6 +209,12 @@ stock comparison therefore requires both a pristine ggml checkout and
   block before writing its shared-memory slot: consecutive reductions on the same
   buffer (soft_max: max then sum) otherwise race and give scheduling-dependent
   results when the SM is shared with a co-resident kernel.
+
+- **0028-cuda-conv1d-preactivation.patch** - for grouped `ggml_conv1d_fused`
+  problems with several output-channel tiles, activates and packs the input once
+  per element into an F16 buffer instead of once per tile, then runs the
+  convolution on the packed input. Results are bit-identical; the NanoCodec
+  decoder runs about twice as fast.
 
 ## Regenerating after editing ggml
 

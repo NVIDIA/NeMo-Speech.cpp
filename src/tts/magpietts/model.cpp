@@ -877,11 +877,11 @@ magpietts_model_load_impl(
     if (!model.backend) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
     if (model.backend && ggml_backend_is_cuda(model.backend)) {
         // The decoder/local-transformer stream is the latency-critical path; run it at the
-        // highest CUDA stream priority so the concurrent NanoCodec worker (default priority)
-        // does not delay its small kernels.
+        // highest CUDA stream priority so the concurrent NanoCodec worker (priority -2) and
+        // default-priority side streams do not delay its small kernels.
         constexpr int kHighestPriority = -100;  // clamped to the device range by ggml
         ggml_backend_cuda_set_stream_priority(model.backend, kHighestPriority);
     }

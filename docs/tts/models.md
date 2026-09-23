@@ -106,12 +106,12 @@ The unified [`convert_model.py`](../../convert_model.py) entry point accepts
 compatible local `.nemo` archives and extracted NeMo checkpoints. It defaults
 to `--outtype q8_0` for MagpieTTS and `--outtype f16` for NanoCodec; pass
 `--outtype f16` or `--outtype f32` to keep MagpieTTS unquantized. The `q8_0`
-output stores the decoder attention and feed-forward projections, the
-local-transformer output projections and the final projection as Q8_0 and keeps
-everything else f16. On CUDA this halves the weight bytes streamed per decoder
-step and enables the fused local-transformer chain kernel with in-kernel
-sampling, for about 12% higher real-time factor than the f16 file at unchanged
-output quality (validated on MagpieTTS v2607). The converter is a source-tree
+output stores the attention and feed-forward projections of the text encoder,
+decoder and local transformer, the local-transformer output projections and the
+final projection as Q8_0, and keeps embeddings, norms and everything else f16.
+Output quality matches the f16 file (validated on MagpieTTS v2607). On CUDA GPUs
+with compute capability 8.0 or newer it also enables the fused decoder and
+local-transformer kernels, which are selected automatically. The converter is a source-tree
 Python tool and is not included
 in native release archives; see [Model conversion](../model-conversion.md) for
 environment setup.

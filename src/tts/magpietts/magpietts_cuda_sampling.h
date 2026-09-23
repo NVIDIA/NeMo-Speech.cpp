@@ -47,6 +47,13 @@ bool magpietts_cuda_sampler_sequence_finish_build_and_launch(
     magpietts_cuda_sampler* sampler, char* error, size_t error_size);
 void magpietts_cuda_sampler_sequence_abort_build(magpietts_cuda_sampler* sampler);
 void magpietts_cuda_sampler_sequence_disable(magpietts_cuda_sampler* sampler);
+// The composed sequence bakes in which kernels the caller enqueued (fused vs ggml local
+// transformer, in-kernel vs separate sampling, CFG pair vs single). Callers tag it with a key
+// describing that structure; reset drops the warm/composed state so a different structure is
+// composed afresh instead of replaying the old graph.
+uint64_t magpietts_cuda_sampler_sequence_key(const magpietts_cuda_sampler* sampler);
+void magpietts_cuda_sampler_sequence_set_key(magpietts_cuda_sampler* sampler, uint64_t key);
+void magpietts_cuda_sampler_sequence_reset(magpietts_cuda_sampler* sampler);
 bool magpietts_cuda_sampler_sequence_launch(
     magpietts_cuda_sampler* sampler, char* error, size_t error_size);
 bool magpietts_cuda_sampler_sequence_add_ggml_graph(

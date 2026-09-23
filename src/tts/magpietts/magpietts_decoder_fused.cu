@@ -24,18 +24,10 @@
 // ---------------------------------------------------------------------------------------
 static constexpr int DF_MAX_LAYERS = 16;
 static constexpr int DF_MAX_CODEBOOKS = 16;
-#ifndef DF_ATTN_SPLITS_OVERRIDE
-#define DF_ATTN_SPLITS_OVERRIDE 2
-#endif
-static constexpr int DF_ATTN_SPLITS =
-    DF_ATTN_SPLITS_OVERRIDE;  // key-range splits per (lane, head) self-attention item
+static constexpr int DF_ATTN_SPLITS = 2;  // key-range splits per (lane, head) self-attention item
 static constexpr int DF_ATTN_MAX_RANGE =
-    2048 / DF_ATTN_SPLITS;  // keys per split (cache_len + 1 <= 2048)
-#ifndef DF_XATTN_BLOCKS_OVERRIDE
-#define DF_XATTN_BLOCKS_OVERRIDE 8
-#endif
-static constexpr int DF_XATTN_BLOCKS =
-    DF_XATTN_BLOCKS_OVERRIDE;                 // tail blocks sharing the cross-attention keys
+    2048 / DF_ATTN_SPLITS;                    // keys per split (cache_len + 1 <= 2048)
+static constexpr int DF_XATTN_BLOCKS = 8;     // tail blocks sharing the cross-attention keys
 static constexpr int DF_XATTN_MAX_KEYS = 64;  // keys per tail block (text_capacity <= 512)
 static constexpr int DF_R_CQ = 1;             // cross_dim rows per block: 128 / 64 = 2
 
@@ -402,8 +394,8 @@ df_final(const df_args& a, int tile, int nblocks, ltf_chain_smem& sm) {
     }
 }
 
-static __global__ void
-__maxnreg__(LTF_CHAIN_MAX_REGS) df_kernel(const df_args a) {
+static __global__ void LTF_CHAIN_LAUNCH_BOUNDS
+df_kernel(const df_args a) {
     extern __shared__ __align__(16) unsigned char df_dyn_smem[];
     ltf_chain_smem& sm = *reinterpret_cast<ltf_chain_smem*>(df_dyn_smem);
     __shared__ int s_flag;
@@ -602,6 +594,11 @@ magpietts_decoder_fused*
 magpietts_decoder_fused_create(
     const magpietts_decoder_fused_weights& w, const magpietts_decoder_fused_cache& cache,
     char* error, size_t error_size) {
+    if (!ltf_kernel_arch_supported(reinterpret_cast<const void*>(df_kernel))) {
+        ltf_set_error(
+            error, error_size, "fused decoder: needs compute capability 8.0+ and an sm_80+ build");
+        return nullptr;
+    }
     if (w.n_embd <= 0 || w.n_embd > LTF_MAX_EMBD || w.n_embd % 64 != 0 || w.n_head <= 0 ||
         w.n_embd / w.n_head != 64 || w.n_ff <= 0 || w.n_ff > LTF_MAX_K || w.n_ff % 64 != 0 ||
         w.cross_dim <= 0 || w.cross_dim % 32 != 0 || w.n_layers <= 0 ||
@@ -656,7 +653,6 @@ magpietts_decoder_fused_create(
         if (L.has_cross && L.collect_alignment)
             ++f->n_collect;
     }
-    // grid: one block per SM (see the LT chain kernel), rows split evenly
     int device = 0, sms = 0, per_sm = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
@@ -680,7 +676,14 @@ magpietts_decoder_fused_create(
         magpietts_decoder_fused_free(f);
         return nullptr;
     }
-    const int grid = sms;
+    // Same tiling contract as the LT chain: exactly LTF_CHAIN_MIN_GRID blocks, one per SM, on any
+    // GPU with at least that many SMs (the rest stay free for the codec).
+    const int grid = LTF_CHAIN_MIN_GRID;
+    if (sms < grid) {
+        ltf_set_error(error, error_size, "fused decoder: needs at least 64 SMs");
+        magpietts_decoder_fused_free(f);
+        return nullptr;
+    }
     auto rows_per_block = [grid](int N) { return (N + grid - 1) / grid; };
     auto fits = [&](int N, int Kdim, int R) {
         return rows_per_block(N) <= LTF_WARPS * R && rows_per_block(N) * Kdim <= LTF_STAGE_BYTES &&

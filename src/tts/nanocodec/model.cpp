@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -338,11 +339,40 @@ nc_pack_grouped_convs(nc_model& model, bool verbose) {
 
 // Repack the stride-1 convolution weights ([K, Cin, Cout] F16, ne0 = K) into the fused CUDA
 // conv layout [cout_pad, cin_pad, K] (ne0 = cout, both channel paddings multiples of 16, zero
-// filled) when the backend supports ggml_conv1d_fused. NANOCODEC_FUSED_CONV=0 disables.
+// filled) when the backend supports ggml_conv1d_fused.
+#if defined(NEMO_SPEECH_GGML_PATCHED)
+// The fused kernel has per-shape limits (kernel size, dilated window, channel padding): ask the
+// backend about every convolution with its real shape instead of one generic probe.
+static bool
+nc_fused_conv_supported(ggml_backend_t backend, const nc_conv& c) {
+    const int64_t K = c.w->ne[0], cin = c.w->ne[1], cout = c.w->ne[2];
+    const int64_t cin_pad = (cin + 15) / 16 * 16, cout_pad = (cout + 15) / 16 * 16;
+    const int64_t left_pad = (K - 1) * c.dilation;
+    ggml_init_params probe_params = {ggml_tensor_overhead() * 8, nullptr, true};
+    ggml_context* probe = ggml_init(probe_params);
+    if (!probe) {
+        return false;
+    }
+    ggml_tensor* x = ggml_new_tensor_3d(probe, GGML_TYPE_F32, 64, cin, 1);
+    ggml_tensor* cache =
+        left_pad > 0 ? ggml_new_tensor_3d(probe, GGML_TYPE_F32, left_pad, cin, 1) : nullptr;
+    ggml_tensor* w = ggml_new_tensor_3d(probe, GGML_TYPE_F16, cin_pad, cout_pad, K);
+    ggml_tensor* op = ggml_conv1d_fused(
+        probe, x, cache, w, nullptr, nullptr, nullptr, (int)K, c.dilation, (int)cout, 0, 0.01f);
+    const bool ok = ggml_backend_supports_op(backend, op);
+    ggml_free(probe);
+    return ok;
+}
+#endif
+
 static void
 nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
-    const char* env = getenv("NANOCODEC_FUSED_CONV");
-    if ((env && atoi(env) == 0) || !model.backend) {
+#if !defined(NEMO_SPEECH_GGML_PATCHED)
+    // ggml_conv1d_fused is provided by the patched ggml series only.
+    (void)model;
+    (void)verbose;
+#else
+    if (!model.backend) {
         return;
     }
     {
@@ -372,7 +402,8 @@ nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
     convs.push_back(&model.post_conv);
     std::vector<nc_conv*> pending;
     for (nc_conv* c : convs) {
-        if (c->w && c->w->type == GGML_TYPE_F16 && c->stride == 1 && ggml_is_contiguous(c->w)) {
+        if (c->w && c->w->type == GGML_TYPE_F16 && c->stride == 1 && ggml_is_contiguous(c->w) &&
+            nc_fused_conv_supported(model.backend, *c)) {
             pending.push_back(c);
         }
     }
@@ -426,6 +457,7 @@ nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
             pending.size());
     }
     nc_pack_grouped_convs(model, verbose);
+#endif
 }
 
 static bool
@@ -473,7 +505,7 @@ nc_model_load(
     if (!model.backend || force_cpu) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
     if (model.backend && ggml_backend_is_cuda(model.backend)) {
         // Above default-priority side streams (longform chunk prefetch) and below the
         // latency-critical Magpie decoder stream, so codec blocks are scheduled ahead of
@@ -822,6 +854,8 @@ struct nc_stream_graph_io {
 
 static constexpr size_t NC_STREAM_MAX_STATE_TENSORS = 256;
 
+struct nc_stream_state;
+
 struct nc_stream_decode_graph {
     ggml_context* ctx = nullptr;
     ggml_cgraph* gf = nullptr;
@@ -831,6 +865,8 @@ struct nc_stream_decode_graph {
     nc_stream_graph_io io;
     int chunk_frames = 0;
     size_t output_samples = 0;
+    const nc_stream_state* state = nullptr;  // state instance the graph's cache tensors belong to
+    uint64_t state_generation = 0;
     size_t samples_per_frame = 0;
     std::vector<float> latent_data;
     std::vector<float> audio_data;
@@ -844,6 +880,9 @@ struct nc_stream_state {
     std::vector<ggml_tensor*> deconv_tails;  // F32 [tail_len, channels, 1]
     size_t conv_pos = 0;
     size_t deconv_pos = 0;
+    // Changes whenever the device buffer is (re)allocated or released: stream graphs bind the
+    // state tensors at build time and use this to notice a different or reallocated state.
+    uint64_t generation = 0;
 
     nc_stream_state() = default;
     nc_stream_state(const nc_stream_state&) = delete;
@@ -877,6 +916,7 @@ struct nc_stream_state {
         conv_caches.clear();
         deconv_tails.clear();
         backend = nullptr;
+        generation = 0;
         begin_graph();
     }
 
@@ -907,6 +947,8 @@ struct nc_stream_state {
             return false;
         }
         ggml_backend_buffer_clear(buffer, 0);
+        static std::atomic<uint64_t> next_generation{1};
+        generation = next_generation.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 };
@@ -1023,6 +1065,9 @@ nc_stream_conv1d_act(
         ggml_tensor* y = act ? half_snake(ctx, x, *act) : x;
         return nc_stream_causal_conv1d(ctx, y, conv, state, io);
     }
+#if !defined(NEMO_SPEECH_GGML_PATCHED)
+    GGML_ABORT("nanocodec: packed conv weights require the patched ggml series");
+#else
     const int kernel = (int)conv.w->ne[0];
     const int left_pad = (kernel - 1) * conv.dilation;
     const int64_t T = x->ne[0];
@@ -1052,6 +1097,7 @@ nc_stream_conv1d_act(
         nc_stream_add_cache_writeback(ctx, io, next, cache);
     }
     return y;
+#endif
 }
 
 static ggml_tensor*
@@ -1107,6 +1153,11 @@ static ggml_tensor*
 nc_stream_grouped_conv(
     ggml_context* ctx, ggml_tensor* x, bool shared_input, const nc_grouped_conv& gc,
     ggml_tensor* residual, bool residual_shared, nc_stream_state& state, nc_stream_graph_io& io) {
+#if !defined(NEMO_SPEECH_GGML_PATCHED)
+    (void)ctx, (void)x, (void)shared_input, (void)gc, (void)residual, (void)residual_shared;
+    (void)state, (void)io;
+    GGML_ABORT("nanocodec: grouped convs require the patched ggml series");
+#else
     int max_pad = 0;
     for (int g = 0; g < gc.groups; ++g) max_pad = std::max(max_pad, (gc.K[g] - 1) * gc.d[g]);
     const int64_t T = x->ne[0];
@@ -1134,6 +1185,7 @@ nc_stream_grouped_conv(
         nc_stream_add_cache_writeback(ctx, io, next, cache);
     }
     return y;
+#endif
 }
 
 static ggml_tensor*
@@ -1413,6 +1465,8 @@ nc_stream_decode_graph_init(
     graph.samples_per_frame = graph.output_samples / (size_t)chunk_frames;
     graph.latent_data.assign((size_t)chunk_frames * h.latent_dim, 0.0f);
     graph.audio_data.resize(graph.output_samples);
+    graph.state = &state;
+    graph.state_generation = state.generation;
     return true;
 }
 
@@ -1720,6 +1774,16 @@ NanoCodecDecoder::decodeStream(
     int threads, std::vector<float>& audio) const {
     if (!require_loaded(model_) || !state.impl_ || !graph.impl_) {
         return false;
+    }
+    nc_stream_decode_graph& g = graph.impl_->graph;
+    const nc_stream_state& s = state.impl_->state;
+    if (g.state != &s || g.state_generation != s.generation) {
+        // The graph was built for another (or since reallocated) state: rebind it.
+        if (g.chunk_frames <= 0 ||
+            !nc_stream_decode_graph_init(
+                model_->impl_->model, state.impl_->state, g.chunk_frames, g)) {
+            return false;
+        }
     }
     return decode_eval_stream(
         model_->impl_->model, state.impl_->state, graph.impl_->graph, frames, threads, audio);

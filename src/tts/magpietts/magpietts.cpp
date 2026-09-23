@@ -295,7 +295,7 @@ class MagpieStreamingWorkspace {
             return false;
         }
         prefetch_backend = ggml_backend_dev_init(device, nullptr);
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
         if (prefetch_backend)
             ggml_backend_cuda_set_graphs_enabled(prefetch_backend, false);  // one-shot graphs
 #endif
@@ -1289,11 +1289,9 @@ stream_magpie_to_audio(
         }
         ~chunk_prefetch_state() { join(); }
     } chunk_prefetch;
-    const char* prefetch_env = std::getenv("MAGPIETTS_CHUNK_PREFETCH");
     const bool prefetch_enabled =
         longform_active && use_cuda_sampling && params.use_local_transformer && params.use_cfg &&
-        params.use_kv_cache && token_chunks.size() > 1 &&
-        !(prefetch_env && prefetch_env[0] == '0') && workspace.ensurePrefetchBackend();
+        params.use_kv_cache && token_chunks.size() > 1 && workspace.ensurePrefetchBackend();
     int prefetch_max_window = 0;
     if (longform_active && params.use_kv_cache) {
         // Size the cross caches once for the widest text window so the persistent decoder
@@ -1417,12 +1415,6 @@ stream_magpie_to_audio(
         });
         chunk_prefetch.launched = true;
     };
-    // Diagnostic: MAGPIETTS_DUMP_CODES=<path> writes the sampled codes of every step (chunk, step,
-    // codes...) -- the cheapest way to compare two runs for bit-identical generation.
-    FILE* dump_codes = nullptr;
-    if (const char* dump_path = std::getenv("MAGPIETTS_DUMP_CODES"))
-        dump_codes = fopen(dump_path, "w");
-
     const int64_t t_start = ggml_time_us();
     metrics.decoder.begin(t_start);
     {
@@ -1675,6 +1667,12 @@ stream_magpie_to_audio(
                             return cancel_worker();
                         }
 #if defined(MAGPIETTS_CUDA_SAMPLING)
+                        if (local_sampler != &workspace.local_sampler) {
+                            // The FP32 local-transformer mirror runs on its own CUDA backend
+                            // (stream); the decoder's hidden states are written asynchronously
+                            // on the Magpie stream, so finish those before the mirror reads them.
+                            ggml_backend_synchronize(magpie.backend);
+                        }
                         if (!local_sampler->sampleCuda(
                                 cond_hidden_device, uncond_hidden_device, params.use_cfg,
                                 h.cfg_scale, h.temperature, h.top_k, forbid_eos,
@@ -1847,11 +1845,6 @@ stream_magpie_to_audio(
                     }
                 }
 
-                if (dump_codes) {
-                    fprintf(dump_codes, "%zu %d", chunk_index, step);
-                    for (int32_t v : next_codes) fprintf(dump_codes, " %d", v);
-                    fprintf(dump_codes, "\n");
-                }
                 std::vector<std::vector<int32_t>> codec_frames;
                 if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
                     fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
@@ -1965,8 +1958,6 @@ stream_magpie_to_audio(
             absolute_token_offset += (int)current_tokens.size();
         }
     }
-    if (dump_codes)
-        fclose(dump_codes);
     metrics.decoder.finish(
         metrics.decoder.last_event_us > 0 ? metrics.decoder.last_event_us : ggml_time_us());
 

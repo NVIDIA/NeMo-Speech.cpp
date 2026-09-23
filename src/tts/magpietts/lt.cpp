@@ -249,6 +249,13 @@ magpietts_local_copy_tensor_fp32(const ggml_tensor* src, ggml_tensor* dst) {
         std::vector<ggml_bf16_t> packed((size_t)elements);
         ggml_backend_tensor_get(src, packed.data(), 0, packed.size() * sizeof(ggml_bf16_t));
         ggml_bf16_to_fp32_row(packed.data(), values.data(), elements);
+    } else if (
+        ggml_is_quantized(src->type) && ggml_is_contiguous(src) &&
+        ggml_get_type_traits(src->type)->to_float) {
+        // q8_0 models quantize the local-transformer projections; the fp32 mirror dequantizes.
+        std::vector<uint8_t> packed(ggml_nbytes(src));
+        ggml_backend_tensor_get(src, packed.data(), 0, packed.size());
+        ggml_get_type_traits(src->type)->to_float(packed.data(), values.data(), elements);
     } else {
         fprintf(
             stderr, "cannot convert local-transformer tensor %s from %s to f32\n",
@@ -1325,26 +1332,28 @@ sample_local_codebooks_impl(
 }
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
+// Largest top-k the in-kernel sampler of the fused chain handles (MAGPIETTS_CUDA_MAX_FAST_TOPK);
+// larger values sample with the separate sampling kernels.
+constexpr int kFusedChainMaxTopK = 256;
 // ---------------------------------------------------------------------------------------
 // Fused CUDA local-transformer round path (magpietts_lt_fused.cu)
 // ---------------------------------------------------------------------------------------
 static void
 local_transformer_fused_try_create(
     const magpietts_model& model, local_transformer_graph_bank& bank, bool use_cfg) {
-    if (bank.fused_checked) {
+    // The fused path serves the CFG pair only; a non-CFG request must not rule it out for later
+    // CFG requests on this bank.
+    if (bank.fused_checked || !use_cfg) {
         return;
     }
     bank.fused_checked = true;
     // Fused CUDA local-transformer path (planar Q8 round kernels, persistent chain kernel,
-    // in-kernel sampling). Default on; MAGPIETTS_LT_FUSED=0 falls back to the ggml round graphs.
-    const char* env = getenv("MAGPIETTS_LT_FUSED");
-    if (env && atoi(env) == 0) {
-        return;
-    }
+    // in-kernel sampling), used whenever the model and the GPU support it; otherwise the ggml
+    // round graphs run.
     const auto& h = model.hparams;
     const magpietts_transformer& tr = model.local;
-    if (!use_cfg || model.lt_in_w || tr.kernel != 1 || tr.norm_out || tr.layers.empty() ||
-        tr.n_head <= 0 || tr.n_embd != h.n_embd || !tr.pos_emb ||
+    if (model.lt_in_w || tr.kernel != 1 || tr.norm_out || tr.layers.empty() || tr.n_head <= 0 ||
+        tr.n_embd != h.n_embd || !tr.pos_emb ||
         !magpietts_fused_cached_attention_available(model.backend)) {
         return;
     }
@@ -1408,17 +1417,24 @@ local_transformer_fused_try_create(
     char error[256] = {};
     magpietts_lt_fused* fused = magpietts_lt_fused_create(w, error, sizeof(error));
     if (!fused) {
-        fprintf(stderr, "MagpieTTS fused local transformer unavailable: %s\n", error);
+        fprintf(stderr, "MagpieTTS local transformer: using ggml round graphs (%s)\n", error);
         return;
     }
     // The fused path pays off through the persistent chain kernel (all rounds in one launch,
     // int8 dot products, in-kernel sampling), which needs Q8_0 projections. With F16 weights
     // the per-round fused kernels are slower than the ggml round graphs, so keep those.
     if (!magpietts_lt_fused_chain_supported(fused)) {
+        bool all_q8 = w.out_type == (int)GGML_TYPE_Q8_0;
+        for (int i = 0; i < w.n_layers; ++i) {
+            const magpietts_lt_fused_layer_weights& lw = w.layers[i];
+            all_q8 = all_q8 && lw.qkv_type == (int)GGML_TYPE_Q8_0 &&
+                     lw.o_type == (int)GGML_TYPE_Q8_0 && lw.ff1_type == (int)GGML_TYPE_Q8_0 &&
+                     lw.ff2_type == (int)GGML_TYPE_Q8_0;
+        }
         fprintf(
-            stderr,
-            "MagpieTTS local transformer: fused CUDA path skipped (needs Q8_0 projections; "
-            "convert with --outtype q8_0); using ggml round graphs\n");
+            stderr, "MagpieTTS local transformer: using ggml round graphs (%s)\n",
+            all_q8 ? "fused CUDA chain not supported on this GPU"
+                   : "the fused CUDA chain needs a q8_0 model; convert with --outtype q8_0");
         magpietts_lt_fused_free(fused);
         return;
     }
@@ -1481,7 +1497,7 @@ local_transformer_fused_eval_cuda(
     // F16 output projections fall back to the separate sampling kernel below.
     if (magpietts_lt_fused_sampling_supported(fused) &&
         magpietts_cuda_sampler_device_pointers(cuda_sample.sampler, &sp) && sp.top_k >= 1 &&
-        sp.top_k <= 256) {
+        sp.top_k <= kFusedChainMaxTopK) {
         fused_sampler.config = sp.config;
         fused_sampler.codes = sp.codes;
         fused_sampler.argmax = sp.argmax;
@@ -1596,6 +1612,18 @@ sample_local_codebooks_cuda_impl(
     cuda_sample.frame_index = frame_index;
     local_transformer_fused_try_create(model, local_graphs, use_cfg);
     const bool use_fused = local_graphs.fused != nullptr && use_cfg;
+    // What the composed per-frame graph contains depends on these choices; a frame that needs a
+    // different structure drops the composed graph instead of replaying a stale one.
+    const bool fused_sampling =
+        use_fused && top_k >= 1 && top_k <= kFusedChainMaxTopK &&
+        magpietts_lt_fused_sampling_supported(static_cast<magpietts_lt_fused*>(local_graphs.fused));
+    const uint64_t sequence_key = (uint64_t)(uintptr_t)&local_graphs * 8u + (use_cfg ? 1u : 0u) +
+                                  (use_fused ? 2u : 0u) + (fused_sampling ? 4u : 0u);
+    if ((magpietts_cuda_sampler_sequence_is_ready(cuda_sampler) ||
+         magpietts_cuda_sampler_sequence_is_warm(cuda_sampler)) &&
+        magpietts_cuda_sampler_sequence_key(cuda_sampler) != sequence_key) {
+        magpietts_cuda_sampler_sequence_reset(cuda_sampler);
+    }
     auto run_chain = [&]() {
         for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             const bool ok =
@@ -1652,6 +1680,7 @@ sample_local_codebooks_cuda_impl(
         if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
             // Initialize the per-codebook graphs before composing them.
             magpietts_cuda_sampler_sequence_mark_warm(cuda_sampler);
+            magpietts_cuda_sampler_sequence_set_key(cuda_sampler, sequence_key);
         }
     }
     if (!chain_ok) {

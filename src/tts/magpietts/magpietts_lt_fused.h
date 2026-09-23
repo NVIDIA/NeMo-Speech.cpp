@@ -87,7 +87,6 @@ bool magpietts_lt_fused_sampling_supported(const magpietts_lt_fused* fused);
 // Persistent chain: all rounds of the frame (input assembly, both layers, output projection and
 // exact top-k sampling per codebook) in a single kernel launch with software grid barriers.
 // Requires planar Q8 weights for every projection and an in-kernel sampler (top_k <= 256).
-// MAGPIETTS_LT_FUSED_CHAIN=0 disables at create time.
 bool magpietts_lt_fused_chain_supported(const magpietts_lt_fused* fused);
 bool magpietts_lt_fused_chain(
     magpietts_lt_fused* fused, void* stream, const magpietts_lt_fused_sampler* sampler, char* error,
