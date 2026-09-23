@@ -61,7 +61,7 @@ class ChannelBirthGate {
     void append(const std::vector<float>& raw, std::vector<float>& timeline);
     bool is_established(int speaker) const;
     // Frontier before which no future birth can change a frame's top speaker:
-    // the first retained frame where an unborn channel is the speaking winner.
+    // the first retained frame where an unborn channel is the raw winner.
     int64_t settled_frames() const;
 
    private:

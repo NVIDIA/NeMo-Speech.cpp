@@ -1144,6 +1144,7 @@ CacheStreamRunner::finalize() {
 
     auto drained = step();  // process any whole chunks first.
     update.new_token_ids = std::move(drained.new_token_ids);
+    update.late_punctuation = std::move(drained.late_punctuation);
 
     const int n_mels = model_->fe_config().n_mels;
     const int sub = enc_cfg_.subsampling_factor;
@@ -1189,7 +1190,7 @@ CacheStreamRunner::finalize() {
             static_cast<float>(model_->fe_config().sample_rate),
         opts_.max_alternatives);
     if (head_)
-        update.late_punctuation = head_->take_late_punctuation(/*end_of_stream=*/true);
+        update.late_punctuation += head_->take_late_punctuation(/*end_of_stream=*/true);
     return update;
 }
 

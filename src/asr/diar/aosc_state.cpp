@@ -161,7 +161,7 @@ ChannelBirthGate::settled_frames() const {
         for (int s = 1; s < n_spk_; s++)
             if (probs[s] > probs[winner])
                 winner = s;
-        if (!established_[winner] && probs[winner] >= kBirthSpeech)
+        if (!established_[winner] && probs[winner] > 0.0f)
             return frame_ - ring_frames + i;
     }
     return frame_;

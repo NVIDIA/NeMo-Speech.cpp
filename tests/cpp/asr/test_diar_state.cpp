@@ -90,13 +90,13 @@ test_birth_gate_settled_frames() {
     gate.append(repeat_frame(4, {0.99f, 0.01f, 0.01f, 0.01f}), timeline);
     require(gate.settled_frames() == 4, "gate: established speech settles immediately");
     gate.append(repeat_frame(10, {0.02f, 0.01f, 0.25f, 0.01f}), timeline);
-    require(gate.settled_frames() == 14, "gate: frames below speech probability are settled");
+    require(gate.settled_frames() == 4, "gate: a weak unborn winner holds the frontier");
     gate.append(repeat_frame(2, {0.30f, 0.01f, 0.01f, 0.80f}), timeline);
     require(
-        !gate.is_established(3) && gate.settled_frames() == 14,
+        !gate.is_established(3) && gate.settled_frames() == 4,
         "gate: an unborn winning channel holds the frontier");
     gate.append(repeat_frame(20, {0.99f, 0.01f, 0.01f, 0.01f}), timeline);
-    require(gate.settled_frames() == 14, "gate: the frontier waits for the revision window");
+    require(gate.settled_frames() == 4, "gate: the frontier waits for the revision window");
     gate.append(
         repeat_frame(ChannelBirthGate::revision_frames, {0.99f, 0.01f, 0.01f, 0.01f}), timeline);
     require(
