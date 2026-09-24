@@ -129,6 +129,25 @@ BackendTensor::alloc2d(
         ggml_set_name(tensor, name);
         return true;
     }
+    // Grow-only: a smaller or equal shape reuses the existing device buffer (cudaFree/cudaMalloc
+    // pairs on the streaming path stall other threads' launches).
+    if (buffer && ctx &&
+        ggml_backend_buffer_get_size(buffer) >= ggml_row_size(type, ne0) * (size_t)ne1) {
+        ggml_free(ctx);
+        ggml_init_params view_params = {
+            /*.mem_size   =*/ggml_tensor_overhead(),
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        ctx = ggml_init(view_params);
+        if (ctx) {
+            tensor = ggml_new_tensor_2d(ctx, type, ne0, ne1);
+            ggml_set_name(tensor, name);
+            ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+            return true;
+        }
+        tensor = nullptr;
+    }
 
     reset();
     ggml_init_params params = {
@@ -858,6 +877,15 @@ magpietts_model_load_impl(
     if (!model.backend) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
+#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
+    if (model.backend && ggml_backend_is_cuda(model.backend)) {
+        // The decoder/local-transformer stream is the latency-critical path; run it at the
+        // highest CUDA stream priority so the concurrent NanoCodec worker (priority -2) and
+        // default-priority side streams do not delay its small kernels.
+        constexpr int kHighestPriority = -100;  // clamped to the device range by ggml
+        ggml_backend_cuda_set_stream_priority(model.backend, kHighestPriority);
+    }
+#endif
     if (!model.backend) {
         fprintf(stderr, "failed to initialize ggml backend\n");
         return false;
@@ -1190,16 +1218,17 @@ ggml_tensor*
 cross_attention_cached(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x, ggml_tensor* attn_prior,
-    ggml_tensor** last_attn, bool prior_is_log) {
+    ggml_tensor** last_attn, bool prior_is_log, ggml_tensor* softmax_bias, int64_t n_kv_override) {
     const int64_t d_head = tr.n_cross_dhead;
     const int64_t n_head = tr.n_cross_head;
     const int64_t cross_dim = d_head * n_head;
     const int64_t n_q = x->ne[1];
-    const int64_t n_kv = cross_kv.text_len;
+    const int64_t n_kv = softmax_bias ? n_kv_override : cross_kv.text_len;
+    const int64_t row_stride = cross_kv.capacity > 0 ? cross_kv.capacity : cross_kv.text_len;
 
     ggml_tensor* q = linear(ctx, layer.cross_q, x);
     const size_t layer_offset =
-        (size_t)layer_index * n_kv * cross_dim * ggml_element_size(cross_kv.memory_k);
+        (size_t)layer_index * row_stride * cross_dim * ggml_element_size(cross_kv.memory_k);
 
     ggml_tensor* qh = ggml_permute(ctx, ggml_cont_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
     ggml_tensor* kh = ggml_permute(
@@ -1209,18 +1238,23 @@ cross_attention_cached(
             n_head, n_kv),
         0, 2, 1, 3);
     ggml_tensor* kq = ggml_mul_mat(ctx, kh, qh);
-    kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
     ggml_tensor* kq_soft = nullptr;
-    if (attn_prior && prior_is_log) {
-        kq_soft = ggml_soft_max(ctx, ggml_add(ctx, kq, ggml_repeat(ctx, attn_prior, kq)));
+    if (softmax_bias) {
+        // scale + additive bias (log prior and/or padding mask) + softmax in one kernel
+        kq_soft = ggml_soft_max_ext(ctx, kq, softmax_bias, 1.0f / std::sqrt((float)d_head), 0.0f);
     } else {
-        kq_soft = ggml_soft_max(ctx, kq);
-    }
-    if (attn_prior && !prior_is_log) {
-        ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
-        kq_soft = ggml_mul(ctx, kq_soft, prior);
-        ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
-        kq_soft = ggml_div(ctx, kq_soft, normalizer);
+        kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
+        if (attn_prior && prior_is_log) {
+            kq_soft = ggml_soft_max(ctx, ggml_add(ctx, kq, ggml_repeat(ctx, attn_prior, kq)));
+        } else {
+            kq_soft = ggml_soft_max(ctx, kq);
+        }
+        if (attn_prior && !prior_is_log) {
+            ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
+            kq_soft = ggml_mul(ctx, kq_soft, prior);
+            ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
+            kq_soft = ggml_div(ctx, kq_soft, normalizer);
+        }
     }
     if (last_attn) {
         const size_t offset = (size_t)(n_q - 1) * kq_soft->nb[1];
@@ -1385,11 +1419,16 @@ compute_graph(
     const magpietts_model& model, ggml_context* ctx, ggml_cgraph* gf,
     const std::vector<std::pair<std::string, std::vector<int32_t>>>& i32_inputs,
     const std::vector<std::pair<std::string, std::vector<float>>>& f32_inputs, int threads,
-    ggml_gallocr_t* keep_allocr) {
+    ggml_gallocr_t* keep_allocr, ggml_backend_t backend) {
     const ggml_nvtx::range nvtx_range("magpietts_compute_graph");
     tag_graph_first_node(gf);
+    if (!backend) {
+        backend = model.backend;
+    }
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    const bool owned = !(keep_allocr && *keep_allocr);
+    ggml_gallocr_t allocr =
+        owned ? ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)) : *keep_allocr;
     if (!allocr) {
         fprintf(stderr, "failed to create graph allocator\n");
         return false;
@@ -1407,7 +1446,9 @@ compute_graph(
             ggml_tensor* t = ggml_graph_get_tensor(gf, it.first.c_str());
             if (!t) {
                 fprintf(stderr, "missing graph input: %s\n", it.first.c_str());
-                ggml_gallocr_free(allocr);
+                if (owned) {
+                    ggml_gallocr_free(allocr);
+                }
                 return false;
             }
             magpietts_backend_tensor_set_staged(
@@ -1417,7 +1458,9 @@ compute_graph(
             ggml_tensor* t = ggml_graph_get_tensor(gf, it.first.c_str());
             if (!t) {
                 fprintf(stderr, "missing graph input: %s\n", it.first.c_str());
-                ggml_gallocr_free(allocr);
+                if (owned) {
+                    ggml_gallocr_free(allocr);
+                }
                 return false;
             }
             magpietts_backend_tensor_set_staged(
@@ -1425,18 +1468,20 @@ compute_graph(
         }
     }
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
+    if (ggml_backend_is_cpu(backend)) {
+        ggml_backend_cpu_set_n_threads(backend, threads);
     }
 
     ggml_status status = GGML_STATUS_FAILED;
     {
         const ggml_nvtx::range nvtx_compute("magpietts_graph_compute");
-        status = ggml_backend_graph_compute(model.backend, gf);
+        status = ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ggml graph compute failed: %s\n", ggml_status_to_string(status));
-        ggml_gallocr_free(allocr);
+        if (owned) {
+            ggml_gallocr_free(allocr);
+        }
         return false;
     }
 

@@ -85,7 +85,7 @@ if(GGML_CUDA)
     if(CUDAToolkit_FOUND)
         enable_language(CUDA)
         foreach(target ${MAGPIETTS_TARGETS})
-            target_sources(${target} PRIVATE magpietts_cuda_sampling.cu)
+            target_sources(${target} PRIVATE magpietts_cuda_sampling.cu magpietts_lt_fused.cu magpietts_decoder_fused.cu)
             target_compile_definitions(${target} PRIVATE GGML_USE_CUDA MAGPIETTS_CUDA_SAMPLING)
             target_link_libraries(${target} PRIVATE CUDA::cudart CUDA::cuda_driver)
             set_target_properties(${target} PROPERTIES

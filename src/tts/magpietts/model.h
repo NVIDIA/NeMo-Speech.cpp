@@ -194,6 +194,10 @@ struct magpietts_transformer {
 struct magpietts_decoder_attention {
     const std::vector<float>* prior = nullptr;
     std::vector<float>* alignment_scores = nullptr;
+    // Persistent CUDA path: enqueue the alignment readback but do not wait for it; the caller
+    // fetches it with MagpieDecoder::completeAlignment after enqueuing the sampler, so the
+    // sampler kernels follow the decoder kernel on the GPU without a host round trip.
+    bool defer_alignment = false;
 };
 
 class MagpieAttentionPriorState {

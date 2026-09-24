@@ -28,7 +28,7 @@ std::string
 unavailable_command(const std::string& command) {
     (void)command;
 #if !defined(NEMO_SPEECH_CLI_ASR)
-    if (command == "transcribe" || command == "bench")
+    if (command == "transcribe")
         return "this build does not include ASR; rebuild with -DNEMO_SPEECH_BUILD_ASR=ON";
 #endif
 #if !defined(NEMO_SPEECH_CLI_DIAR)
@@ -93,9 +93,7 @@ print_help(const char* program) {
 #if defined(NEMO_SPEECH_CLI_TTS)
         "  synthesize   Synthesize speech to a WAV file\n"
 #endif
-#if defined(NEMO_SPEECH_CLI_ASR)
-        "  bench        Benchmark an end-to-end ASR workload\n"
-#endif
+        "  bench        Benchmark an end-to-end workload (asr, tts, diarize, ...)\n"
         "  pull         Download a pinned model from Hugging Face\n"
         "  model        List, pull, or inspect models\n"
         "  doctor       Inspect runtime and device availability\n"
@@ -183,12 +181,10 @@ main(int argc, char** argv) {
             return 0;
         }
 #endif
-#if defined(NEMO_SPEECH_CLI_ASR)
         if (std::strcmp(argv[2], "bench") == 0) {
             print_bench_help(argv[0]);
             return 0;
         }
-#endif
         if (std::strcmp(argv[2], "pull") == 0) {
             std::printf("Usage: %s pull REPO\n", argv[0]);
         } else if (std::strcmp(argv[2], "model") == 0)
@@ -232,10 +228,8 @@ main(int argc, char** argv) {
         return run_session(
             "synthesize", argc, argv, [&] { return command_synthesize(argc - 2, argv + 2); });
 #endif
-#if defined(NEMO_SPEECH_CLI_ASR)
     if (std::strcmp(argv[1], "bench") == 0)
         return run_session("bench", argc, argv, [&] { return command_bench(argc - 2, argv + 2); });
-#endif
     if (std::strcmp(argv[1], "model") == 0)
         return command_model(argc - 2, argv + 2);
     if (std::strcmp(argv[1], "pull") == 0)

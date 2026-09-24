@@ -116,15 +116,16 @@ index 7429cc45..0c570639 100644
          case GGML_OP_SET_ROWS:
 diff --git a/src/ggml-cuda/fused-attention.cu b/src/ggml-cuda/fused-attention.cu
 new file mode 100644
-index 00000000..0a1c1766
+index 00000000..84e1c025
 --- /dev/null
 +++ b/src/ggml-cuda/fused-attention.cu
-@@ -0,0 +1,1650 @@
+@@ -0,0 +1,1720 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +#include "fused-attention.cuh"
 +
 +#include <atomic>
++#include <cstdlib>
 +#include <type_traits>
 +
 +// Fused multi-head attention with optional relative-position terms and a
@@ -188,14 +189,6 @@ index 00000000..0a1c1766
 +        __low2float(values[1]), __high2float(values[1]));
 +}
 +
-+static __device__ __forceinline__ float2 attention_load2(const float * ptr) {
-+    return *reinterpret_cast<const float2 *>(ptr);
-+}
-+
-+static __device__ __forceinline__ float2 attention_load2(const half * ptr) {
-+    return __half22float2(*reinterpret_cast<const half2 *>(ptr));
-+}
-+
 +template <typename T, bool Cached>
 +static __device__ __forceinline__ float4 attention_load_kv4(
 +        const T * chunk_head, const float * cache_head, int j, int cache_len,
@@ -228,23 +221,6 @@ index 00000000..0a1c1766
 +        return (float) chunk_head[(size_t) (j - cache_len) * chunk_sj + d];
 +    }
 +    return (float) chunk_head[(size_t) j * chunk_sj + d];
-+}
-+
-+template <typename T, bool Cached>
-+static __device__ __forceinline__ float2 attention_load_kv2(
-+        const T * chunk_head, const float * cache_head, int j, int cache_len,
-+        int ring_head, long chunk_sj, long cache_sj, int d2) {
-+    if constexpr (Cached) {
-+        if (j < cache_len) {
-+            int physical_j = ring_head + j;
-+            if (physical_j >= cache_len) {
-+                physical_j -= cache_len;
-+            }
-+            return attention_load2(cache_head + (size_t) physical_j * cache_sj + d2);
-+        }
-+        return attention_load2(chunk_head + (size_t) (j - cache_len) * chunk_sj + d2);
-+    }
-+    return attention_load2(chunk_head + (size_t) j * chunk_sj + d2);
 +}
 +
 +// Each thread owns one feature and appends only the current chunk to its
@@ -286,8 +262,15 @@ index 00000000..0a1c1766
 +    }
 +}
 +
++// Split-KV variant of the q=1, d_k=64 cached kernel (flash-decoding style).
++// grid = (n_head, splits, batch). Each block scores a contiguous key range with
++// four keys per warp-iteration (8 lanes x 8 features per key), accumulates a
++// partial (max, sum, context[64]) and the last block to finish for a
++// (batch, head) pair combines the partials. splits == 1 writes the result
++// directly. Partials layout: [batch][head][split][66] floats.
 +template <typename T, bool Cached>
-+static __global__ void fused_cached_attention_q1_d64_kernel(
++static __global__ void __launch_bounds__(256)
++fused_cached_attention_q1_d64_split_kernel(
 +        const float * __restrict__ Q, const T * __restrict__ K,
 +        const T * __restrict__ V, const float * __restrict__ mask,
 +        float * __restrict__ ctx, const float * __restrict__ Kcache,
@@ -297,17 +280,21 @@ index 00000000..0a1c1766
 +        int kv, int cache_len, float scale,
 +        long q_sh, long q_sb, long k_sj, long k_sh, long k_sb,
 +        long v_sj, long v_sh, long v_sb, long cache_sj, long cache_ss,
-+        long o_sh, long o_sb, long m_sb) {
++        long o_sh, long o_sb, long m_sb,
++        float * __restrict__ partials, int * __restrict__ counters, int splits) {
 +    constexpr int d_k = 64;
 +    constexpr int warps = 8;
 +    constexpr int value_parts = 4;
++    constexpr int partial_stride = d_k + 2;
 +    extern __shared__ float sh[];
-+    float * query = sh;
-+    float * scores = query + d_k;
-+    float * reduce = scores + kv;
-+    float * value_partials = reduce + warps;
++    float * query = sh;                       // 64
++    float * reduce = query + d_k;             // warps
++    float * value_partials = reduce + warps;  // value_parts * 64
++    float * scores = value_partials + value_parts * d_k;  // range length
++    __shared__ int s_last;
 +
 +    const int h = blockIdx.x;
++    const int split = blockIdx.y;
 +    const int b = blockIdx.z;
 +    const int tid = threadIdx.x;
 +    const int warp = tid >> 5;
@@ -318,52 +305,68 @@ index 00000000..0a1c1766
 +    const int slot = Cached ? slot_ids[b] : 0;
 +    const int ring_head = Cached ? ring_heads[b] : 0;
 +    const int key_begin = active_lengths ? cache_len - active_lengths[b] : 0;
-+    const float * Kch = Cached
-+        ? Kcache + (size_t) slot * cache_ss + (size_t) h * d_k
-+        : nullptr;
-+    const float * Vch = Cached
-+        ? Vcache + (size_t) slot * cache_ss + (size_t) h * d_k
-+        : nullptr;
++    const float * Kch = Cached ? Kcache + (size_t) slot * cache_ss + (size_t) h * d_k : nullptr;
++    const float * Vch = Cached ? Vcache + (size_t) slot * cache_ss + (size_t) h * d_k : nullptr;
 +    const float * Mb = mask ? mask + (size_t) b * m_sb : nullptr;
++
++    const int n_keys = kv - key_begin;
++    const int per_split = (n_keys + splits - 1) / splits;
++    const int j0 = key_begin + split * per_split;
++    const int j1 = min(kv, j0 + per_split);
++    const int range = max(0, j1 - j0);
 +
 +    if (tid < d_k) {
 +        query[tid] = Qh[tid];
 +    }
 +    __syncthreads();
 +
-+    const int d2 = lane * 2;
-+    const float2 q2 = attention_load2(query + d2);
++    // ---- scores: 4 keys per warp iteration, 8 lanes x 8 features per key ----
++    const int group = lane >> 3;       // key within the warp's 4-key group
++    const int sub = lane & 7;          // feature block: sub*8 .. sub*8+7
++    const int d8 = sub * 8;
++    const float4 qa = *reinterpret_cast<const float4 *>(query + d8);
++    const float4 qb = *reinterpret_cast<const float4 *>(query + d8 + 4);
 +    float local_max = -INFINITY;
-+    for (int j = key_begin + warp; j < kv; j += warps) {
-+        const float2 k2 = attention_load_kv2<T, Cached>(
-+            Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d2);
-+        float score = k2.x * q2.x + k2.y * q2.y;
-+        score = attention_warp_sum(score);
-+        if (lane == 0) {
++    for (int base = j0 + warp * 4; base < j1; base += warps * 4) {
++        const int j = base + group;
++        float score = 0.0f;
++        if (j < j1) {
++            const float4 ka = attention_load_kv4<T, Cached>(Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d8);
++            const float4 kb = attention_load_kv4<T, Cached>(Kh, Kch, j, cache_len, ring_head, k_sj, cache_sj, d8 + 4);
++            score = ka.x * qa.x + ka.y * qa.y + ka.z * qa.z + ka.w * qa.w
++                  + kb.x * qb.x + kb.y * qb.y + kb.z * qb.z + kb.w * qb.w;
++        }
++        // reduce across the 8 lanes of this key group
++        score += __shfl_xor_sync(0xffffffff, score, 1);
++        score += __shfl_xor_sync(0xffffffff, score, 2);
++        score += __shfl_xor_sync(0xffffffff, score, 4);
++        if (sub == 0 && j < j1) {
 +            score = score * scale + (Mb ? Mb[j] : 0.0f);
-+            scores[j] = score;
++            scores[j - j0] = score;
 +            local_max = fmaxf(local_max, score);
 +        }
++    }
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, offset));
 +    }
 +    if (lane == 0) {
 +        reduce[warp] = local_max;
 +    }
 +    __syncthreads();
-+    if (tid == 0) {
-+        float maximum = reduce[0];
++    float maximum = reduce[0];
 +#pragma unroll
-+        for (int w = 1; w < warps; ++w) {
-+            maximum = fmaxf(maximum, reduce[w]);
-+        }
-+        reduce[0] = maximum;
++    for (int w = 1; w < warps; ++w) {
++        maximum = fmaxf(maximum, reduce[w]);
 +    }
 +    __syncthreads();
-+    const float maximum = reduce[0];
 +
++    // A fully masked split has maximum == -inf: give it zero weight instead of NaN.
++    const bool empty_split = maximum == -INFINITY;
 +    float local_sum = 0.0f;
-+    for (int j = key_begin + tid; j < kv; j += blockDim.x) {
-+        const float weight = __expf(scores[j] - maximum);
-+        scores[j] = weight;
++    for (int i = tid; i < range; i += 256) {
++        const float weight = empty_split ? 0.0f : __expf(scores[i] - maximum);
++        scores[i] = weight;
 +        local_sum += weight;
 +    }
 +    local_sum = attention_warp_sum(local_sum);
@@ -371,32 +374,87 @@ index 00000000..0a1c1766
 +        reduce[warp] = local_sum;
 +    }
 +    __syncthreads();
-+    if (tid == 0) {
-+        float sum = reduce[0];
++    float sum = reduce[0];
 +#pragma unroll
-+        for (int w = 1; w < warps; ++w) {
-+            sum += reduce[w];
-+        }
-+        reduce[0] = sum;
++    for (int w = 1; w < warps; ++w) {
++        sum += reduce[w];
 +    }
-+    __syncthreads();
 +
++    // ---- context partial: 4 key-parts x 64 features, 4-way unrolled ----
 +    const int d = tid & (d_k - 1);
 +    const int part = tid / d_k;
-+    float context = 0.0f;
-+    for (int j = key_begin + part; j < kv; j += value_parts) {
-+        context += scores[j] * attention_load_kv<T, Cached>(
-+            Vh, Vch, j, cache_len, ring_head, v_sj, cache_sj, d);
++    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
++    int i = part;
++    for (; i + 3 * value_parts < range; i += 4 * value_parts) {
++        c0 += scores[i] * attention_load_kv<T, Cached>(Vh, Vch, j0 + i, cache_len, ring_head, v_sj, cache_sj, d);
++        c1 += scores[i + value_parts] * attention_load_kv<T, Cached>(Vh, Vch, j0 + i + value_parts, cache_len, ring_head, v_sj, cache_sj, d);
++        c2 += scores[i + 2 * value_parts] * attention_load_kv<T, Cached>(Vh, Vch, j0 + i + 2 * value_parts, cache_len, ring_head, v_sj, cache_sj, d);
++        c3 += scores[i + 3 * value_parts] * attention_load_kv<T, Cached>(Vh, Vch, j0 + i + 3 * value_parts, cache_len, ring_head, v_sj, cache_sj, d);
 +    }
-+    value_partials[part * d_k + d] = context;
++    for (; i < range; i += value_parts) {
++        c0 += scores[i] * attention_load_kv<T, Cached>(Vh, Vch, j0 + i, cache_len, ring_head, v_sj, cache_sj, d);
++    }
++    value_partials[part * d_k + d] = (c0 + c1) + (c2 + c3);
 +    __syncthreads();
-+    if (tid < d_k) {
-+        context = value_partials[tid];
++
++    float * out = ctx + (size_t) b * o_sb + (size_t) h * o_sh;
++    if (splits == 1) {
++        if (tid < d_k) {
++            float context = value_partials[tid];
 +#pragma unroll
-+        for (int part_index = 1; part_index < value_parts; ++part_index) {
-+            context += value_partials[part_index * d_k + tid];
++            for (int p = 1; p < value_parts; ++p) {
++                context += value_partials[p * d_k + tid];
++            }
++            out[tid] = context / sum;
 +        }
-+        ctx[(size_t) b * o_sb + (size_t) h * o_sh + tid] = context / reduce[0];
++        return;
++    }
++
++    float * my_partial = partials + (((size_t) b * gridDim.x + h) * splits + split) * partial_stride;
++    if (tid < d_k) {
++        float context = value_partials[tid];
++#pragma unroll
++        for (int p = 1; p < value_parts; ++p) {
++            context += value_partials[p * d_k + tid];
++        }
++        my_partial[tid] = context;
++    }
++    if (tid == 0) {
++        my_partial[d_k] = maximum;
++        my_partial[d_k + 1] = sum;
++    }
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) {
++        const int done = atomicAdd(counters + (size_t) b * gridDim.x + h, 1);
++        s_last = (done == splits - 1) ? 1 : 0;
++    }
++    __syncthreads();
++    if (!s_last) {
++        return;
++    }
++    __threadfence();
++    const float * all = partials + (((size_t) b * gridDim.x + h) * splits) * partial_stride;
++    if (tid < d_k) {
++        float gmax = -INFINITY;
++        for (int s = 0; s < splits; ++s) {
++            gmax = fmaxf(gmax, all[s * partial_stride + d_k]);
++        }
++        float gsum = 0.0f;
++        float gctx = 0.0f;
++        for (int s = 0; s < splits; ++s) {
++            const float m = all[s * partial_stride + d_k];
++            if (m == -INFINITY) {
++                continue;  // fully masked split
++            }
++            const float w = __expf(m - gmax);
++            gsum += w * all[s * partial_stride + d_k + 1];
++            gctx += w * all[s * partial_stride + tid];
++        }
++        out[tid] = gctx / gsum;
++    }
++    if (tid == 0) {
++        counters[(size_t) b * gridDim.x + h] = 0;
 +    }
 +}
 +
@@ -1541,26 +1599,38 @@ index 00000000..0a1c1766
 +        constexpr int threads = 256;
 +        constexpr int warps = threads / 32;
 +        constexpr int value_partials = 4 * 64;
-+        const size_t specialized_shmem =
-+            ((size_t) 64 + kv_len + warps + value_partials) * sizeof(float);
-+        GGML_ASSERT(specialized_shmem <= max_shmem);
-+        const dim3 specialized_grid(n_head, 1, batch);
++        // Split the key range across blocks (~96 keys per block) so a
++        // (head, batch) pair uses several SMs when the cache is long.
++        int splits = (kv_len + 95) / 96;
++        splits = splits < 1 ? 1 : (splits > 8 ? 8 : splits);
++        const int per_split = (kv_len + splits - 1) / splits;
++        const size_t split_shmem =
++            ((size_t) 64 + warps + value_partials + per_split) * sizeof(float);
++        GGML_ASSERT(split_shmem <= max_shmem);
++        const dim3 split_grid(n_head, splits, batch);
++        ggml_cuda_pool_alloc<float> partials(ctx.pool(), (size_t) batch * n_head * splits * 66);
++        ggml_cuda_pool_alloc<int> counters(ctx.pool(), (size_t) batch * n_head);
++        if (splits > 1) {
++            CUDA_CHECK(cudaMemsetAsync(counters.get(), 0, (size_t) batch * n_head * sizeof(int), stream));
++        }
 +        if (k->type == GGML_TYPE_F16) {
-+            fused_cached_attention_q1_d64_kernel<half, true>
-+                <<<specialized_grid, threads, specialized_shmem, stream>>>(
++            fused_cached_attention_q1_d64_split_kernel<half, true>
++                <<<split_grid, threads, split_shmem, stream>>>(
 +                    (const float *) q->data, (const half *) k->data, (const half *) v->data,
 +                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
 +                    cache_k, cache_v, active_slots, active_ring_heads, active_lengths,
 +                    kv_len, cache_len, scale, q_sh, q_sb, k_sj, k_sh, k_sb,
-+                    v_sj, v_sh, v_sb, cache_sj, cache_ss, o_sh, o_sb, m_sb);
++                    v_sj, v_sh, v_sb, cache_sj, cache_ss, o_sh, o_sb, m_sb,
++                    partials.get(), counters.get(), splits);
 +        } else {
-+            fused_cached_attention_q1_d64_kernel<float, true>
-+                <<<specialized_grid, threads, specialized_shmem, stream>>>(
++            fused_cached_attention_q1_d64_split_kernel<float, true>
++                <<<split_grid, threads, split_shmem, stream>>>(
 +                    (const float *) q->data, (const float *) k->data, (const float *) v->data,
 +                    mask ? (const float *) mask->data : nullptr, (float *) dst->data,
 +                    cache_k, cache_v, active_slots, active_ring_heads, active_lengths,
 +                    kv_len, cache_len, scale, q_sh, q_sb, k_sj, k_sh, k_sb,
-+                    v_sj, v_sh, v_sb, cache_sj, cache_ss, o_sh, o_sb, m_sb);
++                    v_sj, v_sh, v_sb, cache_sj, cache_ss, o_sh, o_sb, m_sb,
++                    partials.get(), counters.get(), splits);
 +        }
 +        update_cache();
 +        return;
@@ -2390,7 +2460,7 @@ index f3c4836a..00000000
 -    }
 -}
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 1b7e26e6..b9700eae 100644
+index 6b934a1e..826d4a59 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -25,7 +25,7 @@
@@ -2413,7 +2483,7 @@ index 1b7e26e6..b9700eae 100644
              break;
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
-@@ -5975,7 +5975,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5976,7 +5976,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  #endif // GGML_USE_MUSA
          case GGML_OP_FLASH_ATTN_EXT:
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);

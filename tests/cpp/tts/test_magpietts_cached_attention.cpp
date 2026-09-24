@@ -81,6 +81,98 @@ reference_attention(
     return output;
 }
 
+// A long cache with its leading half masked out runs the split-KV kernel with fully masked
+// splits; those must contribute nothing (not NaN). Returns the max error, or -1 on failure.
+float
+masked_split_error(ggml_backend_t backend) {
+    constexpr int cap = 2048;
+    const int kv = cap + 1;
+    const int masked = cap / 2;
+    ggml_init_params params = {ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true};
+    ggml_context* ctx = ggml_init(params);
+    ggml_tensor* q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kHeadDim, 1, kHeads, kBatch);
+    ggml_tensor* k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kHeadDim, 1, kHeads, kBatch);
+    ggml_tensor* v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kHeadDim, 1, kHeads, kBatch);
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv, 1);
+    ggml_tensor* cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kFeatures * cap, kBatch, 2);
+    ggml_tensor* slot_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kBatch);
+    ggml_tensor* cache_state = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kBatch, 2);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    ggml_tensor* output =
+        ggml_fused_attn_cached(ctx, q, k, v, mask, cache, slot_ids, cache_state, cap, scale, true);
+    ggml_cgraph* graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return -1.0f;
+    }
+
+    std::vector<float> q_data(ggml_nelements(q)), k_data(q_data.size()), v_data(q_data.size());
+    std::vector<float> cache_data(ggml_nelements(cache)), mask_data(kv);
+    for (size_t i = 0; i < q_data.size(); ++i) {
+        q_data[i] = 0.25f * std::sin(0.013f * static_cast<float>(i + 1));
+        k_data[i] = 0.30f * std::cos(0.017f * static_cast<float>(i + 3));
+        v_data[i] = 0.35f * std::sin(0.019f * static_cast<float>(i + 5));
+    }
+    for (size_t i = 0; i < cache_data.size(); ++i)
+        cache_data[i] = 0.40f * std::cos(0.007f * static_cast<float>(i + 7));
+    for (int j = 0; j < kv; ++j) mask_data[j] = j < masked ? -INFINITY : 0.0f;
+    const int32_t slots[kBatch] = {0, 1};
+    const int32_t state[kBatch * 2] = {0, 0, cap, cap};  // ring head 0, all rows valid
+    ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
+    ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size() * sizeof(float));
+    ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size() * sizeof(float));
+    ggml_backend_tensor_set(cache, cache_data.data(), 0, cache_data.size() * sizeof(float));
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    ggml_backend_tensor_set(slot_ids, slots, 0, sizeof(slots));
+    ggml_backend_tensor_set(cache_state, state, 0, sizeof(state));
+    const bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    std::vector<float> actual(q_data.size());
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    if (!ok)
+        return -1.0f;
+
+    auto row = [&](int d, int head, int position, int batch, int plane) {
+        return static_cast<size_t>(d) + static_cast<size_t>(kHeadDim) * head +
+               static_cast<size_t>(kFeatures) * position +
+               static_cast<size_t>(kFeatures) * cap * batch +
+               static_cast<size_t>(kFeatures) * cap * kBatch * plane;
+    };
+    float max_error = 0.0f;
+    for (int batch = 0; batch < kBatch; ++batch) {
+        for (int head = 0; head < kHeads; ++head) {
+            std::vector<float> scores;
+            float maximum = -INFINITY;
+            for (int j = masked; j <= cap; ++j) {
+                float score = 0.0f;
+                for (int d = 0; d < kHeadDim; ++d)
+                    score += q_data[qkv_index(d, head, batch)] *
+                             (j == cap ? k_data[qkv_index(d, head, batch)]
+                                       : cache_data[row(d, head, j, batch, 0)]);
+                scores.push_back(score * scale);
+                maximum = std::max(maximum, scores.back());
+            }
+            float denominator = 0.0f;
+            for (float& score : scores) denominator += (score = std::exp(score - maximum));
+            for (int d = 0; d < kHeadDim; ++d) {
+                float context = 0.0f;
+                for (int j = masked; j <= cap; ++j)
+                    context += scores[static_cast<size_t>(j - masked)] *
+                               (j == cap ? v_data[qkv_index(d, head, batch)]
+                                         : cache_data[row(d, head, j, batch, 1)]);
+                const float got = actual[qkv_index(d, head, batch)];
+                if (!std::isfinite(got))
+                    return -1.0f;
+                max_error = std::max(max_error, std::fabs(got - context / denominator));
+            }
+        }
+    }
+    return max_error;
+}
+
 }  // namespace
 
 int
@@ -213,8 +305,13 @@ main() {
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+    const float masked_error = masked_split_error(backend);
     ggml_backend_free(backend);
 
+    if (masked_error < 0.0f || masked_error > 2.0e-5f) {
+        std::fprintf(stderr, "FAIL: masked split-KV attention error %.8g\n", masked_error);
+        return 1;
+    }
     if (max_error > 2.0e-5f) {
         std::fprintf(stderr, "FAIL: cached attention max error %.8g\n", max_error);
         return 1;

@@ -36,7 +36,7 @@ struct WarmupOptions {
     bool tts = true;
     bool s2s = true;
     std::string tts_text = "Hello";
-    int tts_steps = 1;
+    int tts_steps = 8;  // enough decoder frames to build the fused runtime and codec graphs
 };
 
 struct EngineRegistryConfig {
