@@ -86,7 +86,8 @@ class TranslateWorkload : public Workload {
     std::string mismatch_key() const override { return "translation_mismatches"; }
     void summarize_run(
         Value& run, const std::vector<ItemResult>& items, double wall_seconds) const override {
-        const double bytes = static_cast<double>(corpus_bytes_) * items.size() / texts_.size();
+        double bytes = 0.0;
+        for (const auto& item : items) bytes += static_cast<double>(texts_[item.input].size());
         run["input_bytes_per_second"] = bytes / wall_seconds;
     }
     std::vector<Column> run_columns() const override {

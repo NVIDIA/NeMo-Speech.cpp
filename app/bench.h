@@ -39,6 +39,7 @@ struct ItemResult {
     std::vector<std::pair<std::string, double>> metrics;
     // Per-item value lists (e.g. every chunk gap), pooled across items.
     std::vector<std::pair<std::string, std::vector<double>>> samples = {};
+    size_t input = 0;  // index of the processed input (set by the harness)
 };
 
 // A table column; `value` reads a run object (summary table) or a per-input

@@ -380,9 +380,9 @@ nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
         ggml_init_params probe_params = {ggml_tensor_overhead() * 8, nullptr, true};
         ggml_context* probe = ggml_init(probe_params);
         ggml_tensor* x = ggml_new_tensor_3d(probe, GGML_TYPE_F32, 64, 16, 1);
-        ggml_tensor* w = ggml_new_tensor_3d(probe, GGML_TYPE_F16, 16, 16, 3);
+        ggml_tensor* w = ggml_new_tensor_3d(probe, GGML_TYPE_F16, 16, 16, 1);
         ggml_tensor* op =
-            ggml_conv1d_fused(probe, x, nullptr, w, nullptr, nullptr, nullptr, 3, 1, 16, 0, 0.01f);
+            ggml_conv1d_fused(probe, x, nullptr, w, nullptr, nullptr, nullptr, 1, 1, 16, 0, 0.01f);
         const bool ok = ggml_backend_supports_op(model.backend, op);
         ggml_free(probe);
         if (!ok) {

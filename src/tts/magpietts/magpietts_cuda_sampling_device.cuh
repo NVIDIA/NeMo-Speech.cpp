@@ -72,10 +72,10 @@ sampled_logit(
 static constexpr int MAGPIETTS_CUDA_MAX_FAST_TOPK = 256;
 
 // Monotone key: ascending key order == descending logit order (larger logit -> smaller
-// key), bit-exact and invertible.
+// key). -0 maps to +0 so equal logits always tie on the lower id.
 static __device__ __forceinline__ uint32_t
 descending_key(float f) {
-    const uint32_t bits = __float_as_uint(f);
+    const uint32_t bits = f == 0.0f ? 0u : __float_as_uint(f);
     const uint32_t ascending = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
     return ~ascending;
 }
@@ -188,7 +188,7 @@ struct magpietts_sample_fast_shared {
     unsigned long long s_best;  // Gumbel-max fast path: (key of the best score) << 32 | id
 };
 
-// Per-item uniform in (0, 1] for the Gumbel draw: counter-based on (seed, frame, codebook, id),
+// Per-item uniform in (0, 1) for the Gumbel draw: counter-based on (seed, frame, codebook, id),
 // so runs are reproducible and every item's draw is independent of the others.
 static __device__ __forceinline__ float
 gumbel_u01(uint64_t seed, int frame_index, int codebook, int id) {
@@ -196,7 +196,8 @@ gumbel_u01(uint64_t seed, int frame_index, int codebook, int id) {
                      (0xabc98388fb8fac03ULL * (uint64_t)(codebook + 1)) ^
                      (0x9e3779b97f4a7c15ULL * (uint64_t)(id + 1));
     const uint64_t r = splitmix64_next(state);
-    return (float)((r >> 40) + 1) * (1.0f / 16777217.0f);
+    // The top draw rounds to 1.0f; keep it below one so -log(-log(u)) stays finite.
+    return fminf((float)((r >> 40) + 1) * (1.0f / 16777217.0f), 0x1.fffffep-1f);
 }
 
 

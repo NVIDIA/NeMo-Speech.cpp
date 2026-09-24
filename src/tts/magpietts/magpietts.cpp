@@ -1320,9 +1320,10 @@ stream_magpie_to_audio(
         }
         ~chunk_prefetch_state() { join(); }
     } chunk_prefetch;
-    const bool prefetch_enabled =
-        longform_active && use_cuda_sampling && params.use_local_transformer && params.use_cfg &&
-        params.use_kv_cache && token_chunks.size() > 1 && workspace.ensurePrefetchBackend();
+    const bool prefetch_enabled = longform_active && use_cuda_sampling &&
+                                  params.use_local_transformer && params.use_cfg &&
+                                  params.use_kv_cache && h.dec_kernel == 1 &&
+                                  token_chunks.size() > 1 && workspace.ensurePrefetchBackend();
     int prefetch_max_window = 0;
     if (longform_active && params.use_kv_cache) {
         // Size the cross caches once for the widest text window so the persistent decoder

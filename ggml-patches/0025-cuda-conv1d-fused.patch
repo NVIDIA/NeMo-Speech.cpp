@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index d403756e..a8f96799 100644
+index d403756e..e40cf62c 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -584,6 +584,7 @@ extern "C" {
@@ -10,13 +10,14 @@ index d403756e..a8f96799 100644
  
          GGML_OP_COUNT,
      };
-@@ -2498,6 +2499,53 @@ extern "C" {
+@@ -2498,6 +2499,54 @@ extern "C" {
              float                 scale,
              bool                  merge_heads);
  
 +    // Fused causal 1-D convolution over [T, C] activations (T contiguous, CUDA only):
 +    //   y[co][t] = bias[co] + sum_{ci,k} act(xcat[ci][t + k*dilation]) * w[k][ci][co]
-+    // where xcat = [cache | x] along T (cache may be NULL) and act is an optional half-snake
++    // where xcat = [cache | x] along T (cache holds exactly (kernel - 1) * dilation columns, or
++    // is NULL when that is 0) and act is an optional half-snake
 +    // activation (alpha/alpha_inv over the first snake_channels channels, leaky-relu(slope) on
 +    // the rest; pass alpha == NULL for identity). w_packed is F16 [cin_pad, cout_pad, K]
 +    // (ne0 = cin_pad; both paddings multiples of 16, zero filled). Output F32 [T_out, cout].
@@ -93,11 +94,14 @@ index 0c570639..f20b8bcb 100644
          case GGML_OP_CPY:
 diff --git a/src/ggml-cuda/conv1d-fused.cu b/src/ggml-cuda/conv1d-fused.cu
 new file mode 100644
-index 00000000..e66928b3
+index 00000000..336ba959
 --- /dev/null
 +++ b/src/ggml-cuda/conv1d-fused.cu
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,483 @@
 +#include "conv1d-fused.cuh"
++
++#include <map>
++#include <mutex>
 +
 +// Fused causal 1-D convolution as an implicit GEMM on tensor cores (mma.sync m16n8k16, F16 in,
 +// F32 accumulate):
@@ -476,16 +480,19 @@ index 00000000..e66928b3
 +    return true;
 +}
 +
-+// Split-K scratch: partial tiles plus arrival counters, one static allocation per device.
-+// Launches on a stream are serialized and every launch's reduction completes inside it, so the
-+// buffer is reused without synchronization; counters are zero-initialized once and reset by the
-+// last block of every tile. (A per-op pool allocation here caused host-side frees and stalls.)
++// Split-K scratch: partial tiles plus arrival counters, one allocation per CUDA stream.
++// Launches on a stream are serialized and every launch's reduction completes inside it, so a
++// stream's buffer is reused without synchronization, and kernels on different streams never share
++// one. Counters are zero-initialized once and reset by the last block of every tile. (A per-op
++// pool allocation here caused host-side frees and stalls.)
 +constexpr size_t CF_SCRATCH_FLOATS = 1u << 20;  // 4 MB of partials
 +constexpr int    CF_MAX_TILES      = 4096;
 +struct conv1d_fused_scratch { float * partials = nullptr; int * counters = nullptr; };
-+static conv1d_fused_scratch & conv1d_fused_get_scratch(int device) {
-+    static conv1d_fused_scratch scratch[GGML_CUDA_MAX_DEVICES];
-+    conv1d_fused_scratch & sc = scratch[device];
++static conv1d_fused_scratch & conv1d_fused_get_scratch(int device, cudaStream_t stream) {
++    static std::mutex mutex;
++    static std::map<std::pair<int, cudaStream_t>, conv1d_fused_scratch> scratch;
++    std::lock_guard<std::mutex> lock(mutex);
++    conv1d_fused_scratch & sc = scratch[{device, stream}];
 +    if (!sc.partials) {
 +        CUDA_CHECK(cudaMalloc(&sc.partials, CF_SCRATCH_FLOATS * sizeof(float)));
 +        CUDA_CHECK(cudaMalloc(&sc.counters, CF_MAX_TILES * sizeof(int)));
@@ -557,7 +564,7 @@ index 00000000..e66928b3
 +    p.n_chunks = p.cin_pad / CF_BK;
 +
 +    geometry g = plan(p);
-+    conv1d_fused_scratch & sc = conv1d_fused_get_scratch(ctx.device);
++    conv1d_fused_scratch & sc = conv1d_fused_get_scratch(ctx.device, ctx.stream());
 +    if (g.partial_floats > CF_SCRATCH_FLOATS || g.tiles_m * g.tiles_n > CF_MAX_TILES) {
 +        // too large for the static scratch: no split-K
 +        g.splits = 1;
@@ -585,7 +592,7 @@ index 00000000..97bb27e1
 +bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op, int cc);
 +void ggml_cuda_op_conv1d_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 9dad7391..e3647155 100644
+index e9a7c373..20841c2f 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -26,6 +26,7 @@
@@ -596,7 +603,7 @@ index 9dad7391..e3647155 100644
  #include "ggml-cuda/getrows.cuh"
  #include "ggml-cuda/im2col.cuh"
  #include "ggml-cuda/mmf.cuh"
-@@ -3319,6 +3320,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -3322,6 +3323,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_FUSED_ATTN:
              ggml_cuda_op_fused_attention(ctx, dst);
              break;
@@ -606,7 +613,7 @@ index 9dad7391..e3647155 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -6376,6 +6380,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6441,6 +6445,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FUSED_ATTN:
              return (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0;  // d_k power of two
@@ -616,7 +623,7 @@ index 9dad7391..e3647155 100644
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
 diff --git a/src/ggml.c b/src/ggml.c
-index cc2e1858..a5f062c5 100644
+index cc2e1858..043c2efb 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -1080,9 +1080,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -643,7 +650,7 @@ index cc2e1858..a5f062c5 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5548,6 +5550,98 @@ struct ggml_tensor * ggml_fused_attn_cached(
+@@ -5548,6 +5550,100 @@ struct ggml_tensor * ggml_fused_attn_cached(
          merge_heads);
  }
  
@@ -666,10 +673,12 @@ index cc2e1858..a5f062c5 100644
 +    GGML_ASSERT(w_packed->ne[0] >= x->ne[1] && (w_packed->ne[0] % 16) == 0);  // cin_pad
 +    GGML_ASSERT(w_packed->ne[1] >= cout && (w_packed->ne[1] % 16) == 0);       // cout_pad
 +    GGML_ASSERT(bias == NULL || ggml_nelements(bias) == cout);  // [cout] or [1, cout, 1]
-+    GGML_ASSERT(cache == NULL || (cache->type == GGML_TYPE_F32 && cache->ne[1] == x->ne[1]));
++    const int64_t pad = (int64_t) (kernel - 1) * dilation;
++    GGML_ASSERT(cache == NULL || (cache->type == GGML_TYPE_F32 && cache->ne[0] == pad && cache->ne[1] == x->ne[1]));
++    GGML_ASSERT(cache != NULL || pad == 0);
 +    GGML_ASSERT((alpha == NULL) == (alpha_inv == NULL));
 +    const int64_t cache_len = cache ? cache->ne[0] : 0;
-+    const int64_t t_out = cache_len + x->ne[0] - (int64_t) (kernel - 1) * dilation;
++    const int64_t t_out = cache_len + x->ne[0] - pad;
 +    GGML_ASSERT(t_out > 0);
 +
 +    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t_out, cout, 1);

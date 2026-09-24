@@ -318,6 +318,7 @@ run_bench(int argc, char** argv) {
                             return;
                         const auto item_start = Clock::now();
                         results[work] = workload->run(work % inputs);
+                        results[work].input = work % inputs;
                         latency[work] =
                             std::chrono::duration<double, std::milli>(Clock::now() - item_start)
                                 .count();

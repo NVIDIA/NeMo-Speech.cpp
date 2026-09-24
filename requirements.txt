@@ -1,7 +1,7 @@
 # Model conversion dependencies. The C++ runtime does not require Python.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-gguf>=0.1.0
+gguf>=0.10.0
 huggingface-hub>=0.25,<2
 librosa>=0.10,<1
 numpy~=1.26.4
