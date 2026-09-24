@@ -51,8 +51,8 @@ asr:
 
 # This model also enables word-level speaker tags on ASR responses.
 diar:
-  model_path: nvidia/diar_streaming_sortformer_4spk-v2
-  preset: streaming             # streaming | offline (larger chunks and caches)
+  model_path: nvidia/Nemotron-3-Diarization
+  # preset: v3-offline         # default follows the model; V3: v3-streaming | v3-offline, V2: streaming | offline
 
 tts:
   enabled: true                 # true | false | auto

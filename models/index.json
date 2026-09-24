@@ -2,7 +2,7 @@
   "schema_version": 1,
   "defaults": {
     "asr": "nvidia/nemotron-3.5-asr-streaming-0.6b",
-    "diarization": "nvidia/diar_streaming_sortformer_4spk-v2",
+    "diarization": "nvidia/Nemotron-3-Diarization",
     "tts": "nvidia/magpie_tts_multilingual_357m",
     "codec": "nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps",
     "tokenizer": "nvidia/magpie_tts_multilingual_357m"
@@ -69,6 +69,22 @@
           "filename": "parakeet-tdt-0.6b-v3.q8_0.gguf",
           "size": 713975456,
           "sha256": "e3880d0aaaaf2c308ea2c35016b2b895c423eb3fda924c1b463d1c19b7f4d32e"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/Nemotron-3-Diarization",
+      "aliases": ["nemotron-3-diarization", "nemotron-diar"],
+      "revision": "f667ed73aee57d40cc39428eb768b4fd87a0a29e",
+      "license": "NVIDIA Open Model License (OpenMDW 1.1)",
+      "license_url": "https://huggingface.co/nvidia/Nemotron-3-Diarization",
+      "artifacts": [
+        {
+          "role": "diarization",
+          "type": "file",
+          "filename": "Nemotron-3-Diarization.q8_0.gguf",
+          "size": 107012128,
+          "sha256": "08456d9e22cd9a323c0364d98375f3746d6e68507ebb705cd46438c534c7a3a1"
         }
       ]
     },

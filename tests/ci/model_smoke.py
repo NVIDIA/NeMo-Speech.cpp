@@ -159,7 +159,7 @@ def main() -> None:
         check(len(segments) >= 1 and speech >= 8.0, "diarization covers the utterance")
         check(len(speakers) == 1, "single-speaker audio yields one speaker")
 
-        meeting = FIXTURES / "ami_en2002d_2172.wav"
+        meeting = FIXTURES / "ami_en2002d_2132.wav"
         diar = json.loads(
             run(args.binary, "diarize", str(meeting), "--backend", args.backend, "--format", "json")
         )
@@ -174,7 +174,7 @@ def main() -> None:
         print(
             f"meeting diarization: {len(speakers)} speakers, DER {der:.1%}, confusion {confusion:.1%}"
         )
-        check(len(speakers) == 3, "three-speaker meeting yields three speakers")
+        check(len(speakers) == 3, "meeting yields its three main speakers")
         check(confusion < 0.06 and der < 0.32, "meeting diarization matches the reference")
 
         transcript = json.loads(

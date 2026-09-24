@@ -97,7 +97,7 @@ print_diarize_help(const char* program) {
         "directory work shares one model and batches compatible GPU steps.\n\n"
         "Options:\n"
         "  -m, --model MODEL         Sortformer GGUF path or indexed HF repo\n"
-        "                            (default: nvidia/diar_streaming_sortformer_4spk-v2)\n"
+        "                            (default: nvidia/Nemotron-3-Diarization)\n"
         "  --device, --backend DEVICE\n"
         "                            auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
         "  --offline                 Full-attention mode for short audio\n"
