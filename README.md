@@ -24,6 +24,16 @@
 | Full-duplex voicechat | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
 | Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
 
+## Performance
+
+Streaming speech synthesis on NVIDIA DGX Spark (GB10):
+
+| Model | Time to first audio | Throughput |
+|---|:---:|:---:|
+| MagpieTTS Multilingual 357M v2607 (Q8_0) | **23 ms** | **29× real time** |
+
+See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
+
 ## Installation
 
 Install the `nemo-speech` CLI for the detected platform and backend:

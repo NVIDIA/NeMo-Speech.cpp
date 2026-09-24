@@ -88,6 +88,8 @@ bool magpietts_lt_fused_sampling_supported(const magpietts_lt_fused* fused);
 // exact top-k sampling per codebook) in a single kernel launch with software grid barriers.
 // Requires planar Q8 weights for every projection and an in-kernel sampler (top_k <= 256).
 bool magpietts_lt_fused_chain_supported(const magpietts_lt_fused* fused);
+// Print and reset the per-phase timing of -DLTF_CHAIN_TIMING builds (no-op otherwise).
+void magpietts_lt_fused_timing_report();
 bool magpietts_lt_fused_chain(
     magpietts_lt_fused* fused, void* stream, const magpietts_lt_fused_sampler* sampler, char* error,
     size_t error_size);

@@ -1647,6 +1647,11 @@ NanoCodecModel::loaded() const {
     return impl_ && impl_->loaded && impl_->model.ctx && impl_->model.backend;
 }
 
+bool
+NanoCodecModel::onAccelerator() const {
+    return loaded() && !ggml_backend_is_cpu(impl_->model.backend);
+}
+
 const NanoCodecHParams&
 NanoCodecModel::hparams() const {
     return impl_ ? impl_->model.hparams : empty_hparams();
