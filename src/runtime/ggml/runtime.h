@@ -55,6 +55,7 @@ std::string format(const char* fmt, ...);
     ::ggml_runtime::log_internal(GGML_LOG_LEVEL_INFO, __FILE__, __LINE__, __func__, __VA_ARGS__)
 
 struct llama_file;
+struct llama_mmap;
 
 namespace ggml_runtime {
 
@@ -77,6 +78,13 @@ class GGUFLoader {
     std::vector<int64_t> get_tensor_ne(const std::string& tensor_name) const;
     bool has_tensor(const std::string& tensor_name) const;
 
+    // True when the file is mmap'd; see mapped_tensor_ptr()/mapped_base().
+    bool is_mmapped() const;
+    uint64_t get_tensor_offset(const std::string& tensor_name) const;
+    // Pointer into the mapping; valid only while this GGUFLoader lives.
+    void* mapped_tensor_ptr(const std::string& tensor_name) const;
+    void* mapped_base() const;
+
     // Metadata accessors (return `def` if key missing).
     uint32_t get_u32(const std::string& key, uint32_t def = 0) const;
     int32_t get_i32(const std::string& key, int32_t def = 0) const;
@@ -91,6 +99,9 @@ class GGUFLoader {
     std::string m_path;
     gguf_context_ptr m_context;
     std::unique_ptr<llama_file> m_file;
+    // Out-of-line dtor sees the complete llama_mmap type; never released by
+    // release_file_resources() — see loader.cpp for why.
+    std::unique_ptr<llama_mmap> m_mapping;
     std::map<std::string, std::tuple<ggml_type, uint64_t>> m_tensor_infos;
     // Per-tensor on-disk dimensionality.
     std::map<std::string, int> m_tensor_n_dims;
@@ -239,6 +250,13 @@ class TensorContainer {
     ggml_bf_context get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft);
     void allocate_tensors_on_backend_buffers();
     void free_temp_ctx();
+
+    // Opt in to zero-copy weight binding for GGUF-backed tensors on
+    // eligible bufts; see allocate_tensors_on_backend_buffers.
+    void set_mmap_loader(GGUFLoader* loader) { mmap_loader_ = loader; }
+    // Non-null once allocate_tensors_on_backend_buffers() built a
+    // zero-copy buffer for this buft.
+    ggml_backend_buffer_t mmap_buffer_for(ggml_backend_buffer_type_t buft) const;
     ggml_bf_tensor get_tensor_by_name(const std::string& name);
     bool has_tensor_by_name(const std::string& name);
     void cache_tensor(std::string name, ggml_bf_tensor tensor);
@@ -268,6 +286,10 @@ class TensorContainer {
     buft_ctx_map_t ctx_map;
     std::vector<ggml_backend_buffer_ptr> backend_buffers;
     std::map<std::string, ggml_bf_tensor> tensor_lookup;
+    // Non-owning; see set_mmap_loader(). Null unless opted in.
+    GGUFLoader* mmap_loader_ = nullptr;
+    // Non-owning views into backend_buffers, keyed by buft; see mmap_buffer_for().
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_t> mmap_bufs_;
 
     ggml_bf_tensor m_create_tensor(ggml_tensor* meta, std::string& name);
 };
@@ -297,6 +319,10 @@ class Session {
 
     // Allows exact dtype copies and F32-to-F16 conversion.
     void load_weight(const std::string& gguf_key);
+
+    // Verbatim bind-or-copy of a GGUF tensor, for set_data() overrides that
+    // read GGUF directly instead of going through load_weight().
+    void bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key);
 
     // Import a model tensor whose storage is owned by the embedding pipeline. Call only from
     // Module::define_tensors(); the tensor and its backend buffer must outlive this Session.
