@@ -69,7 +69,8 @@ ltf_kernel_arch_supported(const void* kernel) {
         (void)cudaGetLastError();
         return false;
     }
-    return major >= 8 && attr.ptxVersion >= 80;
+    // sm_90+ devices also need sm_90+ code (see ltf_cp_async16).
+    return major >= 8 && attr.ptxVersion >= 80 && (major < 9 || attr.ptxVersion >= 90);
 }
 
 static inline void
@@ -414,23 +415,29 @@ ltf_block_layernorm(const float* x, float* xn, const float* weight, int K, float
 
 static constexpr int LTF_MAX_LAYERS = 4;
 static constexpr int LTF_MAX_ROUNDS = LTF_MAX_POS;
-// Rows per warp of each GEMV phase. The grid is LTF_CHAIN_MIN_GRID blocks (one per SM),
-// so a phase of N rows gives each block ceil(N / grid) rows spread over LTF_WARPS warps; setup
-// verifies these bounds for the actual shapes and grid.
-static constexpr int LTF_CHAIN_MIN_GRID = 64 * LTF_CHAIN_BLOCKS_PER_SM;
 static constexpr int LTF_CHAIN_MAX_GRID = 256;
 constexpr int
-ltf_rows_per_warp(int rows_at_128_blocks) {
-    return (rows_at_128_blocks * 2 / LTF_CHAIN_BLOCKS_PER_SM + LTF_WARPS - 1) / LTF_WARPS;
+ltf_rows_per_warp(int rows) {
+    return (rows + LTF_WARPS - 1) / LTF_WARPS;
 }
-static constexpr int LTF_R_QKV = ltf_rows_per_warp(18);  // 3K rows:  2304 / 128 = 18
-static constexpr int LTF_R_O = ltf_rows_per_warp(6);     // K rows:    768 / 128 = 6
-static constexpr int LTF_R_FF1 = ltf_rows_per_warp(24);  // NFF rows: 3072 / 128 = 24
-static constexpr int LTF_R_OUT = ltf_rows_per_warp(16);  // vocab:    2024 / 128 = 16
-static constexpr int LTF_STAGE_BYTES =
-    LTF_CHAIN_BLOCKS_PER_SM == 1 ? 36864 : 24576;  // max staged quants per block
-static constexpr int LTF_STAGE_SCALES =
-    LTF_CHAIN_BLOCKS_PER_SM == 1 ? 1152 : 768;  // max staged scales per block
+// Per-block capacity of the persistent kernels for a grid of GRID co-resident blocks: each block
+// owns ceil(N / GRID) rows of an N-row phase and stages them in one cp.async tile. Sized for the
+// MagpieTTS shapes (K = 768, NFF = 3072, vocab 2024); setup checks the actual shapes and picks
+// the largest tier that fits the GPU.
+template <int GRID>
+struct ltf_chain_tier {
+    static constexpr int grid = GRID;
+    static constexpr int r_qkv = ltf_rows_per_warp((3 * 768 + GRID - 1) / GRID);
+    static constexpr int r_o = ltf_rows_per_warp((768 + GRID - 1) / GRID);
+    static constexpr int r_ff1 = ltf_rows_per_warp((3072 + GRID - 1) / GRID);
+    static constexpr int r_out = ltf_rows_per_warp((2024 + GRID - 1) / GRID);
+    // widest tile: ff1 (NFF rows of K) and ff2 (K rows of NFF)
+    static constexpr int stage_bytes = ((3072 + GRID - 1) / GRID) * 768;
+    static constexpr int stage_scales = stage_bytes / 32;
+};
+// 64 blocks on GPUs with 64+ SMs, 48 on GPUs with 48-63 SMs.
+using ltf_chain_tier_large = ltf_chain_tier<64 * LTF_CHAIN_BLOCKS_PER_SM>;
+using ltf_chain_tier_small = ltf_chain_tier<48 * LTF_CHAIN_BLOCKS_PER_SM>;
 #ifdef LTF_CHAIN_TIMING
 // Microbenchmark instrumentation (-DLTF_CHAIN_TIMING): block 0 stamps %globaltimer when it
 // arrives at and leaves every grid barrier: [round][phase][arrive, release], plus start/end.
@@ -459,6 +466,70 @@ __device__ int g_ltf_chain_detail_phase;  // set by block 0 as it enters each ph
         if (tile == 0 && threadIdx.x == 0 && g_ltf_chain_detail_phase >= 0)               \
             g_ltf_chain_detail[g_ltf_chain_detail_phase * 6 + (sub)] = ltf_globaltimer(); \
     } while (0)
+// Per phase slot (index within a round or layer), summed over launches: block 0's time since its
+// previous barrier release and its wait at the barrier.
+__device__ unsigned long long g_ltf_phase_total[LTF_TIMING_PHASES];
+__device__ unsigned long long g_ltf_phase_wait[LTF_TIMING_PHASES];
+__device__ unsigned long long g_ltf_phase_count[LTF_TIMING_PHASES];
+__device__ unsigned long long g_ltf_launches;
+__device__ unsigned long long g_ltf_launch_ns;
+#define LTF_PHASE_BEGIN(t_arrive)      \
+    unsigned long long t_arrive = 0;   \
+    if (tile == 0 && threadIdx.x == 0) \
+    t_arrive = ltf_globaltimer()
+#define LTF_PHASE_END(slot, t_arrive, t_prev)                  \
+    do {                                                       \
+        if (tile == 0 && threadIdx.x == 0) {                   \
+            const unsigned long long now_ = ltf_globaltimer(); \
+            g_ltf_phase_total[(slot)] += now_ - (t_prev);      \
+            g_ltf_phase_wait[(slot)] += now_ - (t_arrive);     \
+            ++g_ltf_phase_count[(slot)];                       \
+            (t_prev) = now_;                                   \
+        }                                                      \
+    } while (0)
+#define LTF_LAUNCH_END(t_start)                               \
+    do {                                                      \
+        if (tile == 0 && threadIdx.x == 0) {                  \
+            ++g_ltf_launches;                                 \
+            g_ltf_launch_ns += ltf_globaltimer() - (t_start); \
+        }                                                     \
+    } while (0)
+// Print and reset the accumulators of this translation unit.
+static inline void
+ltf_timing_report(const char* name, const char* const* slot_names, int n_slots) {
+    unsigned long long total[LTF_TIMING_PHASES], wait[LTF_TIMING_PHASES], count[LTF_TIMING_PHASES];
+    unsigned long long launches = 0, launch_ns = 0;
+    if (cudaMemcpyFromSymbol(total, g_ltf_phase_total, sizeof(total)) != cudaSuccess ||
+        cudaMemcpyFromSymbol(wait, g_ltf_phase_wait, sizeof(wait)) != cudaSuccess ||
+        cudaMemcpyFromSymbol(count, g_ltf_phase_count, sizeof(count)) != cudaSuccess ||
+        cudaMemcpyFromSymbol(&launches, g_ltf_launches, sizeof(launches)) != cudaSuccess ||
+        cudaMemcpyFromSymbol(&launch_ns, g_ltf_launch_ns, sizeof(launch_ns)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    if (launches == 0)
+        return;
+    fprintf(
+        stderr, "[chain timing] %s: %llu launches, %.1f us per launch\n", name, launches,
+        launch_ns / 1e3 / launches);
+    fprintf(
+        stderr, "[chain timing]   %-26s %10s %10s %12s\n", "phase", "us/phase", "wait us",
+        "us/launch");
+    for (int i = 0; i < n_slots && i < LTF_TIMING_PHASES; ++i) {
+        if (!count[i])
+            continue;
+        fprintf(
+            stderr, "[chain timing]   %-26s %10.2f %10.2f %12.1f\n", slot_names[i],
+            total[i] / 1e3 / count[i], wait[i] / 1e3 / count[i], total[i] / 1e3 / launches);
+    }
+    unsigned long long zero[LTF_TIMING_PHASES] = {};
+    unsigned long long z = 0;
+    cudaMemcpyToSymbol(g_ltf_phase_total, zero, sizeof(zero));
+    cudaMemcpyToSymbol(g_ltf_phase_wait, zero, sizeof(zero));
+    cudaMemcpyToSymbol(g_ltf_phase_count, zero, sizeof(zero));
+    cudaMemcpyToSymbol(g_ltf_launches, &z, sizeof(z));
+    cudaMemcpyToSymbol(g_ltf_launch_ns, &z, sizeof(z));
+}
 #define LTF_ARRIVE(ph)                                                                 \
     do {                                                                               \
         if (threadIdx.x == 0 && (ph) >= 0 && tile < LTF_TIMING_MAX_GRID)               \
@@ -563,19 +634,56 @@ union ltf_chain_smem_union {
     ltf_chain_gemv_smem g;
     magpietts_sample_fast_shared samp;
 };
+template <class Tier>
 struct ltf_chain_smem {
-    __align__(16) int8_t s_w[LTF_STAGE_BYTES];
-    __align__(16) __half s_wd[LTF_STAGE_SCALES];
+    __align__(16) int8_t s_w[Tier::stage_bytes];
+    __align__(16) __half s_wd[Tier::stage_scales];
     ltf_chain_smem_union u;
 };
+
+// Whether an N-row, Kdim-wide phase fits the Tier's R rows per warp and staged tile.
+template <class Tier>
+static inline bool
+ltf_chain_phase_fits(int N, int Kdim, int R) {
+    const int rows = (N + Tier::grid - 1) / Tier::grid;
+    return rows <= LTF_WARPS * R && rows * Kdim <= Tier::stage_bytes &&
+           rows * (Kdim >> 5) <= Tier::stage_scales;
+}
+
+// Whether the Tier instantiation `kernel` can run: all Tier::grid blocks co-resident (grid
+// barriers) and `fits(Tier{})`. Also sets the kernel's shared-memory attributes.
+template <class Tier, class Fits>
+static inline bool
+ltf_chain_tier_usable(const void* kernel, int sms, Fits&& fits) {
+    if (LTF_CHAIN_BLOCKS_PER_SM * sms < Tier::grid || Tier::grid > LTF_CHAIN_MAX_GRID ||
+        !fits(Tier{}))
+        return false;
+    const int smem = (int)sizeof(ltf_chain_smem<Tier>);
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    if (cudaFuncSetAttribute(
+            kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared) != cudaSuccess)
+        (void)cudaGetLastError();  // a hint only
+    int per_sm = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, LTF_THREADS, smem) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return per_sm >= LTF_CHAIN_BLOCKS_PER_SM;
+}
 
 // Weights are streamed once per round (17 MB/round vs a 6 MB L2), so they are fetched with an
 // evict-first L2 policy; the small activation buffers and the K/V cache then stay L2-resident
 // across rounds instead of being flushed by the weight stream.
 static __device__ __forceinline__ unsigned long long
 ltf_evict_first_policy() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-    return 0ull;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800 || __CUDA_ARCH__ >= 900)
+    return 0ull;  // unused: no cp.async hint on these targets (see ltf_cp_async16)
 #else
     unsigned long long policy;
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
@@ -589,9 +697,16 @@ ltf_cp_async16(void* smem, const void* gmem, unsigned long long policy) {
     *reinterpret_cast<int4*>(smem) = *reinterpret_cast<const int4*>(gmem);  // synchronous copy
 #else
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+#if __CUDA_ARCH__ >= 900
+    // No L2 hint on sm_90+: ptxas (CUDA 13.0) can miscompile cp.async with an L2::cache_hint
+    // operand there (invalid uniform-register operands, illegal instruction at runtime).
+    (void)policy;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+#else
     asm volatile(
         "cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
         "l"(policy));
+#endif
 #endif
 }
 static __device__ __forceinline__ void
@@ -669,8 +784,9 @@ ltf_chain_rows(int N, int tile, int nblocks, int& row_begin, int& rows) {
 // Stage this block's rows of W (contiguous in the planar layout) into shared memory
 // asynchronously. Callers must have finished reading the previous stage (__syncthreads)
 // before issuing.
+template <class Smem>
 static __device__ __forceinline__ void
-ltf_chain_stage(const ltf_q8p& W, int K, int N, int tile, ltf_chain_smem& sm) {
+ltf_chain_stage(const ltf_q8p& W, int K, int N, int tile, Smem& sm) {
     int row_begin, rows;
     ltf_chain_rows(N, tile, gridDim.x, row_begin, rows);
     if (rows <= 0)
@@ -689,12 +805,29 @@ ltf_chain_stage(const ltf_q8p& W, int K, int N, int tile, ltf_chain_smem& sm) {
     ltf_cp_async_commit();
 }
 
+// Prefetch into L2 the rows of W a later ltf_chain_stage loads, so the DRAM fetch overlaps the
+// current phase.
+static __device__ __forceinline__ void
+ltf_chain_prefetch_l2(const ltf_q8p& W, int K, int N, int tile) {
+    int row_begin, rows;
+    ltf_chain_rows(N, tile, gridDim.x, row_begin, rows);
+    if (rows <= 0)
+        return;
+    const char* q = reinterpret_cast<const char*>(W.qs + (size_t)row_begin * K);
+    const char* d = reinterpret_cast<const char*>(W.d + (size_t)row_begin * (K >> 5));
+    const int qbytes = rows * K;
+    const int dbytes = rows * (K >> 5) * (int)sizeof(__half);
+    for (int i = threadIdx.x * 128; i < qbytes; i += LTF_THREADS * 128)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(q + i));
+    for (int i = threadIdx.x * 128; i < dbytes; i += LTF_THREADS * 128)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(d + i));
+}
+
 // Load this warp's rows of the staged tile into the register prefetch struct.
-template <int R, int MB>
+template <int R, int MB, class Smem>
 static __device__ __forceinline__ void
 ltf_chain_load_staged(
-    const ltf_chain_smem& sm, int K, int rows_valid, int wrow0, int lane,
-    ltf_q8_prefetch<R, MB>& pf) {
+    const Smem& sm, int K, int rows_valid, int wrow0, int lane, ltf_q8_prefetch<R, MB>& pf) {
     const int blocks = K >> 5;
 #pragma unroll
     for (int r = 0; r < R; ++r) {
@@ -794,9 +927,9 @@ ltf_chain_input(const ltf_chain_phase_args& a, int l, int k) {
 // One GEMV phase on this block's staged tile: prologue (optional assembly + LayerNorm stats +
 // int8 quantization of both lanes), dp4a dot, epilogue. Leaves the block synchronized so the
 // caller may immediately restage the shared weight buffer.
-template <int EPI, int R, int MB>
+template <int EPI, int R, int MB, class Smem>
 static __device__ __forceinline__ void
-ltf_chain_gemv(const ltf_chain_phase_args& a, int tile, ltf_chain_smem& sm) {
+ltf_chain_gemv(const ltf_chain_phase_args& a, int tile, Smem& sm) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;

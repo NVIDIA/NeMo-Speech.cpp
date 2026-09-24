@@ -238,11 +238,41 @@ configuration file](server.md#engine-and-listener-configuration).
 
 ## Benchmark
 
-Benchmark end-to-end ASR concurrency with one shared recognizer:
+`nemo-speech bench <task>` loads one engine, warms it up, and runs every input
+`--repetitions` times at each `--concurrency` level. The tasks compiled into
+the build are listed by `nemo-speech help bench`; a task missing from the build
+fails with `unsupported_feature`.
 
 ```bash
-nemo-speech bench asr recordings/ \
-  --model asr.q8_0.gguf \
-  --concurrency 1,2,4 \
-  --json
+# ASR over a WAV file or directory
+nemo-speech bench asr recordings/ --model asr.q8_0.gguf --concurrency 1,2,4 --json
+
+# TTS over --text, a .txt file or directory (one utterance per file), or
+# --text-file (one utterance per line)
+nemo-speech bench tts --text-file test_files/tts/ljs_audio_text_test_filelist_small.txt \
+  --magpie-model magpie.q8_0.gguf --codec-model codec.gguf --tokenizer-dir tokenizer/ \
+  --per-stream 20 --json
+
+# Diarization over a WAV file or directory
+nemo-speech bench diarize meetings/ --model sortformer.gguf
+
+# Translation over a text file, one input per line (NMT builds)
+nemo-speech bench translate lines.txt --model nmt.gguf --from en --to de
 ```
+
+All tasks share `-n/--repetitions` (or `--per-stream N` requests per
+concurrent stream), `--warmup`, `-c/--concurrency`,
+`--device`, `--config`, the task's `--asr.*`/`--tts.*`/`--diar.*`/`--nmt.*`
+overrides, and `--json`. The report contains `command`, `task`, the model,
+`load_ms`, `warmup_ms`, and one `runs` entry per concurrency level with
+`concurrency`, `items`, `wall_seconds`, `items_per_second`, client-side
+`latency_ms` (`mean`/`p50`/`p90`/`p95`/`p99`/`min`/`max`), per-item `metrics`, task
+throughput such as `rtfx`, and an output-mismatch count against the first
+result observed for each input (`transcript_mismatches`,
+`audio_length_mismatches`, `segment_mismatches`, `translation_mismatches`).
+
+`bench tts` reports time to first audio (TTFA) and inter-chunk latency (ICL),
+measured at the client (`first_audio_ms`, `chunk_gap_ms`), and throughput RTFx,
+plus a per-input breakdown. It fixes `--seed`
+to 1 so repeated runs generate identical audio. The MagpieTTS runtime serializes
+requests, so TTS concurrency above 1 measures queueing.

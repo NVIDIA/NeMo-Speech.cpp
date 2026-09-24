@@ -58,6 +58,7 @@ struct magpietts_lt_fused {
     // persistent chain kernel (all rounds in one launch)
     unsigned int* barrier = nullptr;  // monotonic grid-barrier counter (reset before each launch)
     int chain_grid = 0;               // blocks (0 = chain unsupported)
+    bool prefetch_out = false;
     void* arena = nullptr;  // single allocation holding every scratch buffer (L2 access window)
     size_t arena_bytes = 0;
     bool l2_window = false;  // persisting-L2 window enabled for the arena
@@ -477,6 +478,7 @@ struct ltf_chain_layer {
 
 struct ltf_chain_args {
     int K, NFF, H, P, vocab, n_layers, n_rounds;
+    int prefetch_out;  // L2-prefetch each round's output projection
     float ln_eps, attn_scale;
     ltf_chain_layer layers[LTF_MAX_LAYERS];
     const void* pos;
@@ -600,11 +602,12 @@ ltf_chain_attention_split(
     }
 }
 
+template <class Tier>
 static __global__ void LTF_CHAIN_LAUNCH_BOUNDS
 ltf_chain_kernel(const ltf_chain_args a) {
     // Dynamic shared memory: the staged weight tile can exceed the 48 KB static limit.
     extern __shared__ __align__(16) unsigned char ltf_chain_dyn_smem[];
-    ltf_chain_smem& sm = *reinterpret_cast<ltf_chain_smem*>(ltf_chain_dyn_smem);
+    ltf_chain_smem<Tier>& sm = *reinterpret_cast<ltf_chain_smem<Tier>*>(ltf_chain_dyn_smem);
     __shared__ int s_flag;
     const int tile = blockIdx.x;
     const int warp = threadIdx.x >> 5;
@@ -620,13 +623,22 @@ ltf_chain_kernel(const ltf_chain_args a) {
 #ifdef LTF_CHAIN_TIMING
     int detail_phase = -1;  // phase index within round 8, else -1
 #endif
+#ifdef LTF_CHAIN_TIMING
+    unsigned long long t_start = 0, t_prev = 0;
+    if (tile == 0 && threadIdx.x == 0)
+        t_start = t_prev = ltf_globaltimer();
+#endif
     auto sync = [&]() {
         LTF_STAMP(2 + phase * 2);
 #ifdef LTF_CHAIN_TIMING
         LTF_ARRIVE(detail_phase);
+        LTF_PHASE_BEGIN(t_arrive);
 #endif
         ltf_grid_barrier(a.barrier, target, nblocks);
         LTF_STAMP(2 + phase * 2 + 1);
+#ifdef LTF_CHAIN_TIMING
+        LTF_PHASE_END(phase % LTF_TIMING_PHASES, t_arrive, t_prev);
+#endif
         ++phase;
 #ifdef LTF_CHAIN_TIMING
         if (detail_phase >= 0)
@@ -680,7 +692,7 @@ ltf_chain_kernel(const ltf_chain_args a) {
                 g.kv_lane_stride = (size_t)a.P * K;
                 g.kv_row_stride = (size_t)K;
                 g.kv_row = c;
-                ltf_chain_gemv<LTF_EPI_STORE, LTF_R_QKV, 1>(g, tile, sm);
+                ltf_chain_gemv<LTF_EPI_STORE, Tier::r_qkv, 1>(g, tile, sm);
             }
             ltf_chain_stage(L.o, K, K, tile, sm);
             // attention by the last blocks to finish their qkv rows (K/V of position c complete):
@@ -708,6 +720,9 @@ ltf_chain_kernel(const ltf_chain_args a) {
                 }
             }
             sync();
+            // prefetch this round's output projection (the layer weights stay L2-resident)
+            if (a.prefetch_out && il + 1 == a.n_layers)
+                ltf_chain_prefetch_l2(a.out_w[c], K, a.vocab, tile);
             {  // o + residual (input: ctx quantized by the attention tail); produces the f32
                // residual, q(h*gamma_ff) and partial LN stats for the ff1 phase
                 ltf_chain_phase_args g{};
@@ -723,7 +738,7 @@ ltf_chain_kernel(const ltf_chain_args a) {
                 g.out_keep_f32 = 1;
                 g.out_gamma = L.norm_ff;
                 g.out_stats = a.stats;
-                ltf_chain_gemv<LTF_EPI_RESIDUAL, LTF_R_O, 1>(g, tile, sm);
+                ltf_chain_gemv<LTF_EPI_RESIDUAL, Tier::r_o, 1>(g, tile, sm);
             }
             ltf_chain_stage(L.ff1, K, a.NFF, tile, sm);
             sync();
@@ -741,7 +756,7 @@ ltf_chain_kernel(const ltf_chain_args a) {
                 g.out_d = a.ff_d;
                 g.out_group = 16;
                 g.ln_eps = a.ln_eps;
-                ltf_chain_gemv<LTF_EPI_GELU, LTF_R_FF1, 1>(g, tile, sm);
+                ltf_chain_gemv<LTF_EPI_GELU, Tier::r_ff1, 1>(g, tile, sm);
             }
             ltf_chain_stage(L.ff2, a.NFF, K, tile, sm);
             sync();
@@ -763,7 +778,7 @@ ltf_chain_kernel(const ltf_chain_args a) {
                     g.out_gamma = a.layers[il + 1].norm_self;
                     g.out_stats = a.stats;
                 }
-                ltf_chain_gemv<LTF_EPI_RESIDUAL, LTF_R_O, 3>(g, tile, sm);
+                ltf_chain_gemv<LTF_EPI_RESIDUAL, Tier::r_o, 3>(g, tile, sm);
             }
             if (il + 1 < a.n_layers) {
                 ltf_chain_stage(a.layers[il + 1].qkv, K, 3 * K, tile, sm);
@@ -781,7 +796,7 @@ ltf_chain_kernel(const ltf_chain_args a) {
             g.K = K;
             g.out = a.logits;
             g.bias = a.out_b[c];
-            ltf_chain_gemv<LTF_EPI_BIAS, LTF_R_OUT, 1>(g, tile, sm);
+            ltf_chain_gemv<LTF_EPI_BIAS, Tier::r_out, 1>(g, tile, sm);
         }
         if (c + 1 < a.n_rounds) {
             ltf_chain_stage(a.layers[0].qkv, K, 3 * K, tile, sm);
@@ -858,6 +873,9 @@ ltf_chain_kernel(const ltf_chain_args a) {
         }
     }
     LTF_STAMP(1);
+#ifdef LTF_CHAIN_TIMING
+    LTF_LAUNCH_END(t_start);
+#endif
 }
 
 // ---------------------------------------------------------------------------------------
@@ -886,48 +904,48 @@ ltf_chain_setup(magpietts_lt_fused* f) {
     const int K = w.n_embd;
     if ((K >> 5) > 32 || (w.n_ff >> 5) > 96)
         return;  // R=4 tiles need MB=1, ff2 tiles MB<=3
-    int device = 0, sms = 0, per_sm = 0;
-    if (cudaGetDevice(&device) != cudaSuccess)
-        return;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
-        return;
-    if (cudaFuncSetAttribute(
-            ltf_chain_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)sizeof(ltf_chain_smem)) != cudaSuccess)
-        return;
-    // Ask for the largest shared-memory carveout so a codec block fits beside the chain block.
-    cudaFuncSetAttribute(
-        ltf_chain_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-        cudaSharedmemCarveoutMaxShared);
-    const cudaError_t occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &per_sm, ltf_chain_kernel, LTF_THREADS, sizeof(ltf_chain_smem));
-    if (occ_err != cudaSuccess || per_sm < LTF_CHAIN_BLOCKS_PER_SM)
-        return;
-    // The phase tiling (rows per warp, staged bytes, quantization groups) is sized for exactly
-    // LTF_CHAIN_MIN_GRID resident blocks, one per SM. Larger GPUs run the same grid and leave
-    // the remaining SMs to the codec; smaller ones keep the per-round path.
-    const int grid = LTF_CHAIN_MIN_GRID;
-    if (LTF_CHAIN_BLOCKS_PER_SM * sms < grid)
-        return;
-    auto rows_per_block = [grid](int N) { return (N + grid - 1) / grid; };
-    auto fits = [&](int N, int Kdim, int R) {
-        return rows_per_block(N) <= LTF_WARPS * R && rows_per_block(N) * Kdim <= LTF_STAGE_BYTES &&
-               rows_per_block(N) * (Kdim >> 5) <= LTF_STAGE_SCALES;
-    };
-    if (!fits(3 * K, K, LTF_R_QKV) || !fits(K, K, LTF_R_O) || !fits(w.n_ff, K, LTF_R_FF1) ||
-        !fits(K, w.n_ff, LTF_R_O) || !fits(w.vocab, K, LTF_R_OUT))
-        return;
-    if ((w.n_head * LTF_LANES + LTF_ATTN_TASKS_PER_BLOCK - 1) / LTF_ATTN_TASKS_PER_BLOCK > grid)
-        return;
-    // producer-side quantization: every block's ff1 rows form whole groups of 16, its residual
-    // rows whole groups of 4; head dim 64; per-block LN partials fit the stats buffer
-    if (w.n_ff % grid != 0 || (w.n_ff / grid) % 16 != 0 || K % grid != 0 || (K / grid) % 4 != 0 ||
-        K / w.n_head != 64 || grid > LTF_CHAIN_MAX_GRID)
-        return;
     for (int i = 0; i < w.n_layers; ++i)
         if (!f->layers[i].qkv_c || !f->layers[i].ff1_c)
             return;
-    f->chain_grid = grid;
+    int device = 0, sms = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    auto fits = [&](auto tier) {
+        using Tier = decltype(tier);
+        const int grid = Tier::grid;
+        // producer-side quantization: every block's ff1 rows form whole groups of 16, its
+        // residual rows whole groups of 4; head dim 64
+        return ltf_chain_phase_fits<Tier>(3 * K, K, Tier::r_qkv) &&
+               ltf_chain_phase_fits<Tier>(K, K, Tier::r_o) &&
+               ltf_chain_phase_fits<Tier>(w.n_ff, K, Tier::r_ff1) &&
+               ltf_chain_phase_fits<Tier>(K, w.n_ff, Tier::r_o) &&
+               ltf_chain_phase_fits<Tier>(w.vocab, K, Tier::r_out) &&
+               (w.n_head * LTF_LANES + LTF_ATTN_TASKS_PER_BLOCK - 1) / LTF_ATTN_TASKS_PER_BLOCK <=
+                   grid &&
+               w.n_ff % grid == 0 && (w.n_ff / grid) % 16 == 0 && K % grid == 0 &&
+               (K / grid) % 4 == 0 && K / w.n_head == 64;
+    };
+    // Without a fitting tier the per-round path runs.
+    if (ltf_chain_tier_usable<ltf_chain_tier_large>(
+            reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_large>), sms, fits)) {
+        f->chain_grid = ltf_chain_tier_large::grid;
+    } else if (ltf_chain_tier_usable<ltf_chain_tier_small>(
+                   reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_small>), sms,
+                   fits)) {
+        f->chain_grid = ltf_chain_tier_small::grid;
+    } else {
+        return;
+    }
+    {
+        // Prefetch the output projection only if it stays comfortably L2-resident.
+        int l2 = 0;
+        cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device);
+        const size_t out_q8 = (size_t)w.vocab * K;
+        f->prefetch_out = (size_t)l2 >= 4 * (out_q8 + out_q8 / 16);
+    }
     // Pin the activation arena (~0.5 MB) in L2 while the 17 MB/round weight stream passes.
     {
         int max_persist = 0, max_window = 0;
@@ -946,7 +964,8 @@ ltf_chain_setup(magpietts_lt_fused* f) {
 
 magpietts_lt_fused*
 magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size_t error_size) {
-    if (!ltf_kernel_arch_supported(reinterpret_cast<const void*>(ltf_chain_kernel))) {
+    if (!ltf_kernel_arch_supported(
+            reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_large>))) {
         ltf_set_error(
             error, error_size,
             "fused local transformer: needs compute capability 8.0+ and an sm_80+ build");
@@ -1305,6 +1324,16 @@ magpietts_lt_fused_sampling_supported(const magpietts_lt_fused* f) {
     return f && f->w.out_type == LTF_TYPE_Q8_0 && f->w.vocab <= MAGPIETTS_CUDA_SMALL_VOCAB;
 }
 
+void
+magpietts_lt_fused_timing_report() {
+#ifdef LTF_CHAIN_TIMING
+    static const char* const slots[] = {"L0 qkv + attention tail", "L0 o-proj", "L0 ff1", "L0 ff2",
+                                        "L1 qkv + attention tail", "L1 o-proj", "L1 ff1", "L1 ff2",
+                                        "out-proj + sampling tail"};
+    ltf_timing_report("LT chain (per round)", slots, 9);
+#endif
+}
+
 bool
 magpietts_lt_fused_chain_supported(const magpietts_lt_fused* f) {
     return f && f->chain_grid > 0;
@@ -1363,6 +1392,7 @@ ltf_enqueue_chain(
     a.top_vals = sampler->top_vals;
     a.sample_codebook_size = sampler->audio_codebook_size;
     a.sample_eos_id = sampler->audio_eos_id;
+    a.prefetch_out = f->prefetch_out ? 1 : 0;
     cudaError_t err = cudaMemsetAsync(f->barrier, 0, 2 * sizeof(unsigned int), stream);
     if (err != cudaSuccess) {
         ltf_set_error(error, error_size, "fused local transformer: barrier reset failed", err);
@@ -1377,7 +1407,15 @@ ltf_enqueue_chain(
         attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
     }
-    ltf_chain_kernel<<<f->chain_grid, LTF_THREADS, sizeof(ltf_chain_smem), stream>>>(a);
+    if (f->chain_grid == ltf_chain_tier_large::grid) {
+        ltf_chain_kernel<ltf_chain_tier_large>
+            <<<f->chain_grid, LTF_THREADS, sizeof(ltf_chain_smem<ltf_chain_tier_large>), stream>>>(
+                a);
+    } else {
+        ltf_chain_kernel<ltf_chain_tier_small>
+            <<<f->chain_grid, LTF_THREADS, sizeof(ltf_chain_smem<ltf_chain_tier_small>), stream>>>(
+                a);
+    }
     if (f->l2_window) {
         cudaStreamAttrValue none{};
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &none);

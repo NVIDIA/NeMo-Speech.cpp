@@ -46,6 +46,8 @@ class NanoCodecModel {
     bool load(const std::string& path, bool force_cpu = false, bool verbose = false);
     void reset();
     bool loaded() const;
+    // Whether the decoder runs on an accelerator backend (not the CPU).
+    bool onAccelerator() const;
 
     const NanoCodecHParams& hparams() const;
     int sampleRate() const;

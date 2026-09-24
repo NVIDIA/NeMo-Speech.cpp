@@ -265,8 +265,14 @@ DecoderCrossKvCache::init(const magpietts_model& model, int requested_text_len) 
     // buffer (and the persistent decoder graph built on it); padded rows stay zero and are
     // masked out of the attention by the persistent graph.
     constexpr int kTextCapacityGranule = 128;
-    const int wanted_capacity = (requested_text_len + kTextCapacityGranule - 1) /
-                                kTextCapacityGranule * kTextCapacityGranule;
+    int wanted_capacity = (requested_text_len + kTextCapacityGranule - 1) / kTextCapacityGranule *
+                          kTextCapacityGranule;
+#if defined(GGML_USE_CUDA)
+    // The persistent decoder runtime is built on this buffer; allocate the fused step's full
+    // text window once so a longer sentence never forces a rebuild.
+    if (model.backend && ggml_backend_is_cuda(model.backend))
+        wanted_capacity = std::max(wanted_capacity, MAGPIETTS_DECODER_FUSED_MAX_TEXT);
+#endif
     if (ctx) {
         if (capacity < requested_text_len || n_layers != h.n_dec_layer ||
             n_cross_dim != cross_dim) {
@@ -682,6 +688,18 @@ checked_persistent_cache_len(const magpietts_model& model, int stacked_position_
     return static_cast<int>(cache_len);
 }
 
+// Position budget for a persistent runtime: at least the model default, so requests share it.
+static int
+persistent_budget(const magpietts_model& model, int stacked_position_budget) {
+    const magpietts_hparams& h = model.hparams;
+    const int stacking = std::max(1, (int)h.frame_stacking_factor);
+    const int model_budget = (h.max_decoder_steps + stacking - 1) / stacking;
+    if (model_budget <= stacked_position_budget ||
+        (int64_t)h.baked_context_length + model_budget - 1 >= h.n_ctx)
+        return stacked_position_budget;
+    return model_budget;
+}
+
 class MagpieDecoder::PersistentDecoderRuntime {
    public:
     PersistentDecoderRuntime(
@@ -711,11 +729,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
     }
 
     // The graph depends on the cross cache buffer and its row capacity, not on the exact text
-    // length: chunks up to the capacity reuse the runtime (set_text_len updates the mask).
+    // length: chunks up to the capacity reuse the runtime (set_text_len updates the mask), as
+    // does any request budget up to the built one (the ring cache attends its valid suffix).
     bool matches(
         const DecoderCrossKvCache* cross_kv, int text_len, int stacked_position_budget) const {
         return cross_kv == cross_kv_ && cross_kv->capacity == text_capacity_ && text_len > 0 &&
-               text_len <= text_capacity_ && stacked_position_budget == stacked_position_budget_;
+               text_len <= text_capacity_ && stacked_position_budget <= stacked_position_budget_;
     }
 
     void set_text_len(int text_len) { text_len_ = text_len; }
@@ -987,6 +1006,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // Drop a deferred alignment readback that was never completed (the step that enqueued it
     // was aborted); called at the start of every decoder step.
     void discardPendingAlignment() { alignment_pending_ = false; }
+    bool fusedStepExclusive() const { return magpietts_decoder_fused_exclusive(fused_); }
 
     // Deferred alignment: the readback into pinned memory is enqueued by run_fused and read by
     // completeAlignment once the stream has been synchronized by the caller (or here).
@@ -1031,6 +1051,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         st.position = position;
         st.ring_head = ring_head_;
         st.valid_len = valid_tokens_;
+        st.text_len = text_len_;
         st.prior = d_prior;
         st.mask = d_mask;
         st.hidden_cond = hidden_cond;
@@ -1166,7 +1187,8 @@ MagpieDecoder::evalCachedPair(
             }
             if (cond_kv.n_tokens > 0 && !persistent_runtime_) {
                 persistent_runtime_ = std::make_unique<PersistentDecoderRuntime>(
-                    model_, *cond_cross_kv, text_len, stacked_position_budget);
+                    model_, *cond_cross_kv, text_len,
+                    persistent_budget(model_, stacked_position_budget));
                 persistent_runtime_->seed(cond_kv, uncond_kv);
                 fprintf(
                     stderr,
@@ -1872,6 +1894,15 @@ MagpieDecoder::completeAlignment(const magpietts_decoder_attention* attention) c
     (void)attention;
 #endif
     return true;
+}
+
+bool
+MagpieDecoder::fusedStepExclusive() const {
+#if defined(GGML_USE_CUDA)
+    return persistent_runtime_ && persistent_runtime_->fusedStepExclusive();
+#else
+    return false;
+#endif
 }
 
 bool

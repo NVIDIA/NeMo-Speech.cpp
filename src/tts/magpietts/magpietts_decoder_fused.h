@@ -51,6 +51,9 @@ struct magpietts_decoder_fused_weights {
     const magpietts_decoder_fused_layer_weights* layers = nullptr;
 };
 
+// Largest cross-attention text window (text_capacity) the fused step supports.
+constexpr int MAGPIETTS_DECODER_FUSED_MAX_TEXT = 512;
+
 struct magpietts_decoder_fused_cache {
     int cache_len = 0;                 // self-attention rows per lane
     float* const* kv_arena = nullptr;  // per layer: [2 planes][2 lanes][cache_len][n_embd] F32
@@ -64,6 +67,7 @@ struct magpietts_decoder_fused_step_args {
     int position = 0;
     int ring_head = 0;  // oldest physical cache row before this step (the new row's slot)
     int valid_len = 0;  // valid cache rows before this step
+    int text_len = 0;   // real text rows (<= text_capacity; 0 = all)
     const float* prior = nullptr;  // device [text_capacity]: log prior on real rows, -1e30 on pads
     const float* mask = nullptr;   // device [text_capacity]: 0 on real rows, -1e30 on pads
     float* hidden_cond = nullptr;  // device [n_embd] outputs after the final norm
@@ -77,6 +81,10 @@ magpietts_decoder_fused* magpietts_decoder_fused_create(
 void magpietts_decoder_fused_free(magpietts_decoder_fused* f);
 bool magpietts_decoder_fused_supported(const magpietts_decoder_fused* f);
 int magpietts_decoder_fused_grid(const magpietts_decoder_fused* f);
+// Whether the step's persistent kernel leaves no room on its SMs for other kernels.
+bool magpietts_decoder_fused_exclusive(const magpietts_decoder_fused* f);
+// Print and reset the per-phase timing of -DLTF_CHAIN_TIMING builds (no-op otherwise).
+void magpietts_decoder_fused_timing_report();
 bool magpietts_decoder_fused_step(
     magpietts_decoder_fused* f, cudaStream_t stream, const magpietts_decoder_fused_step_args& step,
     char* error, size_t error_size);

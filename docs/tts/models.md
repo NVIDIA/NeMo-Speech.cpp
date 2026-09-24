@@ -110,8 +110,10 @@ output stores the attention and feed-forward projections of the text encoder,
 decoder and local transformer, the local-transformer output projections and the
 final projection as Q8_0, and keeps embeddings, norms and everything else f16.
 Output quality matches the f16 file (validated on MagpieTTS v2607). On CUDA GPUs
-with compute capability 8.0 or newer it also enables the fused decoder and
-local-transformer kernels, which are selected automatically. The converter is a source-tree
+with compute capability 8.0 or newer and at least 48 SMs it also enables the
+fused decoder and local-transformer kernels, which are selected automatically.
+On Hopper and newer, build with native code for the GPU (for example
+`-DCMAKE_CUDA_ARCHITECTURES=native`). The converter is a source-tree
 Python tool and is not included
 in native release archives; see [Model conversion](../model-conversion.md) for
 environment setup.

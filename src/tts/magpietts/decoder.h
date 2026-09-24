@@ -174,6 +174,9 @@ class MagpieDecoder {
     // Finish a deferred alignment readback (see magpietts_decoder_attention::defer_alignment);
     // a no-op when nothing is pending.
     bool completeAlignment(const magpietts_decoder_attention* attention) const;
+    // Whether decoder steps run a fused CUDA kernel that leaves no room on the GPU for other
+    // kernels (such as the codec) while it runs.
+    bool fusedStepExclusive() const;
     bool adoptPrefill(
         const DecoderKvCache& prefetched_cond_kv, const DecoderKvCache& prefetched_uncond_kv,
         const DecoderCrossKvCache& prefetched_cross_kv, DecoderKvCache& cond_kv,

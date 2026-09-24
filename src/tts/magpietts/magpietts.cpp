@@ -32,6 +32,10 @@
 #include "nvtx_utils.h"
 #include "token_utils.h"
 #include "tts/nanocodec/model.h"
+#if defined(GGML_USE_CUDA)
+#include "magpietts_decoder_fused.h"
+#include "magpietts_lt_fused.h"
+#endif
 
 namespace nemo_speech::tts {
 
@@ -807,6 +811,7 @@ struct codec_stream_worker {
     std::mutex mutex;
     std::condition_variable has_work;
     std::condition_variable has_room;
+    std::condition_variable first_audio;
     std::thread worker;
     bool input_closed = false;
     bool abort_requested = false;
@@ -819,6 +824,8 @@ struct codec_stream_worker {
     int write_idx = 0;
     int last_token_id = -1;
     int chunks_done = 0;
+    bool first_chunk_taken = false;
+    bool first_chunk_done = false;
 
     codec_stream_worker(
         const nc::NanoCodecModel& codec_, nc::NanoCodecDecoder& decoder_,
@@ -858,6 +865,21 @@ struct codec_stream_worker {
     bool is_failed() {
         std::lock_guard<std::mutex> lock(mutex);
         return failed;
+    }
+
+    bool first_audio_done() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return first_chunk_done;
+    }
+
+    // Block the producer until the first audio chunk is decoded, so a decoder step that occupies
+    // the whole GPU does not delay first audio.
+    void wait_first_audio() {
+        std::unique_lock<std::mutex> lock(mutex);
+        first_audio.wait(lock, [&] {
+            return first_chunk_done || failed || abort_requested || input_closed ||
+                   (!first_chunk_taken && !has_tokens_locked());
+        });
     }
 
     std::vector<int32_t> eos_frame() const {
@@ -929,6 +951,7 @@ struct codec_stream_worker {
         }
         has_work.notify_all();
         has_room.notify_all();
+        first_audio.notify_all();
         if (worker.joinable()) {
             worker.join();
         }
@@ -945,6 +968,7 @@ struct codec_stream_worker {
         }
         has_work.notify_all();
         has_room.notify_all();
+        first_audio.notify_all();
     }
 
     bool has_tokens_locked() const {
@@ -1013,6 +1037,7 @@ struct codec_stream_worker {
         }
         if (has_tokens_locked()) {
             item = read_tokens_locked();
+            first_chunk_taken = true;
             return !item.frames.empty();
         }
         if (send_final_audio) {
@@ -1063,6 +1088,11 @@ struct codec_stream_worker {
                     return;
                 }
                 ++chunks_done;
+                if (chunks_done == 1) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    first_chunk_done = true;
+                    first_audio.notify_all();
+                }
                 if (item.final_read) {
                     std::lock_guard<std::mutex> lock(mutex);
                     send_final_audio = true;
@@ -1258,6 +1288,7 @@ stream_magpie_to_audio(
     };
 
     int frames_generated = 0;
+    bool first_audio_pending = true;  // see codec_stream_worker::wait_first_audio
     int decoder_frames_generated = 0;
     MagpieLongformAttentionPriorState attention_prior;
     std::vector<int32_t> prior_text_tokens;
@@ -1901,6 +1932,13 @@ stream_magpie_to_audio(
                         ++frames_generated;
                         ++chunk_frames_generated;
                     }
+                    if (first_audio_pending) {
+                        first_audio_pending = false;
+                        if (decoder.fusedStepExclusive() && codec.onAccelerator()) {
+                            codec_worker.wait_first_audio();
+                            first_audio_pending = !codec_worker.first_audio_done();
+                        }
+                    }
                 } else {
                     suppressed_nonfinal_frames += frames_to_emit;
                 }
@@ -1978,6 +2016,11 @@ stream_magpie_to_audio(
 
     metrics.generated_frames = frames_generated;
     metrics.finish(outputs.samples_written, codec.sampleRate(), codec_fps);
+#if defined(GGML_USE_CUDA)
+    // -DLTF_CHAIN_TIMING builds only
+    magpietts_decoder_fused_timing_report();
+    magpietts_lt_fused_timing_report();
+#endif
     const double generation_elapsed_s = (ggml_time_us() - t_start) / 1000000.0;
     const bool warmup = std::strcmp(label, "warmup") == 0;
     if (params.verbose || (params.benchmark && !warmup)) {

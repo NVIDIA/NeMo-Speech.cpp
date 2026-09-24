@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+find_package(Threads REQUIRED)
 add_executable(nemo_speech_cli
     main.cpp
+    bench.cpp
     cli_util.cpp
     doctor.cpp
     model.cpp
@@ -15,6 +17,7 @@ target_link_libraries(nemo_speech_cli PRIVATE
     nemo_speech_engine_registry
     ggml
     ggml-base
+    Threads::Threads
 )
 target_include_directories(nemo_speech_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
 if(WIN32)
@@ -22,14 +25,11 @@ if(WIN32)
 endif()
 
 if(NEMO_SPEECH_BUILD_ASR)
-    find_package(Threads REQUIRED)
     target_sources(nemo_speech_cli PRIVATE
-        bench.cpp
+        bench_asr.cpp
         transcribe.cpp)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_ASR=1)
-    target_link_libraries(nemo_speech_cli PRIVATE
-        nemo_speech_asr
-        Threads::Threads)
+    target_link_libraries(nemo_speech_cli PRIVATE nemo_speech_asr)
     if(NEMO_SPEECH_BUILD_MIC_CAPTURE)
         if(NOT EXISTS "${CMAKE_SOURCE_DIR}/llama.cpp/vendor/miniaudio/miniaudio.h")
             message(FATAL_ERROR
@@ -85,12 +85,12 @@ if(NEMO_SPEECH_WITH_NORM)
 endif()
 if(NEMO_SPEECH_BUILD_DIAR)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_DIAR=1)
-    target_sources(nemo_speech_cli PRIVATE diarize.cpp)
+    target_sources(nemo_speech_cli PRIVATE bench_diarize.cpp diarize.cpp)
     target_link_libraries(nemo_speech_cli PRIVATE nemo_speech_asr)
 endif()
 if(NEMO_SPEECH_BUILD_TTS)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_TTS=1)
-    target_sources(nemo_speech_cli PRIVATE synthesize.cpp)
+    target_sources(nemo_speech_cli PRIVATE bench_tts.cpp synthesize.cpp)
     target_link_libraries(nemo_speech_cli PRIVATE nemo_speech_tts_magpietts)
     if(NEMO_SPEECH_TTS_WITH_JA)
         target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_TTS_JA=1)
@@ -101,7 +101,7 @@ if(NEMO_SPEECH_BUILD_TTS)
 endif()
 if(NEMO_SPEECH_BUILD_NMT)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_NMT=1)
-    target_sources(nemo_speech_cli PRIVATE translate.cpp)
+    target_sources(nemo_speech_cli PRIVATE bench_translate.cpp translate.cpp)
     target_link_libraries(nemo_speech_cli PRIVATE nemo_speech_nmt)
 endif()
 
