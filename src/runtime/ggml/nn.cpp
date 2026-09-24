@@ -29,25 +29,34 @@ cached_q8_input(
         const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16");
         return value != nullptr && value[0] != '0';
     }();
+#else
+    // Stock ggml has no Q8_0 x F16 matmul; the cast would leave no backend.
+    constexpr bool enabled = false;
+#endif
     static const int min_columns = [] {
         const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
         const int parsed = value != nullptr ? std::atoi(value) : 128;
         return parsed > 0 ? parsed : 1;
     }();
+    static const bool outer_batch_dispatch = [] {
+        const char* value = std::getenv("GGML_SKINNY_Q8_OUTER_BATCH");
+        return value != nullptr && value[0] != '0';
+    }();
     const int64_t columns = ggml_nelements(input) / input->ne[0];
+    const bool eligible_columns =
+        outer_batch_dispatch ? columns > 8 : input->ne[1] > 8 && input->ne[1] <= 64;
+    const bool eligible_block_q8 =
+        std::string(weight.tensor->name).rfind("encoder.", 0) == 0 && eligible_columns;
+#ifdef NEMO_SPEECH_GGML_PATCHED
     const bool planar = (weight.tensor->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
-    const bool eligible_block_q8 = std::string(weight.tensor->name).rfind("encoder.", 0) == 0 &&
-                                   input->ne[1] > 8 && input->ne[1] <= 64;
+#else
+    const bool planar = false;
+#endif
     if (enabled && session->params.use_gpu && weight.tensor->type == GGML_TYPE_Q8_0 &&
         (planar || eligible_block_q8) && input->type == GGML_TYPE_F32 && columns >= min_columns) {
         const auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight.buft);
         return ggml_cast(bf_ctx.ctx, input, GGML_TYPE_F16);
     }
-#else
-    (void)session;
-    (void)session_tensor_container;
-    (void)weight;
-#endif
     return input;
 }
 

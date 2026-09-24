@@ -65,7 +65,7 @@ run_itn_cases(const postproc::Itn& itn, const std::string& suite, const test::It
 int
 main() {
     // Keep the last completed check visible when CI pipes stdout through tee.
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     // Write a small profanity list to a temp file. temp_directory_path() honors
     // TMPDIR/TMP/TEMP and is portable (no hardcoded /tmp).

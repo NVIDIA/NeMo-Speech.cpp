@@ -9,6 +9,7 @@ similarity ratio rather than exact match so backend numerics cannot flake it.
 """
 import argparse
 import difflib
+import itertools
 import json
 import pathlib
 import re
@@ -23,6 +24,7 @@ JFK_TEXT = (
     "ask what you can do for your country"
 )
 TTS_TEXT = "The quick brown fox jumps over the lazy dog."
+FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "test_files" / "diar"
 
 
 def normalize(text: str) -> str:
@@ -55,6 +57,67 @@ def read_wav_stats(path: pathlib.Path) -> tuple[float, int, int]:
         samples = struct.unpack(f"<{frames}h", audio.readframes(frames))
         seconds = frames / audio.getframerate()
     return seconds, len(set(samples)), max(abs(s) for s in samples)
+
+
+def speaker_frames(segments, step=0.01):
+    frames = {}
+    for speaker, start, end in segments:
+        frames.setdefault(speaker, set()).update(range(round(start / step), round(end / step)))
+    return frames
+
+
+def diarization_errors(reference, hypothesis) -> tuple[float, float]:
+    """Frame-level DER and speaker confusion (no collar) under the best speaker mapping."""
+    ref, hyp = speaker_frames(reference), speaker_frames(hypothesis)
+    frames = set().union(*ref.values(), *hyp.values())
+    ref_count = {f: sum(f in s for s in ref.values()) for f in frames}
+    hyp_count = {f: sum(f in s for s in hyp.values()) for f in frames}
+    ref_ids, hyp_ids = list(ref), list(hyp) + [None] * max(0, len(ref) - len(hyp))
+    best = max(
+        (
+            sum(len(ref[r] & hyp[h]) for r, h in zip(ref_ids, perm) if h is not None)
+            for perm in itertools.permutations(hyp_ids, len(ref_ids))
+        ),
+        default=0,
+    )
+    total = sum(ref_count.values())
+    miss = sum(max(ref_count[f] - hyp_count[f], 0) for f in frames)
+    false_alarm = sum(max(hyp_count[f] - ref_count[f], 0) for f in frames)
+    confusion = sum(min(ref_count[f], hyp_count[f]) for f in frames) - best
+    return (miss + false_alarm + confusion) / total, confusion / total
+
+
+FILLERS = {"mm", "hmm", "mm-hmm", "mhm", "uh", "um", "uh-huh"}
+
+
+def meeting_words(text: str) -> list[str]:
+    # AMI spells letters as "D_N_L_G_"; fillers are not scored.
+    text = re.sub(r"[^a-z0-9'_ -]+", " ", text.lower().replace("_", ""))
+    return [w for w in text.split() if w not in FILLERS]
+
+
+def edit_distance(a: list[str], b: list[str]) -> int:
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, y in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (x != y))
+    return row[-1]
+
+
+def cp_wer(reference: dict[str, list[str]], hypothesis: dict[str, list[str]]) -> float:
+    """Concatenated minimum-permutation WER over speaker assignments."""
+    ref_ids = list(reference)
+    hyp_ids = list(hypothesis) + [None] * max(0, len(reference) - len(hypothesis))
+    best = None
+    for perm in itertools.permutations(hyp_ids, len(ref_ids)):
+        errors = sum(
+            edit_distance(reference[r], hypothesis.get(h, [])) for r, h in zip(ref_ids, perm)
+        )
+        # Hypothesis speakers left unassigned are pure insertions.
+        errors += sum(len(hypothesis[h]) for h in hypothesis if h not in perm)
+        best = errors if best is None else min(best, errors)
+    return best / sum(len(words) for words in reference.values())
 
 
 def main() -> None:
@@ -95,6 +158,50 @@ def main() -> None:
         print(f"diarization: {len(segments)} segments, {speech:.1f}s speech, speakers {speakers}")
         check(len(segments) >= 1 and speech >= 8.0, "diarization covers the utterance")
         check(len(speakers) == 1, "single-speaker audio yields one speaker")
+
+        meeting = FIXTURES / "ami_en2002d_2172.wav"
+        diar = json.loads(
+            run(args.binary, "diarize", str(meeting), "--backend", args.backend, "--format", "json")
+        )
+        hypothesis = [(s["speaker"], s["start"], s["end"]) for s in diar.get("segments", [])]
+        reference = []
+        for line in meeting.with_suffix(".rttm").read_text().splitlines():
+            fields = line.split()
+            start = float(fields[3])
+            reference.append((fields[7], start, start + float(fields[4])))
+        der, confusion = diarization_errors(reference, hypothesis)
+        speakers = {s for s, _, _ in hypothesis}
+        print(
+            f"meeting diarization: {len(speakers)} speakers, DER {der:.1%}, confusion {confusion:.1%}"
+        )
+        check(len(speakers) == 3, "three-speaker meeting yields three speakers")
+        check(confusion < 0.06 and der < 0.32, "meeting diarization matches the reference")
+
+        transcript = json.loads(
+            run(
+                args.binary,
+                "transcribe",
+                str(meeting),
+                "--diarize",
+                "--backend",
+                args.backend,
+                "--format",
+                "json",
+            )
+        )
+        hypothesis_words = {}
+        for word in transcript.get("words", []):
+            hypothesis_words.setdefault(word.get("speaker", 0), []).extend(
+                meeting_words(word["word"])
+            )
+        reference_words = {}
+        for segment in json.loads(meeting.with_suffix(".json").read_text()):
+            reference_words.setdefault(segment["speaker"], []).extend(
+                meeting_words(segment["words"])
+            )
+        score = cp_wer(reference_words, hypothesis_words)
+        print(f"meeting transcription: {len(hypothesis_words)} speakers, cpWER {score:.1%}")
+        check(score < 0.30, "diarized meeting transcript matches the reference")
 
         if args.skip_tts:
             return

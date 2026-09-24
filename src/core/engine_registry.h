@@ -53,8 +53,7 @@ class EngineRegistry {
 
 #if defined(NEMO_SPEECH_REGISTRY_DIAR)
     std::shared_ptr<asr::Diarizer> load_diarization(
-        int gpu, const std::string& model_path,
-        asr::DiarGeometry geometry = asr::DiarGeometry::preset("streaming"),
+        int gpu, const std::string& model_path, asr::DiarGeometry geometry = {},
         asr::BatchingConfig batching = {});
     std::shared_ptr<asr::Diarizer> diarization() const;
 #endif

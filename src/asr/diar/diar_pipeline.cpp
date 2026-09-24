@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
+
 
 using namespace nemo_speech::asr;
 
@@ -33,6 +35,11 @@ DiarModel::DiarModel(
     fe_.set_mel_basis(model_.mel_basis().data(), fe_cfg_.n_mels, n_bins);
 }
 
+DiarGeometry
+DiarModel::resolved_geometry(const DiarGeometry& requested) const {
+    return requested.resolved(cfg().is_v3());
+}
+
 std::vector<float>
 DiarModel::diarize_offline(const float* audio, size_t n_samples, int64_t* n_frames) {
     // NeMo's offline path (streaming_mode=False, process_signal) peak-
@@ -55,39 +62,56 @@ DiarModel::diarize_offline(const float* audio, size_t n_samples, int64_t* n_fram
     if (t_enc > max_enc) {
         throw std::invalid_argument(
             "diarize_offline: " + std::to_string(t_enc) +
-            " encoder frames exceeds the rel-pos "
-            "table (" +
-            std::to_string(max_enc) + " = ~" + std::to_string(max_enc * 8 / 100 / 60) +
+            " encoder frames exceeds the model position limit (" + std::to_string(max_enc) +
+            " = ~" + std::to_string(max_enc * 8 / 100 / 60) +
             " min); use DiarStream for long-form audio");
     }
 
     // One forward with empty spkcache/fifo == NeMo streaming_mode=False.
     auto out = model_.run_chunk(mel.data(), t_mel, nullptr, 0, nullptr, 0);
+    if (model_.cfg().is_v3()) {
+        const int valid = static_cast<int>(
+            std::ceil(t_mel / static_cast<double>(model_.cfg().output_subsampling_factor)));
+        out.native_preds.resize(
+            static_cast<size_t>(std::min(valid, out.native_total_frames)) *
+            model_.cfg().num_speakers);
+        if (n_frames)
+            *n_frames = static_cast<int64_t>(out.native_preds.size()) / model_.cfg().num_speakers;
+        return std::move(out.native_preds);
+    }
     if (n_frames)
         *n_frames = out.total_frames;
     return std::move(out.preds);
 }
 
 DiarStream::DiarStream(DiarModel& model, const DiarGeometry& geometry)
-    : m_(model), geo_(geometry), n_spk_(model.cfg().num_speakers),
+    : m_(model), geo_(model.resolved_geometry(geometry)), n_spk_(model.cfg().num_speakers),
       sub_(model.cfg().encoder.subsampling_factor),
-      sec_per_frame_(
-          model.cfg().encoder.subsampling_factor * static_cast<double>(model.cfg().window_stride)),
-      state_(geo_, model.cfg().scoring, n_spk_, model.cfg().encoder.d_model), birth_gate_(n_spk_) {
+      sec_per_frame_(model.cfg().seconds_per_output_frame()),
+      word_anchor_frames_(model.cfg().word_anchor_frames()),
+      state_(
+          geo_, model.cfg().scoring, n_spk_, model.cfg().encoder.d_model,
+          model.model().learnable_silence_embedding()),
+      birth_gate_(n_spk_) {
     n_mels_ = m_.fe().n_mels();
+    compact_trigger_frames_ = static_cast<int64_t>(std::ceil(20.0 * 60.0 / sec_per_frame_));
+    compact_retain_frames_ = static_cast<int64_t>(std::ceil(10.0 * 60.0 / sec_per_frame_));
     geo_.validate(
         n_spk_, model.cfg().scoring.sil_frames_per_spk, model.cfg().encoder.pos_emb_max_len);
 }
 
 void
 DiarStream::reset() {
-    state_ = AoscState(geo_, m_.cfg().scoring, n_spk_, m_.cfg().encoder.d_model);
+    state_ = AoscState(
+        geo_, m_.cfg().scoring, n_spk_, m_.cfg().encoder.d_model,
+        m_.model().learnable_silence_embedding());
     birth_gate_.reset();
     audio_buf_.clear();
     audio_base_ = 0;
     mel_buf_.clear();
     mel_base_ = 0;
     mel_consumed_ = 0;
+    provisional_frames_ = 0;
     finished_ = false;
     probs_.clear();
     probs_base_ = 0;
@@ -142,9 +166,8 @@ DiarStream::finish() {
 
 // Chunk scheduler, the streaming counterpart of NeMo's streaming_feat_loader:
 // the next chunk covers mel [mel_consumed_, mel_consumed_ + hop) plus lc/rc
-// context, clamped at the stream edges (riva feeds exact-length tails - no
-// pad+mask). Forced (on-demand) chunks may be shorter than a full hop but
-// stay on the 80 ms encoder-frame grid so frames are labeled exactly once.
+// context, clamped at stream edges. Forced on-demand chunks are temporary
+// predictions; they must not alter the persistent 80 ms-grid chunk schedule.
 bool
 DiarStream::run_one_chunk(bool force, bool final_flush) {
     const int hop_mel = geo_.chunk_len * sub_;
@@ -153,19 +176,26 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
 
     const int64_t stt = mel_consumed_;
     int64_t end = stt + hop_mel;
+    const bool provisional = force && !final_flush;
     if (!force) {
         // Run only when the full window incl. right context is covered.
         if (end + rc_mel_max > mel_produced())
             return false;
-    } else {
+    } else if (final_flush) {
         end = std::min(end, mel_produced());
-        if (!final_flush)
-            end = stt + ((end - stt) / sub_) * sub_;  // whole encoder frames only
+        if (end <= stt)
+            return false;
+    } else {
+        if (mel_produced() - stt < rc_mel_max + sub_)
+            return false;
+        end = std::min(end, mel_produced() - rc_mel_max);
+        end = stt + ((end - stt) / sub_) * sub_;
         if (end <= stt)
             return false;
     }
     const int64_t lc_mel = std::min<int64_t>(lc_mel_max, stt);
-    const int64_t rc_mel = std::min<int64_t>(rc_mel_max, mel_produced() - end);
+    const int64_t rc_mel =
+        provisional ? rc_mel_max : std::min<int64_t>(rc_mel_max, mel_produced() - end);
     const int64_t w0 = stt - lc_mel;
     const int t_mel = static_cast<int>(end + rc_mel - w0);
     if (t_mel <= 0)
@@ -175,16 +205,60 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
         throw std::runtime_error("DiarStream: mel window trimmed too aggressively");
     const float* mel = mel_buf_.data() + (w0 - mel_base_) * m_.fe().n_mels();
 
+    std::optional<AoscState> preview_state;
+    if (provisional)
+        preview_state.emplace(state_);
+    auto& run_state = preview_state ? *preview_state : state_;
     auto out = m_.model().run_chunk(
-        mel, t_mel, state_.spkcache_frames() ? state_.spkcache().data() : nullptr,
-        state_.spkcache_frames(), state_.fifo_frames() ? state_.fifo().data() : nullptr,
-        state_.fifo_frames());
+        mel, t_mel, run_state.spkcache_frames() ? run_state.spkcache().data() : nullptr,
+        run_state.spkcache_frames(), run_state.fifo_frames() ? run_state.fifo().data() : nullptr,
+        run_state.fifo_frames());
 
     const int lc_enc = static_cast<int>(std::lround(lc_mel / static_cast<double>(sub_)));
     const int rc_enc = static_cast<int>(std::ceil(rc_mel / static_cast<double>(sub_)));
     auto emitted =
-        state_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
-    birth_gate_.append(emitted, probs_);
+        run_state.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
+    if (m_.cfg().is_v3()) {
+        const int native_factor = m_.cfg().upsample_factor;
+        const int state_frames = out.total_frames - out.chunk_frames;
+        const int native_offset = (state_frames + lc_enc) * native_factor;
+        const int native_count = static_cast<int>(
+            std::ceil((end - stt) / static_cast<double>(m_.cfg().output_subsampling_factor)));
+        if (native_offset < 0 || native_count < 0 ||
+            native_offset + native_count > out.native_total_frames) {
+            throw std::runtime_error("DiarStream: invalid v3 high-resolution output slice");
+        }
+        const auto begin = out.native_preds.begin() + static_cast<size_t>(native_offset) * n_spk_;
+        // V3's streaming Sortformer state already preserves speaker identity
+        // across chunks.  The V2 birth heuristic can reject a real V3
+        // channel during a continuous handoff and fold it into an established
+        // speaker, permanently merging the two speakers.  Keep the native V3
+        // channel probabilities exactly as NeMo emits them.
+        emitted.assign(begin, begin + static_cast<size_t>(native_count) * n_spk_);
+    }
+    if (emitted.empty())
+        return false;
+
+    const size_t preview_values = static_cast<size_t>(provisional_frames_) * n_spk_;
+    if (preview_values > probs_.size())
+        throw std::runtime_error("DiarStream: inconsistent provisional probability tail");
+    probs_.resize(probs_.size() - preview_values);
+    provisional_frames_ = 0;
+    if (m_.cfg().is_v3()) {
+        probs_.insert(probs_.end(), emitted.begin(), emitted.end());
+    } else if (provisional) {
+        ChannelBirthGate preview_gate = birth_gate_;
+        std::vector<float> preview_probs;
+        preview_gate.append(emitted, preview_probs);
+        probs_.insert(probs_.end(), preview_probs.begin(), preview_probs.end());
+    } else {
+        // V2 can transiently redraw channels and still needs the legacy gate.
+        birth_gate_.append(emitted, probs_);
+    }
+    if (provisional) {
+        provisional_frames_ = static_cast<int64_t>(emitted.size()) / n_spk_;
+        return true;
+    }
     maybe_compact();
     mel_consumed_ = end;
 
@@ -214,8 +288,18 @@ DiarStream::run_ready_chunks(bool end_of_stream) {
 
 void
 DiarStream::flush_available(int64_t target_frame) {
-    while (n_frames() < target_frame && run_one_chunk(/*force=*/true, /*final_flush=*/false)) {
-    }
+    if (!finished_ && n_frames() < target_frame)
+        run_one_chunk(/*force=*/true, /*final_flush=*/false);
+}
+
+int64_t
+DiarStream::stable_frames() const {
+    if (finished_)
+        return n_frames();
+    const int64_t committed = std::max<int64_t>(0, n_frames() - provisional_frames_);
+    if (m_.cfg().is_v3())
+        return committed;
+    return std::clamp<int64_t>(birth_gate_.settled_frames(), 0, committed);
 }
 
 int
@@ -251,7 +335,7 @@ int
 DiarStream::speaker_for_word_time(double t0, double t1) const {
     const int64_t f0 = static_cast<int64_t>(t0 / sec_per_frame_);
     const int64_t f1 = static_cast<int64_t>(std::ceil(t1 / sec_per_frame_));
-    return speaker_for_frames(f0, std::min(f1, f0 + 2));
+    return speaker_for_frames(f0, std::min(f1, f0 + word_anchor_frames_));
 }
 
 std::vector<DiarSegment>

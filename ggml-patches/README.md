@@ -166,6 +166,17 @@ stock comparison therefore requires both a pristine ggml checkout and
   fusion costs 26%. Covered by
   `tests/cpp/tts/test_nanocodec_half_snake_fusion.cpp`.
 
+- **0022-cuda-q8-gelu-fusion.patch** - fuses the bias add, exact `GELU_ERF`,
+  and optional F16 cast after the cached-F16 Q8 cuBLAS GEMM into one CUDA
+  kernel. Active only with `GGML_SKINNY_Q8_CUBLAS_F16=1` on SM80+ GPUs;
+  `GGML_SKINNY_Q8_GELU=0` disables it. Covered by `test-backend-ops -o
+  Q8_GELU_ERF_FUSION`.
+
+- **0023-cuda-skinny-q8-cache-lifetime.patch** - drops skinny-Q8 cache entries,
+  and any planes they own, when their CUDA weight buffer is freed or cleared.
+  The cache was keyed only by device address, so weights later allocated at a
+  reused address were treated as already repacked.
+
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the

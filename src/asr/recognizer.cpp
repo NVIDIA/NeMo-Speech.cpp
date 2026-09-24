@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "model.h"
@@ -125,11 +126,14 @@ Recognizer::Recognizer(RecognizerConfig cfg)
 
     if (!cfg_.diar.model_path.empty()) {
         diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path, cfg_.batching);
-        const DiarGeometry geo = cfg_.diar.resolved_geometry();
+        const DiarGeometry geo = diar_model_->resolved_geometry(cfg_.diar.resolved_geometry());
+        const auto& diar_cfg = diar_model_->cfg();
         GGMLF_LOG_INFO(
-            "[recognizer] diarizer loaded: %s (spkcache=%d fifo=%d chunk=%d rc=%d)\n",
-            cfg_.diar.model_path.c_str(), geo.spkcache_len, geo.fifo_len, geo.chunk_len,
-            geo.chunk_right_context);
+            "[recognizer] diarizer loaded: %s (%s, speakers=%d, output=%.0fms, "
+            "spkcache=%d fifo=%d chunk=%d lc=%d rc=%d)\n",
+            cfg_.diar.model_path.c_str(), diar_cfg.is_v3() ? "v3" : "v2", diar_cfg.num_speakers,
+            diar_cfg.seconds_per_output_frame() * 1000.0, geo.spkcache_len, geo.fifo_len,
+            geo.chunk_len, geo.chunk_left_context, geo.chunk_right_context);
     }
     log_model_status();
 }
@@ -389,7 +393,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     r.channel_tag = 1;
     r.audio_processed = u.audio_processed_sec;
 
-    if (!is_final) {
+    if (!is_final && !interim_words_) {
         // Interim results contain only the raw top hypothesis.
         Alternative alt;
         alt.transcript = u.transcript_so_far;
@@ -419,6 +423,31 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     std::vector<std::string> tag_words;
     tag_words.reserve(langs.size());
     for (const auto& l : langs) tag_words.push_back("<" + l + ">");
+
+    if (!is_final) {
+        // Raw interim text plus decoder word timings. Speaker tags only once
+        // the model-specific attribution window covers the word onset.
+        Alternative alt;
+        alt.transcript = u.transcript_so_far;
+        alt.confidence = 0.0f;
+        alt.language_codes.assign(langs.begin(), langs.end());
+        if (want_off) {
+            for (const auto& w : u.words) {
+                if (std::find(tag_words.begin(), tag_words.end(), w.word) != tag_words.end())
+                    continue;
+                Word ww;
+                ww.word = w.word;
+                ww.start_time = static_cast<int32_t>(w.start_frame * ms + 0.5);
+                ww.end_time = static_cast<int32_t>(w.end_frame * ms + 0.5);
+                ww.confidence = w.confidence;
+                ww.language_code = lang0;
+                alt.words.push_back(std::move(ww));
+            }
+        }
+        r.alternatives.push_back(std::move(alt));
+        refresh_speaker_tags(r);
+        return r;
+    }
 
     // Build one Alternative from a decoder hypothesis. Postproc (PnC/ITN/
     // profanity) may remap word spans, so it runs before frame->ms conversion;
@@ -493,10 +522,13 @@ RecognitionStream::next() {
     const ScopedBatchCohort cohort_scope(
         pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     auto u = runner_->step();
+    late_punctuation_ += u.late_punctuation;
     if (u.is_final) {
         flush_diar_deficit_(u);
         last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
-        return build_result_(u, /*is_final=*/true);
+        auto result = build_result_(u, /*is_final=*/true);
+        result.late_punctuation = std::exchange(late_punctuation_, {});
+        return result;
     }
     // Deliver an interim only when this step advanced the audio cursor (decoded
     // at least one new window). Once the buffered audio is consumed the cursor
@@ -507,7 +539,9 @@ RecognitionStream::next() {
     last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
     if (advanced && !u.transcript_so_far.empty()) {
         pending_cohort_target_ = 0;
-        return build_result_(u, /*is_final=*/false);
+        auto result = build_result_(u, /*is_final=*/false);
+        result.late_punctuation = std::exchange(late_punctuation_, {});
+        return result;
     }
     pending_cohort_target_ = 0;
     return std::nullopt;
@@ -531,7 +565,25 @@ RecognitionStream::finish() {
     if (diar_)
         diar_->finish();  // flush the diarizer tail before tagging final words
     auto u = runner_->finalize();
-    return build_result_(u, /*is_final=*/true);
+    auto result = build_result_(u, /*is_final=*/true);
+    result.late_punctuation = std::exchange(late_punctuation_, {}) + u.late_punctuation;
+    return result;
+}
+
+double
+RecognitionStream::stable_speaker_time() const {
+    return diar_ ? diar_->stable_frames() * diar_->seconds_per_frame() : 0.0;
+}
+
+void
+RecognitionStream::refresh_speaker_tags(Result& result) const {
+    if (!diar_ || result.alternatives.empty())
+        return;
+    for (auto& word : result.alternatives.front().words) {
+        const int speaker =
+            diar_->speaker_for_word_time(word.start_time / 1000.0, word.end_time / 1000.0);
+        word.speaker_tag = speaker >= 0 ? speaker + 1 : 0;
+    }
 }
 
 std::unique_ptr<RecognitionStream>

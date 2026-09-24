@@ -147,8 +147,7 @@ main(int argc, char** argv) {
     double sec_per_frame = 0.0;
     if (offline) {
         probs = model.diarize_offline(audio.data(), audio.size(), &n_frames);
-        sec_per_frame =
-            model.cfg().encoder.subsampling_factor * static_cast<double>(model.cfg().window_stride);
+        sec_per_frame = model.cfg().seconds_per_output_frame();
         segs = diar_segments_from_probs(
             probs.data(), n_frames, model.cfg().num_speakers, sec_per_frame, seg_cfg);
     } else {

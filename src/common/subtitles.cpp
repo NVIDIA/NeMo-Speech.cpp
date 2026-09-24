@@ -44,14 +44,6 @@ ends_with_any(const std::string& value, const std::vector<std::string>& suffixes
 }
 
 bool
-attaches_to_previous(const std::string& word) {
-    static const std::vector<std::string> punctuation{
-        ".",  ",",  "!",  "?",  ";",  ":",  "%",  ")",  "]", "}", "\xE2\x80\x9D", "\xE2\x80\x99",
-        "。", "，", "！", "？", "；", "：", "）", "】", "》"};
-    return starts_with_any(word, punctuation);
-}
-
-bool
 is_title_abbreviation(const std::string& word) {
     std::string lower;
     lower.reserve(word.size());
@@ -147,6 +139,32 @@ struct Group {
 };
 
 }  // namespace
+
+bool
+attaches_to_previous(const std::string& text) {
+    static const std::vector<std::string> punctuation{
+        ".",  ",",  "!",  "?",  ";",  ":",  "%",  ")",  "]", "}", "\xE2\x80\x9D", "\xE2\x80\x99",
+        "。", "，", "！", "？", "；", "：", "）", "】", "》"};
+    return starts_with_any(text, punctuation);
+}
+
+std::vector<SpeakerTurn>
+make_speaker_turns(const std::vector<Word>& words) {
+    std::vector<SpeakerTurn> turns;
+    for (const auto& word : words) {
+        int speaker = word.speaker;
+        // Standalone closing punctuation stays with the preceding speaker.
+        if (!turns.empty() && attaches_to_previous(word.text))
+            speaker = turns.back().speaker;
+        if (turns.empty() || turns.back().speaker != speaker)
+            turns.push_back({speaker, word.start_ms, word.end_ms, {}});
+        if (!turns.back().text.empty() && !attaches_to_previous(word.text))
+            turns.back().text += ' ';
+        turns.back().text += word.text;
+        turns.back().end_ms = std::max(turns.back().end_ms, word.end_ms);
+    }
+    return turns;
+}
 
 std::vector<Cue>
 make_cues(const std::vector<Word>& words, const std::string& fallback_text, int audio_ms) {

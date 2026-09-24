@@ -1,0 +1,82 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -640,6 +640,8 @@
+ 
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
++    ggml_cuda_set_device(ctx->device);
++    ggml_cuda_skinny_q8_forget(ctx->dev_ptr, buffer->size);
+     delete ctx;
+ }
+ 
+@@ -744,6 +746,7 @@
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_skinny_q8_forget(ctx->dev_ptr, buffer->size);
+ }
+ 
+ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+diff --git a/src/ggml-cuda/skinny-q8.cu b/src/ggml-cuda/skinny-q8.cu
+--- a/src/ggml-cuda/skinny-q8.cu
++++ b/src/ggml-cuda/skinny-q8.cu
+@@ -424,8 +424,9 @@
+ #endif
+ 
+ // Repacked-weight cache. Keyed by the weight tensor's device pointer; entries
+-// live for the process lifetime (model weights are loaded once). Repacking
+-// happens on first (eager/warmup) use, before any CUDA-graph capture.
++// are dropped when the device buffer holding the weight is freed or cleared, so
++// new weights at the same address are repacked again. Repacking happens on
++// first (eager/warmup) use, before any CUDA-graph capture.
+ namespace {
+ struct skq8_planes {
+     int8_t * qs;
+@@ -438,6 +439,32 @@
+ std::mutex                                    g_skq8_mutex;
+ }  // namespace
+ 
++void ggml_cuda_skinny_q8_forget(const void * base, size_t size) {
++    const uintptr_t begin = (uintptr_t) base;
++    std::lock_guard<std::mutex> lock(g_skq8_mutex);
++    for (auto it = g_skq8_cache.begin(); it != g_skq8_cache.end();) {
++        // Compare as integers: the cache holds pointers into unrelated allocations.
++        const uintptr_t key = (uintptr_t) it->first;
++        if (key < begin || key - begin >= size) {
++            ++it;
++            continue;
++        }
++        const skq8_planes & planes = it->second;
++        // In-place and planar weights alias the tensor; only a separate
++        // (GGML_SKINNY_Q8_INPLACE=0) repack owns its planes.
++        if ((const void *) planes.qs != it->first) {
++            CUDA_CHECK(cudaFree(planes.qs));
++            CUDA_CHECK(cudaFree(planes.d));
++        }
++#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
++        if (planes.f16 != nullptr) {
++            CUDA_CHECK(cudaFree(planes.f16));
++        }
++#endif
++        it = g_skq8_cache.erase(it);
++    }
++}
++
+ bool ggml_cuda_skinny_q8_supported(
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+     static const bool disabled = []() {
+diff --git a/src/ggml-cuda/skinny-q8.cuh b/src/ggml-cuda/skinny-q8.cuh
+--- a/src/ggml-cuda/skinny-q8.cuh
++++ b/src/ggml-cuda/skinny-q8.cuh
+@@ -4,6 +4,10 @@
+ 
+ // Skinny-N (9..64 cols) Q8_0 x F32 GEMM specialized for streaming encoders.
+ // See skinny-q8.cu for the design notes.
++
++// Drop cached planes for weights in a device allocation being freed or cleared.
++void ggml_cuda_skinny_q8_forget(const void * base, size_t size);
++
+ bool ggml_cuda_skinny_q8_supported(
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ 

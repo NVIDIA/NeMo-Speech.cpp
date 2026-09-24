@@ -23,6 +23,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "context_biasing.h"  // ContextBiasingTree (RNNT word boosting)
@@ -141,13 +142,18 @@ class RnntGreedyDecoder : public Decoder {
 
     void reset() override;
     // Soft utterance reset for callers that intentionally preserve predictor
-    // context. CacheStreamRunner uses reset() at an endpoint boundary.
+    // context. CacheStreamRunner uses this at an endpoint boundary.
     // Also resets the context-biasing match position so phrase
     // matching restarts cleanly.
     void reset_utterance() override {
+        // Punctuation before the next word can still end this utterance.
+        late_punctuation_open_ = utterance_has_content_ && !last_presented_punctuation_;
         words_.clear();
         cur_ = WordTiming{};
         cur_open_ = false;
+        utterance_has_content_ = false;
+        last_presented_punctuation_ = false;
+        pending_word_boundary_ = false;
         bias_node_ = ContextBiasingTree::kRoot;
     }
     // Build the per-request context-biasing tree from speech_contexts.
@@ -161,14 +167,16 @@ class RnntGreedyDecoder : public Decoder {
     int blank_id() const override { return engine_->rnnt_config().blank_id; }
     const std::vector<std::string>& vocab() const override { return engine_->vocab(); }
 
-    // The next step() is an end-of-utterance (is_last) chunk: apply the EOU
-    // punctuation floor (see the punct-bias note in the .cpp).
-    void set_finalizing(bool on) override { finalizing_ = on; }
-
     void set_compute_timestamps(bool on) override { compute_ts_ = on; }
     const std::vector<WordTiming>& word_timings() const override { return words_; }
     void finalize() override;  // flush the trailing in-progress word
     int64_t last_emit_frame() const override { return last_emit_frame_; }
+    int64_t last_speech_frame() const override { return last_speech_frame_; }
+    std::string take_late_punctuation(bool end_of_stream = false) override {
+        if (end_of_stream && !late_punctuation_pending_.empty())
+            late_punctuation_ = std::exchange(late_punctuation_pending_, {});
+        return std::exchange(late_punctuation_, {});
+    }
     const RnntDecodeStats& stats() const { return stats_; }
 
    private:
@@ -176,7 +184,7 @@ class RnntGreedyDecoder : public Decoder {
         const float* enc_out, const ggml_runtime::DeviceTensor* device_enc_out, int d_model, int T,
         int64_t frame_offset);
     void flush_word();
-    void build_punct_bias();
+    bool present_token(int token, int64_t frame);
 
     RnntEngine* engine_;
     std::unique_ptr<RnntStreamState> stream_state_;
@@ -190,20 +198,19 @@ class RnntGreedyDecoder : public Decoder {
     bool predictor_valid_ = false;
     std::vector<int32_t> token_ids_;
     RnntDecodeStats stats_;
-    // Last token-emitting encoder frame (speech evidence for token-silence EOU).
+    // Raw model emission and lexical speech clocks; punctuation is not speech.
     int64_t last_emit_frame_ = -1;
+    int64_t last_speech_frame_ = -1;
 
-    // End-of-utterance punctuation floor (adapted from riva's PunctBiasHelper).
-    // The RNNT model self-punctuates internally, but the terminal '.'/'?' is
-    // marginal - on the trailing frames it sits as the #2 logit just behind
-    // blank, so greedy never commits it. On the is_last flush we add a floor to
-    // those tokens' logits so they win. Empty for models whose vocab carries no
-    // sentence terminators (then it is a no-op).
-    // Dense vocab-sized bias so the joint graph can broadcast it over all
-    // remaining encoder frames before device-side argmax.
-    std::vector<float> punct_bias_;
-    bool has_punct_bias_ = false;
-    bool finalizing_ = false;  // next step() is an end-of-utterance chunk
+    bool utterance_has_content_ = false;
+    bool last_presented_punctuation_ = false;
+    bool pending_word_boundary_ = false;
+    // Previous utterance ended unpunctuated and no word has followed yet;
+    // punctuation emitted now belongs to it.
+    bool late_punctuation_open_ = false;
+    // Held until the next word shows whether a new sentence started.
+    std::string late_punctuation_pending_;
+    std::string late_punctuation_;
 
     // Word-timestamp accumulation (only when compute_ts_); grouped on the ▁
     // boundary, same convention as GreedyCtcDecoder.

@@ -22,9 +22,11 @@ target_link_libraries(test_vad PRIVATE nemo_speech_asr)
 
 add_executable(test_endpointer test_endpointer.cpp)
 target_link_libraries(test_endpointer PRIVATE nemo_speech_asr)
+add_test(NAME endpointer_policy COMMAND test_endpointer)
 
 add_executable(test_postproc test_postproc.cpp)
 target_link_libraries(test_postproc PRIVATE nemo_speech_asr Threads::Threads)
+add_test(NAME asr_postprocessing COMMAND test_postproc)
 
 add_executable(test_audio_resampler test_audio_resampler.cpp)
 target_link_libraries(test_audio_resampler PRIVATE nemo_speech_common)
@@ -34,6 +36,7 @@ target_link_libraries(test_audio_decoder PRIVATE nemo_speech_common)
 
 add_executable(test_decoders test_decoders.cpp)
 target_link_libraries(test_decoders PRIVATE nemo_speech_asr)
+add_test(NAME decoders COMMAND test_decoders)
 
 # Do not link sentencepiece directly; it is provided by nemo_speech_asr.
 add_executable(test_oov_boost test_oov_boost.cpp)
@@ -54,6 +57,13 @@ add_test(NAME diar_state COMMAND test_diar_state)
 
 add_executable(test_diar_recognizer test_diar_recognizer.cpp)
 target_link_libraries(test_diar_recognizer PRIVATE nemo_speech_asr)
+
+# The presenter is CLI code; compile it in directly so tests need no CLI target.
+add_executable(test_live_transcript test_live_transcript.cpp
+    ${CMAKE_SOURCE_DIR}/app/live_transcript.cpp)
+target_include_directories(test_live_transcript PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(test_live_transcript PRIVATE nemo_speech_asr)
+add_test(NAME live_transcript COMMAND test_live_transcript)
 
 add_executable(test_batching test_batching.cpp)
 target_link_libraries(test_batching PRIVATE nemo_speech_asr Threads::Threads)

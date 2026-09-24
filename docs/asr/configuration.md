@@ -62,13 +62,13 @@ column lists the short flag where one exists - the dotted form
 | `asr.vad.masker.stddev_floor` | `--vad-stddev-floor` | `1e-5` | normalization denom floor |
 | `asr.vad.masker.mask_value` | `--vad-mask-value` | `-16.635` | log-mel fill for masked frames |
 | `asr.diar.model_path` | `--diar-model` | - | Sortformer diarizer GGUF (empty = diarization unavailable) |
-| `asr.diar.preset` | `--diar-preset` | `streaming` | `streaming` or `offline` (8 s chunks and larger caches; both stream); replaces the individual keys below |
-| `asr.diar.chunk` | `--diar-chunk` | `20` | chunk length (80 ms frames) |
-| `asr.diar.right_context` | `--diar-rc` | `0` | chunk right context (frames) |
-| `asr.diar.left_context` | `--diar-lc` | `0` | chunk left context (frames) |
-| `asr.diar.fifo` | `--diar-fifo` | `80` | FIFO length (frames) |
-| `asr.diar.spkcache` | `--diar-spkcache` | `160` | speaker cache length (frames) |
-| `asr.diar.update_period` | `--diar-update-period` | `80` | speaker cache update period (frames) |
+| `asr.diar.preset` | `--diar-preset` | model default | `streaming`/`offline` for V2 or `v3-streaming`/`v3-offline` for V3; replaces the individual keys below |
+| `asr.diar.chunk` | `--diar-chunk` | model default | chunk length (80 ms frames) |
+| `asr.diar.right_context` | `--diar-rc` | model default | chunk right context (frames) |
+| `asr.diar.left_context` | `--diar-lc` | model default | chunk left context (frames) |
+| `asr.diar.fifo` | `--diar-fifo` | model default | FIFO length (frames) |
+| `asr.diar.spkcache` | `--diar-spkcache` | model default | speaker cache length (frames) |
+| `asr.diar.update_period` | `--diar-update-period` | model default | speaker cache update period (frames) |
 | `asr.endpointing.enable` | `--endpointing` | `false` | mid-stream EOU (multiple finals) |
 | `asr.endpointing.vad_based` | `--vad-based-eou` | `false` | ride VAD timeline vs token-silence |
 | `asr.endpointing.stop_history_eou_ms` | `--stop-history-eou-ms` | `800` | trailing-silence EOU (ms) |
@@ -220,7 +220,7 @@ Masking and endpointing are independent and can be enabled separately or
 together. For Riva-compatible gRPC clients,
 `custom_configuration["stop_history_eou"]` overrides the threshold for a stream;
 a `runtime_config["force_eou"] = "true"` message finalizes the current utterance
-immediately.
+once the audio received so far is decoded.
 
 ## Postprocessing: profanity, ITN, PnC
 
