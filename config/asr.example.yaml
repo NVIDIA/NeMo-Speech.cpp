@@ -58,8 +58,8 @@ asr:
     stop_history_eou_ms: 800     # trailing silence before EOU (ms)
 
   diar:
-    # model_path: sortformer     # enables word-level speaker tags when requested
-    preset: streaming            # streaming | offline (larger chunks and caches)
+    # model_path: nemotron-3-diarization  # enables word-level speaker tags when requested
+    # preset: v3-offline         # default follows the model; V3: v3-streaming | v3-offline, V2: streaming | offline
 
   postproc:
     # pnc_model_path: /models/pnc.gguf           # punctuation + capitalization
