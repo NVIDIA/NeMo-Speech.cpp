@@ -98,8 +98,10 @@ class DiarizeWorkload : public Workload {
     std::string mismatch_key() const override { return "segment_mismatches"; }
     void summarize_run(
         Value& run, const std::vector<ItemResult>& items, double wall_seconds) const override {
-        const double audio_seconds =
-            corpus_seconds_ * static_cast<double>(items.size()) / inputs_.size();
+        double audio_seconds = 0.0;
+        for (const auto& item : items)
+            audio_seconds += static_cast<double>(inputs_[item.input].audio.samples.size()) /
+                             inputs_[item.input].audio.sample_rate;
         run["audio_seconds"] = audio_seconds;
         run["rtfx"] = audio_seconds / wall_seconds;
     }

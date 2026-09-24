@@ -705,7 +705,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     PersistentDecoderRuntime(
         const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
         int stacked_position_budget)
-        : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
+        : model_(model), cross_kv_(&cross_kv), cross_k_(cross_kv.memory_k), text_len_(text_len),
           text_capacity_(cross_kv.capacity > 0 ? cross_kv.capacity : text_len),
           stacked_position_budget_(stacked_position_budget),
           cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
@@ -733,8 +733,9 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // does any request budget up to the built one (the ring cache attends its valid suffix).
     bool matches(
         const DecoderCrossKvCache* cross_kv, int text_len, int stacked_position_budget) const {
-        return cross_kv == cross_kv_ && cross_kv->capacity == text_capacity_ && text_len > 0 &&
-               text_len <= text_capacity_ && stacked_position_budget <= stacked_position_budget_;
+        return cross_kv == cross_kv_ && cross_kv->memory_k == cross_k_ &&
+               cross_kv->capacity == text_capacity_ && text_len > 0 && text_len <= text_capacity_ &&
+               stacked_position_budget <= stacked_position_budget_;
     }
 
     void set_text_len(int text_len) { text_len_ = text_len; }
@@ -1086,6 +1087,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
 #endif
     const magpietts_model& model_;
     const DecoderCrossKvCache* cross_kv_ = nullptr;
+    const ggml_tensor* cross_k_ = nullptr;  // the allocation the graph was built on
     int text_len_ = 0;
     int text_capacity_ = 0;
     int stacked_position_budget_ = 0;
@@ -1216,6 +1218,11 @@ MagpieDecoder::evalCachedPair(
             cond_kv.clear();
             uncond_kv.clear();
         }
+    }
+    if (persistent_owns_kv_) {
+        // The live caches are stale (the runtime arena holds the K/V): let the eager path refill.
+        cond_kv.clear();
+        uncond_kv.clear();
     }
     persistent_owns_kv_ = false;  // the eager path (re)fills cond_kv/uncond_kv memory itself
     return decoder_eval_cached_pair_impl(
@@ -2278,7 +2285,8 @@ decoder_eval_cached_pair_impl(
                 if (!uncond_cache->buffer || !uncond_hidden_last) {
                     uncond_cache->reset();
                 }
-            } else {
+            }
+            if (!uncond_cache->ready.load(std::memory_order_acquire) && uncond_cache->buffer) {
                 for (int il = 0; il < uncond_kv.n_layers; ++il) {
                     for (int plane = 0; plane < 2; ++plane) {
                         ggml_tensor* src = ggml_view_1d(

@@ -1286,7 +1286,7 @@ magpietts_lt_fused_capture_round(
     magpietts_lt_fused* f, int c, const int32_t* codes, void** graph_out, const float** logits_cond,
     const float** logits_uncond, char* error, size_t error_size,
     const magpietts_lt_fused_sampler* sampler) {
-    if (!f || !graph_out) {
+    if (!f || !graph_out || c < 0 || c >= f->w.n_rounds || (c > 0 && !codes)) {
         ltf_set_error(error, error_size, "fused local transformer: invalid capture arguments");
         return false;
     }

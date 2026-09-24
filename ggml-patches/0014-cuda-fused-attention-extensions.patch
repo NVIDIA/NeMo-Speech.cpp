@@ -116,10 +116,10 @@ index 7429cc45..0c570639 100644
          case GGML_OP_SET_ROWS:
 diff --git a/src/ggml-cuda/fused-attention.cu b/src/ggml-cuda/fused-attention.cu
 new file mode 100644
-index 00000000..aac18f83
+index 00000000..84e1c025
 --- /dev/null
 +++ b/src/ggml-cuda/fused-attention.cu
-@@ -0,0 +1,1715 @@
+@@ -0,0 +1,1720 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +#include "fused-attention.cuh"
@@ -361,9 +361,11 @@ index 00000000..aac18f83
 +    }
 +    __syncthreads();
 +
++    // A fully masked split has maximum == -inf: give it zero weight instead of NaN.
++    const bool empty_split = maximum == -INFINITY;
 +    float local_sum = 0.0f;
 +    for (int i = tid; i < range; i += 256) {
-+        const float weight = __expf(scores[i] - maximum);
++        const float weight = empty_split ? 0.0f : __expf(scores[i] - maximum);
 +        scores[i] = weight;
 +        local_sum += weight;
 +    }
@@ -442,7 +444,10 @@ index 00000000..aac18f83
 +        float gctx = 0.0f;
 +        for (int s = 0; s < splits; ++s) {
 +            const float m = all[s * partial_stride + d_k];
-+            const float w = (m == -INFINITY) ? 0.0f : __expf(m - gmax);
++            if (m == -INFINITY) {
++                continue;  // fully masked split
++            }
++            const float w = __expf(m - gmax);
 +            gsum += w * all[s * partial_stride + d_k + 1];
 +            gctx += w * all[s * partial_stride + tid];
 +        }

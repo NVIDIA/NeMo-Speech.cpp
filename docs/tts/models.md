@@ -108,7 +108,7 @@ to `--outtype q8_0` for MagpieTTS and `--outtype f16` for NanoCodec; pass
 `--outtype f16` or `--outtype f32` to keep MagpieTTS unquantized. The `q8_0`
 output stores the attention and feed-forward projections of the text encoder,
 decoder and local transformer, the local-transformer output projections and the
-final projection as Q8_0, and keeps embeddings, norms and everything else f16.
+final projection as Q8_0, keeps norms and biases f32, and everything else f16.
 Output quality matches the f16 file (validated on MagpieTTS v2607). On CUDA GPUs
 with compute capability 8.0 or newer and at least 48 SMs it also enables the
 fused decoder and local-transformer kernels, which are selected automatically.

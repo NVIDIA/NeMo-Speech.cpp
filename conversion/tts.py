@@ -33,8 +33,8 @@ SPEAKER_NAMES = ["John", "Sofia", "Aria", "Jason", "Leo"]
 
 # 2-D projection weights stored as Q8_0 by ``--outtype q8_0``: the attention and feed-forward
 # projections (per-tap Conv1d slices) of the text encoder, the decoder and the local
-# transformer, the local-transformer output projections and the final projection. Embeddings,
-# norms and all other tensors keep the f16 layout. The CUDA runtime's fused decoder and
+# transformer, the local-transformer output projections and the final projection. Norms and
+# biases stay f32; all other tensors keep the f16 layout. The CUDA runtime's fused decoder and
 # local-transformer kernels need these Q8_0 projections; other backends run them through
 # ggml's Q8_0 matrix multiplication.
 Q8_PROJECTION_WEIGHT = re.compile(
