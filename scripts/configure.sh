@@ -176,4 +176,10 @@ if [ "$need_nmt" = ON ] || [ "$need_s2s" = ON ]; then
     scripts/apply-llama-patches.sh
 fi
 
-cmake --preset "$PRESET" "$@"
+ggml_native=ON
+case "$PRESET" in
+    cpu-*) ggml_native=OFF ;;
+esac
+ggml_native="$(cmake_bool_override GGML_NATIVE "$ggml_native" "$@")"
+
+cmake --preset "$PRESET" "-DGGML_NATIVE=$ggml_native" "$@"

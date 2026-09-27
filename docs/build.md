@@ -119,6 +119,11 @@ adapters and separate `riva_server` executable are needed.
 
 The preset selects which components and ggml backend are compiled.
 
+CPU presets disable ggml's native-architecture optimization by default so
+portable x86_64 CPU artifacts do not require instruction sets from the build
+host. Pass `-DGGML_NATIVE=ON` only when producing an artifact for a known
+target machine.
+
 Additional CMake definitions can follow the preset:
 
 ```bash
