@@ -182,4 +182,14 @@ case "$PRESET" in
 esac
 ggml_native="$(cmake_bool_override GGML_NATIVE "$ggml_native" "$@")"
 
-cmake --preset "$PRESET" "-DGGML_NATIVE=$ggml_native" "$@"
+ggml_options=("-DGGML_NATIVE=$ggml_native")
+case "$PRESET" in
+    cpu-*)
+        for variable in GGML_SSE42 GGML_AVX GGML_AVX2 GGML_BMI2 GGML_FMA GGML_F16C; do
+            value="$(cmake_bool_override "$variable" OFF "$@")"
+            ggml_options+=("-D$variable=$value")
+        done
+        ;;
+esac
+
+cmake --preset "$PRESET" "${ggml_options[@]}" "$@"
