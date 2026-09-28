@@ -8,15 +8,15 @@ MagpieTTS Multilingual 357M v2607 (Q8_0), streaming, one stream:
 
 | Time to first audio (ms)<br>avg · p99 | Inter-chunk latency (ms)<br>avg · p99 | Throughput (RTFX) |
 |:---:|:---:|:---:|
-| **22.9** · 30.9 | **5.9** · 25.8 | **28.7×** |
+| **16.8** · 18.1 | **5.8** · 25.5 | **30.0×** |
 
 By input length:
 
 | Input | Audio (s) | Time to first audio (ms)<br>avg · p99 | Throughput (RTFX) |
 |---|:---:|:---:|:---:|
-| Short (8 words) | 3.1 | **21.9** · 26.3 | **26.8×** |
-| Medium (55 words) | 22.0 | **23.2** · 28.0 | **26.6×** |
-| Long (258 words) | 87.0 | **24.7** · 27.6 | **27.5×** |
+| Short (8 words) | 3.1 | **18.6** · 23.2 | **27.9×** |
+| Medium (55 words) | 22.0 | **16.3** · 17.8 | **27.5×** |
+| Long (258 words) | 87.0 | **18.4** · 19.2 | **28.3×** |
 
 Latencies are measured at the client from the streaming audio callback;
 throughput is audio duration divided by wall time. The first table uses the 10

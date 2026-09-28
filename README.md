@@ -28,9 +28,9 @@
 
 Streaming speech synthesis on NVIDIA DGX Spark (GB10):
 
-| Model | Time to first audio | Throughput |
-|---|:---:|:---:|
-| MagpieTTS Multilingual 357M v2607 (Q8_0) | **23 ms** | **29× real time** |
+| Model | Time to first audio | Inter-chunk latency | Throughput |
+|---|:---:|:---:|:---:|
+| MagpieTTS Multilingual | **17 ms** | **6 ms** | **30× real time** |
 
 See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
 
