@@ -29,6 +29,7 @@ struct CommonOptions {
     std::string device = "auto";
     bool device_set = false;
     bool recursive = false;
+    std::string save_dir;  // write each input's first output here as <name>.txt
     std::vector<std::string> positional;
 };
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,6 +56,8 @@ class AsrWorkload : public Workload {
             if (mode != "offline" && mode != "stream")
                 throw std::invalid_argument("--mode must be offline or stream");
             stream_ = mode == "stream";
+        } else if (arg == "--chunk-ms") {
+            chunk_ms_ = parse_int(value(), arg, 10, 60000);
         } else {
             return false;
         }
@@ -94,18 +97,27 @@ class AsrWorkload : public Workload {
         recognizer_ = engines_.load_asr(config_);
     }
     void warmup_engine() override { engines_.warmup(); }
-    ItemResult run(size_t index) override { return {recognize(inputs_[index]), {}}; }
+    ItemResult run(size_t index) override {
+        std::vector<double> chunk_latency_ms;
+        auto transcript = recognize(inputs_[index], chunk_latency_ms);
+        if (!stream_)
+            return {std::move(transcript), {}};
+        return {std::move(transcript), {}, {{"chunk_latency_ms", std::move(chunk_latency_ms)}}};
+    }
 
     void describe(Value& output) const override {
         output["model"] = recognizer_->model_name();
         output["mode"] = stream_ ? "stream" : "offline";
+        if (stream_)
+            output["chunk_ms"] = chunk_ms();
         output["files"] = static_cast<double>(inputs_.size());
         output["corpus_audio_seconds"] = corpus_seconds_;
     }
     std::vector<std::string> header_lines() const override {
         return {
             "Model: " + recognizer_->model_name(),
-            std::string("Mode: ") + (stream_ ? "stream" : "offline")};
+            std::string("Mode: ") +
+                (stream_ ? "stream, " + std::to_string(chunk_ms()) + " ms chunks" : "offline")};
     }
     std::string mismatch_key() const override { return "transcript_mismatches"; }
     void summarize_run(
@@ -120,11 +132,32 @@ class AsrWorkload : public Workload {
         run["utterances_per_second"] = items.size() / wall_seconds;
     }
     std::vector<Column> run_columns() const override {
-        return {{"RTFx", [](const Value& run) { return run.number_or("rtfx"); }, 2}};
+        std::vector<Column> columns = {
+            {"RTFx", [](const Value& run) { return run.number_or("rtfx"); }, 2}};
+        if (stream_) {
+            // compute time per streamed chunk (push + drain), client-side
+            columns.push_back(
+                {"CHUNK avg (ms)",
+                 [](const Value& run) { return stat(run, "metrics", "chunk_latency_ms", "mean"); },
+                 2});
+            columns.push_back(
+                {"CHUNK p99 (ms)",
+                 [](const Value& run) { return stat(run, "metrics", "chunk_latency_ms", "p99"); },
+                 2});
+        }
+        return columns;
     }
 
    private:
-    std::string recognize(const AudioInput& input) {
+    // Streamed chunk length: the model's cache-aware chunk ((right context + 1) x 80 ms) unless
+    // --chunk-ms overrides it.
+    int chunk_ms() const {
+        if (chunk_ms_ > 0)
+            return chunk_ms_;
+        const int rc = config_.streaming.rnnt_right_context;
+        return rc >= 0 ? (rc + 1) * 80 : 160;
+    }
+    std::string recognize(const AudioInput& input, std::vector<double>& chunk_latency_ms) {
         asr::AsrRequestOptions request;
         request.language_code = language_;
         if (!stream_) {
@@ -133,16 +166,21 @@ class AsrWorkload : public Workload {
                 input.audio.sample_rate));
         }
         auto stream = recognizer_->streaming_recognize(request, language_);
-        const size_t chunk = std::max<size_t>(1, input.audio.sample_rate * 160 / 1000);
+        const size_t chunk =
+            std::max<size_t>(1, static_cast<size_t>(input.audio.sample_rate) * chunk_ms() / 1000);
         std::string transcript;
         for (size_t offset = 0; offset < input.audio.samples.size(); offset += chunk) {
             const size_t count = std::min(chunk, input.audio.samples.size() - offset);
+            const auto started = std::chrono::steady_clock::now();
             stream->push(input.audio.samples.data() + offset, count, input.audio.sample_rate);
             while (auto result = stream->next()) {
                 if (!result->is_final)
                     break;
                 append_text(transcript, first_transcript(*result));
             }
+            chunk_latency_ms.push_back(std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - started)
+                                           .count());
         }
         append_text(transcript, first_transcript(stream->finish()));
         return transcript;
@@ -152,6 +190,7 @@ class AsrWorkload : public Workload {
     std::string model_;
     std::string language_;
     bool stream_ = false;
+    int chunk_ms_ = 0;
     std::vector<AudioInput> inputs_;
     double corpus_seconds_ = 0.0;
     EngineRegistry engines_;

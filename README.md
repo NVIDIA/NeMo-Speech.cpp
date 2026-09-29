@@ -26,12 +26,19 @@
 
 ## Performance
 
-Streaming speech synthesis with MagpieTTS Multilingual:
+Streaming speech recognition with Nemotron Speech Streaming 0.6B (Q8_0):
 
-| GPU | Time to first audio | Inter-chunk latency | Throughput |
-|---|:---:|:---:|:---:|
-| NVIDIA GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** |
-| NVIDIA DGX Spark (GB10) | **17 ms** | **6 ms** | **30× real time** |
+| GPU | Chunk | Latency per chunk | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|:---:|
+| NVIDIA DGX Spark (GB10) | 160 ms | **4.7 ms** | **32× real time** | **3.8×** |
+| NVIDIA DGX Spark (GB10) | 1.12 s | **6.6 ms** | **120× real time** | **2.4×** |
+
+Streaming speech synthesis with MagpieTTS Multilingual (Q8_0):
+
+| GPU | Time to first audio | Inter-chunk latency | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|:---:|
+| NVIDIA GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** | – |
+| NVIDIA DGX Spark (GB10) | **17 ms** | **6 ms** | **30× real time** | **14×** |
 
 See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
 

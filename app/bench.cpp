@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -248,6 +250,8 @@ run_bench(int argc, char** argv) {
             options.device_set = true;
         } else if (arg == "--recursive" || arg == "-r") {
             options.recursive = true;
+        } else if (arg == "--save") {
+            options.save_dir = value();
         } else if (arg == "--json") {
             json = true;
         } else if (workload->parse_option(arg, value)) {
@@ -386,6 +390,18 @@ run_bench(int argc, char** argv) {
         runs.emplace_back(std::move(run));
     }
     output["runs"] = std::move(runs);
+    if (!options.save_dir.empty()) {
+        fs::create_directories(options.save_dir);
+        for (size_t index = 0; index < inputs; ++index) {
+            if (!reference_set[index])
+                continue;
+            std::ofstream file(
+                fs::path(options.save_dir) / (fs::path(names[index]).stem().string() + ".txt"));
+            file << reference[index] << '\n';
+            if (!file)
+                throw std::runtime_error("cannot write outputs to " + options.save_dir);
+        }
+    }
 
     if (json) {
         std::printf("%s\n", output.dump(2).c_str());
@@ -452,12 +468,14 @@ print_bench_help(const char* program) {
         "  --device, --backend DEVICE\n"
         "                          auto, cpu, cuda[:N], metal, or vulkan[:N]\n"
         "  -r, --recursive         Recurse into input directories\n"
+        "  --save DIR              Write each input's output to DIR/<input>.txt\n"
         "  --json                  Emit machine-readable results\n"
         "  --config FILE           Apply YAML configuration\n"
 #if defined(NEMO_SPEECH_CLI_ASR)
         "\nasr options:\n"
         "  -m, --model MODEL       Local ASR GGUF path\n"
         "  --mode offline|stream   Recognition mode (default: offline)\n"
+        "  --chunk-ms MS           Streamed chunk length (default: the model's chunk)\n"
         "  -l, --language CODE     Prompt language code\n"
         "  --asr.* VALUE           Override any ASR engine setting\n"
 #endif
