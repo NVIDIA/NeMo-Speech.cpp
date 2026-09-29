@@ -2,6 +2,22 @@
 
 We welcome external contributions to NeMo-Speech.cpp.
 
+## AI usage
+
+You may use AI tools as assistants for code, but the contribution must be yours. Pull request descriptions, issues and review replies must be written by you.
+
+- **Disclose it.** If AI was used, mention in the pull request in what capacity it was used.
+- **Write it yourself.** Issues, pull request descriptions and review replies
+  must be your own words, not AI output.
+- **Review it.** Review every line of code before submitting. You should understand and be able to
+  explain the design and any line of code when a reviewer asks.
+- **Verify it.** Build and run the relevant tests and benchmarks yourself, and
+  report the commands and results you actually ran.
+- **Keep it focused.** Don't include unrelated refactors, reformatting or
+  speculative changes that a tool added along the way.
+
+Pull requests that don't follow these guidelines may be closed without review.
+
 ## Development checks
 
 Follow the [source-build guide](docs/build.md) for prerequisites and submodules.
