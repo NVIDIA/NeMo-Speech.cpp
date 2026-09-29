@@ -216,6 +216,12 @@ stock comparison therefore requires both a pristine ggml checkout and
   convolution on the packed input. Results are bit-identical; the NanoCodec
   decoder runs about twice as fast.
 
+- **0029-cuda-skinny-q8-history-independent-dispatch.patch** - skinny-Q8
+  dispatch depends only on the column count (N <= 8: MMVQ, planar after a
+  repack; wider: skinny-Q8), not on whether an earlier call repacked the
+  weight, so outputs no longer depend on previously served requests. Removes
+  `GGML_SKINNY_Q8_OUTER_BATCH`.
+
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the

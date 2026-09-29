@@ -1,0 +1,166 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 77521087..7382e03e 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2837,8 +2837,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+ 
+     if (!split && !bad_padding_clear && ggml_cuda_skinny_q8_supported(src0, src1, dst)) {
+-        // streaming-ASR specialization: Q8_0 weights x skinny (9..64 col)
+-        // activations — beats mul_mat_q's LLM-batch tiling at these shapes
++        // streaming-encoder specialization: Q8_0 weights x activations wider
++        // than MMVQ's range; beats mul_mat_q's LLM-batch tiling at skinny N
+         ggml_cuda_mul_mat_skinny_q8(ctx, src0, src1, dst);
+     } else if (!split && use_mul_mat_vec_f) {
+         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
+diff --git a/src/ggml-cuda/skinny-q8.cu b/src/ggml-cuda/skinny-q8.cu
+index 61a433b9..60dcaddc 100644
+--- a/src/ggml-cuda/skinny-q8.cu
++++ b/src/ggml-cuda/skinny-q8.cu
+@@ -23,8 +23,11 @@
+ //
+ // Bit-accuracy: same q8 activation round-trip as mul_mat_q, but a different
+ // summation order — results are not bit-identical to mmq. Dispatch must
+-// therefore depend only on the per-sequence matrix shape, never on the outer
+-// batch size, so singleton and batched execution cannot select different math.
++// therefore depend only on the call's shape, never on process history: a
++// weight takes MMVQ for N <= 8 and this kernel for every wider call, from its
++// first call on, whether or not an earlier call already repacked it. Each
++// output column's sum is independent of N (tiles only add columns), so
++// singleton and batched calls wider than 8 columns compute the same bits.
+ 
+ #include "skinny-q8.cuh"
+ #if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+@@ -43,7 +46,6 @@
+ #define SKQ8_KSTEP 128  // k bytes staged per pipeline stage; K % KSTEP == 0
+ #define SKQ8_KTB (SKQ8_KSTEP / 32)  // q8 blocks per stage
+ #define SKQ8_STAGES 2
+-#define SKQ8_NMAX SKQ8_NPAD
+ // Shared-memory strides (bytes). KSTEP + 16 keeps the 16B cp.async stores
+ // aligned while breaking the power-of-two bank pattern on fragment loads.
+ #define SKQ8_SW (SKQ8_KSTEP + 16)
+@@ -393,7 +395,6 @@ static __global__ void skq8_reduce_splitk(
+     dst[i] = sum;
+ }
+ 
+-#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+ static __global__ void skq8_add_epilogue_f32(
+     float * __restrict__ dst, const float * __restrict__ bias,
+     const float * __restrict__ residual, const int m, const int64_t count) {
+@@ -411,6 +412,7 @@ static __global__ void skq8_add_epilogue_f32(
+     dst[i] = value;
+ }
+ 
++#if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+ template <typename T>
+ static __global__ void skq8_bias_gelu_erf(
+         const float * src, const float * bias, T * dst, int m, int64_t count) {
+@@ -551,32 +553,28 @@ bool ggml_cuda_skinny_q8_supported(
+     if (repacked) {
+         // The weight was converted IN PLACE to the plane layout — the
+         // block_q8_0 bytes no longer exist, so every mul_mat on this tensor
+-        // must come through here (the >64-col path tiles, small N pads).
+-        // Falling back to mmq/mmvq would silently read garbage: abort loudly
+-        // instead if a call shape we cannot serve ever appears.
++        // must come through here (skq8_run serves N <= MMVQ_MAX_BATCH_SIZE
++        // with planar MMVQ and tiles wider N). Falling back to mmq/mmvq would
++        // silently read garbage: abort loudly instead if a call shape we
++        // cannot serve ever appears.
+         GGML_ASSERT(call_ok && "skinny-q8: repacked weight used in an unsupported mul_mat shape");
+         return true;
+     }
+-    // Keep the accumulation path independent of outer batch size by default.
+-    // The opt-in mode flattens [K,N,B...] for the tensor-core kernel; use a
+-    // separate repack allocation with multi-stream schedulers.
+-    static const bool outer_batch_dispatch = []() {
+-        const char * e = getenv("GGML_SKINNY_Q8_OUTER_BATCH");
+-        return e != nullptr && e[0] != '0';
+-    }();
+-    const int64_t logical_n = src1->ne[1];
+-    const bool logical_eligible = logical_n > MMVQ_MAX_BATCH_SIZE && logical_n <= SKQ8_NMAX;
+-    const bool outer_eligible = total_n > MMVQ_MAX_BATCH_SIZE;
+-    const bool eligible =
+-        tensor_ok && call_ok && (outer_batch_dispatch ? outer_eligible : logical_eligible);
+-    return eligible;
++    // Same rule as serialized planar weights above, applied from the first
++    // call: the kernel depends only on the call's column count, never on
++    // whether an earlier call already repacked the weight. N <= 8 stays on
++    // MMVQ (planar MMVQ after a repack computes the same bits); every wider
++    // call runs skq8, which repacks on first use. An N cap here would send
++    // wide calls to mmq before the first repack and to skq8 after it, making
++    // outputs depend on which requests the process served earlier.
++    return tensor_ok && call_ok && total_n > MMVQ_MAX_BATCH_SIZE;
+ }
+ 
+ bool ggml_cuda_skinny_q8_residual_supported(
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+ #if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+     const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
+-    return ggml_cuda_skinny_q8_supported(src0, src1, dst) &&
++    return total_n > MMVQ_MAX_BATCH_SIZE && ggml_cuda_skinny_q8_supported(src0, src1, dst) &&
+            skq8_cublas_f16_enabled_for_n(total_n);
+ #else
+     GGML_UNUSED_VARS(src0, src1, dst);
+@@ -588,7 +586,7 @@ bool ggml_cuda_skinny_q8_gelu_supported(
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+ #if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+     const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
+-    return ggml_cuda_skinny_q8_supported(src0, src1, dst) &&
++    return total_n > MMVQ_MAX_BATCH_SIZE && ggml_cuda_skinny_q8_supported(src0, src1, dst) &&
+            skq8_cublas_f16_enabled_for_n(total_n);
+ #else
+     GGML_UNUSED_VARS(src0, src1, dst);
+@@ -605,8 +603,11 @@ static void skq8_run(
+     const int64_t KB = K / 32;
+ 
+     cudaStream_t stream = ctx.stream();
++    // Only a repacked weight reaches here with N <= MMVQ_MAX_BATCH_SIZE (see
++    // ggml_cuda_skinny_q8_supported); it keeps the MMVQ math it had before.
++    const bool mmvq_cols = N <= MMVQ_MAX_BATCH_SIZE;
+ #if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+-    const bool use_cublas_f16 = skq8_cublas_f16_enabled_for_n(N);
++    const bool use_cublas_f16 = !mmvq_cols && skq8_cublas_f16_enabled_for_n(N);
+ #endif
+ 
+     // Repacked weight planes (create on first use). Default: IN PLACE. The plane
+@@ -696,6 +697,26 @@ static void skq8_run(
+ #endif
+     }
+ 
++    if (mmvq_cols) {
++        // Serve MMVQ's column range with MMVQ, as before the repack. In-place
++        // (and serialized planar) planes alias the tensor bytes, so read them
++        // through planar MMVQ, which computes the same bits as block MMVQ; a
++        // separate (GGML_SKINNY_Q8_INPLACE=0) repack left the block bytes intact.
++        GGML_ASSERT(src1->type == GGML_TYPE_F32 && residual == nullptr && !gelu);
++        ggml_tensor weight = *src0;
++        if ((const void *) planes.qs == src0->data) {
++            weight.flags |= GGML_TENSOR_FLAG_Q8_PLANAR;
++        }
++        ggml_cuda_mul_mat_vec_q(ctx, &weight, src1, nullptr, dst);
++        if (bias != nullptr) {
++            // separate add, like the unfused mul_mat + add graph
++            const int64_t count = M * N;
++            skq8_add_epilogue_f32<<<(count + 255) / 256, 256, 0, stream>>>(
++                (float *) dst->data, (const float *) bias->data, nullptr, (int) M, count);
++        }
++        return;
++    }
++
+ #if defined(GGML_CUDA_SKINNY_Q8_CUBLAS_F16)
+     // Keep the model artifact Q8, expand immutable weights once, convert only
+     // the live activation, and retain FP32 accumulation/output.
+diff --git a/src/ggml-cuda/skinny-q8.cuh b/src/ggml-cuda/skinny-q8.cuh
+index bb3dac78..fa5a9b35 100644
+--- a/src/ggml-cuda/skinny-q8.cuh
++++ b/src/ggml-cuda/skinny-q8.cuh
+@@ -2,7 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ #include "common.cuh"
+ 
+-// Skinny-N (9..64 cols) Q8_0 x F32 GEMM specialized for streaming encoders.
++// Skinny-N Q8_0 x F32 GEMM specialized for streaming encoders (claims every
++// call wider than MMVQ's 8 columns on an eligible weight).
+ // See skinny-q8.cu for the design notes.
+ 
+ // Drop cached planes for weights in a device allocation being freed or cleared.

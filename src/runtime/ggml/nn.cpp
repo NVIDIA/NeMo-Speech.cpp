@@ -38,13 +38,10 @@ cached_q8_input(
         const int parsed = value != nullptr ? std::atoi(value) : 128;
         return parsed > 0 ? parsed : 1;
     }();
-    static const bool outer_batch_dispatch = [] {
-        const char* value = std::getenv("GGML_SKINNY_Q8_OUTER_BATCH");
-        return value != nullptr && value[0] != '0';
-    }();
     const int64_t columns = ggml_nelements(input) / input->ne[0];
-    const bool eligible_columns =
-        outer_batch_dispatch ? columns > 8 : input->ne[1] > 8 && input->ne[1] <= 64;
+    // Mirrors ggml_cuda_skinny_q8_supported: skinny Q8 claims every call wider than MMVQ's
+    // 8 columns.
+    const bool eligible_columns = columns > 8;
     const bool eligible_block_q8 =
         std::string(weight.tensor->name).rfind("encoder.", 0) == 0 && eligible_columns;
 #ifdef NEMO_SPEECH_GGML_PATCHED

@@ -26,11 +26,12 @@
 
 ## Performance
 
-Streaming speech synthesis on NVIDIA DGX Spark (GB10):
+Streaming speech synthesis with MagpieTTS Multilingual:
 
-| Model | Time to first audio | Inter-chunk latency | Throughput |
+| GPU | Time to first audio | Inter-chunk latency | Throughput |
 |---|:---:|:---:|:---:|
-| MagpieTTS Multilingual | **17 ms** | **6 ms** | **30× real time** |
+| NVIDIA GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** |
+| NVIDIA DGX Spark (GB10) | **17 ms** | **6 ms** | **30× real time** |
 
 See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
 

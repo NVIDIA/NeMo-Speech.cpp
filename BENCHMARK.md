@@ -2,6 +2,22 @@
 
 ## Speech synthesis (MagpieTTS)
 
+### NVIDIA GeForce RTX 4090
+
+MagpieTTS Multilingual 357M v2607 (Q8_0), streaming, one stream:
+
+| Time to first audio (ms)<br>avg · p99 | Inter-chunk latency (ms)<br>avg · p99 | Throughput (RTFX) |
+|:---:|:---:|:---:|
+| **8.6** · 9.4 | **2.9** · 3.1 | **59.8×** |
+
+By input length:
+
+| Input | Audio (s) | Time to first audio (ms)<br>avg · p99 | Throughput (RTFX) |
+|---|:---:|:---:|:---:|
+| Short (8 words) | 2.6 | **8.4** · 9.8 | **56.5×** |
+| Medium (55 words) | 22.8 | **9.0** · 10.3 | **54.3×** |
+| Long (258 words) | 92.6 | **10.1** · 11.0 | **56.0×** |
+
 ### NVIDIA DGX Spark (GB10)
 
 MagpieTTS Multilingual 357M v2607 (Q8_0), streaming, one stream:
@@ -27,13 +43,13 @@ LJSpeech sentences of the Riva TTS performance reports
 
 ### Setup
 
-| | |
-|---|---|
-| System | NVIDIA DGX Spark: GB10 GPU (48 SMs), 20-core Arm CPU, 128 GB unified memory |
-| Software | Ubuntu 24.04, NVIDIA driver 580.126.09, CUDA 13.0 |
-| Build | Release, `-DCMAKE_CUDA_ARCHITECTURES=121` |
-| Models | MagpieTTS Multilingual 357M v2607 (Q8_0 GGUF), NeMo NanoCodec 22 kHz (F16 GGUF) |
-| Synthesis | `en-US`, default voice, seed 1, 22.05 kHz audio in 186 ms chunks (4 codec frames) |
+| | RTX 4090 | DGX Spark |
+|---|---|---|
+| System | GeForce RTX 4090 (128 SMs, 24 GB), Intel Core i7-11700K (16 threads), 128 GB RAM | NVIDIA DGX Spark: GB10 GPU (48 SMs), 20-core Arm CPU, 128 GB unified memory |
+| Software | Ubuntu 24.04, NVIDIA driver 595.84, CUDA 13.2 | Ubuntu 24.04, NVIDIA driver 580.126.09, CUDA 13.0 |
+| Build | Release, `-DCMAKE_CUDA_ARCHITECTURES=89` | Release, `-DCMAKE_CUDA_ARCHITECTURES=121` |
+| Models | MagpieTTS Multilingual 357M v2607 (Q8_0 GGUF), NeMo NanoCodec 22 kHz (F16 GGUF) | same |
+| Synthesis | `en-US`, default voice, seed 1, 22.05 kHz audio in 186 ms chunks (4 codec frames) | same |
 
 ### Reproduce
 
