@@ -176,19 +176,12 @@ if [ "$need_nmt" = ON ] || [ "$need_s2s" = ON ]; then
     scripts/apply-llama-patches.sh
 fi
 
-ggml_native=ON
 case "$PRESET" in
-    cpu-*) ggml_native=OFF ;;
+    cpu-*)
+        ggml_native="$(cmake_bool_override GGML_NATIVE OFF "$@")"
+        cmake --preset "$PRESET" "-DGGML_NATIVE=$ggml_native" "$@"
+        ;;
+    *)
+        cmake --preset "$PRESET" "$@"
+        ;;
 esac
-ggml_native="$(cmake_bool_override GGML_NATIVE "$ggml_native" "$@")"
-
-ggml_cpu_options=()
-if [[ "$PRESET" == cpu-* && "$ggml_native" = OFF ]]; then
-    for variable in GGML_SSE42 GGML_AVX GGML_AVX2 GGML_BMI2 GGML_FMA GGML_F16C; do
-        value="$(cmake_bool_override "$variable" OFF "$@")"
-        ggml_cpu_options+=("-D$variable=$value")
-    done
-fi
-
-cmake --preset "$PRESET" "-DGGML_NATIVE=$ggml_native" \
-    "${ggml_cpu_options[@]}" "$@"
