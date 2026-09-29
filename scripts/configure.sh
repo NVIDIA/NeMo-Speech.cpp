@@ -178,8 +178,15 @@ fi
 
 case "$PRESET" in
     cpu-*)
-        ggml_native="$(cmake_bool_override GGML_NATIVE OFF "$@")"
-        cmake --preset "$PRESET" "-DGGML_NATIVE=$ggml_native" "$@"
+        case "$(uname -m)" in
+            x86_64|amd64)
+                ggml_native="$(cmake_bool_override GGML_NATIVE OFF "$@")"
+                cmake --preset "$PRESET" "-DGGML_NATIVE=$ggml_native" "$@"
+                ;;
+            *)
+                cmake --preset "$PRESET" "$@"
+                ;;
+        esac
         ;;
     *)
         cmake --preset "$PRESET" "$@"
