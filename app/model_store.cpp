@@ -804,13 +804,15 @@ download(const Model& model, const Artifact& artifact, const fs::path& output) {
                 fs::remove(segment, error);
                 throw std::runtime_error("downloaded tokenizer archive range has the wrong size");
             }
-            std::ifstream input(segment, std::ios::binary);
-            combined << input.rdbuf();
-            if (input.bad() || !combined) {
-                fs::remove(segment, error);
-                throw std::runtime_error("cannot assemble ranged tokenizer artifact");
+            bool assembled = false;
+            {
+                std::ifstream input(segment, std::ios::binary);
+                assembled = input && (combined << input.rdbuf());
             }
+            // Close the segment before removing it; Windows cannot delete open files.
             fs::remove(segment, error);
+            if (!assembled)
+                throw std::runtime_error("cannot assemble ranged tokenizer artifact");
         }
         combined.close();
         if (!combined)

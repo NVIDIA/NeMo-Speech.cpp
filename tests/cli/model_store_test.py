@@ -363,6 +363,7 @@ def main() -> None:
                 if value is not None
             ]
             assert actual_ranges == expected_ranges
+            assert not list(ranged_cache.rglob("*.range-*"))
             ArtifactHandler.payloads["tiny-tts.nemo"] = tokenizer_tar
             write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
 
