@@ -13,6 +13,28 @@
 
 namespace ggml_runtime {
 
+namespace {
+// putenv retains the supplied storage, so each entry must have static lifetime.
+void
+set_environment_default(const char* name, char* entry) {
+    if (std::getenv(name) == nullptr) {
+        putenv(entry);
+    }
+}
+}  // namespace
+
+void
+keep_cuda_graphs_resident() {
+    static char entry[] = "GGML_CUDA_GRAPH_EVICT_AFTER_MS=0";
+    set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", entry);
+}
+
+void
+keep_skinny_q8_weights_separate() {
+    static char entry[] = "GGML_SKINNY_Q8_INPLACE=0";
+    set_environment_default("GGML_SKINNY_Q8_INPLACE", entry);
+}
+
 BackendManager::BackendManager(Params params) {
     nemo_speech::common::ensure_ggml_logging();
     this->params = params;
@@ -30,12 +52,9 @@ void
 BackendManager::init_backends() {
 #if defined(GGML_USE_VULKAN)
     // Graph optimization is incompatible with in-place persistent cache tensors.
-    // Vulkan reads this setting during device initialization; respect user overrides.
-    // putenv retains the supplied storage, so the buffer must have static lifetime.
-    if (std::getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE") == nullptr) {
-        static char kv[] = "GGML_VK_DISABLE_GRAPH_OPTIMIZE=1";
-        putenv(kv);
-    }
+    // Vulkan reads this setting during device initialization.
+    static char vk_entry[] = "GGML_VK_DISABLE_GRAPH_OPTIMIZE=1";
+    set_environment_default("GGML_VK_DISABLE_GRAPH_OPTIMIZE", vk_entry);
 #endif  // GGML_USE_VULKAN
 
     ggml_time_init();

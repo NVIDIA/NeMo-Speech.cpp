@@ -49,5 +49,5 @@ On Windows:
 The heavier project-specific CUDA kernels (fused rel-pos attention, skinny-Q8 GEMM,
 NVFP4 quantization, BF16 FastConformer epilogues, fused LayerNorm, and F16
 depthwise conv2d) live as ggml patches rather than in `kernels/` - see
-[ggml patches](ggml-patches.md). `kernels/` holds only the cuBLAS shim and its
+[`patches/`](../../patches/README.md). `kernels/` holds only the cuBLAS shim and its
 version-map template.

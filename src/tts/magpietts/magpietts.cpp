@@ -32,7 +32,7 @@
 #include "nvtx_utils.h"
 #include "token_utils.h"
 #include "tts/nanocodec/model.h"
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
 #include "magpietts_decoder_fused.h"
 #include "magpietts_lt_fused.h"
 #endif
@@ -2017,7 +2017,7 @@ stream_magpie_to_audio(
 
     metrics.generated_frames = frames_generated;
     metrics.finish(outputs.samples_written, codec.sampleRate(), codec_fps);
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     // -DLTF_CHAIN_TIMING builds only
     magpietts_decoder_fused_timing_report();
     magpietts_lt_fused_timing_report();

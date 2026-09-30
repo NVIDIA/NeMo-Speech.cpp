@@ -23,9 +23,9 @@ reviews:
           synchronization, and caches or reuse that do not actually take effect.
         - Portability: assumptions tied to one GPU, architecture, backend or platform; hardware
           limits must be queried or guarded, with a working fallback.
-    - path: "ggml-patches/**"
+    - path: "patches/**"
       instructions: |
-        Patches to the pinned ggml submodule. Apply the same correctness, performance and
+        Patches to the pinned llama.cpp submodule. Apply the same correctness, performance and
         portability checks; also check that op preconditions match what the kernels support
         and that the patch series stays consistent.
     - path: "{BENCHMARK.md,README.md,docs/**,app/bench*}"

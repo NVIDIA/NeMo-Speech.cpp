@@ -20,10 +20,6 @@ list(REMOVE_ITEM ASR_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/c_api.cpp")
 
 add_library(nemo_speech_asr SHARED ${ASR_SOURCES})
 
-if(NEMO_SPEECH_GGML_PATCHED)
-    target_compile_definitions(nemo_speech_asr PRIVATE NEMO_SPEECH_GGML_PATCHED=1)
-endif()
-
 # Windows portability: this lib relies on Linux default symbol visibility to
 # export its public API (AsrModel, runners, read_wav_mono_16k). MSVC/clang-cl
 # export nothing from a DLL unless annotated with __declspec(dllexport), so the
@@ -145,22 +141,6 @@ endif()
 if(NEMO_SPEECH_WITH_FLASHLIGHT)
     target_compile_definitions(nemo_speech_asr PUBLIC NEMO_SPEECH_WITH_FLASHLIGHT=1)
     target_link_libraries(nemo_speech_asr PRIVATE flashlight-text flashlight-text-kenlm)
-endif()
-
-if(NEMO_SPEECH_FUSED_RELPOS_ATTN)
-    target_compile_definitions(nemo_speech_asr PRIVATE NEMO_SPEECH_FUSED_RELPOS_ATTN=1)
-endif()
-
-if(NEMO_SPEECH_DIRECT_DW_CONV)
-    # The encoder's channels-inner conv-module path uses the cwhn direct
-    # depthwise kernel (F16-safe only on the patched CUDA backend, like the
-    # nn.cpp Conv1D fast path this flag already gates).
-    target_compile_definitions(nemo_speech_asr PRIVATE NEMO_SPEECH_DIRECT_DW_CONV=1)
-endif()
-
-if(NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS)
-    target_compile_definitions(
-        nemo_speech_asr PRIVATE NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS=1)
 endif()
 
 # ---------------------------------------------------------------------------

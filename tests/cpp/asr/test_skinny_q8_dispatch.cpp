@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Skinny-Q8 dispatch must not depend on call history (ggml patch 0029). The first 9..64-column
-// mul_mat on an eligible Q8_0 weight repacks it in place; every column count must produce the same
-// bits before and after that repack, including MMVQ's range (N <= 8, planar MMVQ after the repack)
-// and widths above 64. Skips itself (exit 77) without a GPU backend.
+// Skinny-Q8 dispatch must not depend on call history (the skinny-Q8 ggml patch). The first
+// 9..64-column mul_mat on an eligible Q8_0 weight repacks it in place; every column count must
+// produce the same bits before and after that repack, including MMVQ's range (N <= 8, planar MMVQ
+// after the repack) and widths above 64. Skips itself (exit 77) without a GPU backend.
 #include <cmath>
 #include <cstdio>
 #include <cstring>

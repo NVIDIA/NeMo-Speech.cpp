@@ -11,6 +11,11 @@
 #include <ggml-cpp.h>
 #include <ggml.h>
 
+// CUDA paths that use operations added by patches/ (see patches/README.md).
+#if defined(NEMO_SPEECH_GGML_PATCHED) && defined(GGML_USE_CUDA)
+#define NEMO_SPEECH_CUDA_FAST_PATHS 1
+#endif
+
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -57,6 +62,24 @@ std::string format(const char* fmt, ...);
 struct llama_file;
 
 namespace ggml_runtime {
+
+// ggml_conv_1d with the batch axis kept apart from the output channels for a batch
+// (b->ne[2]) > 1, which ggml_conv_1d mixes up (ggml-org/llama.cpp#28738).
+// Use ggml_conv_1d again once that fix is in the pinned llama.cpp.
+inline ggml_tensor*
+conv_1d(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, int s0, int p0, int d0) {
+    ggml_tensor* im2col = ggml_im2col(
+        ctx, a, b, s0, 0, p0, 0, d0, 0, false,
+        a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16);  // [N, OL, IC * K]
+    ggml_tensor* result = ggml_mul_mat(
+        ctx, ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+        ggml_reshape_2d(ctx, a, a->ne[0] * a->ne[1], a->ne[2]));  // [N * OL, OC]
+    if (im2col->ne[2] == 1) {
+        return ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], 1);
+    }
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]);
+    return ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));  // [OL, OC, N]
+}
 
 class GGUFLoader {
    public:
@@ -164,6 +187,17 @@ class Module {
     // Upload values into tensors declared by define_tensors().
     virtual void set_data(Session* session) = 0;
 };
+
+// Process-wide settings for the patched CUDA backend (see patches/README.md). They
+// are read when a CUDA backend is created, so call them before loading models, and
+// they leave a value the user already set in the environment alone.
+//
+// Keep captured CUDA graphs instead of evicting ones idle for 10 s. For TTS and
+// VoiceChat, whose per-frame graphs must stay resident between requests.
+void keep_cuda_graphs_resident();
+// Repack skinny-Q8 encoder weights into a separate buffer instead of in place. The
+// in-place copy races with llama.cpp's multi-stream scheduler in the same process.
+void keep_skinny_q8_weights_separate();
 
 struct Params {
     bool use_gpu = false;

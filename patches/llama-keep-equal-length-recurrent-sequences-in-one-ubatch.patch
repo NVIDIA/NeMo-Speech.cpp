@@ -1,0 +1,129 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: keep equal-length recurrent sequences in one ubatch
+
+When every token's output is requested (embeddings), recurrent and hybrid
+memories split by sequence, turning an N-stream decode into N graph
+executions and invalidating the CUDA graph. Use the equal split instead;
+decode() restores output order. Used by the S2S NemotronH backbone.
+
+Upstream: candidate once split_seq is kept for pooled embeddings.
+
+diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
+index 06f7fd5428c4e92c445b5c0170e92e557b2f62df..eaaa5a9fa87227f1f9f7e8ea3ef32b4e042328de 100644
+--- a/src/llama-memory-hybrid-iswa.cpp
++++ b/src/llama-memory-hybrid-iswa.cpp
+@@ -73,20 +73,20 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
+         while (true) {
+             llama_ubatch ubatch;
+ 
+-            if (embd_all) {
+-                // if all tokens are output, split by sequence
+-                ubatch = balloc.split_seq(n_ubatch);
+-            } else {
+-                // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
+-                const bool unified = (mem_attn->get_base()->get_n_stream() == 1);
+-
+-                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+-                //   so that the rollback snapshots remain valid
+-                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+-
+-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+-            }
++            // Requesting every token's output does not require serializing
++            // independent equal-length sequences.  Keep them in one recurrent
++            // microbatch so CUDA graphs see a stable state/cache shape.
++            // Use non-sequential split when KV cache is unified (needed for
++            // hellaswag/winogrande/multiple-choice).
++            const bool unified = (mem_attn->get_base()->get_n_stream() == 1);
++
++            // [TAG_RECURRENT_ROLLBACK_SPLITS]
++            // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
++            //   so that the rollback snapshots remain valid
++            const uint32_t n_rs_seq = mem_recr->n_rs_seq;
++
++            GGML_UNUSED(embd_all);
++            ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+ 
+             if (ubatch.n_tokens == 0) {
+                 break;
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381a9e6fa507c925ba66a35a7e433c4447b8..577844e070989eb6a541ef773bddc57b53dcfc22 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -74,20 +74,22 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
+         while (true) {
+             llama_ubatch ubatch;
+ 
+-            if (embd_all) {
+-                // if all tokens are output, split by sequence
+-                ubatch = balloc.split_seq(n_ubatch);
+-            } else {
+-                // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
+-                const bool unified = (mem_attn->get_n_stream() == 1);
+-
+-                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+-                //   so that the rollback snapshots remain valid
+-                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+-
+-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+-            }
++            // Requesting every token's output does not require serializing
++            // independent equal-length sequences.  Keeping them together is
++            // essential for continuous batching and gives CUDA graphs a stable
++            // recurrent/KV-cache shape instead of rotating through one stream
++            // slot at a time.  decode() restores the caller's output order.
++            // Use non-sequential split when KV cache is unified (needed for
++            // hellaswag/winogrande/multiple-choice).
++            const bool unified = (mem_attn->get_n_stream() == 1);
++
++            // [TAG_RECURRENT_ROLLBACK_SPLITS]
++            // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
++            //   so that the rollback snapshots remain valid
++            const uint32_t n_rs_seq = mem_recr->n_rs_seq;
++
++            GGML_UNUSED(embd_all);
++            ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+ 
+             if (ubatch.n_tokens == 0) {
+                 break;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919accf09569e129ab35b5b2bd4dab7dbe8a3a..954b86fe52425658959c07fb0c0ef8543355b550 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -433,17 +433,23 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
+         while (true) {
+             llama_ubatch ubatch;
+ 
+-            if (embd_all) {
+-                // if all tokens are output, split by sequence
+-                ubatch = balloc.split_seq(n_ubatch);
+-            } else {
+-                // TODO: non-sequential equal split can be done if using unified KV cache
+-                //       for simplicity, we always use sequential equal split for now
+-                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+-                //   so that the rollback snapshots remain valid
+-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+-            }
++            // Recurrent models require equal-length independent sequences in a
++            // microbatch, but producing an embedding for every token does not
++            // require serializing those sequences.  split_seq() did exactly
++            // that and turned an N-way one-token decode into N separate graph
++            // executions.  Besides defeating batching, rotating through the
++            // recurrent-state slots continually invalidated the CUDA graph.
++            //
++            // split_equal() preserves every requested output and decode()
++            // restores the caller's output order after processing.  It also
++            // retains the existing behavior for a single multi-token prompt.
++            // TODO: non-sequential equal split can be done if using unified KV cache
++            //       for simplicity, we always use sequential equal split for now
++            // [TAG_RECURRENT_ROLLBACK_SPLITS]
++            // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
++            //   so that the rollback snapshots remain valid
++            GGML_UNUSED(embd_all);
++            ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+ 
+             if (ubatch.n_tokens == 0) {
+                 break;

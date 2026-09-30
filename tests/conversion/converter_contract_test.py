@@ -363,9 +363,9 @@ class ConverterContractTest(unittest.TestCase):
             llama_cpp.mkdir()
             (llama_cpp / "CMakeLists.txt").touch()
             (llama_cpp / "convert_hf_to_gguf.py").touch()
-            patch_script = root / "scripts" / "apply-llama-patches.sh"
-            patch_script.parent.mkdir()
-            patch_script.touch()
+            materialize = root / "cmake" / "llama_cpp.cmake"
+            materialize.parent.mkdir()
+            materialize.touch()
             built = default_quantizer_path(llama_cpp)
 
             def fake_run(command, **_kwargs):
@@ -390,7 +390,11 @@ class ConverterContractTest(unittest.TestCase):
 
             self.assertEqual(actual, built)
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(commands[0], ["bash", str(patch_script)])
+            self.assertEqual(commands[0][-2:], ["-P", str(materialize)])
+            self.assertIn(f"-DDEST_DIR={root / '.deps' / 'llama.cpp-patched'}", commands[0])
+            self.assertEqual(
+                commands[1][commands[1].index("-S") + 1], str(root / ".deps" / "llama.cpp-patched")
+            )
             self.assertIn("-DLLAMA_BUILD_TOOLS=ON", commands[1])
             self.assertEqual(commands[2][-3:], ["--target", "llama-quantize", "--parallel"])
 

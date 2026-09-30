@@ -13,22 +13,6 @@
 #include "runtime.h"
 
 namespace nemo_speech::s2s {
-namespace {
-
-void
-set_environment_default(const char* name, const char* value) {
-    if (std::getenv(name))
-        return;
-#if defined(_WIN32)
-    if (_putenv_s(name, value) != 0)
-        throw std::runtime_error(std::string("could not set process default ") + name);
-#else
-    if (setenv(name, value, 0) != 0)
-        throw std::runtime_error(std::string("could not set process default ") + name);
-#endif
-}
-
-}  // namespace
 
 VoiceChatConfig
 voicechat_config_from_model_dir(const std::string& model_dir, int gpu, int max_streams) {
@@ -54,7 +38,7 @@ voicechat_config_from_model_dir(const std::string& model_dir, int gpu, int max_s
 struct VoiceChat::Impl {
     explicit Impl(VoiceChatConfig value) : voicechat_config(std::move(value)) {
         configure_llama_logging(voicechat_config.verbose);
-        set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", "0");
+        ggml_runtime::keep_cuda_graphs_resident();
         ggml_runtime::Params params;
         params.use_gpu = voicechat_config.gpu >= 0;
         params.gpu_device_idx = voicechat_config.gpu >= 0 ? voicechat_config.gpu : 0;

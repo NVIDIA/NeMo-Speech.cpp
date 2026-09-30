@@ -265,7 +265,7 @@ CacheAwareEncoder::ensure_session() {
     session_->setup();  // declares the indexed K/V/conv cache arenas
     slots_used_.assign(static_cast<size_t>(arena_slots_), false);
     slots_need_reset_.assign(static_cast<size_t>(arena_slots_), true);
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     const int d_k = cfg_.d_model / cfg_.n_heads;
     ring_cache_enabled_ = session_->params.use_gpu && cfg_.cache_left_ctx > 0 &&
                           cfg_.cache_chunk_frames > 0 && (d_k & (d_k - 1)) == 0;

@@ -72,9 +72,8 @@ only when selecting those features; see the platform sections below.
 Initialize the submodules needed by the selected components:
 
 ```bash
-git submodule update --init ggml
+git submodule update --init llama.cpp                # required (also provides ggml)
 git submodule update --init third_party/cpp-httplib  # HTTP server only
-git submodule update --init llama.cpp                # ASR live capture, NMT, or VoiceChat
 git submodule update --init proto/riva-common        # gRPC only
 git submodule update --init third_party/flashlight-text third_party/kenlm  # Flashlight only
 git submodule update --init third_party/open_jtalk   # Japanese TTS only
@@ -82,8 +81,8 @@ git submodule update --init --recursive third_party/cppjieba  # Mandarin TTS onl
 ```
 
 Always configure through `scripts/configure.sh`. It checks the required
-submodules and applies the patches needed by the selected preset. CUDA presets
-apply the pinned patches from `ggml-patches/` in order. Mandarin TTS also
+submodules and runs the preset. CMake applies the project's llama.cpp and ggml
+changes from `patches/` itself, so no separate patch step is needed. Mandarin TTS also
 requires the Git LFS files under `src/tts/tokenizer/mandarin_data/`; the helper
 reports any files that are still LFS pointers. Materialize them with
 `git lfs pull --include='src/tts/tokenizer/mandarin_data/*'`.
@@ -126,8 +125,8 @@ scripts/configure.sh cuda-server -DNEMO_SPEECH_WITH_NORM=ON
 cmake --build --preset cuda-server
 ```
 
-For a manual configuration, explicitly disable the patched CUDA paths when
-building against stock ggml:
+A raw CMake configuration also applies `patches/` automatically. To build
+against pristine upstream llama.cpp and ggml instead:
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -136,8 +135,8 @@ cmake -S . -B build -G Ninja \
 cmake --build build -j"$(nproc)"
 ```
 
-See [ggml patches](development/ggml-patches.md) for the patched and stock
-runtime tradeoffs.
+See [`patches/README.md`](../patches/README.md) for what the patches change and
+how to edit them.
 
 ## Components
 

@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -21,7 +20,6 @@
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -133,27 +131,7 @@ class IngressBatchCoordinator {
    public:
     explicit IngressBatchCoordinator(const BatchingConfig& config)
         : enabled_(config.enabled), delay_us_(std::max(0, config.ingress_cohort_delay_us)),
-          max_batch_size_(std::max(1, config.max_batch_size)) {
-        auto parse_env_int = [](const char* name, int& parsed) {
-            const char* value = std::getenv(name);
-            if (value == nullptr)
-                return false;
-            const std::string_view text(value);
-            if (text.empty())
-                return false;
-            int candidate = 0;
-            const auto result = std::from_chars(text.data(), text.data() + text.size(), candidate);
-            if (result.ec != std::errc{} || result.ptr != text.data() + text.size())
-                return false;
-            parsed = candidate;
-            return true;
-        };
-        int value = 0;
-        if (parse_env_int("NEMO_SPEECH_INGRESS_COHORT", value))
-            enabled_ = enabled_ && value != 0;
-        if (parse_env_int("NEMO_SPEECH_INGRESS_COHORT_US", value))
-            delay_us_ = std::max(0, value);
-    }
+          max_batch_size_(std::max(1, config.max_batch_size)) {}
 
     int arrive(int expected_participants = 0) {
         if (!enabled_)

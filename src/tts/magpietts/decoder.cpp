@@ -15,7 +15,7 @@
 #include "../../runtime/ggml/runtime.h"
 #include "graph.h"
 #include "nvtx_utils.h"
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
 #include <cuda_runtime.h>
 
 #include <cstdlib>
@@ -267,7 +267,7 @@ DecoderCrossKvCache::init(const magpietts_model& model, int requested_text_len) 
     constexpr int kTextCapacityGranule = 128;
     int wanted_capacity = (requested_text_len + kTextCapacityGranule - 1) / kTextCapacityGranule *
                           kTextCapacityGranule;
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     // The persistent decoder runtime is built on this buffer; allocate the fused step's full
     // text window once so a longer sentence never forces a rebuild.
     if (model.backend && ggml_backend_is_cuda(model.backend))
@@ -718,7 +718,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     }
 
     ~PersistentDecoderRuntime() {
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
         if (fused_)
             magpietts_decoder_fused_free(fused_);
         if (fused_dev_)
@@ -847,7 +847,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             {"magpietts.decoder.runtime.mask", GGML_TYPE_F32, pad_mask.data(), {text_capacity_}}};
 
         const bool has_alignment = module_.alignment_count() > 0;
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
         if (fused_) {
             std::vector<float> fused_alignment;
             const bool want_alignment = has_alignment && attention && attention->alignment_scores;
@@ -906,7 +906,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // Single-launch CUDA decoder step (magpietts_decoder_fused.cu) replacing the ggml graph
     // whenever the projections are Q8_0, the shapes fit and the GPU supports it.
     void init_fused() {
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
         if (!model_.backend || !ggml_backend_is_cuda(model_.backend))
             return;
         const magpietts_hparams& h = model_.hparams;
@@ -1000,7 +1000,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
 #endif
     }
 
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     // Runs the fused step. hidden_*: device outputs; alignment (host, text_len_) filled when
     // requested.
    public:
@@ -1152,7 +1152,7 @@ MagpieDecoder::evalCachedPair(
     magpietts_cuda_sample_request* cuda_sample, const magpietts_backend_tensor* text_cond_device,
     magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out,
     DecoderCrossKvCache* cond_cross_kv, const magpietts_decoder_attention* attention) const {
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     if (persistent_runtime_) {
         persistent_runtime_->discardPendingAlignment();
     }
@@ -1894,7 +1894,7 @@ MagpieDecoder::prefillPair(
 
 bool
 MagpieDecoder::completeAlignment(const magpietts_decoder_attention* attention) const {
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     if (persistent_runtime_ && attention && attention->alignment_scores)
         return persistent_runtime_->completeAlignment(attention->alignment_scores);
 #else
@@ -1905,7 +1905,7 @@ MagpieDecoder::completeAlignment(const magpietts_decoder_attention* attention) c
 
 bool
 MagpieDecoder::fusedStepExclusive() const {
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     return persistent_runtime_ && persistent_runtime_->fusedStepExclusive();
 #else
     return false;
@@ -1919,7 +1919,7 @@ MagpieDecoder::adoptPrefill(
     DecoderKvCache& uncond_kv, DecoderCrossKvCache& cond_cross_kv, int text_len,
     int stacked_position_budget) const {
     const ggml_nvtx::range nvtx_range("magpietts_decoder_adopt_prefill");
-#if defined(GGML_USE_CUDA)
+#if defined(MAGPIETTS_CUDA_SAMPLING)
     if (persistent_runtime_) {
         persistent_runtime_->discardPendingAlignment();
     }

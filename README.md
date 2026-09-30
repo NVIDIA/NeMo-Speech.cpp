@@ -156,7 +156,7 @@ development files, and the toolchain required by the selected backend, if any.
 For a CUDA ASR and TTS server with the playground:
 
 ```bash
-git submodule update --init ggml llama.cpp third_party/cpp-httplib
+git submodule update --init llama.cpp third_party/cpp-httplib
 scripts/configure.sh cuda-server
 cmake --build --preset cuda-server
 ```

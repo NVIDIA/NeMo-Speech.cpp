@@ -119,21 +119,15 @@ set(NEMO_SPEECH_DEPENDENCY_PREFIX "${CMAKE_SOURCE_DIR}/.deps" CACHE PATH
     "User-writable prefix containing optional project-built dependencies")
 # GGML_CUDA is forwarded directly to ggml's CMake via -DGGML_CUDA=ON.
 
-# Keep the legacy WITH_NMT/WITH_GRPC options as downstream-compatible aliases.
-if(NEMO_SPEECH_WITH_NMT)
-    set(NEMO_SPEECH_BUILD_NMT ON CACHE BOOL "Build text translation (links llama.cpp)" FORCE)
-endif()
-if(NEMO_SPEECH_BUILD_NMT)
-    set(NEMO_SPEECH_WITH_NMT ON)
-endif()
+# WITH_NMT/WITH_GRPC only seed the BUILD_* defaults above; an explicit BUILD_*
+# value takes precedence.
+foreach(_alias NMT GRPC)
+    if(NEMO_SPEECH_WITH_${_alias})
+        message(DEPRECATION "NEMO_SPEECH_WITH_${_alias} is deprecated; use NEMO_SPEECH_BUILD_${_alias}")
+    endif()
+endforeach()
 if(NEMO_SPEECH_BUILD_S2S)
     set(NEMO_SPEECH_BUILD_ASR ON CACHE BOOL "Build automatic speech recognition" FORCE)
-endif()
-if(NEMO_SPEECH_WITH_GRPC)
-    set(NEMO_SPEECH_BUILD_GRPC ON CACHE BOOL "Build Riva-compatible gRPC adapters" FORCE)
-endif()
-if(NEMO_SPEECH_BUILD_GRPC)
-    set(NEMO_SPEECH_WITH_GRPC ON)
 endif()
 
 # Reject invalid component combinations early.
@@ -176,57 +170,14 @@ endif()
 # no-op for Metal, Vulkan, and CPU builds.
 option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (native GEMM, no cuBLASLt)" OFF)
 
-# Whether the linked ggml has the project ASR patches applied (ggml-patches/:
-# the fused rel-pos attention op and the F16 depthwise-conv kernel). The ASR
-# directly references these (a new op symbol + F16 CONV_2D_DW behaviour), so a
-# build against STANDARD upstream ggml must set -DNEMO_SPEECH_GGML_PATCHED=OFF
-# - the encoder then uses only stock ggml ops (unfused rel-pos, ggml_conv_1d_dw)
-# at some latency cost. The remaining low-level patches (NVFP4, skinny-q8,
-# norm/BF16 fusions, CUDA graph and launch fixes) are transparent ggml-cuda internals.
-option(NEMO_SPEECH_GGML_PATCHED "Linked ggml has the project ASR patches applied (fused rel-pos op, F16 dw-conv)" ON)
-
-# Relative-position mode of the fused CUDA attention op. Replaces the unfused
-# encoder attention sequence with one kernel. Defaults ON with CUDA and the
-# patched ggml; the encoder otherwise uses stock ggml ops.
-if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
-    option(NEMO_SPEECH_FUSED_RELPOS_ATTN "Use the fused rel-pos attention CUDA op in the encoder" ON)
-else()
-    set(NEMO_SPEECH_FUSED_RELPOS_ATTN OFF CACHE BOOL
-        "Use the fused rel-pos attention CUDA op in the encoder" FORCE)
-    message(STATUS
-        "NEMO_SPEECH_FUSED_RELPOS_ATTN forced OFF: requires GGML_CUDA=ON and "
-        "NEMO_SPEECH_GGML_PATCHED=ON (patched ggml). Using the unfused path.")
-endif()
-
-# Direct depthwise-conv kernel (GGML_OP_CONV_2D_DW) for the conformer/subsample
-# convs. Faster than ggml_conv_1d_dw's im2col + matmul, but the conv weights are
-# F16 and the direct CONV_2D_DW op only reads F16 kernels correctly on the
-# patched CUDA backend (ggml patch 0004); stock ggml (CPU or unpatched CUDA)
-# reads them as F32. Defaults ON whenever GGML_CUDA + a patched ggml are present;
-# forced OFF otherwise, where nn.cpp falls back to the portable ggml_conv_1d_dw
-# lowering (im2col + mul_mat, F16-safe on every backend and on stock ggml). Kept
-# as an explicit option so it can be toggled OFF for debugging.
-if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
-    option(NEMO_SPEECH_DIRECT_DW_CONV "Use the direct CUDA depthwise-conv kernel in the encoder" ON)
-else()
-    set(NEMO_SPEECH_DIRECT_DW_CONV OFF CACHE BOOL
-        "Use the direct CUDA depthwise-conv kernel in the encoder" FORCE)
-    message(STATUS
-        "NEMO_SPEECH_DIRECT_DW_CONV forced OFF: requires GGML_CUDA=ON and "
-        "NEMO_SPEECH_GGML_PATCHED=ON (patched ggml). Using ggml_conv_1d_dw.")
-endif()
-
-# FastConformer graph rewrites that target CUDA-only ggml ops/fusions (sigmoid
-# GLU plus BF16 projection epilogues). Keep the symbols out of standard-ggml,
-# CPU, Metal, and Vulkan builds. The CUDA backend performs the finer runtime
-# architecture checks: native BF16 epilogues require NVIDIA SM80+, and the
-# 1024-wide LayerNorm launch specialization requires SM90+.
-if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
-    option(NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS
-        "Use patched CUDA FastConformer graph fusions" ON)
-else()
-    set(NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS OFF CACHE BOOL
-        "Use patched CUDA FastConformer graph fusions" FORCE)
+# Build ggml and llama.cpp with the patches/ series applied (see patches/README.md
+# and cmake/llama_cpp.cmake). OFF builds the pristine llama.cpp submodule; the code
+# then uses only stock ggml operations, at some latency cost on CUDA.
+option(NEMO_SPEECH_GGML_PATCHED "Apply patches/ to ggml and llama.cpp and use the patched operations" ON)
+if(NEMO_SPEECH_BUILD_S2S AND NOT NEMO_SPEECH_GGML_PATCHED AND NOT NEMO_SPEECH_LLAMA_CPP_SOURCE_DIR)
+    # EarTTS stores its Gemma 3 attention scale in GGUF metadata that stock
+    # llama.cpp ignores, which would silently change the model's output.
+    message(FATAL_ERROR "NEMO_SPEECH_BUILD_S2S requires NEMO_SPEECH_GGML_PATCHED=ON")
 endif()
 
 set(GGML_DEPENDENCIES ggml ggml-base ggml-cpu)
@@ -245,12 +196,6 @@ if(GGML_CUDA)
     # on by default. ggml-cuda gates it at runtime and disables it for graphs it
     # can't capture (e.g. shapes that change between calls).
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable ggml-cuda CUDA Graphs")
-    file(READ "${CMAKE_SOURCE_DIR}/ggml/src/ggml-cuda/conv-transpose-1d.cu" GGML_CUDA_CONV_TRANSPOSE_1D)
-    if(NOT GGML_CUDA_CONV_TRANSPOSE_1D MATCHES "conv_transpose_1d_use_nanocodec_grouped2")
-        message(WARNING
-            "MagpieTTS/NanoCodec CUDA ggml patch is not applied. "
-            "Run scripts/apply-ggml-patches.sh before compiling CUDA TTS targets.")
-    endif()
 endif()
 if(GGML_VULKAN)
     list(APPEND GGML_DEPENDENCIES ggml-vulkan)
@@ -263,7 +208,8 @@ endif()
 # it CPU matmuls run one dot product per output.
 set(GGML_LLAMAFILE ON CACHE BOOL "ggml: use llamafile SGEMM")
 
-add_subdirectory(ggml EXCLUDE_FROM_ALL)
+include(cmake/llama_cpp.cmake)
+add_subdirectory("${NEMO_SPEECH_LLAMA_CPP_DIR}/ggml" "${CMAKE_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
 
 # ggml is an implementation dependency, so install only the runtime libraries
 # required by our shared libraries. Its C++ headers, CMake package, pkg-config
@@ -367,14 +313,14 @@ endif()
 # llama.cpp for the NMT decoder. It reuses the ggml target added above (its
 # CMake builds its own ggml only when the target is absent), so one ggml backend
 # is shared across asr/tts/nmt. Build only libllama.
-if(NEMO_SPEECH_WITH_NMT OR NEMO_SPEECH_BUILD_S2S)
+if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S)
     set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
     set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
-    add_subdirectory(llama.cpp EXCLUDE_FROM_ALL)
+    add_subdirectory("${NEMO_SPEECH_LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
     set_property(TARGET llama PROPERTY PUBLIC_HEADER "")
     install(TARGETS llama
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -470,7 +416,7 @@ if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
             RENAME LICENSE)
     endforeach()
 endif()
-install(FILES ggml/LICENSE
+install(FILES llama.cpp/LICENSE
     DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/ggml")
 if(NEMO_SPEECH_BUILD_ASR AND NEMO_SPEECH_BUILD_CLI AND NEMO_SPEECH_BUILD_MIC_CAPTURE)
     install(FILES third_party/miniaudio/LICENSE

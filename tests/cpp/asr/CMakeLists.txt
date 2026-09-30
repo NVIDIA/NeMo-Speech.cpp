@@ -83,7 +83,7 @@ endif()
 add_executable(asr_c_dlopen ${CMAKE_SOURCE_DIR}/tests/c/asr_c_dlopen.c)
 target_link_libraries(asr_c_dlopen PRIVATE ${CMAKE_DL_LIBS})
 
-# Skinny-Q8 dispatch (ggml patch 0029) must give the same bits before and after a weight is
+# Skinny-Q8 dispatch (the skinny-Q8 ggml patch) must give the same bits before and after a weight is
 # repacked. The kernel exists only in the patched CUDA ggml. Skips itself (exit 77) without a GPU.
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_skinny_q8_dispatch test_skinny_q8_dispatch.cpp)

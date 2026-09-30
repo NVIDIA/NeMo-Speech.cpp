@@ -31,18 +31,13 @@ if(NEMO_SPEECH_BUILD_ASR)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_ASR=1)
     target_link_libraries(nemo_speech_cli PRIVATE nemo_speech_asr)
     if(NEMO_SPEECH_BUILD_MIC_CAPTURE)
-        if(NOT EXISTS "${CMAKE_SOURCE_DIR}/llama.cpp/vendor/miniaudio/miniaudio.h")
-            message(FATAL_ERROR
-                "ASR CLI microphone capture requires the vendored miniaudio header; "
-                "run: git submodule update --init llama.cpp")
-        endif()
         target_sources(nemo_speech_cli PRIVATE
             live_terminal.cpp
             live_transcript.cpp
             microphone_capture.cpp)
         target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_LIVE=1)
         target_include_directories(nemo_speech_cli PRIVATE
-            ${CMAKE_SOURCE_DIR}/llama.cpp/vendor/miniaudio)
+            ${NEMO_SPEECH_LLAMA_CPP_DIR}/vendor/miniaudio)
         target_link_libraries(nemo_speech_cli PRIVATE ${CMAKE_DL_LIBS})
         if(APPLE)
             target_link_libraries(nemo_speech_cli PRIVATE

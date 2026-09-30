@@ -22,7 +22,7 @@ static inline ggml_tensor*
 pad_ext_backend(
     ggml_context* ctx, ggml_tensor* t, int lp0, int rp0, int lp1, int rp1, int lp2, int rp2,
     int lp3, int rp3) {
-#ifdef NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     return ggml_pad_ext(ctx, t, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
 #else
     ggml_tensor* right_padded =
@@ -452,7 +452,7 @@ ConformerConv::build_graph(
                    : ggml_add_inplace(bf_ctx.ctx, x_ct, b1.tensor);
     }
     ggml_runtime::TensorBag out_bag;
-#ifdef NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     if (session->params.use_gpu) {
         // Split contiguous (2*C,T,B) in the CUDA GLU kernel and materialize
         // only the final (T,C,B) depthwise-convolution layout.
@@ -919,7 +919,7 @@ ConformerLayer::build_mha_cached(
     const float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
 
     ggml_tensor* ctx_attn = nullptr;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     // Single-kernel path: bias adds, content+position scores, the rel-shift,
     // scale+mask, softmax and the attn@V context all happen inside
     // ggml_fused_relpos_attn (the same op the offline encoder uses; its
@@ -1439,7 +1439,7 @@ FastConformerEncoder::build_graph(
     // gathers degenerate to arena views and feedback uses in-place copies.
     // Multi-slot arenas retain indexed gather/scatter.
     const bool single_slot = cfg_.cache_state_slots == 1 && batch == 1;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     const int d_k = cfg_.d_model / cfg_.n_heads;
     const bool direct_kv_arena =
         session->params.use_gpu && mask_t.tensor != nullptr && (d_k & (d_k - 1)) == 0;
@@ -1493,9 +1493,9 @@ FastConformerEncoder::build_graph(
         cache.attn_mask = mask_t.tensor;
         cache.pos_proj =
             session->model_tensor_container->get_tensor_by_name(pos_proj_name(l)).tensor;
-#ifdef NEMO_SPEECH_DIRECT_DW_CONV
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
         // Repacked channel-inner dw weight enables the (d_model, T)-layout
-        // conv module; the cwhn direct kernel is CUDA-only (patch 0004), so a
+        // conv module; the cwhn direct kernel is CUDA-only (depthwise-conv patch), so a
         // CPU session in a CUDA build leaves it null and the layer takes the
         // portable transpose-based conv path (runtime-gated in nn.cpp).
         if (session->params.use_gpu) {

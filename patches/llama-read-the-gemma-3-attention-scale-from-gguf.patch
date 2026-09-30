@@ -1,0 +1,36 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: read the Gemma 3 attention scale from GGUF
+
+Honors gemma3.attention.scale (written by the EarTTS converter), falling back
+to the upstream default.
+
+Upstream: candidate (needs converter support and a round-trip test).
+
+diff --git a/src/models/gemma3.cpp b/src/models/gemma3.cpp
+index f99bbaacd8adcdd34810064eb4b2320ff28e2d71..48da85e596f97852622636fc6925287ea5684f85 100644
+--- a/src/models/gemma3.cpp
++++ b/src/models/gemma3.cpp
+@@ -1,6 +1,8 @@
+ #include "models.h"
+ 
+ void llama_model_gemma3::load_arch_hparams(llama_model_loader & ml) {
++    const bool found_attention_scale =
++        ml.get_key(LLM_KV_ATTENTION_SCALE, hparams.f_attention_scale, false);
+     const bool found_swa = ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+     if (found_swa && hparams.n_swa > 0) {
+         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+@@ -26,9 +28,11 @@ void llama_model_gemma3::load_arch_hparams(llama_model_loader & ml) {
+     }
+ 
+     // ref: https://github.com/google/gemma_pytorch/blob/014acb7ac4563a5f77c76d7ff98f31b568c16508/gemma/config.py#L289
+-    hparams.f_attention_scale = type == LLM_TYPE_27B
+-        ? 1.0f / std::sqrt(float(hparams.n_embd / hparams.n_head(0)))
+-        : 1.0f / std::sqrt(float(hparams.n_embd_head_k()));
++    if (!found_attention_scale || hparams.f_attention_scale <= 0.0f) {
++        hparams.f_attention_scale = type == LLM_TYPE_27B
++            ? 1.0f / std::sqrt(float(hparams.n_embd / hparams.n_head(0)))
++            : 1.0f / std::sqrt(float(hparams.n_embd_head_k()));
++    }
+ }
+ 
+ void llama_model_gemma3::load_arch_tensors(llama_model_loader &) {

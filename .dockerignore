@@ -1,7 +1,7 @@
 .git
-# Nested submodule .git files (ggml, llama.cpp, third_party/*) become broken
-# pointers once copied; exclude them so apply-ggml-patches.sh runs git-apply
-# on a plain tree and the build context stays small.
+# Nested submodule .git files (llama.cpp, third_party/*) become broken pointers
+# once copied; exclude them so the build context stays small. CMake applies
+# patches/ to a copy of the plain llama.cpp tree.
 **/.git
 .gitignore
 .gitmodules

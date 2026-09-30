@@ -265,18 +265,36 @@ def ensure_quantizer(
             "C++ compiler; install the build prerequisites or pass --llama-quantize PATH"
         )
 
+    source = checkout
     if checkout == (root / "llama.cpp").resolve():
-        patch_script = root / "scripts" / "apply-llama-patches.sh"
-        if not patch_script.is_file():
-            raise RuntimeError(f"missing llama.cpp patch helper: {patch_script}")
-        print("[convert-s2s] applying pinned llama.cpp compatibility patches")
-        subprocess.run(["bash", str(patch_script)], cwd=root, check=True)
+        # Build from a patched copy; the submodule itself stays pristine.
+        materialize = root / "cmake" / "llama_cpp.cmake"
+        if not materialize.is_file():
+            raise RuntimeError(f"missing llama.cpp patch helper: {materialize}")
+        source = root / ".deps" / "llama.cpp-patched"
+        print("[convert-s2s] applying patches/ to a copy of the pinned llama.cpp")
+        subprocess.run(
+            [
+                cmake,
+                f"-DSOURCE_DIR={checkout}",
+                f"-DPATCH_DIR={root / 'patches'}",
+                f"-DDEST_DIR={source}",
+                "-P",
+                str(materialize),
+            ],
+            check=True,
+        )
 
     build_dir = checkout / "build-quantize"
+    cache = build_dir / "CMakeCache.txt"
+    if cache.is_file() and f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n" not in cache.read_text():
+        # Configured from a different source tree; CMake cannot switch sources
+        # in place.
+        shutil.rmtree(build_dir)
     configure = [
         cmake,
         "-S",
-        str(checkout),
+        str(source),
         "-B",
         str(build_dir),
         "-DCMAKE_BUILD_TYPE=Release",

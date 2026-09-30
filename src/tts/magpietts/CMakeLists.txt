@@ -45,9 +45,6 @@ target_link_libraries(nemo_speech_tts PUBLIC
 # Stable C ABI (nemo_speech_tts_*) and the in-tree C++ API share one implementation
 # library. Aliases preserve existing target names without producing extra DSOs.
 target_compile_definitions(nemo_speech_tts PRIVATE NEMO_SPEECH_TTS_BUILD)
-if(NEMO_SPEECH_GGML_PATCHED)
-    target_compile_definitions(nemo_speech_tts PRIVATE NEMO_SPEECH_GGML_PATCHED=1)
-endif()
 set_target_properties(nemo_speech_tts PROPERTIES SOVERSION 1)
 if(UNIX AND NOT APPLE)
     target_link_options(nemo_speech_tts PRIVATE
@@ -75,7 +72,8 @@ foreach(target ${MAGPIETTS_TARGETS})
     )
 endforeach()
 
-if(GGML_CUDA)
+# The CUDA sampler runs on ggml's stream, which only the patched ggml exposes.
+if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND AND CUDAToolkit_INCLUDE_DIRS)
         foreach(target ${MAGPIETTS_TARGETS})
@@ -86,7 +84,7 @@ if(GGML_CUDA)
         enable_language(CUDA)
         foreach(target ${MAGPIETTS_TARGETS})
             target_sources(${target} PRIVATE magpietts_cuda_sampling.cu magpietts_lt_fused.cu magpietts_decoder_fused.cu)
-            target_compile_definitions(${target} PRIVATE GGML_USE_CUDA MAGPIETTS_CUDA_SAMPLING)
+            target_compile_definitions(${target} PRIVATE MAGPIETTS_CUDA_SAMPLING)
             target_link_libraries(${target} PRIVATE CUDA::cudart CUDA::cuda_driver)
             set_target_properties(${target} PROPERTIES
                 CUDA_STANDARD 17
@@ -105,10 +103,4 @@ if(GGML_CUDA)
             endforeach()
         endif()
     endif()
-endif()
-
-if(GGML_METAL)
-    foreach(target ${MAGPIETTS_TARGETS})
-        target_compile_definitions(${target} PRIVATE GGML_USE_METAL)
-    endforeach()
 endif()
