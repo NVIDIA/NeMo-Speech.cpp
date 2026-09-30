@@ -1,12 +1,18 @@
 # Install NeMo-Speech.cpp
 
-The installer selects a backend-matched native release containing the ASR,
-diarization, translation, and TTS CLI, HTTP API, realtime WebSocket endpoint,
-browser playground, SDK, and notices. It builds from source when a matching
-archive is unavailable. Models are distributed separately; inference commands
-download missing indexed defaults on first use, while the server downloads a
-model only when explicitly enabled with an indexed name. See [models and
-cache](cli.md#models-and-cache).
+The installer downloads a prebuilt release archive for your backend containing
+the ASR, diarization, translation, and TTS CLI, HTTP API, realtime WebSocket
+endpoint, browser playground, SDK, and notices. It builds from source when a
+matching archive is unavailable. Models are distributed separately; inference
+commands download missing indexed defaults on first use, while the server
+downloads a model only when explicitly enabled with an indexed name. See
+[models and cache](cli.md#models-and-cache).
+
+> [!IMPORTANT]
+> **For the best performance and the latest features, build natively from source** with
+> `--source` (`-Source` on Windows) or by following the [source-build guide](build.md). A native
+> build is compiled for your machine's CPU and GPU, and release tags can be out of sync with the
+> `main` branch.
 
 ## Linux and macOS
 
@@ -22,7 +28,7 @@ nemo-speech --version
 
 With no version argument, the installer reads the current release identifier
 from the repository's `VERSION` file, including prerelease identifiers.
-Native Linux archives require glibc 2.31 or newer (Ubuntu 20.04 or equivalent).
+Prebuilt Linux archives require glibc 2.31 or newer (Ubuntu 20.04 or equivalent).
 
 Prebuilt CPU archives require no GPU toolkit. Linux CUDA archives include the
 required user-space CUDA libraries but still need a compatible NVIDIA driver.
@@ -48,8 +54,10 @@ available.
 
 It installs without `sudo` and links the CLI into `~/.local/bin`. Run `--help`
 to see prefix, backend, PATH, and dry-run options. Downloaded archives are
-verified against their published SHA-256 files; a present archive with an
-invalid or mismatched checksum always fails rather than falling back to source.
+checked against the SHA-256 file published with the release, which detects a
+corrupted or incomplete download but is not a signature. A present archive with
+an invalid or mismatched checksum always fails rather than falling back to
+source.
 
 The source fallback requires Git, CMake 3.26 or newer, Ninja, a C++17 compiler,
 SentencePiece development files, and any toolkit required by the selected

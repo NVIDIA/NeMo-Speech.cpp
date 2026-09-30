@@ -28,10 +28,10 @@ class Recognizer;
 
 struct BackendConfig {
     int gpu = 0;      // -1 = CPU
-    int threads = 4;  // CPU backend threads
+    int threads = 0;  // CPU backend threads; 0 = min(8, hardware threads)
     void Register(common::ParameterParser& p) {
         p.Register("gpu", &gpu, "GPU device index (-1 = CPU)", {"--gpu", "-g"});
-        p.Register("threads", &threads, "CPU backend threads");
+        p.Register("threads", &threads, "CPU backend threads (0 = min(8, hardware threads))");
     }
 };
 

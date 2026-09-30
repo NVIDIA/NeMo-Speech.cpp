@@ -49,6 +49,11 @@ See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
 
 ## Installation
 
+> [!IMPORTANT]
+> **For the best performance and the latest features, build natively from source.** A native
+> build is compiled for your machine, and release tags can be out of sync with the
+> `main` branch. See [Build from source](#build-from-source).
+
 Install the `nemo-speech` CLI for the detected platform and backend:
 
 On Linux or macOS, run:
@@ -68,10 +73,12 @@ irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
 Open a new PowerShell window after installation so the updated user `PATH`
 takes effect.
 
-The installer prefers a verified native release and falls back to a source
-build when an artifact is unavailable. A source build requires Git, CMake 3.26
-or newer, Ninja, a C++17 compiler, SentencePiece development files, and the
-toolchain required by the selected backend, if any. See
+The installer downloads the prebuilt archive for the latest release, checks it
+against the SHA-256 checksum published with the release, and builds from source
+when no archive is available for your platform. **Pass `--source` (`-Source` on
+Windows) to always build from the `main` branch.** A source build requires Git,
+CMake 3.26 or newer, Ninja, a C++17 compiler, SentencePiece development files,
+and the toolchain required by the selected backend, if any. See
 [Installation](docs/install.md) for platform-specific prerequisites and
 options.
 
