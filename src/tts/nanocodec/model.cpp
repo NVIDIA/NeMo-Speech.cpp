@@ -64,6 +64,12 @@ struct nc_conv {
     ggml_tensor* w_f32 = nullptr;
     // Optional F16 weights repacked as [cout_pad, cin_pad, K] for the fused CUDA conv op.
     ggml_tensor* w_packed = nullptr;
+    // Optional F16 weights [K, cin_pad, Cout] with input channels zero-padded to a multiple of 16
+    // for the CPU backend, whose tiled GEMM (llamafile) needs the im2col depth K * Cin to be one.
+    ggml_tensor* w_cpu = nullptr;
+    // Optional F32 transposed-convolution weights [cin_pad, K * Cout] (row k * Cout + co) for the
+    // CPU GEMM + overlap-add path (nc_conv_transpose_full).
+    ggml_tensor* wt_cpu = nullptr;
     int stride = 1;
     int dilation = 1;
 };
@@ -108,6 +114,8 @@ struct nc_model {
     ggml_backend_buffer_t aux_buffer = nullptr;
     ggml_context* pack_ctx = nullptr;  // fused-conv packed weights
     ggml_backend_buffer_t pack_buffer = nullptr;
+    ggml_context* cpu_pad_ctx = nullptr;  // channel-padded conv weights (CPU backend)
+    ggml_backend_buffer_t cpu_pad_buffer = nullptr;
     ggml_context* group_ctx =
         nullptr;  // grouped fused-conv tensors (weights, biases, snake params)
     ggml_backend_buffer_t group_buffer = nullptr;
@@ -460,6 +468,122 @@ nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
 #endif
 }
 
+// Transposed convolutions that nc_conv_transpose_full runs as GEMM + overlap-add on the CPU
+// backend.
+static bool
+nc_cpu_gemm_transposed(const nc_model& model, const nc_conv& c) {
+    return model.backend && ggml_backend_is_cpu(model.backend) && c.w &&
+           c.w->type == GGML_TYPE_F16 && ggml_is_contiguous(c.w) && c.stride > 0 &&
+           c.w->ne[0] % c.stride == 0;
+}
+
+// CPU-backend weight layouts, prepared once at load (results are unchanged):
+//  - stride-1 convolutions whose input channel count is not a multiple of 16 get a zero-padded copy
+//    (w_cpu): the CPU runs ggml_conv_1d as im2col + GEMM, and its tiled GEMM only accepts an im2col
+//    depth (K * Cin) that is a multiple of 16; otherwise the matmul falls back to one dot product
+//    per output;
+//  - transposed convolutions get their weights re-laid out for a GEMM (wt_cpu): ggml's CPU
+//    conv_transpose_1d re-permutes the whole weight on a single thread on every call.
+static void
+nc_prepare_cpu_conv_weights(nc_model& model, bool verbose) {
+    if (!model.backend || !ggml_backend_is_cpu(model.backend)) {
+        return;
+    }
+    std::vector<nc_conv*> pending;
+    auto consider = [&](nc_conv& c) {
+        if (c.w && c.w->type == GGML_TYPE_F16 && c.stride == 1 && ggml_is_contiguous(c.w) &&
+            c.w->ne[1] % 16 != 0) {
+            pending.push_back(&c);
+        }
+    };
+    consider(model.pre_conv);
+    for (nc_res_layer& layer : model.res_layers) {
+        for (auto& stack : layer.by_kernel) {
+            for (nc_res_block& block : stack) {
+                consider(block.input_conv);
+                consider(block.skip_conv);
+            }
+        }
+    }
+    consider(model.post_conv);
+    std::vector<nc_conv*> transposed;
+    for (nc_conv& c : model.up_convs) {
+        if (nc_cpu_gemm_transposed(model, c)) {
+            transposed.push_back(&c);
+        }
+    }
+    if (pending.empty() && transposed.empty()) {
+        return;
+    }
+    ggml_init_params params = {
+        ggml_tensor_overhead() * (pending.size() + transposed.size() + 1), nullptr, true};
+    model.cpu_pad_ctx = ggml_init(params);
+    std::vector<ggml_tensor*> padded;
+    for (nc_conv* c : pending) {
+        const int64_t K = c->w->ne[0], cin_pad = (c->w->ne[1] + 15) / 16 * 16, cout = c->w->ne[2];
+        ggml_tensor* dst = ggml_new_tensor_3d(model.cpu_pad_ctx, GGML_TYPE_F16, K, cin_pad, cout);
+        const std::string name = std::string(ggml_get_name(c->w)) + ".cpu";
+        ggml_set_name(dst, name.c_str());
+        padded.push_back(dst);
+    }
+    std::vector<ggml_tensor*> relaid;
+    for (nc_conv* c : transposed) {
+        // src: [K, Cout, Cin] (ne0 = K); dst: [cin_pad, K * Cout]
+        const int64_t K = c->w->ne[0], cout = c->w->ne[1], cin_pad = (c->w->ne[2] + 15) / 16 * 16;
+        ggml_tensor* dst = ggml_new_tensor_2d(model.cpu_pad_ctx, GGML_TYPE_F32, cin_pad, K * cout);
+        const std::string name = std::string(ggml_get_name(c->w)) + ".cpu";
+        ggml_set_name(dst, name.c_str());
+        relaid.push_back(dst);
+    }
+    model.cpu_pad_buffer = ggml_backend_alloc_ctx_tensors(model.cpu_pad_ctx, model.backend);
+    if (!model.cpu_pad_buffer) {
+        fprintf(stderr, "warning: could not allocate padded NanoCodec conv weights\n");
+        ggml_free(model.cpu_pad_ctx);
+        model.cpu_pad_ctx = nullptr;
+        return;
+    }
+    std::vector<ggml_fp16_t> src, dst;
+    for (size_t i = 0; i < pending.size(); ++i) {
+        nc_conv* c = pending[i];
+        const int64_t K = c->w->ne[0], cin = c->w->ne[1], cout = c->w->ne[2];
+        const int64_t cin_pad = padded[i]->ne[1];
+        src.resize((size_t)ggml_nelements(c->w));
+        ggml_backend_tensor_get(c->w, src.data(), 0, src.size() * sizeof(ggml_fp16_t));
+        dst.assign((size_t)(K * cin_pad * cout), ggml_fp32_to_fp16(0.0f));
+        for (int64_t co = 0; co < cout; ++co) {
+            std::copy_n(
+                &src[(size_t)(co * cin * K)], (size_t)(cin * K), &dst[(size_t)(co * cin_pad * K)]);
+        }
+        ggml_backend_tensor_set(padded[i], dst.data(), 0, dst.size() * sizeof(ggml_fp16_t));
+        c->w_cpu = padded[i];
+    }
+    std::vector<float> dstf;
+    for (size_t i = 0; i < transposed.size(); ++i) {
+        nc_conv* c = transposed[i];
+        const int64_t K = c->w->ne[0], cout = c->w->ne[1], cin = c->w->ne[2];
+        const int64_t cin_pad = relaid[i]->ne[0];
+        src.resize((size_t)ggml_nelements(c->w));
+        ggml_backend_tensor_get(c->w, src.data(), 0, src.size() * sizeof(ggml_fp16_t));
+        dstf.assign((size_t)(cin_pad * K * cout), 0.0f);
+        for (int64_t ci = 0; ci < cin; ++ci) {
+            for (int64_t co = 0; co < cout; ++co) {
+                for (int64_t k = 0; k < K; ++k) {
+                    dstf[(size_t)((k * cout + co) * cin_pad + ci)] =
+                        ggml_fp16_to_fp32(src[(size_t)((ci * cout + co) * K + k)]);
+                }
+            }
+        }
+        ggml_backend_tensor_set(relaid[i], dstf.data(), 0, dstf.size() * sizeof(float));
+        c->wt_cpu = relaid[i];
+    }
+    if (verbose) {
+        fprintf(
+            stderr,
+            "nanocodec: CPU layouts for %zu channel-padded and %zu transposed convolutions\n",
+            pending.size(), transposed.size());
+    }
+}
+
 static bool
 nc_model_load(
     const std::string& fname, nc_model& model, bool force_cpu = false, bool verbose = false) {
@@ -583,7 +707,8 @@ nc_model_load(
     {
         std::vector<size_t> pending;
         for (size_t i = 0; i < model.up_convs.size(); ++i) {
-            if (model.up_convs[i].w && model.up_convs[i].w->type == GGML_TYPE_F16) {
+            if (model.up_convs[i].w && model.up_convs[i].w->type == GGML_TYPE_F16 &&
+                !nc_cpu_gemm_transposed(model, model.up_convs[i])) {
                 pending.push_back(i);
             }
         }
@@ -649,6 +774,7 @@ nc_model_load(
     model.post_activation = load_activation(model, "dec.post_act");
     model.post_conv = load_conv(model, "dec.post");
     nc_pack_fused_conv_weights(model, verbose);
+    nc_prepare_cpu_conv_weights(model, verbose);
 
     if (verbose) {
         fprintf(
@@ -662,6 +788,14 @@ nc_model_load(
 
 static void
 nc_model_free(nc_model& model) {
+    if (model.cpu_pad_buffer) {
+        ggml_backend_buffer_free(model.cpu_pad_buffer);
+        model.cpu_pad_buffer = nullptr;
+    }
+    if (model.cpu_pad_ctx) {
+        ggml_free(model.cpu_pad_ctx);
+        model.cpu_pad_ctx = nullptr;
+    }
     if (model.group_buffer) {
         ggml_backend_buffer_free(model.group_buffer);
         model.group_buffer = nullptr;
@@ -716,24 +850,60 @@ new_graph_context() {
     return ggml_init(params);
 }
 
+// Zero input channels needed by a channel-padded CPU weight (nc_conv::w_cpu).
+static int
+nc_cpu_channel_pad(const nc_conv& conv, const ggml_tensor* x) {
+    return conv.w_cpu ? (int)(conv.w_cpu->ne[1] - x->ne[1]) : 0;
+}
+
 static ggml_tensor*
 causal_conv1d(ggml_context* ctx, ggml_tensor* x, const nc_conv& conv) {
     const int kernel = (int)conv.w->ne[0];
     const int left_pad = (kernel - 1) * conv.dilation;
-    ggml_tensor* padded = ggml_pad_ext(ctx, x, left_pad, 0, 0, 0, 0, 0, 0, 0);
-    ggml_tensor* y = ggml_conv_1d(ctx, conv.w, padded, conv.stride, 0, conv.dilation);
+    ggml_tensor* padded =
+        ggml_pad_ext(ctx, x, left_pad, 0, 0, nc_cpu_channel_pad(conv, x), 0, 0, 0, 0);
+    ggml_tensor* y =
+        ggml_conv_1d(ctx, conv.w_cpu ? conv.w_cpu : conv.w, padded, conv.stride, 0, conv.dilation);
     y = ggml_add(ctx, y, conv.b);
     return y;
+}
+
+// Full transposed convolution [(T - 1) * stride + K, Cout] of x [T, Cin]. With CPU weights
+// (wt_cpu) it is one GEMM giving every tap's contribution per input step, Z[t][k * Cout + co], and
+// an overlap-add: tap k = q * stride + m of step t lands on output (t + q) * stride + m.
+static ggml_tensor*
+nc_conv_transpose_full(ggml_context* ctx, const nc_conv& conv, ggml_tensor* x) {
+    if (!conv.wt_cpu) {
+        ggml_tensor* weight =
+            conv.w_f32 ? conv.w_f32 : ggml_cont(ctx, ggml_cast(ctx, conv.w, GGML_TYPE_F32));
+        return ggml_conv_transpose_1d(ctx, weight, x, conv.stride, 0, 1);
+    }
+    const int64_t T = x->ne[0], cin = x->ne[1], cin_pad = conv.wt_cpu->ne[0];
+    const int64_t K = conv.w->ne[0], cout = conv.w->ne[1], s = conv.stride, r = K / s;
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, x, T, cin)));
+    if (cin_pad > cin) {
+        xt = ggml_pad(ctx, xt, (int)(cin_pad - cin), 0, 0, 0);
+    }
+    ggml_tensor* z = ggml_mul_mat(ctx, conv.wt_cpu, xt);  // [K * Cout, T]
+    ggml_tensor* sum = nullptr;
+    for (int64_t q = 0; q < r; ++q) {
+        ggml_tensor* zq = ggml_view_2d(
+            ctx, z, s * cout, T, z->nb[1], (size_t)(q * s * cout) * ggml_element_size(z));
+        zq = ggml_pad_ext(ctx, zq, 0, 0, (int)q, (int)(r - 1 - q), 0, 0, 0, 0);
+        sum = sum ? ggml_add(ctx, sum, zq) : zq;
+    }
+    // [Cout, stride * (T + r - 1)] -> [(T - 1) * stride + K, Cout, 1]
+    ggml_tensor* full = ggml_reshape_2d(ctx, sum, cout, s * (T + r - 1));
+    full = ggml_cont(ctx, ggml_transpose(ctx, full));
+    return ggml_reshape_3d(ctx, full, full->ne[0], cout, 1);
 }
 
 static ggml_tensor*
 causal_conv_transpose1d(ggml_context* ctx, ggml_tensor* x, const nc_conv& conv) {
     const int64_t out_len = x->ne[0] * conv.stride;
-    ggml_tensor* weight =
-        conv.w_f32 ? conv.w_f32 : ggml_cont(ctx, ggml_cast(ctx, conv.w, GGML_TYPE_F32));
-    ggml_tensor* full = ggml_conv_transpose_1d(ctx, weight, x, conv.stride, 0, 1);
+    ggml_tensor* full = nc_conv_transpose_full(ctx, conv, x);
     ggml_tensor* cropped =
-        ggml_view_3d(ctx, full, out_len, weight->ne[1], 1, full->nb[1], full->nb[2], 0);
+        ggml_view_3d(ctx, full, out_len, full->ne[1], 1, full->nb[1], full->nb[2], 0);
     return ggml_add(ctx, cropped, conv.b);
 }
 
@@ -1048,7 +1218,11 @@ nc_stream_causal_conv1d(
         nc_stream_add_cache_writeback(ctx, io, tail, cache);
     }
 
-    ggml_tensor* y = ggml_conv_1d(ctx, conv.w, conv_in, conv.stride, 0, conv.dilation);
+    if (const int channel_pad = nc_cpu_channel_pad(conv, conv_in)) {
+        conv_in = ggml_pad(ctx, conv_in, 0, channel_pad, 0, 0);
+    }
+    ggml_tensor* y =
+        ggml_conv_1d(ctx, conv.w_cpu ? conv.w_cpu : conv.w, conv_in, conv.stride, 0, conv.dilation);
     y = ggml_add(ctx, y, conv.b);
     return y;
 }
@@ -1105,9 +1279,7 @@ nc_stream_causal_conv_transpose1d(
     ggml_context* ctx, ggml_tensor* x, const nc_conv& conv, nc_stream_state& state,
     nc_stream_graph_io& io) {
     const int64_t out_len = x->ne[0] * conv.stride;
-    ggml_tensor* weight =
-        conv.w_f32 ? conv.w_f32 : ggml_cont(ctx, ggml_cast(ctx, conv.w, GGML_TYPE_F32));
-    ggml_tensor* full = ggml_conv_transpose_1d(ctx, weight, x, conv.stride, 0, 1);
+    ggml_tensor* full = nc_conv_transpose_full(ctx, conv, x);
     const int64_t tail_len = std::max<int64_t>(0, full->ne[0] - out_len);
 
     ggml_tensor* current = nullptr;

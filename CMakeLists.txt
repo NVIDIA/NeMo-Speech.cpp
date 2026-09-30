@@ -259,6 +259,10 @@ if(GGML_METAL)
     list(APPEND GGML_DEPENDENCIES ggml-metal)
 endif()
 
+# Tiled CPU GEMM (llamafile tinyBLAS) for F16/F32/Q8_0 matmuls. Stock ggml leaves it off; without
+# it CPU matmuls run one dot product per output.
+set(GGML_LLAMAFILE ON CACHE BOOL "ggml: use llamafile SGEMM")
+
 add_subdirectory(ggml EXCLUDE_FROM_ALL)
 
 # ggml is an implementation dependency, so install only the runtime libraries

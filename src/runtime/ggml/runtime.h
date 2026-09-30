@@ -169,6 +169,7 @@ struct Params {
     bool use_gpu = false;
     int gpu_device_idx = 0;
     char* pe_bin_path = nullptr;
+    int n_threads = 4;  // CPU backend threads
 };
 
 // Owns ggml backend handles shared by one or more Sessions.

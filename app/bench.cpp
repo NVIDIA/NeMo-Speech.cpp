@@ -476,6 +476,7 @@ print_bench_help(const char* program) {
         "  -m, --model MODEL       Local ASR GGUF path\n"
         "  --mode offline|stream   Recognition mode (default: offline)\n"
         "  --chunk-ms MS           Streamed chunk length (default: the model's chunk)\n"
+        "  --trace FILE            Write per-chunk timing and partial transcripts (JSONL; stream)\n"
         "  -l, --language CODE     Prompt language code\n"
         "  --asr.* VALUE           Override any ASR engine setting\n"
 #endif

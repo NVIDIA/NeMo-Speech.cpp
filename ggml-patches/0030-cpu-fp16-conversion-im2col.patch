@@ -1,0 +1,90 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 7485ba4f..af250c21 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6292,38 +6292,42 @@ static void ggml_compute_forward_im2col_f16(
+     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+ 
+     // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
++    // Each thread fills a contiguous range of output rows (one row per output position), so threads
++    // never share output cache lines and consecutive rows reuse the same source elements.
+     {
+         ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
+ 
+-        for (int64_t in = 0; in < N; in++) {
+-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+-                for (int64_t iow = 0; iow < OW; iow++) {
+-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+-
+-                        // micro kernel
+-                        ggml_fp16_t * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
+-                        const float * const src_data_f32 = src1->type == GGML_TYPE_F32
+-                            ? (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+-                            : nullptr; // [IH, IW]
+-                        const ggml_fp16_t * const src_data_f16 = src1->type == GGML_TYPE_F16
+-                            ? (const ggml_fp16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+-                            : nullptr; // [IH, IW]
+-
+-                        for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
+-                            for (int64_t ikw = 0; ikw < KW; ikw++) {
+-                                const int64_t iiw = iow*s0 + ikw*d0 - p0;
+-                                const int64_t iih = ioh*s1 + ikh*d1 - p1;
+-
+-                                if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
+-                                } else {
+-                                    if (src_data_f32 != nullptr) {
+-                                        dst_data[iic*(KH*KW) + ikh*KW + ikw] = GGML_CPU_FP32_TO_FP16(src_data_f32[iih*IW + iiw]);
+-                                    } else {
+-                                        dst_data[iic*(KH*KW) + ikh*KW + ikw] = src_data_f16[iih*IW + iiw];
+-                                    }
+-                                }
+-                            }
++        const int64_t rows = N*OH*OW;
++        const int64_t dr   = (rows + nth - 1)/nth;
++        const int64_t r0   = dr*ith;
++        const int64_t r1   = MIN(r0 + dr, rows);
++
++        for (int64_t r = r0; r < r1; r++) {
++            const int64_t in  = r/(OH*OW);
++            const int64_t ioh = (r/OW)%OH;
++            const int64_t iow = r%OW;
++
++            ggml_fp16_t * dst_data = wdata + r*(IC*KH*KW); // [IC, KH, KW]
++
++            for (int64_t iic = 0; iic < IC; iic++) {
++                const float * const src_data_f32 = src1->type == GGML_TYPE_F32
++                    ? (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1)
++                    : nullptr; // [IH, IW]
++                const ggml_fp16_t * const src_data_f16 = src1->type == GGML_TYPE_F16
++                    ? (const ggml_fp16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1)
++                    : nullptr; // [IH, IW]
++
++                for (int64_t ikh = 0; ikh < KH; ikh++) {
++                    for (int64_t ikw = 0; ikw < KW; ikw++) {
++                        const int64_t iiw = iow*s0 + ikw*d0 - p0;
++                        const int64_t iih = ioh*s1 + ikh*d1 - p1;
++
++                        if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
++                            dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
++                        } else if (src_data_f32 != nullptr) {
++                            dst_data[iic*(KH*KW) + ikh*KW + ikw] = GGML_CPU_FP32_TO_FP16(src_data_f32[iih*IW + iiw]);
++                        } else {
++                            dst_data[iic*(KH*KW) + ikh*KW + ikw] = src_data_f16[iih*IW + iiw];
+                         }
+                     }
+                 }
+diff --git a/src/ggml-cpu/simd-mappings.h b/src/ggml-cpu/simd-mappings.h
+index 0deda930..b698056b 100644
+--- a/src/ggml-cpu/simd-mappings.h
++++ b/src/ggml-cpu/simd-mappings.h
+@@ -61,6 +61,9 @@ extern "C" {
+         #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) _cvtsh_ss(x)
+         #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) _cvtss_sh(x, 0)
+     #endif
++    // One vcvtps2ph (round to nearest even, like the portable routine) instead of the bit-manipulating
++    // fallback below; per-element conversions such as im2col's F32 -> F16 are otherwise bound by it.
++    #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
+ #elif defined(__POWER9_VECTOR__)
+     #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) power_compute_fp16_to_fp32(x)
+     #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) power_compute_fp32_to_fp16(x)

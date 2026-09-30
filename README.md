@@ -26,19 +26,24 @@
 
 ## Performance
 
-Streaming speech recognition with Nemotron Speech Streaming 0.6B (Q8_0):
+NeMo-Speech.cpp is blazing fast and built for real-time streaming. Speech recognition
+transcribes audio in 160 ms chunks up to 67× faster than real time, and speech synthesis
+generates speech up to 60× faster than real time with its first audio in under 10 ms. Both stay
+faster than real time even on a CPU.
 
-| GPU | Chunk | Latency per chunk | Throughput | Speedup over NeMo (FP32) |
+Streaming speech recognition with Nemotron Speech Streaming 0.6B (Q8_0), 160 ms chunks:
+
+| Device | Latency per chunk | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|
+| GeForce RTX 4090 | **2.3 ms** | **67× real time** | **8.8×** |
+| CPU | **27 ms** | **6× real time** | **3.7×** |
+
+Streaming speech synthesis with MagpieTTS Multilingual (Q8_0), 186 ms audio chunks:
+
+| Device | Time to first audio | Inter-chunk latency | Throughput | Speedup over NeMo (FP32) |
 |---|:---:|:---:|:---:|:---:|
-| NVIDIA DGX Spark (GB10) | 160 ms | **4.7 ms** | **32× real time** | **3.8×** |
-| NVIDIA DGX Spark (GB10) | 1.12 s | **6.6 ms** | **120× real time** | **2.4×** |
-
-Streaming speech synthesis with MagpieTTS Multilingual (Q8_0):
-
-| GPU | Time to first audio | Inter-chunk latency | Throughput | Speedup over NeMo (FP32) |
-|---|:---:|:---:|:---:|:---:|
-| NVIDIA GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** | – |
-| NVIDIA DGX Spark (GB10) | **17 ms** | **6 ms** | **30× real time** | **14×** |
+| GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** | **40×** |
+| CPU | **203 ms** | **64 ms** | **2.7× real time** | **9.7×** |
 
 See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
 

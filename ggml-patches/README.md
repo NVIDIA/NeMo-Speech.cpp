@@ -222,6 +222,12 @@ stock comparison therefore requires both a pristine ggml checkout and
   weight, so outputs no longer depend on previously served requests. Removes
   `GGML_SKINNY_Q8_OUTER_BATCH`.
 
+- **0030-cpu-fp16-conversion-im2col.patch** - on x86 with F16C, scalar
+  FP32 -> FP16 conversions use `vcvtps2ph` instead of the portable
+  bit-manipulating routine, and `im2col` splits threads by output row instead
+  of interleaved channels. Results are bit-identical; NanoCodec decodes about
+  1.7x faster on CPU.
+
 ## Regenerating after editing ggml
 
 Several patches touch the same ggml files, so regenerating a patch from the

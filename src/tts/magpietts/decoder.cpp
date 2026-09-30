@@ -2167,8 +2167,8 @@ decoder_eval_cached_pair_impl(
     for (const auto& codes : stacked_audio) {
         flat_codes.insert(flat_codes.end(), codes.begin(), codes.end());
     }
-    const bool cache_eligible =
-        refill && uncond_cache && !compute_logits && cond_hidden_out && uncond_hidden_out;
+    // Only the lane's last hidden state leaves the graph (no logits), on device or host.
+    const bool cache_eligible = refill && uncond_cache && !compute_logits;
     const bool use_uncond_cache =
         cache_eligible && uncond_cache->ready.load(std::memory_order_acquire) &&
         uncond_cache->n_tokens == total_len && uncond_cache->n_layers == uncond_kv.n_layers &&
@@ -2232,7 +2232,7 @@ decoder_eval_cached_pair_impl(
         ggml_set_output(cond_hidden_last);
         ggml_build_forward_expand(gf, cond_hidden_last);
     }
-    if (uncond_hidden_out && dec_out_uncond) {
+    if ((uncond_hidden_out || fill_uncond_cache) && dec_out_uncond) {
         uncond_hidden_last =
             ggml_view_2d(ctx, dec_out_uncond, h.n_embd, 1, dec_out_uncond->nb[1], hidden_off);
         ggml_set_name(uncond_hidden_last, "magpietts_decoder_hidden_last_uncond_cached");
@@ -2295,7 +2295,9 @@ decoder_eval_cached_pair_impl(
                         ggml_tensor* dst = ggml_view_1d(
                             ctx, plane == 0 ? uncond_cache->k : uncond_cache->v, rows,
                             (size_t)il * rows * sizeof(float));
-                        // views carry no buffer of their own: use the backend copy path
+                        // bind the views to their parents' buffers (CPU copies need them)
+                        ggml_backend_view_init(src);
+                        ggml_backend_view_init(dst);
                         ggml_backend_tensor_copy_async(copy_backend, copy_backend, src, dst);
                     }
                 }
@@ -2316,10 +2318,14 @@ decoder_eval_cached_pair_impl(
                     ggml_tensor* dst = ggml_view_1d(
                         ctx, plane == 0 ? uncond_kv.memory_k : uncond_kv.memory_v, rows,
                         (size_t)il * kv_layer_bytes);
+                    ggml_backend_view_init(src);
+                    ggml_backend_view_init(dst);
                     ggml_backend_tensor_copy_async(copy_backend, copy_backend, src, dst);
                 }
             }
-            ggml_backend_tensor_copy(uncond_cache->hidden, uncond_hidden_out->tensor);
+            if (uncond_hidden_out) {
+                ggml_backend_tensor_copy(uncond_cache->hidden, uncond_hidden_out->tensor);
+            }
             ggml_backend_synchronize(copy_backend);
         }
     }
@@ -2365,9 +2371,15 @@ decoder_eval_cached_pair_impl(
             model, output_staging, logits_uncond, uncond_result.logits_last.data(), logits_off,
             uncond_result.logits_last.size() * sizeof(float));
     }
-    magpietts_backend_tensor_get_staged(
-        model, output_staging, dec_out_uncond, uncond_result.hidden_last.data(), hidden_off,
-        uncond_result.hidden_last.size() * sizeof(float));
+    if (dec_out_uncond) {
+        magpietts_backend_tensor_get_staged(
+            model, output_staging, dec_out_uncond, uncond_result.hidden_last.data(), hidden_off,
+            uncond_result.hidden_last.size() * sizeof(float));
+    } else {
+        ggml_backend_tensor_get(
+            uncond_cache->hidden, uncond_result.hidden_last.data(), 0,
+            uncond_result.hidden_last.size() * sizeof(float));
+    }
     release_allocr();
     ggml_free(ctx);
 

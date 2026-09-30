@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -58,6 +60,8 @@ class AsrWorkload : public Workload {
             stream_ = mode == "stream";
         } else if (arg == "--chunk-ms") {
             chunk_ms_ = parse_int(value(), arg, 10, 60000);
+        } else if (arg == "--trace") {
+            trace_path_ = value();
         } else {
             return false;
         }
@@ -77,6 +81,13 @@ class AsrWorkload : public Workload {
         }
         if (options.device_set)
             config_.backend.gpu = options.gpu;
+        if (!trace_path_.empty()) {
+            if (!stream_)
+                throw std::invalid_argument("--trace requires --mode stream");
+            trace_.open(trace_path_, std::ios::trunc);
+            if (!trace_)
+                throw std::runtime_error("cannot write " + trace_path_);
+        }
     }
     size_t input_count() const override { return inputs_.size(); }
     std::string input_name(size_t index) const override {
@@ -168,22 +179,53 @@ class AsrWorkload : public Workload {
         auto stream = recognizer_->streaming_recognize(request, language_);
         const size_t chunk =
             std::max<size_t>(1, static_cast<size_t>(input.audio.sample_rate) * chunk_ms() / 1000);
+        const auto stream_started = std::chrono::steady_clock::now();
         std::string transcript;
         for (size_t offset = 0; offset < input.audio.samples.size(); offset += chunk) {
             const size_t count = std::min(chunk, input.audio.samples.size() - offset);
             const auto started = std::chrono::steady_clock::now();
             stream->push(input.audio.samples.data() + offset, count, input.audio.sample_rate);
+            std::string interim;
             while (auto result = stream->next()) {
-                if (!result->is_final)
+                if (!result->is_final) {
+                    interim = first_transcript(*result);
                     break;
+                }
                 append_text(transcript, first_transcript(*result));
             }
-            chunk_latency_ms.push_back(std::chrono::duration<double, std::milli>(
-                                           std::chrono::steady_clock::now() - started)
-                                           .count());
+            const auto now = std::chrono::steady_clock::now();
+            chunk_latency_ms.push_back(
+                std::chrono::duration<double, std::milli>(now - started).count());
+            if (trace_.is_open()) {
+                std::string text = transcript;
+                append_text(text, interim);
+                write_trace(
+                    input, static_cast<double>(offset + count) / input.audio.sample_rate,
+                    std::chrono::duration<double, std::milli>(now - stream_started).count(), text);
+            }
         }
         append_text(transcript, first_transcript(stream->finish()));
+        if (trace_.is_open())
+            write_trace(
+                input, static_cast<double>(input.audio.samples.size()) / input.audio.sample_rate,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - stream_started)
+                    .count(),
+                transcript);
         return transcript;
+    }
+
+    // One JSON line per streamed chunk: audio position, elapsed time since the stream started, and
+    // the transcript so far (finals plus the current interim). Used to render speed demos.
+    void write_trace(
+        const AudioInput& input, double audio_s, double elapsed_ms, const std::string& text) {
+        Value line;
+        line["input"] = input.path.filename().string();
+        line["audio_s"] = audio_s;
+        line["elapsed_ms"] = elapsed_ms;
+        line["text"] = text;
+        std::lock_guard<std::mutex> lock(trace_mutex_);
+        trace_ << line.dump() << '\n';
     }
 
     asr::RecognizerConfig config_;
@@ -191,6 +233,9 @@ class AsrWorkload : public Workload {
     std::string language_;
     bool stream_ = false;
     int chunk_ms_ = 0;
+    std::string trace_path_;
+    std::ofstream trace_;
+    std::mutex trace_mutex_;
     std::vector<AudioInput> inputs_;
     double corpus_seconds_ = 0.0;
     EngineRegistry engines_;
