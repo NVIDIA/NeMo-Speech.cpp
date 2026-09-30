@@ -93,9 +93,14 @@ to `--outtype q8_0` for MagpieTTS and `--outtype f16` for NanoCodec; pass
 output stores the attention and feed-forward projections of the text encoder,
 decoder and local transformer, the local-transformer output projections and the
 final projection as Q8_0, keeps norms and biases f32, and everything else f16.
-Output quality matches the f16 file (validated on MagpieTTS v2607). On CUDA GPUs
+In an ASR round trip on the 10 LJSpeech sentences of
+[`ljs_audio_text_test_filelist_small.txt`](../../test_files/tts/ljs_audio_text_test_filelist_small.txt)
+(three seeds each, transcribed with Nemotron Speech Streaming 0.6B), MagpieTTS v2607 Q8_0 scores
+5.6% WER and 2.2% CER against 4.7% and 2.1% for f16. On CUDA GPUs
 with compute capability 8.0 or newer and at least 48 SMs it also enables the
-fused decoder and local-transformer kernels, which are selected automatically.
+fused decoder kernel and, when classifier-free guidance is on (the default;
+`--tts.no-cfg` turns it off), the fused local-transformer kernel. Both are
+selected automatically.
 On Hopper and newer, build with native code for the GPU (for example
 `-DCMAKE_CUDA_ARCHITECTURES=native`). The converter is a source-tree
 Python tool and is not included

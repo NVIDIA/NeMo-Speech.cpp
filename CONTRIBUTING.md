@@ -60,8 +60,9 @@ Every commit must be signed off. By adding a `Signed-off-by` line to a commit,
 you agree to the [Developer Certificate of Origin (DCO)
 1.1](#developer-certificate-of-origin) reproduced below: you certify that you
 wrote the contribution or otherwise have the right to submit it under the
-project's open source license. Commits without a `Signed-off-by` line will not
-be accepted.
+project's open source license, and you acknowledge that the contribution and
+your sign-off are public and kept permanently. Commits without a
+`Signed-off-by` line will not be accepted.
 
 Use Git's `--signoff` (or `-s`) option:
 
@@ -77,7 +78,8 @@ Signed-off-by: Your Name <your@email.com>
 
 ### Developer Certificate of Origin
 
-Signing off means you agree to each of the four certifications (a)-(d) below.
+Signing off certifies that at least one of (a), (b), or (c) below applies to
+your contribution, and that you agree to (d).
 The full, unmodified [Developer Certificate of Origin
 1.1](https://developercertificate.org/) follows:
 

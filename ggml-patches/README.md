@@ -225,8 +225,11 @@ stock comparison therefore requires both a pristine ggml checkout and
 - **0030-cpu-fp16-conversion-im2col.patch** - on x86 with F16C, scalar
   FP32 -> FP16 conversions use `vcvtps2ph` instead of the portable
   bit-manipulating routine, and `im2col` splits threads by output row instead
-  of interleaved channels. Results are bit-identical; NanoCodec decodes about
-  1.7x faster on CPU.
+  of interleaved channels, so threads no longer write interleaved segments of
+  the same output rows. The conversion matches the portable routine for every
+  non-NaN FP32 input (checked exhaustively; NaN payloads may differ), and
+  `im2col` computes the same values in a different thread order. Both speed up
+  F16 convolutions such as the NanoCodec decoder on CPU.
 
 ## Regenerating after editing ggml
 

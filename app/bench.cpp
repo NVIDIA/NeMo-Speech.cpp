@@ -270,6 +270,19 @@ run_bench(int argc, char** argv) {
     const size_t inputs = workload->input_count();
     if (inputs == 0)
         throw std::invalid_argument("bench " + workload->task() + " has no inputs");
+    if (!options.save_dir.empty()) {
+        // --save writes DIR/<input stem>.txt: inputs sharing a stem (e.g. the same file name in
+        // two directories under -r) would overwrite each other.
+        std::map<std::string, std::string> saved;
+        for (size_t i = 0; i < inputs; ++i) {
+            const std::string name = workload->input_name(i);
+            const auto [it, inserted] = saved.emplace(fs::path(name).stem().string(), name);
+            if (!inserted)
+                throw std::invalid_argument(
+                    "--save: inputs " + it->second + " and " + name + " would both be written to " +
+                    it->first + ".txt; give them distinct file names");
+        }
+    }
     const int max_concurrency =
         *std::max_element(options.concurrency.begin(), options.concurrency.end());
 
