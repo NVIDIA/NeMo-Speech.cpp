@@ -19,7 +19,9 @@ add_test(NAME magpietts_frame_stacking COMMAND test_magpietts_frame_stacking)
 # itself (exit 77) without a GPU backend.
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_nanocodec_half_snake_fusion test_nanocodec_half_snake_fusion.cpp)
-    target_link_libraries(test_nanocodec_half_snake_fusion PRIVATE ggml)
+    # Links ggml directly, so runtime_ggml's PUBLIC CUDA::cuda_driver stub doesn't
+    # reach it; add it so libggml-cuda's NEEDED libcuda.so.1 resolves without a driver.
+    target_link_libraries(test_nanocodec_half_snake_fusion PRIVATE ggml CUDA::cuda_driver)
     add_test(
         NAME nanocodec_half_snake_fusion
         COMMAND test_nanocodec_half_snake_fusion)
