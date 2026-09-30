@@ -22,6 +22,8 @@
 #include "nvtx_utils.h"
 
 static constexpr int NANO_CODEC_MAX_NODES = 32768;
+// Upper bound on persistent layer caches: one per causal conv plus one tail per upsampler.
+static constexpr int NANO_CODEC_MAX_CACHES = 512;
 
 using nc_hparams = nemo_speech::tts::nanocodec::NanoCodecHParams;
 
@@ -77,6 +79,10 @@ struct nc_model {
     ggml_context* ctx = nullptr;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
+
+    // Holds F32 copies of the upsampler kernels on backends that need them; empty otherwise.
+    ggml_context* aux_ctx = nullptr;
+    ggml_backend_buffer_t aux_buffer = nullptr;
 
     nc_conv pre_conv;
     std::vector<nc_activation> activations;
@@ -186,6 +192,119 @@ load_conv(const nc_model& model, const std::string& prefix, int stride = 1, int 
     conv.stride = stride;
     conv.dilation = dilation;
     return conv;
+}
+
+// Whether this backend can convolve with the stored F16 kernel without changing the result.
+//
+// The transposed convolutions are the one place the stored F16 weights meet an op whose
+// backend behaviour varies. CUDA and Metal widen each kernel element to F32 and accumulate
+// in F32, so an F16 kernel is bit-identical to an F32 copy of it. Vulkan rejects a
+// non-F32 kernel outright, and ggml's CPU path pairs an F16 kernel with an F16 rounding of
+// the F32 activations, which loses precision the old F32 copy kept. Those two get a
+// converted copy instead -- made once here rather than on every graph evaluation.
+static bool
+nc_backend_takes_f16_deconv(ggml_backend_t backend, const nc_conv& conv) {
+    if (!backend || !conv.w || ggml_backend_is_cpu(backend)) {
+        return false;
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context* ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor* input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, conv.w->ne[2], 1);
+    ggml_tensor* probe = ggml_conv_transpose_1d(ctx, conv.w, input, conv.stride, 0, 1);
+    const bool supported = probe && ggml_backend_supports_op(backend, probe);
+    ggml_free(ctx);
+    return supported;
+}
+
+static bool
+nc_prepare_deconv_weights(nc_model& model, bool verbose) {
+    if (model.up_convs.empty()) {
+        return true;
+    }
+    if (nc_backend_takes_f16_deconv(model.backend, model.up_convs.front())) {
+        if (verbose) {
+            fprintf(stderr, "NanoCodec upsampler kernels used as stored (F16)\n");
+        }
+        return true;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ggml_tensor_overhead() * (model.up_convs.size() + 2),
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    model.aux_ctx = ggml_init(params);
+    if (!model.aux_ctx) {
+        fprintf(stderr, "failed to allocate NanoCodec auxiliary weight context\n");
+        return false;
+    }
+
+    std::vector<ggml_tensor*> converted(model.up_convs.size(), nullptr);
+    size_t pending = 0;
+    for (size_t i = 0; i < model.up_convs.size(); ++i) {
+        const ggml_tensor* src = model.up_convs[i].w;
+        if (src->type == GGML_TYPE_F32) {
+            continue;
+        }
+        // Reject an unsupported type before reserving anything for it.
+        if (src->type != GGML_TYPE_F16) {
+            fprintf(stderr, "unsupported upsampler kernel type %s\n", ggml_type_name(src->type));
+            return false;
+        }
+        converted[i] =
+            ggml_new_tensor_3d(model.aux_ctx, GGML_TYPE_F32, src->ne[0], src->ne[1], src->ne[2]);
+        ggml_set_name(converted[i], (std::string(ggml_get_name(src)) + ".f32").c_str());
+        ++pending;
+    }
+
+    // A backend that will not take F16 kernels but whose model already stores them as F32
+    // leaves nothing to convert. ggml_backend_alloc_ctx_tensors returns NULL for an empty
+    // context, which is success here, not a failure to allocate.
+    if (pending == 0) {
+        ggml_free(model.aux_ctx);
+        model.aux_ctx = nullptr;
+        if (verbose) {
+            fprintf(stderr, "NanoCodec upsampler kernels already stored as F32\n");
+        }
+        return true;
+    }
+
+    model.aux_buffer = ggml_backend_alloc_ctx_tensors(model.aux_ctx, model.backend);
+    if (!model.aux_buffer) {
+        fprintf(stderr, "failed to allocate NanoCodec F32 upsampler kernels\n");
+        return false;
+    }
+
+    std::vector<ggml_fp16_t> src_half;
+    std::vector<float> dst_full;
+    for (size_t i = 0; i < converted.size(); ++i) {
+        if (!converted[i]) {
+            continue;
+        }
+        ggml_tensor* src = model.up_convs[i].w;
+        const size_t n = (size_t)ggml_nelements(src);
+        src_half.resize(n);
+        dst_full.resize(n);
+        ggml_backend_tensor_get(src, src_half.data(), 0, n * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(src_half.data(), dst_full.data(), (int64_t)n);
+        ggml_backend_tensor_set(converted[i], dst_full.data(), 0, n * sizeof(float));
+        model.up_convs[i].w = converted[i];
+    }
+
+    if (verbose) {
+        fprintf(
+            stderr, "NanoCodec upsampler kernels converted to F32 (%.1f MiB) for backend %s\n",
+            (double)ggml_backend_buffer_get_size(model.aux_buffer) / (1024.0 * 1024.0),
+            ggml_backend_name(model.backend));
+    }
+    return true;
 }
 
 static bool
@@ -317,6 +436,10 @@ nc_model_load(
     model.post_activation = load_activation(model, "dec.post_act");
     model.post_conv = load_conv(model, "dec.post");
 
+    if (!nc_prepare_deconv_weights(model, verbose)) {
+        return false;
+    }
+
     if (verbose) {
         fprintf(
             stderr,
@@ -329,6 +452,14 @@ nc_model_load(
 
 static void
 nc_model_free(nc_model& model) {
+    if (model.aux_buffer) {
+        ggml_backend_buffer_free(model.aux_buffer);
+        model.aux_buffer = nullptr;
+    }
+    if (model.aux_ctx) {
+        ggml_free(model.aux_ctx);
+        model.aux_ctx = nullptr;
+    }
     if (model.buffer) {
         ggml_backend_buffer_free(model.buffer);
         model.buffer = nullptr;
@@ -372,10 +503,11 @@ causal_conv1d(ggml_context* ctx, ggml_tensor* x, const nc_conv& conv) {
 static ggml_tensor*
 causal_conv_transpose1d(ggml_context* ctx, ggml_tensor* x, const nc_conv& conv) {
     const int64_t out_len = x->ne[0] * conv.stride;
-    ggml_tensor* weight = ggml_cont(ctx, ggml_cast(ctx, conv.w, GGML_TYPE_F32));
-    ggml_tensor* full = ggml_conv_transpose_1d(ctx, weight, x, conv.stride, 0, 1);
+    // The kernel is already in a type this backend convolves with directly; any conversion
+    // the backend needed happened once at load time.
+    ggml_tensor* full = ggml_conv_transpose_1d(ctx, conv.w, x, conv.stride, 0, 1);
     ggml_tensor* cropped =
-        ggml_view_3d(ctx, full, out_len, weight->ne[1], 1, full->nb[1], full->nb[2], 0);
+        ggml_view_3d(ctx, full, out_len, conv.w->ne[1], 1, full->nb[1], full->nb[2], 0);
     return ggml_add(ctx, cropped, conv.b);
 }
 
@@ -486,22 +618,19 @@ enum nc_stream_cache_kind {
     NC_STREAM_CACHE_DECONV = 1,
 };
 
-struct nc_stream_cache {
-    int64_t len = 0;
-    int64_t channels = 0;
-    std::vector<float> data;
-};
-
-struct nc_stream_pending_tensor {
-    ggml_tensor* tensor = nullptr;
-    nc_stream_cache_kind kind = NC_STREAM_CACHE_CONV;
-    size_t index = 0;
+// One refresh of a layer cache. `barrier` is the last graph node that reads the cache;
+// expanding it before `write` keeps the copy ordered after every read of the old value.
+struct nc_stream_cache_write {
+    ggml_tensor* barrier = nullptr;
+    ggml_tensor* write = nullptr;
 };
 
 struct nc_stream_graph_io {
-    std::vector<nc_stream_pending_tensor> inputs;
-    std::vector<nc_stream_pending_tensor> outputs;
+    std::vector<nc_stream_cache_write> cache_writes;
 };
+
+// Defined below; the graph only records which state owns its cache tensors.
+struct nc_stream_state;
 
 struct nc_stream_decode_graph {
     ggml_context* ctx = nullptr;
@@ -510,6 +639,9 @@ struct nc_stream_decode_graph {
     ggml_tensor* latent = nullptr;
     ggml_tensor* audio = nullptr;
     nc_stream_graph_io io;
+    // The state whose cache tensors these nodes point at. A different state with the same
+    // cache count would otherwise pass the check below and read freed tensors.
+    const nc_stream_state* owner = nullptr;
     int chunk_frames = 0;
     size_t output_samples = 0;
     size_t samples_per_frame = 0;
@@ -517,21 +649,41 @@ struct nc_stream_decode_graph {
     std::vector<float> audio_data;
 };
 
+// Layer state lives in backend memory for the lifetime of the stream. The decode graph
+// reads each cache in place and writes the next value back with ggml_cpy, so decoding a
+// chunk never round-trips conv state through the host.
+//
+// The tensors are created while the graph is built and the graph nodes point straight at
+// them, so a state backs exactly one graph: re-initializing a graph resets the state, and
+// the graph must be destroyed before the state it was built against.
 struct nc_stream_state {
-    std::vector<nc_stream_cache> conv_caches;
-    std::vector<nc_stream_cache> deconv_tails;
-    size_t conv_pos = 0;
-    size_t deconv_pos = 0;
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    std::vector<ggml_tensor*> caches;
 
-    void begin_graph() {
-        conv_pos = 0;
-        deconv_pos = 0;
+    nc_stream_state() = default;
+    ~nc_stream_state() { free_tensors(); }
+
+    nc_stream_state(const nc_stream_state&) = delete;
+    nc_stream_state& operator=(const nc_stream_state&) = delete;
+
+    void free_tensors() {
+        if (buffer) {
+            ggml_backend_buffer_free(buffer);
+            buffer = nullptr;
+        }
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+        caches.clear();
     }
 
+    // Reset the stream to silence without discarding the graph built against these tensors.
     void clear() {
-        conv_caches.clear();
-        deconv_tails.clear();
-        begin_graph();
+        if (buffer) {
+            ggml_backend_buffer_clear(buffer, 0);
+        }
     }
 };
 
@@ -561,6 +713,7 @@ nc_stream_decode_graph_free(nc_stream_decode_graph& graph) {
     graph.latent = nullptr;
     graph.audio = nullptr;
     graph.io = {};
+    graph.owner = nullptr;
     graph.chunk_frames = 0;
     graph.output_samples = 0;
     graph.samples_per_frame = 0;
@@ -568,53 +721,27 @@ nc_stream_decode_graph_free(nc_stream_decode_graph& graph) {
     graph.audio_data.clear();
 }
 
-static nc_stream_cache&
-nc_stream_cache_at(
-    std::vector<nc_stream_cache>& caches, size_t index, int64_t len, int64_t channels) {
-    if (index >= caches.size()) {
-        caches.resize(index + 1);
-    }
-    nc_stream_cache& cache = caches[index];
-    if (cache.len != len || cache.channels != channels ||
-        cache.data.size() != (size_t)(len * channels)) {
-        cache.len = len;
-        cache.channels = channels;
-        cache.data.assign((size_t)(len * channels), 0.0f);
-    }
-    return cache;
-}
-
-static nc_stream_cache&
-nc_stream_get_or_create_cache(nc_stream_state& state, const nc_stream_pending_tensor& pending) {
-    const int64_t len = pending.tensor ? pending.tensor->ne[0] : 0;
-    const int64_t channels = pending.tensor ? pending.tensor->ne[1] : 0;
-    if (pending.kind == NC_STREAM_CACHE_CONV) {
-        return nc_stream_cache_at(state.conv_caches, pending.index, len, channels);
-    }
-    return nc_stream_cache_at(state.deconv_tails, pending.index, len, channels);
-}
-
+// Allocate one persistent layer cache in the state's own context. The tensors are backed
+// by a backend buffer once the whole graph is built, before the graph allocator runs, so
+// the allocator treats them as pre-allocated leaves and never reuses their memory.
 static ggml_tensor*
 nc_stream_cache_tensor(
-    ggml_context* ctx, nc_stream_state& state, nc_stream_graph_io& io, nc_stream_cache_kind kind,
-    size_t index, int64_t len, int64_t channels) {
-    if (kind == NC_STREAM_CACHE_CONV) {
-        nc_stream_cache_at(state.conv_caches, index, len, channels);
-    } else {
-        nc_stream_cache_at(state.deconv_tails, index, len, channels);
-    }
-
-    ggml_tensor* tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, len, channels, 1);
+    nc_stream_state& state, nc_stream_cache_kind kind, int64_t len, int64_t channels) {
+    ggml_tensor* tensor = ggml_new_tensor_3d(state.ctx, GGML_TYPE_F32, len, channels, 1);
     ggml_set_input(tensor);
-    io.inputs.push_back({tensor, kind, index});
+    const std::string name = (kind == NC_STREAM_CACHE_CONV ? "nc_conv_cache_" : "nc_deconv_tail_") +
+                             std::to_string(state.caches.size());
+    ggml_set_name(tensor, name.c_str());
+    state.caches.push_back(tensor);
     return tensor;
 }
 
+// Refresh `cache` from `next` once `barrier` -- the last node reading the old value -- has run.
 static void
-nc_stream_add_cache_output(
-    nc_stream_graph_io& io, ggml_tensor* tensor, nc_stream_cache_kind kind, size_t index) {
-    ggml_set_output(tensor);
-    io.outputs.push_back({tensor, kind, index});
+nc_stream_write_cache(
+    ggml_context* ctx, nc_stream_graph_io& io, ggml_tensor* barrier, ggml_tensor* next,
+    ggml_tensor* cache) {
+    io.cache_writes.push_back({barrier, ggml_cpy(ctx, next, cache)});
 }
 
 static ggml_tensor*
@@ -626,17 +753,16 @@ nc_stream_causal_conv1d(
     ggml_tensor* conv_in = x;
 
     if (left_pad > 0) {
-        const size_t cache_index = state.conv_pos++;
-        ggml_tensor* cache = nc_stream_cache_tensor(
-            ctx, state, io, NC_STREAM_CACHE_CONV, cache_index, left_pad, x->ne[1]);
+        ggml_tensor* cache =
+            nc_stream_cache_tensor(state, NC_STREAM_CACHE_CONV, left_pad, x->ne[1]);
         conv_in = ggml_concat(ctx, cache, x, 0);
 
         const int64_t tail_start = conv_in->ne[0] - left_pad;
         ggml_tensor* tail = ggml_view_3d(
             ctx, conv_in, left_pad, x->ne[1], 1, conv_in->nb[1], conv_in->nb[2],
             (size_t)tail_start * conv_in->nb[0]);
-        tail = ggml_cont_3d(ctx, tail, left_pad, x->ne[1], 1);
-        nc_stream_add_cache_output(io, tail, NC_STREAM_CACHE_CONV, cache_index);
+        // The concat is the only reader of `cache`, so the refresh may follow it directly.
+        nc_stream_write_cache(ctx, io, conv_in, tail, cache);
     }
 
     ggml_tensor* y = ggml_conv_1d(ctx, conv.w, conv_in, conv.stride, 0, conv.dilation);
@@ -649,15 +775,13 @@ nc_stream_causal_conv_transpose1d(
     ggml_context* ctx, ggml_tensor* x, const nc_conv& conv, nc_stream_state& state,
     nc_stream_graph_io& io) {
     const int64_t out_len = x->ne[0] * conv.stride;
-    ggml_tensor* weight = ggml_cont(ctx, ggml_cast(ctx, conv.w, GGML_TYPE_F32));
-    ggml_tensor* full = ggml_conv_transpose_1d(ctx, weight, x, conv.stride, 0, 1);
+    ggml_tensor* full = ggml_conv_transpose_1d(ctx, conv.w, x, conv.stride, 0, 1);
     const int64_t tail_len = std::max<int64_t>(0, full->ne[0] - out_len);
 
     ggml_tensor* current = nullptr;
     if (tail_len > 0) {
-        const size_t tail_index = state.deconv_pos++;
-        ggml_tensor* prev_tail = nc_stream_cache_tensor(
-            ctx, state, io, NC_STREAM_CACHE_DECONV, tail_index, tail_len, full->ne[1]);
+        ggml_tensor* prev_tail =
+            nc_stream_cache_tensor(state, NC_STREAM_CACHE_DECONV, tail_len, full->ne[1]);
 
         const int64_t add_len = std::min<int64_t>(tail_len, out_len);
         ggml_tensor* prefix =
@@ -682,8 +806,8 @@ nc_stream_causal_conv_transpose1d(
         ggml_tensor* next_tail = ggml_view_3d(
             ctx, full, tail_len, full->ne[1], 1, full->nb[1], full->nb[2],
             (size_t)out_len * full->nb[0]);
-        next_tail = ggml_cont_3d(ctx, next_tail, tail_len, full->ne[1], 1);
-        nc_stream_add_cache_output(io, next_tail, NC_STREAM_CACHE_DECONV, tail_index);
+        // `current` descends from the add that consumes the old tail, so it is the barrier.
+        nc_stream_write_cache(ctx, io, current, next_tail, prev_tail);
     } else {
         current = ggml_view_3d(ctx, full, out_len, conv.w->ne[1], 1, full->nb[1], full->nb[2], 0);
     }
@@ -880,7 +1004,24 @@ nc_stream_decode_graph_init(
         return false;
     }
 
-    state.begin_graph();
+    // The graph nodes will point straight at the state tensors, so the previous state is
+    // discarded together with the previous graph and the stream restarts from silence.
+    state.free_tensors();
+    {
+        ggml_init_params cache_params = {
+            // One over the limit: nc_stream_cache_tensor can create the cache that trips
+            // the post-build check, and an exhausted pool aborts rather than reporting.
+            /*.mem_size   =*/ggml_tensor_overhead() * (NANO_CODEC_MAX_CACHES + 1),
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        state.ctx = ggml_init(cache_params);
+    }
+    if (!state.ctx) {
+        fprintf(stderr, "failed to allocate stream cache context\n");
+        nc_stream_decode_graph_free(graph);
+        return false;
+    }
 
     {
         const ggml_nvtx::range nvtx_build("nanocodec_stream_build_persistent_decoder_graph");
@@ -904,12 +1045,34 @@ nc_stream_decode_graph_init(
         graph.audio = x;
 
         graph.gf = ggml_new_graph_custom(graph.ctx, NANO_CODEC_MAX_NODES, false);
-        for (const nc_stream_pending_tensor& pending : graph.io.outputs) {
-            ggml_build_forward_expand(graph.gf, pending.tensor);
+        // Expanding each barrier before its write keeps every cache refresh ordered after
+        // the node that reads the old value, while still letting the refreshes interleave
+        // with the forward pass so the allocator can recycle activation buffers early.
+        for (const nc_stream_cache_write& refresh : graph.io.cache_writes) {
+            ggml_build_forward_expand(graph.gf, refresh.barrier);
+            ggml_build_forward_expand(graph.gf, refresh.write);
         }
         ggml_build_forward_expand(graph.gf, graph.audio);
         tag_graph_first_node(graph.gf);
     }
+
+    if ((int)state.caches.size() > NANO_CODEC_MAX_CACHES) {
+        fprintf(
+            stderr, "stream graph needs %zu layer caches, over the %d limit\n", state.caches.size(),
+            NANO_CODEC_MAX_CACHES);
+        nc_stream_decode_graph_free(graph);
+        return false;
+    }
+
+    // Back the caches before the graph allocator runs so it sees them as pre-allocated
+    // leaves and never hands their memory to an intermediate tensor.
+    state.buffer = ggml_backend_alloc_ctx_tensors(state.ctx, model.backend);
+    if (!state.buffer) {
+        fprintf(stderr, "failed to allocate stream layer caches on the backend\n");
+        nc_stream_decode_graph_free(graph);
+        return false;
+    }
+    state.clear();
 
     graph.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!graph.allocr) {
@@ -936,6 +1099,9 @@ nc_stream_decode_graph_init(
         return false;
     }
 
+    // Every node above points at this state's cache tensors; record it so a later decode
+    // cannot pair the graph with a different state that happens to hold as many caches.
+    graph.owner = &state;
     graph.samples_per_frame = graph.output_samples / (size_t)chunk_frames;
     graph.latent_data.assign((size_t)chunk_frames * h.latent_dim, 0.0f);
     graph.audio_data.resize(graph.output_samples);
@@ -957,6 +1123,13 @@ decode_eval_stream(
         fprintf(stderr, "persistent stream graph is not initialized\n");
         return false;
     }
+    // The graph nodes point at this state's cache tensors; a state that was reset or paired
+    // with a different graph would leave those reads dangling.
+    if (!state.buffer || graph.owner != &state ||
+        state.caches.size() != graph.io.cache_writes.size()) {
+        fprintf(stderr, "stream state does not back the persistent stream graph\n");
+        return false;
+    }
     if ((int)frames.size() > graph.chunk_frames) {
         fprintf(
             stderr, "stream chunk has %zu frames, larger than fixed graph chunk_frames=%d\n",
@@ -973,16 +1146,11 @@ decode_eval_stream(
     }
 
     {
+        // The layer caches stay in backend memory across chunks, so the latent is the only
+        // input the host has to upload.
         const ggml_nvtx::range nvtx_inputs("nanocodec_stream_graph_set_inputs");
         ggml_backend_tensor_set(
             graph.latent, graph.latent_data.data(), 0, graph.latent_data.size() * sizeof(float));
-        for (const nc_stream_pending_tensor& pending : graph.io.inputs) {
-            nc_stream_cache& cache = nc_stream_get_or_create_cache(state, pending);
-            if (!cache.data.empty()) {
-                ggml_backend_tensor_set(
-                    pending.tensor, cache.data.data(), 0, cache.data.size() * sizeof(float));
-            }
-        }
     }
 
     if (ggml_backend_is_cpu(model.backend)) {
@@ -1000,15 +1168,8 @@ decode_eval_stream(
     }
 
     {
+        // The graph refreshed the layer caches in place, so only the audio comes back.
         const ggml_nvtx::range nvtx_outputs("nanocodec_stream_graph_get_outputs");
-        for (const nc_stream_pending_tensor& pending : graph.io.outputs) {
-            nc_stream_cache& cache = nc_stream_get_or_create_cache(state, pending);
-            if (!cache.data.empty()) {
-                ggml_backend_tensor_get(
-                    pending.tensor, cache.data.data(), 0, cache.data.size() * sizeof(float));
-            }
-        }
-
         ggml_backend_tensor_get(
             graph.audio, graph.audio_data.data(), 0, graph.audio_data.size() * sizeof(float));
     }
