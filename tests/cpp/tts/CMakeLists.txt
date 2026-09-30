@@ -5,6 +5,10 @@ find_package(Threads REQUIRED)
 add_executable(test_magpietts_file test_magpietts_file.cpp)
 target_link_libraries(test_magpietts_file PRIVATE nemo_speech_tts_magpietts)
 
+add_executable(test_tts_device_policy test_tts_device_policy.cpp)
+target_link_libraries(test_tts_device_policy PRIVATE nemo_speech_tts_magpietts)
+add_test(NAME tts_device_policy COMMAND test_tts_device_policy)
+
 add_executable(test_magpietts_attention_prior test_magpietts_attention_prior.cpp)
 target_link_libraries(test_magpietts_attention_prior PRIVATE nemo_speech_tts_magpietts)
 

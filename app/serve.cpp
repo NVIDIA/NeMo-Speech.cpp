@@ -29,6 +29,11 @@
 
 namespace {
 
+#if defined(NEMO_SPEECH_CLI_TTS)
+using nemo_speech::tts::apply_tts_device_policy;
+using nemo_speech::tts::TtsCliDevice;
+#endif
+
 std::atomic<bool> shutdown_requested{false};
 
 template <typename Callback>
@@ -587,15 +592,10 @@ run_server(int argc, char** argv) {
                    device_name.rfind("gpu:", 0) == 0;
 #endif
         if (device_set) {
-            if (!tts_cuda) {
-                tts_config.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                tts_config.runtime.sampling_backend =
-                    nemo_speech::tts::MagpieBackendPreference::Cpu;
-                tts_config.runtime.magpie_cpu = gpu < 0;
-                tts_config.runtime.codec_cpu = gpu < 0;
-            } else {
-                tts_config.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cuda;
-            }
+            const auto tts_device = gpu < 0    ? TtsCliDevice::Cpu
+                                    : tts_cuda ? TtsCliDevice::Cuda
+                                               : TtsCliDevice::Accelerator;
+            apply_tts_device_policy(tts_config.runtime, tts_device);
         }
         tts_config.runtime.magpie_model = magpie_path;
         tts_config.runtime.verbose = cli_verbose();
