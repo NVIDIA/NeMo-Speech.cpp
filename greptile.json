@@ -1,43 +1,5 @@
 {
-  "strictness": 2,
-  "commentTypes": [
-    "logic",
-    "syntax",
-    "style"
-  ],
   "triggerOnUpdates": true,
-  "includeBranches": [
-    "main"
-  ],
-  "excludeAuthors": [
-    "dependabot[bot]",
-    "renovate[bot]",
-    "pre-commit-ci[bot]"
-  ],
-  "ignorePatterns": "greptile.json\nthird_party/**\ntest_files/**\n",
-  "fixWithAI": false,
-  "shouldUpdateDescription": false,
-  "statusCommentsEnabled": false,
-  "summarySection": {
-    "included": true,
-    "collapsible": true,
-    "defaultOpen": false
-  },
-  "issuesTableSection": {
-    "included": true,
-    "collapsible": true,
-    "defaultOpen": false
-  },
-  "confidenceScoreSection": {
-    "included": false,
-    "collapsible": false,
-    "defaultOpen": false
-  },
-  "sequenceDiagramSection": {
-    "included": false,
-    "collapsible": false,
-    "defaultOpen": false
-  },
   "instructions": "NeMo-Speech.cpp is a C++17 speech runtime (ASR, diarization, TTS, translation, VoiceChat) built on ggml from a pinned llama.cpp submodule, with CPU, CUDA, Metal and Vulkan backends and portable release archives for Linux, macOS and Windows. patches/ holds the project's own changes to llama.cpp and ggml, including custom GPU kernels; review them like any other code.\n\nPrioritize findings in this order: correctness, performance, portability, maintainability. Report only problems the change introduces or makes reachable, each with the concrete input, backend or platform where it fails and what to do about it. Do not comment on formatting, naming or anything pre-commit already checks.",
   "customContext": {
     "rules": [
