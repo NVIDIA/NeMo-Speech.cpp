@@ -37,6 +37,11 @@ x86_64 CUDA archive supports Turing-class GPUs (compute capability 7.5,
 including RTX 20-series) and newer. On an older GPU, select `--backend cpu` or
 `--backend vulkan`, or build from source with a compatible CUDA toolkit.
 
+Linux and macOS archives include inverse text normalization for transcripts
+(`--itn-model-dir`) and text normalization for synthesis (`--tn-model-dir`).
+The grammars are published with each release as `itn_configs.tar.bz2` and
+`tn_configs.tar.bz2`.
+
 The installer selects CUDA when `nvidia-smi` is available, Metal on Apple
 Silicon, and CPU otherwise. Override the backend or force a source build:
 

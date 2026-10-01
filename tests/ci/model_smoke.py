@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CLI smoke test with real models: ASR, diarization, and a TTS round trip.
 
+With grammar directories, it also checks text normalization: TN must turn digits
+into words before synthesis, and ITN must turn them back in the transcript.
+
 Models are pulled by the CLI from the indexed Hugging Face repos into
 NEMO_SPEECH_MODEL_DIR, so a warm cache makes this cheap. Text comparisons use a
 similarity ratio rather than exact match so backend numerics cannot flake it.
@@ -24,6 +27,8 @@ JFK_TEXT = (
     "ask what you can do for your country"
 )
 TTS_TEXT = "The quick brown fox jumps over the lazy dog."
+NORM_TEXT = "I paid 25 dollars for 3 tickets."
+NORM_SPOKEN = "i paid twenty five dollars for three tickets"
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "test_files" / "diar"
 
 
@@ -126,15 +131,35 @@ def main() -> None:
     parser.add_argument("--backend", default="cpu")
     parser.add_argument("--audio", required=True)
     parser.add_argument("--skip-tts", action="store_true")
+    parser.add_argument("--itn-model-dir", help="ITN grammar directory")
+    parser.add_argument("--tn-model-dir", help="TN grammar directory")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="nemo-speech-smoke-") as temporary:
         work = pathlib.Path(temporary)
 
+        if args.itn_model_dir or args.tn_model_dir:
+            features = json.loads(run(args.binary, "doctor", "--json"))["features"]
+            check(features.get("text_normalization") is True, "build includes text normalization")
+
         text = run(args.binary, "transcribe", args.audio, "--backend", args.backend)
         ratio = similarity(text, JFK_TEXT)
         print(f"asr transcript: {text.strip()!r} (similarity {ratio:.2f})")
         check(ratio >= 0.9, "ASR offline transcript matches the reference")
+
+        if args.itn_model_dir:
+            text = run(
+                args.binary,
+                "transcribe",
+                args.audio,
+                "--backend",
+                args.backend,
+                "--itn-model-dir",
+                args.itn_model_dir,
+            )
+            ratio = similarity(text, JFK_TEXT)
+            print(f"asr transcript with itn: {text.strip()!r} (similarity {ratio:.2f})")
+            check(ratio >= 0.9, "ASR transcript with ITN matches the reference")
 
         streamed = run(
             args.binary,
@@ -218,6 +243,36 @@ def main() -> None:
         ratio = similarity(round_trip, TTS_TEXT)
         print(f"tts round trip: {round_trip.strip()!r} (similarity {ratio:.2f})")
         check(ratio >= 0.8, "TTS output transcribes back to the input text")
+
+        if args.tn_model_dir:
+            wav = work / "tn.wav"
+            run(
+                args.binary,
+                "synthesize",
+                NORM_TEXT,
+                "--backend",
+                args.backend,
+                "--tn-model-dir",
+                args.tn_model_dir,
+                "--output",
+                str(wav),
+            )
+            spoken = run(args.binary, "transcribe", str(wav), "--backend", args.backend)
+            ratio = similarity(spoken, NORM_SPOKEN)
+            print(f"tn round trip: {spoken.strip()!r} (similarity {ratio:.2f})")
+            check(ratio >= 0.8, "TN spells out numbers before synthesis")
+            if args.itn_model_dir:
+                written = run(
+                    args.binary,
+                    "transcribe",
+                    str(wav),
+                    "--backend",
+                    args.backend,
+                    "--itn-model-dir",
+                    args.itn_model_dir,
+                )
+                print(f"itn round trip: {written.strip()!r}")
+                check("$25" in written, "ITN writes spoken numbers in written form")
 
 
 if __name__ == "__main__":

@@ -77,6 +77,9 @@
 
 .PARAMETER Architecture
     Target architecture: auto (the host), x64, or arm64.
+.PARAMETER CMakeArgs
+    Extra arguments appended to the CMake configure command, for example
+    -CMakeArgs '-DGGML_NATIVE=OFF'.
 
 .EXAMPLE
     pwsh scripts\windows\build.ps1 -Backend cuda -Profile server
@@ -112,7 +115,8 @@ param(
     [ValidateSet('auto', 'msvc', 'clang-cl')]
     [string]$Compiler = 'auto',
     [int]$Jobs = 0,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [string[]]$CMakeArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -443,6 +447,7 @@ switch ($Backend) {
     }
 }
 
+$cmakeArgs += $CMakeArgs
 Write-Host "==> cmake $($cmakeArgs -join ' ')"
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed ($LASTEXITCODE)" }

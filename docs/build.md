@@ -196,6 +196,15 @@ prefix without `sudo`:
 CC=gcc-12 CXX=g++-12 scripts/build_itn_deps.sh
 ```
 
+With `STATIC=1`, the default on macOS, the script also builds pinned Protobuf
+and RE2 and installs static archives only. `libnemo_speech_text_normalization`
+then carries the whole stack privately, so neither system package is needed at
+build or run time. The release archives use this mode:
+
+```bash
+STATIC=1 scripts/build_itn_deps.sh
+```
+
 On Linux, normalization builds also require the static SentencePiece
 dependency:
 

@@ -16,3 +16,5 @@ the server want [ASR configuration](../asr/configuration.md),
 - [`cublas-shim.md`](cublas-shim.md) - the in-tree drop-in cuBLAS replacement
   under `kernels/` and where the custom GPU kernels live.
 - [Windows build notes](windows-build.md)
+- [`releasing.md`](releasing.md) - how the release workflow builds, checks, and
+  publishes the binary archives.

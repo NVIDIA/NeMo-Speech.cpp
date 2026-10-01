@@ -1,0 +1,668 @@
+name: Release
+
+# Builds the portable release archives that scripts/install.sh and
+# scripts/install.ps1 download, checks them, and publishes them.
+#
+#   push of a vX.Y.Z tag -> draft release vX.Y.Z; a maintainer reviews and publishes it
+#   nightly schedule     -> prerelease "nightly", rebuilt in place when main has moved
+#   workflow_dispatch    -> dry run (build and check only) or a nightly
+#   pull request         -> dry run when it changes release packaging (pull-request/N
+#                           branches pushed by copy-pr-bot, as in gpu.yml)
+#
+# x86_64 binaries target x86-64-v3 (AVX2): the archives are built with
+# GGML_NATIVE=OFF, scanned for AVX-512/AMX instructions, and the Linux CPU
+# archive runs under an emulated Haswell CPU before anything is published.
+#
+# Linux and macOS archives include text normalization (ITN/TN). The grammars are
+# not built here: they are taken from the latest release, used by the smoke
+# tests, and published again with every release.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["pull-request/[0-9]+"]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "dry-run builds and checks without publishing"
+        type: choice
+        options: [dry-run, nightly]
+        default: dry-run
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+
+permissions:
+  contents: read
+
+env:
+  NEMO_SPEECH_MODEL_DIR: ${{ github.workspace }}/.ci-models
+  JFK_AUDIO: test_files/asr/wav/test/jfk.wav
+
+jobs:
+  prepare:
+    name: Resolve version
+    if: github.repository == 'NVIDIA/NeMo-Speech.cpp'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      channel: ${{ steps.version.outputs.channel }}
+      build: ${{ steps.version.outputs.build }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve version and channel
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          RELEASE_PATHS: >-
+            ^(\.github/workflows/release\.yml|docker/Dockerfile\.release-linux|scripts/build_itn_deps\.sh|scripts/build_sentencepiece_static\.sh|scripts/release/|scripts/windows/(build|package-release)\.ps1|tests/ci/model_smoke\.py)
+        run: |
+          set -euo pipefail
+          declared="$(sed -n 's/^NEMO_SPEECH_VERSION:[[:space:]]*//p' VERSION)"
+          build=true
+          case "$EVENT:$GITHUB_REF_TYPE" in
+            push:branch)
+              # Dry run only when the pull request changes release packaging. A
+              # paths filter cannot tell: copy-pr-bot mirrors commits that
+              # already exist, so the push lists no changed files.
+              channel=dry-run
+              version="$declared"
+              git fetch --no-tags --quiet origin main
+              if ! git diff --name-only FETCH_HEAD...HEAD | grep -qE "$RELEASE_PATHS"; then
+                build=false
+                echo "::notice::no release packaging changes; skipping"
+              fi
+              ;;
+            push:tag)
+              if [ "$GITHUB_REF_NAME" != "v$declared" ]; then
+                echo "::error::tag $GITHUB_REF_NAME does not match VERSION ($declared)"
+                exit 1
+              fi
+              channel=release
+              version="$declared"
+              ;;
+            schedule:*) channel=nightly; version=nightly ;;
+            *)
+              channel="$INPUT_CHANNEL"
+              if [ "$channel" = nightly ]; then version=nightly; else version="$declared"; fi
+              ;;
+          esac
+          if [ "$EVENT" = schedule ]; then
+            # The nightly tag points at the commit it was built from; the
+            # peeled entry, when present, sorts last.
+            published="$(git ls-remote origin refs/tags/nightly 'refs/tags/nightly^{}' |
+              tail -n 1 | cut -f 1)"
+            if [ "$published" = "$GITHUB_SHA" ]; then
+              build=false
+              echo "::notice::nightly is already built from $GITHUB_SHA; skipping"
+            fi
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Building $version ($channel): $build"
+
+  grammars:
+    name: Text-normalization grammars
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download from the latest release
+        run: |
+          set -euo pipefail
+          mkdir -p grammars
+          for name in itn_configs tn_configs; do
+            curl -fsSL --retry 3 -o "grammars/$name.tar.bz2" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$name.tar.bz2"
+          done
+
+      - name: Upload grammars
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: grammars
+          path: grammars/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }} ${{ matrix.artifact_backend }}
+    needs: [prepare, grammars]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, platform: linux/amd64, backend: cpu, artifact_backend: cpu, target: artifact }
+          - { arch: x86_64, runner: ubuntu-24.04, platform: linux/amd64, backend: vulkan, artifact_backend: vulkan, target: artifact }
+          - arch: x86_64
+            runner: ${{ vars.RELEASE_LINUX_X64_CUDA_RUNNER || 'ubuntu-24.04' }}
+            platform: linux/amd64
+            backend: cuda
+            artifact_backend: cuda
+            target: cuda-artifact
+            cuda_image: nvcr.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
+            cuda_arch: "75-real;80-virtual;86-real;89-real;120a-real"
+          - { arch: aarch64, runner: ubuntu-24.04-arm, platform: linux/arm64, backend: cpu, artifact_backend: cpu, target: artifact }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, platform: linux/arm64, backend: vulkan, artifact_backend: vulkan, target: artifact }
+          - arch: aarch64
+            runner: ${{ vars.RELEASE_LINUX_ARM64_CUDA_RUNNER || 'ubuntu-24.04-arm' }}
+            platform: linux/arm64
+            backend: cuda
+            artifact_backend: cuda12
+            target: cuda-artifact
+            cuda_image: nvcr.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
+            cuda_arch: "87-real;87-virtual"
+          - arch: aarch64
+            runner: ${{ vars.RELEASE_LINUX_ARM64_CUDA_RUNNER || 'ubuntu-24.04-arm' }}
+            platform: linux/arm64
+            backend: cuda
+            artifact_backend: cuda13
+            target: cuda-artifact
+            cuda_image: nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+            cuda_arch: "110a-real;121a-real;110-virtual"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: |
+          git submodule update --init --depth 1 llama.cpp third_party/cpp-httplib
+
+      - name: Free disk space
+        # Make room for the CUDA image and build tree.
+        if: matrix.backend == 'cuda'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Build and package
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          BACKEND: ${{ matrix.backend }}
+          ARTIFACT_BACKEND: ${{ matrix.artifact_backend }}
+          CUDA_IMAGE: ${{ matrix.cuda_image }}
+          CUDA_ARCH: ${{ matrix.cuda_arch }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          args=(--build-arg "BACKEND=$BACKEND" --build-arg "ARTIFACT_BACKEND=$ARTIFACT_BACKEND"
+                --build-arg "RELEASE_VERSION=$RELEASE_VERSION" --build-arg "JOBS=$(nproc)")
+          if [ "$BACKEND" = cuda ]; then
+            args+=(--build-arg "CUDA_IMAGE=$CUDA_IMAGE" --build-arg "CUDA_ARCH=$CUDA_ARCH")
+          fi
+          docker buildx build --platform "$PLATFORM" -f docker/Dockerfile.release-linux \
+            --target "$TARGET" "${args[@]}" \
+            --output type=local,dest=release-artifacts .
+          test "$(find release-artifacts -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+          (cd release-artifacts && sha256sum --check ./*.sha256)
+
+      - name: Cache models
+        if: matrix.backend == 'cpu'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Download grammars
+        if: matrix.backend == 'cpu'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grammars
+          path: ${{ runner.temp }}/grammars
+
+      - name: Smoke test
+        # CPU archives run the model smoke test; Vulkan archives must start (the
+        # hosted runner has no GPU); CUDA archives are tested in gpu-smoke.
+        if: matrix.backend != 'cuda'
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/extract"
+          tar -xzf release-artifacts/*.tar.gz -C "$RUNNER_TEMP/extract"
+          cli="$(echo "$RUNNER_TEMP"/extract/*/bin/nemo-speech)"
+          if [ "$BACKEND" = cpu ]; then
+            grammars="$RUNNER_TEMP/grammars"
+            tar -xjf "$grammars/itn_configs.tar.bz2" -C "$grammars"
+            tar -xjf "$grammars/tn_configs.tar.bz2" -C "$grammars"
+            python3 tests/ci/model_smoke.py --binary "$cli" --backend cpu --audio "$JFK_AUDIO" \
+              --itn-model-dir "$grammars/itn_configs/en" --tn-model-dir "$grammars/tn_configs"
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1
+            "$cli" --version
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-${{ matrix.arch }}-${{ matrix.artifact_backend }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }} ${{ matrix.backend }}
+    needs: [prepare, grammars]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: aarch64, runner: macos-15, backend: cpu, preset: cpu-server, cmake_args: "-DGGML_METAL=OFF" }
+          - { arch: aarch64, runner: macos-15, backend: metal, preset: metal-server, cmake_args: "" }
+          - { arch: x86_64, runner: macos-15-intel, backend: cpu, preset: cpu-server, cmake_args: "-DGGML_METAL=OFF" }
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.3"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: |
+          git submodule update --init --depth 1 llama.cpp third_party/cpp-httplib
+
+      - name: Install dependencies
+        run: brew install bash ninja
+
+      - name: Build SentencePiece
+        run: JOBS="$(sysctl -n hw.ncpu)" scripts/build_sentencepiece_static.sh
+
+      - name: Build the text-normalization dependencies
+        run: STATIC=1 JOBS="$(sysctl -n hw.ncpu)" scripts/build_itn_deps.sh
+
+      - name: Configure and build
+        env:
+          PRESET: ${{ matrix.preset }}
+          CMAKE_ARGS: ${{ matrix.cmake_args }}
+        run: |
+          set -euo pipefail
+          # configure.sh needs bash 4+; the runner's default bash is 3.2.
+          # shellcheck disable=SC2086
+          "$(brew --prefix)/bin/bash" scripts/configure.sh "$PRESET" \
+            -DGGML_NATIVE=OFF \
+            -DNEMO_SPEECH_BUILD_GRPC=OFF -DNEMO_SPEECH_WITH_GRPC=OFF \
+            -DNEMO_SPEECH_WITH_NORM=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            $CMAKE_ARGS
+          cmake --build --preset "$PRESET" --parallel
+          cmake --install "build/$PRESET" --prefix "$RUNNER_TEMP/install"
+
+      - name: Package
+        env:
+          BACKEND: ${{ matrix.backend }}
+          ARCH: ${{ matrix.arch }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          scripts/release/package-macos.sh --install-prefix "$RUNNER_TEMP/install" \
+            --backend "$BACKEND" --arch "$ARCH" --version "$RELEASE_VERSION" \
+            --min-macos "$MACOSX_DEPLOYMENT_TARGET" --output-dir release-artifacts
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Download grammars
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grammars
+          path: ${{ runner.temp }}/grammars
+
+      - name: Smoke test
+        # The hosted VM's paravirtual GPU cannot run ggml Metal inference
+        # (see build.yml), so every archive runs on the CPU backend.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/extract"
+          tar -xzf release-artifacts/*.tar.gz -C "$RUNNER_TEMP/extract"
+          cli="$(echo "$RUNNER_TEMP"/extract/*/bin/nemo-speech)"
+          grammars="$RUNNER_TEMP/grammars"
+          tar -xjf "$grammars/itn_configs.tar.bz2" -C "$grammars"
+          tar -xjf "$grammars/tn_configs.tar.bz2" -C "$grammars"
+          python3 tests/ci/model_smoke.py --binary "$cli" --backend cpu --audio "$JFK_AUDIO" \
+            --itn-model-dir "$grammars/itn_configs/en" --tn-model-dir "$grammars/tn_configs"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos-${{ matrix.arch }}-${{ matrix.backend }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 ${{ matrix.backend }}
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { backend: cpu, runner: windows-2022 }
+          - { backend: vulkan, runner: windows-2022 }
+          - backend: cuda
+            runner: ${{ vars.RELEASE_WINDOWS_CUDA_RUNNER || 'windows-2022' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        shell: bash
+        run: |
+          git submodule update --init --depth 1 llama.cpp third_party/cpp-httplib
+
+      - name: Install the Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install -y --no-progress vulkan-sdk
+          $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+          if (-not $vulkan) { throw 'VULKAN_SDK was not set by the installer' }
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan"
+          Add-Content -Path $env:GITHUB_PATH -Value "$vulkan\Bin"
+
+      - name: Install the CUDA toolkit
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: "13.0.0"
+          method: network
+
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
+          restore-keys: vcpkg-windows-x64-
+
+      - name: Build
+        id: build
+        shell: pwsh
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          $arguments = @{
+            Backend   = $env:BACKEND
+            Profile   = 'server'
+            BuildDir  = "${{ github.workspace }}\build\release-$env:BACKEND"
+            CMakeArgs = @('-DGGML_NATIVE=OFF')
+          }
+          if ($env:BACKEND -eq 'cuda') {
+            $arguments.CudaArch = '75-real;80-virtual;86-real;89-real;120a-real'
+            $arguments.CublasShim = $true
+          }
+          scripts\windows\build.ps1 @arguments
+
+      - name: Save vcpkg binaries
+        if: steps.build.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Package
+        shell: pwsh
+        env:
+          BACKEND: ${{ matrix.backend }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          scripts\windows\package-release.ps1 -BuildDir "build\release-$env:BACKEND" `
+            -Backend $env:BACKEND -Version $env:RELEASE_VERSION -OutputDir release-artifacts
+
+      - name: Cache models
+        if: matrix.backend == 'cpu'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Smoke test
+        # GPU archives need a GPU driver at load time; the CUDA archive is tested in gpu-smoke.
+        if: matrix.backend == 'cpu'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $extract = Join-Path $env:RUNNER_TEMP 'extract'
+          Expand-Archive -Path (Get-Item release-artifacts\*.zip).FullName -DestinationPath $extract
+          $cli = (Get-Item "$extract\*\bin\nemo-speech.exe").FullName
+          python tests\ci\model_smoke.py --binary $cli --backend cpu --audio $env:JFK_AUDIO
+          if ($LASTEXITCODE -ne 0) { throw "model smoke test failed ($LASTEXITCODE)" }
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-x86_64-${{ matrix.backend }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  verify:
+    name: Verify archives
+    needs: [prepare, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the archive set
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=""
+          for name in linux-x86_64-cpu linux-x86_64-vulkan linux-x86_64-cuda \
+                      linux-aarch64-cpu linux-aarch64-vulkan linux-aarch64-cuda12 linux-aarch64-cuda13 \
+                      macos-aarch64-cpu macos-aarch64-metal macos-x86_64-cpu; do
+            expected="$expected nemo-speech-$VERSION-$name.tar.gz"
+          done
+          for name in windows-x86_64-cpu windows-x86_64-vulkan windows-x86_64-cuda; do
+            expected="$expected nemo-speech-$VERSION-$name.zip"
+          done
+          actual="$(cd dist && ls -- *.tar.gz *.zip | sort | tr '\n' ' ')"
+          wanted="$(printf '%s\n' $expected | sort | tr '\n' ' ')"
+          if [ "$actual" != "$wanted" ]; then
+            echo "::error::archive set differs from the expected 13"
+            diff <(printf '%s\n' $wanted) <(printf '%s\n' $actual) || true
+            exit 1
+          fi
+
+      - name: Check checksums, layout, and the x86_64 instruction baseline
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
+          python3 scripts/release/check_release.py archives dist --version "$VERSION"
+
+  baseline:
+    name: x86_64 baseline (emulated Haswell CPU)
+    needs: [prepare, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Download the Linux x86_64 CPU archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-linux-x86_64-cpu
+          path: dist
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Transcribe on an AVX2-only CPU
+        # Hosted runners usually have AVX-512, so a native run would not catch
+        # AVX-512 code. QEMU's Haswell model has AVX2/FMA/F16C and no AVX-512,
+        # so such an instruction raises SIGILL here.
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+          mkdir -p "$RUNNER_TEMP/extract"
+          tar -xzf dist/*.tar.gz -C "$RUNNER_TEMP/extract"
+          cli="$(echo "$RUNNER_TEMP"/extract/*/bin/nemo-speech)"
+          "$cli" pull nvidia/nemotron-3.5-asr-streaming-0.6b
+          text="$(qemu-x86_64 -cpu Haswell "$cli" transcribe "$JFK_AUDIO" --backend cpu)"
+          echo "$text"
+          echo "$text" | grep -qi "fellow americans"
+
+  gpu-smoke-linux:
+    name: Linux x86_64 CUDA archive (L4)
+    needs: [prepare, grammars, linux]
+    runs-on: linux-amd64-gpu-l4-latest-1
+    timeout-minutes: 60
+    container:
+      image: nvcr.io/nvidia/cuda@sha256:1e8ac7a54c184a1af8ef2167f28fa98281892a835c981ebcddb1fad04bdd452d # 13.0.0-devel-ubuntu24.04
+      options: -u root --security-opt seccomp=unconfined --shm-size 16g
+      env:
+        NVIDIA_VISIBLE_DEVICES: ${{ env.NVIDIA_VISIBLE_DEVICES }}
+    steps:
+      - name: Install prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends git python3 ca-certificates bzip2
+
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Download the CUDA archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-linux-x86_64-cuda
+          path: dist
+
+      - name: Download grammars
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grammars
+          path: /tmp/grammars
+
+      - name: Model smoke test
+        run: |
+          set -eu
+          mkdir -p /tmp/extract
+          tar -xzf dist/*.tar.gz -C /tmp/extract
+          tar -xjf /tmp/grammars/itn_configs.tar.bz2 -C /tmp/grammars
+          tar -xjf /tmp/grammars/tn_configs.tar.bz2 -C /tmp/grammars
+          python3 tests/ci/model_smoke.py --binary "$(echo /tmp/extract/*/bin/nemo-speech)" \
+            --backend cuda --audio "$JFK_AUDIO" \
+            --itn-model-dir /tmp/grammars/itn_configs/en --tn-model-dir /tmp/grammars/tn_configs
+
+  gpu-smoke-windows:
+    name: Windows x86_64 CUDA archive (L4)
+    needs: [prepare, windows]
+    runs-on: windows-amd64-gpu-l4-latest-1
+    timeout-minutes: 60
+    # Non-blocking, like the other jobs on this runner (see gpu.yml).
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Download the CUDA archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-windows-x86_64-cuda
+          path: dist
+
+      - name: Model smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $extract = Join-Path $env:RUNNER_TEMP 'extract'
+          Expand-Archive -Path (Get-Item dist\*.zip).FullName -DestinationPath $extract
+          $cli = (Get-Item "$extract\*\bin\nemo-speech.exe").FullName
+          python tests\ci\model_smoke.py --binary $cli --backend cuda --audio $env:JFK_AUDIO
+          if ($LASTEXITCODE -ne 0) { throw "model smoke test failed ($LASTEXITCODE)" }
+
+  publish:
+    name: Publish (${{ needs.prepare.outputs.channel }})
+    needs: [prepare, grammars, verify, baseline, gpu-smoke-linux, gpu-smoke-windows]
+    if: needs.prepare.outputs.channel != 'dry-run'
+    runs-on: ubuntu-latest
+    # Requires approval when the "release" environment has required reviewers.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        run: cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+      - name: Add the text-normalization grammars
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: grammars
+          path: dist
+
+      - name: Create the draft release
+        if: needs.prepare.outputs.channel == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "NeMo-Speech.cpp $VERSION" --generate-notes dist/*
+
+      - name: Replace the nightly prerelease
+        if: needs.prepare.outputs.channel == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create nightly --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+            --title "Nightly" --notes "Built from $GITHUB_SHA." dist/*
