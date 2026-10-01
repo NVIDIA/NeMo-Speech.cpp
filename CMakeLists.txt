@@ -24,7 +24,12 @@ add_compile_definitions(NEMO_SPEECH_VERSION_STR="${NEMO_SPEECH_VERSION}")
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 if(WIN32)
-    # Install the Visual C++ runtime required by Windows packages.
+    # Install the Visual C++ runtime required by Windows packages, plus the
+    # OpenMP runtime (vcomp140.dll) that ggml's CPU threading links against
+    # unless GGML_OPENMP is OFF.
+    if(NOT DEFINED GGML_OPENMP OR GGML_OPENMP)
+        set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
+    endif()
     include(InstallRequiredSystemLibraries)
 endif()
 set(NEMO_SPEECH_LICENSE_INSTALL_DIR

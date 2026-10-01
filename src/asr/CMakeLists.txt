@@ -63,8 +63,8 @@ target_link_libraries(nemo_speech_asr PUBLIC nemo_speech_runtime_ggml)
 # SentencePiece is a core ASR dependency: the RNNT head tokenizes word-boosting
 # phrases with the model's embedded tokenizer (context biasing in
 # rnnt_greedy_decoder.cpp / RnntModel::encode_phrase); the flashlight decoder
-# also encodes OOV boost phrases with it. Prefer a static archive on ELF
-# platforms so its bundled protobuf symbols stay private.
+# also encodes OOV boost phrases with it. Prefer a static archive on ELF and
+# Apple platforms so its bundled protobuf symbols stay private.
 if(UNIX AND NOT APPLE)
     set(_NEMO_SPEECH_LIBRARY_SUFFIXES "${CMAKE_FIND_LIBRARY_SUFFIXES}")
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
@@ -72,6 +72,11 @@ if(UNIX AND NOT APPLE)
         HINTS "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/lib")
     set(CMAKE_FIND_LIBRARY_SUFFIXES "${_NEMO_SPEECH_LIBRARY_SUFFIXES}")
     unset(_NEMO_SPEECH_LIBRARY_SUFFIXES)
+elseif(APPLE)
+    # Only the project-built archive: Homebrew's libsentencepiece.a needs its
+    # shared abseil, which release archives cannot carry.
+    find_library(SENTENCEPIECE_STATIC_LIB libsentencepiece.a
+        PATHS "${NEMO_SPEECH_DEPENDENCY_PREFIX}/sentencepiece/lib" NO_DEFAULT_PATH)
 endif()
 if(SENTENCEPIECE_STATIC_LIB)
     find_path(SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h
@@ -79,10 +84,15 @@ if(SENTENCEPIECE_STATIC_LIB)
     if(NOT SENTENCEPIECE_INCLUDE_DIR)
         message(FATAL_ERROR "SentencePiece archive found without sentencepiece_processor.h")
     endif()
-    target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_STATIC_LIB})
     target_include_directories(nemo_speech_asr PRIVATE ${SENTENCEPIECE_INCLUDE_DIR})
-    target_link_options(
-        nemo_speech_asr PRIVATE "LINKER:--exclude-libs,libsentencepiece.a")
+    if(APPLE)
+        target_link_options(
+            nemo_speech_asr PRIVATE "LINKER:-load_hidden,${SENTENCEPIECE_STATIC_LIB}")
+    else()
+        target_link_libraries(nemo_speech_asr PRIVATE ${SENTENCEPIECE_STATIC_LIB})
+        target_link_options(
+            nemo_speech_asr PRIVATE "LINKER:--exclude-libs,libsentencepiece.a")
+    endif()
 elseif(NEMO_SPEECH_WITH_NORM AND UNIX AND NOT APPLE)
     message(FATAL_ERROR
         "normalization requires private static SentencePiece; "

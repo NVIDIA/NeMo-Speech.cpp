@@ -81,7 +81,9 @@ clone https://github.com/sarane22/sparrowhawk.git sparrowhawk 8b082acc507312077a
 if [ "$STATIC" = 1 ]; then
     clone https://github.com/protocolbuffers/protobuf.git protobuf f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c  # v21.12
     clone https://github.com/google/re2.git               re2      3a8436ac436124a57a4e22d5c8713a2d42b381d7  # 2023-03-01
-    cmake -S "$WORK/protobuf" -B "$WORK/protobuf/build" \
+    # Build outside the source trees: RE2 ships a Bazel BUILD file, which
+    # "re2/build" resolves to on case-insensitive filesystems (macOS).
+    cmake -S "$WORK/protobuf" -B "$WORK/protobuf-build" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DCMAKE_INSTALL_LIBDIR=lib \
@@ -89,15 +91,15 @@ if [ "$STATIC" = 1 ]; then
         -Dprotobuf_BUILD_SHARED_LIBS=OFF \
         -Dprotobuf_BUILD_TESTS=OFF \
         -Dprotobuf_WITH_ZLIB=OFF
-    cmake --build "$WORK/protobuf/build" --target install -j "$JOBS"
-    cmake -S "$WORK/re2" -B "$WORK/re2/build" \
+    cmake --build "$WORK/protobuf-build" --target install -j "$JOBS"
+    cmake -S "$WORK/re2" -B "$WORK/re2-build" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DBUILD_SHARED_LIBS=OFF \
         -DRE2_BUILD_TESTING=OFF
-    cmake --build "$WORK/re2/build" --target install -j "$JOBS"
+    cmake --build "$WORK/re2-build" --target install -j "$JOBS"
     # Sparrowhawk's configure and Makefiles run protoc from PATH.
     export PATH="$PREFIX/bin:$PATH"
     install_license "$WORK/protobuf/LICENSE" protobuf
@@ -108,6 +110,9 @@ fi
 cd "$WORK/openfst"
 # FST_FLAGS_v rename missed by the fork.
 perl -pi -e 's/\bFLAGS_v\b/FST_FLAGS_v/g' src/include/fst/label-reachable.h
+# VectorHashBiTable's copy constructor reads a nonexistent member (fixed
+# upstream); Clang 20+ rejects it without instantiation.
+perl -pi -e 's/selector_\(table\.s_\)/selector_(table.selector_)/' src/include/fst/bi-table.h
 # FAR + PDT cover Sparrowhawk's runtime grammar formats. Disable command-line
 # tools/script wrappers: the runtime calls the typed C++ OpenFST API directly.
 stamp_autotools

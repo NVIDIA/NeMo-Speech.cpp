@@ -9,6 +9,8 @@
 #include <stdexcept>
 
 #ifdef NEMO_SPEECH_WITH_NORM
+#include <unistd.h>  // mkdtemp (macOS declares it only here)
+
 #include <climits>
 #include <cstdlib>
 #include <filesystem>

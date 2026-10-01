@@ -117,8 +117,8 @@ failures="$work_dir/failures"
 macho_files="$work_dir/macho-files"
 find "$package_root/bin" "$package_root/lib" -type f -print | LC_ALL=C sort > "$macho_files"
 while IFS= read -r file; do
-    otool -h "$file" >/dev/null 2>&1 || continue
-    archs="$(lipo -archs "$file" 2>/dev/null || true)"
+    # lipo, not otool: llvm-otool exits 0 for files that are not Mach-O.
+    archs="$(lipo -archs "$file" 2>/dev/null)" || continue
     [[ "$archs" == "$macho_arch" ]] || echo "$file: built for '$archs', expected $macho_arch" >> "$failures"
 
     minos="$(otool -l "$file" | awk '$1 == "minos" { print $2; exit }')"
@@ -149,7 +149,7 @@ fi
 # Strip local symbols, then ad-hoc sign: install-time rpath edits invalidate the
 # linker's signature, and arm64 macOS refuses to run unsigned code.
 while IFS= read -r file; do
-    otool -h "$file" >/dev/null 2>&1 || continue
+    lipo -archs "$file" >/dev/null 2>&1 || continue
     strip -x "$file"
     codesign --force --sign - "$file"
 done < "$macho_files"
