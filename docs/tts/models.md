@@ -16,7 +16,7 @@ options are omitted.
 
 Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidia/magpie_tts_multilingual_357m)
 
-Use `nemo-speech pull magpie` to download the GGUF and matching tokenizer
+Use `nemo-speech pull magpie` to download the F16 GGUF and matching tokenizer
 assets pinned by the model index. For manually managed checkpoints, download
 the GGUF and `.nemo` archive from the same Hugging Face revision and pass their
 local paths explicitly.
@@ -26,8 +26,9 @@ frame-stacking factor of 2. This is independent of `tts.chunk-frames`, which
 groups generated frames for NanoCodec streaming. Both versions use the same
 NanoCodec decoder.
 
-The fused CUDA decode path needs a Q8_0 GGUF. Convert the `.nemo` locally
-(Q8_0 is the converter default):
+The fused CUDA decode path, which the published TTS benchmarks use, needs a
+Q8_0 GGUF; the pulled F16 GGUF runs the unfused path. Convert the `.nemo`
+locally (Q8_0 is the converter default):
 
 ```bash
 python3 convert_model.py magpie_tts_multilingual_357m.nemo \

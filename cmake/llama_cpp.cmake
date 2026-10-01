@@ -49,7 +49,8 @@ function(nemo_speech_materialize_llama_cpp source_dir patch_dir dest_dir)
     nemo_speech_llama_cpp_series("${patch_dir}" patches)
 
     # Key the copy by the pinned commit and the series content. Source archives
-    # without git metadata fall back to the public headers as the base identity.
+    # without git metadata are keyed by the content of every file the copy
+    # takes, so replacing the tree with another llama.cpp version refreshes it.
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" rev-parse HEAD
         OUTPUT_VARIABLE base RESULT_VARIABLE rc OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
@@ -57,9 +58,15 @@ function(nemo_speech_materialize_llama_cpp source_dir patch_dir dest_dir)
     if(rc EQUAL 0)
         set(have_git_metadata ON)
     else()
-        file(SHA256 "${source_dir}/ggml/include/ggml.h" ggml_h)
-        file(SHA256 "${source_dir}/include/llama.h" llama_h)
-        set(base "${ggml_h}-${llama_h}")
+        file(GLOB_RECURSE tree_files RELATIVE "${source_dir}" LIST_DIRECTORIES false "${source_dir}/*")
+        list(FILTER tree_files EXCLUDE REGEX "^(\\.git|models|docs|media)(/|$)")
+        list(SORT tree_files)
+        set(tree_listing "")
+        foreach(path IN LISTS tree_files)
+            file(SHA256 "${source_dir}/${path}" digest)
+            string(APPEND tree_listing "${path} ${digest}\n")
+        endforeach()
+        string(SHA256 base "${tree_listing}")
     endif()
     set(stamp_input "${base}")
     foreach(patch IN LISTS patches)

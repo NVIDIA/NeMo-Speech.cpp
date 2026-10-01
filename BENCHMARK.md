@@ -144,7 +144,7 @@ Whisper English normalizer.
 
 | | |
 |---|---|
-| Models | MagpieTTS Multilingual 357M v2607, NeMo NanoCodec 22 kHz (F16) |
+| Models | MagpieTTS Multilingual 357M v2607 (Q8_0, [converted locally](docs/tts/models.md#magpietts-token-generator)), NeMo NanoCodec 22 kHz (F16) |
 | Synthesis | `en-US`, default voice, seed 1, 22.05 kHz audio in 186 ms chunks (4 codec frames) |
 | Inputs | The 10 LJSpeech sentences of the Riva TTS performance reports ([`ljs_audio_text_test_filelist_small.txt`](test_files/tts/ljs_audio_text_test_filelist_small.txt), 20 requests); by length, [`test_files/tts/bench`](test_files/tts/bench) (5 requests per input) |
 | Metrics | Latencies at the client from the streaming audio callback; throughput is audio duration over wall time |

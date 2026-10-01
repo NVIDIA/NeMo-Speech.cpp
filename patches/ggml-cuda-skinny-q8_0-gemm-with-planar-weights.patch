@@ -212,7 +212,7 @@ index 6730a6e28ef9ab02c74cf4e164ff2e8ac5cfb0bf..32b96b5e7fdb48a02ad255dfab688520
              fused_mul_mat_vec = true;
              fused_node_count  = 2;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a85155360a7ba48014bf8a450fc3a35bafd2aa1d..dd11a3f65c06e3170df64ee6054818d0f1f44c81 100644
+index a85155360a7ba48014bf8a450fc3a35bafd2aa1d..8deb33650513227e81eea584c6fb1b744550e76b 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,5 +1,6 @@
@@ -545,7 +545,7 @@ index a85155360a7ba48014bf8a450fc3a35bafd2aa1d..dd11a3f65c06e3170df64ee6054818d0
  
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 +    const bool q8_planar = (src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0 ||
-+                           (src0->type == GGML_TYPE_Q8_0 && ggml_cuda_skinny_q8_repacked_in_place(src0->data));
++                           ggml_cuda_skinny_q8_repacked_in_place(src0);
 +    if (q8_planar) {
 +        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && ids == nullptr);
 +        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0));
@@ -566,7 +566,7 @@ index a85155360a7ba48014bf8a450fc3a35bafd2aa1d..dd11a3f65c06e3170df64ee6054818d0
  
      ggml_cuda_mm_fusion_args_device fusion_local{};
 +    GGML_ASSERT((src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) == 0 &&
-+                !(src0->type == GGML_TYPE_Q8_0 && ggml_cuda_skinny_q8_repacked_in_place(src0->data)) &&
++                !ggml_cuda_skinny_q8_repacked_in_place(src0) &&
 +                "planar Q8 does not support split-buffer MMVQ");
      mul_mat_vec_q_switch_type(
          src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
@@ -577,10 +577,10 @@ index a85155360a7ba48014bf8a450fc3a35bafd2aa1d..dd11a3f65c06e3170df64ee6054818d0
  }
 diff --git a/ggml/src/ggml-cuda/skinny-q8.cu b/ggml/src/ggml-cuda/skinny-q8.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..0bd27dddb8524ccc1c086ce07fd45692cc858857
+index 0000000000000000000000000000000000000000..a39355ea5cb3640b6244c73a246bd46876d98fdb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/skinny-q8.cu
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,676 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +// Skinny-N Q8_0 GEMM for streaming ASR encoders (nemo-speech).
@@ -964,10 +964,31 @@ index 0000000000000000000000000000000000000000..0bd27dddb8524ccc1c086ce07fd45692
 +std::mutex                                    g_skq8_mutex;
 +}  // namespace
 +
-+bool ggml_cuda_skinny_q8_repacked_in_place(const void * data) {
++static const ggml_tensor * skq8_root(const ggml_tensor * t) {
++    while (t->view_src != nullptr) {
++        t = t->view_src;
++    }
++    return t;
++}
++
++// This specialization targets encoder matrices, whose ne[1] is a time or token
++// dimension: the FastConformer encoders and the MagpieTTS text encoder, which
++// shares the "encoder." prefix. Keeping the domain explicit also prevents a
++// decoder's request batch (which commonly occupies ne[1]) from being mistaken
++// for a skinny time dimension.
++static bool skq8_encoder_weight(const ggml_tensor * root) {
++    return strncmp(root->name, "encoder.", 8) == 0;
++}
++
++bool ggml_cuda_skinny_q8_repacked_in_place(const ggml_tensor * src0) {
++    // Only encoder weights are ever repacked, so every other Q8_0 weight skips
++    // the lock on MMVQ's per-call check.
++    if (src0->type != GGML_TYPE_Q8_0 || !skq8_encoder_weight(skq8_root(src0))) {
++        return false;
++    }
 +    std::lock_guard<std::mutex> lock(g_skq8_mutex);
-+    const auto it = g_skq8_cache.find(data);
-+    return it != g_skq8_cache.end() && (const void *) it->second.qs == data;
++    const auto it = g_skq8_cache.find(src0->data);
++    return it != g_skq8_cache.end() && (const void *) it->second.qs == src0->data;
 +}
 +
 +void ggml_cuda_skinny_q8_forget(const void * base, size_t size) {
@@ -1003,18 +1024,12 @@ index 0000000000000000000000000000000000000000..0bd27dddb8524ccc1c086ce07fd45692
 +    // serialized planar tensor is accepted only through its full allocation,
 +    // since a normal ggml byte-offset view cannot describe two separate
 +    // tensor-wide planes.
-+    const ggml_tensor * root = src0;
-+    while (root->view_src != nullptr) {
-+        root = root->view_src;
-+    }
++    const ggml_tensor * root = skq8_root(src0);
 +    const bool planar_q8 = (root->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
 +    if (disabled && !planar_q8) {
 +        return false;
 +    }
-+    // This specialization is for FastConformer encoder matrices. Keeping the
-+    // domain explicit also prevents a decoder's request batch (which commonly
-+    // occupies ne[1]) from being mistaken for a skinny time dimension.
-+    if (strncmp(root->name, "encoder.", 8) != 0) {
++    if (!skq8_encoder_weight(root)) {
 +        return false;
 +    }
 +    if (!planar_q8 && strstr(root->name, ".linear_qkv.weight") != nullptr) {
@@ -1244,7 +1259,7 @@ index 0000000000000000000000000000000000000000..0bd27dddb8524ccc1c086ce07fd45692
 +}
 diff --git a/ggml/src/ggml-cuda/skinny-q8.cuh b/ggml/src/ggml-cuda/skinny-q8.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..dd34d2515fc33d6aa0b69294ce14c3e6dfd297b5
+index 0000000000000000000000000000000000000000..1847c2b1391a58f78937c1ef6f4edfccd1dea8d3
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/skinny-q8.cuh
 @@ -0,0 +1,27 @@
@@ -1259,9 +1274,9 @@ index 0000000000000000000000000000000000000000..dd34d2515fc33d6aa0b69294ce14c3e6
 +// Drop cached planes for weights in a device allocation being freed or cleared.
 +void ggml_cuda_skinny_q8_forget(const void * base, size_t size);
 +
-+// True when the Q8_0 weight at `data` was repacked to the planar layout in place, so its
++// True when the Q8_0 weight src0 was repacked to the planar layout in place, so its
 +// bytes are no longer block_q8_0 even though the tensor is not flagged planar.
-+bool ggml_cuda_skinny_q8_repacked_in_place(const void * data);
++bool ggml_cuda_skinny_q8_repacked_in_place(const ggml_tensor * src0);
 +
 +bool ggml_cuda_skinny_q8_supported(
 +    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
