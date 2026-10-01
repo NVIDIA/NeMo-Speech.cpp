@@ -206,12 +206,14 @@ COPY . /work
 COPY --from=sentencepiece-dependency /work/.deps/sentencepiece /work/.deps/sentencepiece
 COPY --from=itn-dependency /work/.deps/itn /work/.deps/itn
 
+# The default architectures match the default CUDA 12.8 image; CUDA 13 builds
+# (sm_110, sm_121) pass CUDA_ARCH.
 RUN set -eux; \
     cuda_arch="${CUDA_ARCH}"; \
     if [ -z "$cuda_arch" ]; then \
         case "${TARGETARCH}" in \
             amd64) cuda_arch='75-real;80-virtual;86-real;89-real;120a-real' ;; \
-            arm64) cuda_arch='87-real;110a-real;121a-real;87-virtual' ;; \
+            arm64) cuda_arch='87-real;87-virtual' ;; \
             *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 2 ;; \
         esac; \
     fi; \

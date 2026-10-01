@@ -14,8 +14,9 @@ name: Release
 # archive runs under an emulated Haswell CPU before anything is published.
 #
 # Linux and macOS archives include text normalization (ITN/TN). The grammars are
-# not built here: they are taken from the latest release, used by the smoke
-# tests, and published again with every release.
+# not built here: they are taken from the release pinned in the grammars job,
+# checked against recorded SHA-256 digests, used by the smoke tests, and
+# published again with every release.
 
 on:
   push:
@@ -64,7 +65,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT_CHANNEL: ${{ inputs.channel }}
           RELEASE_PATHS: >-
-            ^(\.github/workflows/release\.yml|docker/Dockerfile\.release-linux|scripts/build_itn_deps\.sh|scripts/build_sentencepiece_static\.sh|scripts/release/|scripts/windows/(build|package-release)\.ps1|tests/ci/model_smoke\.py)
+            ^(\.github/workflows/release\.yml|docker/Dockerfile\.release-linux|scripts/build_itn_deps\.sh|scripts/build_sentencepiece_static\.sh|scripts/release/|scripts/windows/(build|package-release)\.ps1|CMakeLists\.txt|src/(asr|common)/CMakeLists\.txt|tests/ci/model_smoke\.py)
         run: |
           set -euo pipefail
           declared="$(sed -n 's/^NEMO_SPEECH_VERSION:[[:space:]]*//p' VERSION)"
@@ -93,6 +94,10 @@ jobs:
             schedule:*) channel=nightly; version=nightly ;;
             *)
               channel="$INPUT_CHANNEL"
+              if [ "$channel" = nightly ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+                echo "::error::nightly can only be published from main"
+                exit 1
+              fi
               if [ "$channel" = nightly ]; then version=nightly; else version="$declared"; fi
               ;;
           esac
@@ -117,14 +122,22 @@ jobs:
     if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - name: Download from the latest release
+      - name: Download the pinned grammars
+        # To ship new grammars, attach them to a release and update the tag and
+        # digests here.
+        env:
+          GRAMMARS_RELEASE: v0.1.0
         run: |
           set -euo pipefail
           mkdir -p grammars
           for name in itn_configs tn_configs; do
             curl -fsSL --retry 3 -o "grammars/$name.tar.bz2" \
-              "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$name.tar.bz2"
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$GRAMMARS_RELEASE/$name.tar.bz2"
           done
+          (cd grammars && sha256sum --check --strict) <<'EOF'
+          880c9365d1d52c17450bd930950b0e58eca294421b7be62eb71666fb21b8997f  itn_configs.tar.bz2
+          2ca242c6d29f551eba3663d7e508c0d9dad10440e287628234154c6d1a72c7bc  tn_configs.tar.bz2
+          EOF
 
       - name: Upload grammars
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -555,7 +568,8 @@ jobs:
         NVIDIA_VISIBLE_DEVICES: ${{ env.NVIDIA_VISIBLE_DEVICES }}
     steps:
       - name: Install prerequisites
-        run: apt-get update && apt-get install -y --no-install-recommends git python3 ca-certificates bzip2
+        # The CLI downloads models with curl.
+        run: apt-get update && apt-get install -y --no-install-recommends git curl python3 ca-certificates bzip2
 
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -567,6 +581,12 @@ jobs:
         with:
           name: release-linux-x86_64-cuda
           path: dist
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
 
       - name: Download grammars
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -590,8 +610,9 @@ jobs:
     needs: [prepare, windows]
     runs-on: windows-amd64-gpu-l4-latest-1
     timeout-minutes: 60
-    # Non-blocking, like the other jobs on this runner (see gpu.yml).
-    continue-on-error: true
+    # Non-blocking, like the other jobs on this runner (see gpu.yml), except
+    # for tagged releases.
+    continue-on-error: ${{ needs.prepare.outputs.channel != 'release' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -603,6 +624,12 @@ jobs:
         with:
           name: release-windows-x86_64-cuda
           path: dist
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
 
       - name: Model smoke test
         shell: pwsh

@@ -172,6 +172,12 @@ done
 runtime_license_dir="$package_root/share/licenses/nemo-speech/third_party/gcc-runtime"
 mkdir -p "$package_root/lib" "$runtime_license_dir"
 for runtime in libstdc++.so.6 libgcc_s.so.1 libgomp.so.1 libatomic.so.1; do
+    # Vulkan drivers (Mesa ICDs) need the host's newer C++ runtime; a bundled
+    # copy loaded first through DT_RPATH would make them fail to load.
+    if [[ "$backend" == vulkan ]] &&
+       [[ "$runtime" == libstdc++.so.6 || "$runtime" == libgcc_s.so.1 ]]; then
+        continue
+    fi
     if [[ "$runtime" == libstdc++* ]]; then
         compiler=c++
     else
