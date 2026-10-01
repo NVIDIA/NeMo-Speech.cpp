@@ -31,6 +31,13 @@ ARCHIVE = re.compile(
     r"\.(?P<ext>tar\.gz|zip)$"
 )
 
+# x86-64-v3 has no EVEX (AVX-512) instructions, and in 64-bit code a leading 0x62 opcode byte
+# after legacy prefixes is always EVEX, so the encoding catches every AVX-512 instruction
+# whatever its registers. The mnemonics below add the VEX-encoded extensions beyond v3
+# (AVX-VNNI, AMX) and AVX-512 forms reported by name.
+INSTRUCTION = re.compile(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*(\S.*)$")
+LEGACY_PREFIXES = {"26", "2e", "36", "3e", "64", "65", "66", "67", "f0", "f2", "f3"}
+
 # AT&T syntax, as printed by objdump and llvm-objdump.
 BEYOND_X86_64_V3 = re.compile(
     r"%zmm\d+|%[xy]mm(?:1[6-9]|2\d|3[01])\b|%k[0-7]\b|\{%k[0-7]\}"
@@ -74,6 +81,24 @@ def disassembler() -> str:
     raise SystemExit("error: llvm-objdump or objdump is required")
 
 
+def beyond_v3(disassembly: str) -> list[str]:
+    """Return the instructions beyond x86-64-v3 in llvm-objdump or objdump output."""
+    lines = [m for m in map(INSTRUCTION.match, disassembly.splitlines()) if m]
+    # Bytes the disassembler cannot decode are data in a code section, such as a jump table:
+    # llvm-objdump prints <unknown>, GNU objdump (bad). Data next to them can decode as a
+    # valid-looking instruction, so ignore hits adjacent to undecodable bytes; real AVX-512
+    # code never appears only there.
+    data = [m.group(2).startswith(("(bad)", "<unknown>")) for m in lines]
+    hits = []
+    for i, m in enumerate(lines):
+        if data[i] or (i > 0 and data[i - 1]) or (i + 1 < len(lines) and data[i + 1]):
+            continue
+        opcode = next((b for b in m.group(1).split() if b not in LEGACY_PREFIXES), "")
+        if opcode == "62" or BEYOND_X86_64_V3.search(m.group(2)):
+            hits.append(m.group(0).strip())
+    return hits
+
+
 def scan_isa(paths: list[pathlib.Path]) -> list[str]:
     tool = disassembler()
     failures = []
@@ -90,7 +115,7 @@ def scan_isa(paths: list[pathlib.Path]) -> list[str]:
             if arch != "x86_64":
                 continue
             result = subprocess.run(
-                [tool, "-d", "--no-show-raw-insn", str(path)],
+                [tool, "-d", str(path)],
                 capture_output=True,
                 text=True,
                 errors="replace",
@@ -98,9 +123,7 @@ def scan_isa(paths: list[pathlib.Path]) -> list[str]:
             if result.returncode != 0 or "file format not recognized" in result.stderr:
                 failures.append(f"{path}: {tool} could not disassemble it")
                 continue
-            hits = [
-                line.strip() for line in result.stdout.splitlines() if BEYOND_X86_64_V3.search(line)
-            ]
+            hits = beyond_v3(result.stdout)
             if hits:
                 failures.append(
                     f"{path}: {len(hits)} instructions beyond x86-64-v3, first: {hits[0]}"
@@ -113,11 +136,12 @@ def extract(archive: pathlib.Path, dest: pathlib.Path) -> None:
         with zipfile.ZipFile(archive) as z:
             z.extractall(dest)
     else:
+        if not hasattr(tarfile, "data_filter"):
+            raise SystemExit(
+                "error: safe tar extraction needs Python 3.12 or a release with tarfile.data_filter"
+            )
         with tarfile.open(archive) as t:
-            if hasattr(tarfile, "data_filter"):
-                t.extractall(dest, filter="data")
-            else:
-                t.extractall(dest)
+            t.extractall(dest, filter="data")
 
 
 def check_archives(directory: pathlib.Path, version: str) -> list[str]:

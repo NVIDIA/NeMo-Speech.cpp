@@ -702,7 +702,15 @@ jobs:
         if: needs.prepare.outputs.channel == 'nightly'
         env:
           GH_TOKEN: ${{ github.token }}
+        # Upload to a draft first: if the upload fails, the current nightly stays
+        # in place. Only a complete draft replaces it.
         run: |
+          set -euo pipefail
+          staging="nightly-staging-$GITHUB_RUN_ID"
+          if ! gh release create "$staging" --repo "$GITHUB_REPOSITORY" --draft --prerelease \
+              --target "$GITHUB_SHA" --title "Nightly" --notes "Built from $GITHUB_SHA." dist/*; then
+            gh release delete "$staging" --repo "$GITHUB_REPOSITORY" --yes || true
+            exit 1
+          fi
           gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-          gh release create nightly --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
-            --title "Nightly" --notes "Built from $GITHUB_SHA." dist/*
+          gh release edit "$staging" --repo "$GITHUB_REPOSITORY" --tag nightly --draft=false
