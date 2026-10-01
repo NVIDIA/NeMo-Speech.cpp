@@ -1077,7 +1077,7 @@ k_hgemm_tn_smalln_warp(
 // large subsampling-conv GEMMs (k-reuse bound) but LOSES ~2.5x on the small
 // streaming GEMMs (which need parallelism, not reuse) — so launch() picks per
 // shape: tiled iff the aggregate batched output is large enough to fill the
-// GPU (see EDGE_SHIM_TILE_MIN).
+// GPU (see use_tiled).
 #define EDGE_TM 64
 #define EDGE_TN 64
 #define EDGE_TK 16
@@ -1167,26 +1167,13 @@ k_strided_tiled(
 inline bool
 use_tiled(int m, int n, int batch) {
     // Crossover between the naive (parallelism-bound, small outputs) and the
-    // tiled (k-reuse-bound, large batched outputs). Overridable for tuning.
-    static const size_t min_mn = [] {
-        const char* e = getenv("EDGE_SHIM_TILE_MIN");
-        return e ? (size_t)atoll(e) : (size_t)64 * 1024;
-    }();
-    return (size_t)m * (size_t)n * (size_t)batch >= min_mn;
-}
-inline size_t
-wmma_min_mn() {
-    static const size_t min_mn = [] {
-        const char* e = getenv("EDGE_SHIM_WMMA_MIN_MN");
-        return e ? (size_t)atoll(e) : (size_t)1;
-    }();
-    return min_mn;
+    // tiled (k-reuse-bound, large batched outputs).
+    return (size_t)m * (size_t)n * (size_t)batch >= (size_t)64 * 1024;
 }
 inline bool
 use_wmma_tn(int m, int n, int opA, int opB, int ta, int tb, int tc) {
     return opA == OP_T && opB == OP_N && ta == R_16F && tb == R_16F &&
-           (tc == R_16F || tc == R_32F || tc == R_16BF) && n > 1 &&
-           (size_t)m * (size_t)n >= wmma_min_mn();
+           (tc == R_16F || tc == R_32F || tc == R_16BF) && n > 1 && m > 0;
 }
 inline bool
 use_hgemv_tn(int n, int opA, int opB, int ta, int tb, int tc) {

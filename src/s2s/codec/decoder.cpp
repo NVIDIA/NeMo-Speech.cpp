@@ -188,7 +188,7 @@ CodecDecodeWavModule::build_graph(gr::Session* s, gr::TensorBag in, gr::TensorCo
         }
     }
 
-    x = ggml_conv_1d(g, W(s, "dec.proj_out.weight"), x, 1, 0, 1);
+    x = ggml_runtime::conv_1d(g, W(s, "dec.proj_out.weight"), x, 1, 0, 1);
     x = add_channel_bias(g, x, W_opt(s, "dec.proj_out.bias"));
     ggml_tensor* out_spec = x;  // (out_t, spec_channels, B)
 

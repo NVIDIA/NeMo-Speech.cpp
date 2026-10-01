@@ -1,0 +1,20 @@
+# Apply order for the patches in this directory (scripts/llama-patches.sh export).
+ggml-add-fused-attention-op-for-fastconformer-and-magpietts.patch
+ggml-cuda-fuse-layernorm-with-row-vector-scale-and-bias.patch
+ggml-cuda-support-f16-weights-in-direct-depthwise-conv.patch
+ggml-cuda-skinny-q8_0-gemm-with-planar-weights.patch
+ggml-cuda-target-jetson-thor-sm110.patch
+ggml-cuda-cuda-graph-cache-keys-replay-updates-and-eviction-knobs.patch
+ggml-cuda-two-column-mmvf-epilogue.patch
+ggml-cuda-flatten-shared-weight-cublas-gemms-fuse-silu-to-bf16.patch
+ggml-fastconformer-cuda-fusions-and-sigmoid-glu.patch
+ggml-cuda-flatten-pad-launches-for-large-batches.patch
+ggml-cuda-vectorized-contiguous-set_rows.patch
+ggml-cuda-expose-the-backend-stream-and-cuda-graph-controls.patch
+ggml-cuda-bf16-depthwise-conv-and-bias-round-epilogue.patch
+ggml-cuda-tiled-1d-im2col.patch
+ggml-nanocodec-convolution-kernels.patch
+ggml-cpu-f16c-scalar-fp32-fp16-and-row-split-f16-im2col.patch
+llama-keep-equal-length-recurrent-sequences-in-one-ubatch.patch
+llama-enable-nvfp4-in-llama-quantize.patch
+llama-read-the-gemma-3-attention-scale-from-gguf.patch

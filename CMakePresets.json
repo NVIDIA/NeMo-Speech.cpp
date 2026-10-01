@@ -15,7 +15,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "NEMO_SPEECH_BUILD_EXAMPLES": "OFF",
         "NEMO_SPEECH_BUILD_TESTS": "OFF",
-        "NEMO_SPEECH_BUILD_TOOLS": "OFF"
+        "NEMO_SPEECH_BUILD_TOOLS": "OFF",
+        "GGML_LLAMAFILE": "ON"
       }
     },
     {
@@ -23,7 +24,7 @@
       "inherits": "base",
       "displayName": "CPU ASR and diarization",
       "cacheVariables": {
-        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_GGML_PATCHED": "ON",
         "NEMO_SPEECH_BUILD_ASR": "ON",
         "NEMO_SPEECH_BUILD_DIAR": "ON",
         "NEMO_SPEECH_BUILD_TTS": "OFF",
@@ -35,7 +36,7 @@
       "inherits": "base",
       "displayName": "CPU standalone diarization",
       "cacheVariables": {
-        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_GGML_PATCHED": "ON",
         "NEMO_SPEECH_BUILD_ASR": "OFF",
         "NEMO_SPEECH_BUILD_DIAR": "ON",
         "NEMO_SPEECH_BUILD_TTS": "OFF",
@@ -47,7 +48,7 @@
       "inherits": "base",
       "displayName": "CPU text-to-speech",
       "cacheVariables": {
-        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_GGML_PATCHED": "ON",
         "NEMO_SPEECH_BUILD_ASR": "OFF",
         "NEMO_SPEECH_BUILD_DIAR": "OFF",
         "NEMO_SPEECH_BUILD_TTS": "ON",
@@ -59,7 +60,7 @@
       "inherits": "base",
       "displayName": "CPU text translation",
       "cacheVariables": {
-        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_GGML_PATCHED": "ON",
         "NEMO_SPEECH_BUILD_ASR": "OFF",
         "NEMO_SPEECH_BUILD_DIAR": "OFF",
         "NEMO_SPEECH_BUILD_TTS": "OFF",
@@ -71,7 +72,7 @@
       "inherits": "base",
       "displayName": "CPU ASR, diarization, NMT, and TTS",
       "cacheVariables": {
-        "NEMO_SPEECH_GGML_PATCHED": "OFF",
+        "NEMO_SPEECH_GGML_PATCHED": "ON",
         "NEMO_SPEECH_BUILD_ASR": "ON",
         "NEMO_SPEECH_BUILD_DIAR": "ON",
         "NEMO_SPEECH_BUILD_TTS": "ON",
@@ -128,7 +129,8 @@
       "inherits": "cpu-asr",
       "displayName": "Metal ASR and diarization",
       "cacheVariables": {
-        "GGML_METAL": "ON"
+        "GGML_METAL": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -136,7 +138,8 @@
       "inherits": "cpu-diar",
       "displayName": "Metal standalone diarization",
       "cacheVariables": {
-        "GGML_METAL": "ON"
+        "GGML_METAL": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -144,7 +147,8 @@
       "inherits": "cpu-tts",
       "displayName": "Metal text-to-speech",
       "cacheVariables": {
-        "GGML_METAL": "ON"
+        "GGML_METAL": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -152,7 +156,8 @@
       "inherits": "cpu-nmt",
       "displayName": "Metal text translation",
       "cacheVariables": {
-        "GGML_METAL": "ON"
+        "GGML_METAL": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -160,7 +165,8 @@
       "inherits": "cpu-speech",
       "displayName": "Metal ASR, diarization, NMT, and TTS",
       "cacheVariables": {
-        "GGML_METAL": "ON"
+        "GGML_METAL": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -168,7 +174,8 @@
       "inherits": "cpu-asr",
       "displayName": "Vulkan ASR and diarization",
       "cacheVariables": {
-        "GGML_VULKAN": "ON"
+        "GGML_VULKAN": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -176,7 +183,8 @@
       "inherits": "cpu-diar",
       "displayName": "Vulkan standalone diarization",
       "cacheVariables": {
-        "GGML_VULKAN": "ON"
+        "GGML_VULKAN": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -184,7 +192,8 @@
       "inherits": "cpu-tts",
       "displayName": "Vulkan text-to-speech",
       "cacheVariables": {
-        "GGML_VULKAN": "ON"
+        "GGML_VULKAN": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -192,7 +201,8 @@
       "inherits": "cpu-nmt",
       "displayName": "Vulkan text translation",
       "cacheVariables": {
-        "GGML_VULKAN": "ON"
+        "GGML_VULKAN": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -200,7 +210,8 @@
       "inherits": "cpu-speech",
       "displayName": "Vulkan ASR, diarization, NMT, and TTS",
       "cacheVariables": {
-        "GGML_VULKAN": "ON"
+        "GGML_VULKAN": "ON",
+        "NEMO_SPEECH_GGML_PATCHED": "OFF"
       }
     },
     {
@@ -211,9 +222,7 @@
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
-        "NEMO_SPEECH_BUILD_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "ON"
+        "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
     },
     {
@@ -224,9 +233,7 @@
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
-        "NEMO_SPEECH_BUILD_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "ON"
+        "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
     },
     {
@@ -239,9 +246,7 @@
         "NEMO_SPEECH_BUILD_NMT": "OFF",
         "NEMO_SPEECH_BUILD_S2S": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
-        "NEMO_SPEECH_BUILD_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "OFF"
+        "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
     },
     {
@@ -252,9 +257,7 @@
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
-        "NEMO_SPEECH_BUILD_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "ON"
+        "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
     },
     {
@@ -265,9 +268,7 @@
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
-        "NEMO_SPEECH_BUILD_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_GRPC": "OFF",
-        "NEMO_SPEECH_WITH_NMT": "ON"
+        "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
     },
     {
@@ -278,8 +279,6 @@
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "ON",
-        "NEMO_SPEECH_WITH_NMT": "ON",
-        "NEMO_SPEECH_WITH_GRPC": "ON",
         "NEMO_SPEECH_WITH_FLASHLIGHT": "ON",
         "NEMO_SPEECH_WITH_NORM": "ON",
         "NEMO_SPEECH_TTS_WITH_JA": "ON",

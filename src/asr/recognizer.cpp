@@ -38,11 +38,18 @@ head_name(HeadKind head) {
 }
 
 std::unique_ptr<ggml_runtime::BackendManager>
-make_backend(int gpu_idx) {
+make_backend(const BackendConfig& backend) {
     ggml_runtime::Params p;
-    p.use_gpu = (gpu_idx >= 0);
-    p.gpu_device_idx = std::max(gpu_idx, 0);
+    p.use_gpu = (backend.gpu >= 0);
+    p.gpu_device_idx = std::max(backend.gpu, 0);
     p.pe_bin_path = const_cast<char*>("");
+    if (backend.threads > 0) {
+        p.n_threads = backend.threads;
+    } else {
+        // More busy-waiting CPU workers than hardware threads slows the graph down.
+        const unsigned hw = std::thread::hardware_concurrency();
+        p.n_threads = hw > 0 ? std::min(8, static_cast<int>(hw)) : 8;
+    }
     return std::make_unique<ggml_runtime::BackendManager>(p);
 }
 
@@ -89,7 +96,7 @@ exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int inpu
 }
 
 Recognizer::Recognizer(RecognizerConfig cfg)
-    : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)),
+    : bm_(make_backend(cfg.backend)), cfg_(std::move(cfg)),
       streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
     if (cfg_.streaming.chunk_size <= 0.0f || cfg_.streaming.ctc_left_padding < 0.0f ||
         cfg_.streaming.ctc_right_padding < 0.0f)

@@ -24,7 +24,35 @@
 | Full-duplex voicechat | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
 | Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
 
+## Performance
+
+NeMo-Speech.cpp is blazing fast and built for real-time streaming. Speech recognition
+transcribes audio in 160 ms chunks up to 67× faster than real time, and speech synthesis
+generates speech up to 60× faster than real time with its first audio in under 10 ms. Both stay
+faster than real time even on a CPU.
+
+Streaming speech recognition with Nemotron Speech Streaming 0.6B (Q8_0), 160 ms chunks:
+
+| Device | Latency per chunk | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|
+| GeForce RTX 4090 | **2.3 ms** | **67× real time** | **8.8×** |
+| CPU | **27 ms** | **6× real time** | **3.7×** |
+
+Streaming speech synthesis with MagpieTTS Multilingual (Q8_0), 186 ms audio chunks:
+
+| Device | Time to first audio | Inter-chunk latency | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|:---:|
+| GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** | **40×** |
+| CPU | **203 ms** | **64 ms** | **2.7× real time** | **9.7×** |
+
+See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
+
 ## Installation
+
+> [!IMPORTANT]
+> **For the best performance and the latest features, build natively from source.** A native
+> build is compiled for your machine, and release tags can be out of sync with the
+> `main` branch. See [Build from source](#build-from-source).
 
 Install the `nemo-speech` CLI for the detected platform and backend:
 
@@ -45,10 +73,12 @@ irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
 Open a new PowerShell window after installation so the updated user `PATH`
 takes effect.
 
-The installer prefers a verified native release and falls back to a source
-build when an artifact is unavailable. A source build requires Git, CMake 3.26
-or newer, Ninja, a C++17 compiler, SentencePiece development files, and the
-toolchain required by the selected backend, if any. See
+The installer downloads the prebuilt archive for the latest release, checks it
+against the SHA-256 checksum published with the release, and builds from source
+when no archive is available for your platform. **Pass `--source` (`-Source` on
+Windows) to always build from the `main` branch.** A source build requires Git,
+CMake 3.26 or newer, Ninja, a C++17 compiler, SentencePiece development files,
+and the toolchain required by the selected backend, if any. See
 [Installation](docs/install.md) for platform-specific prerequisites and
 options.
 
@@ -126,7 +156,7 @@ development files, and the toolchain required by the selected backend, if any.
 For a CUDA ASR and TTS server with the playground:
 
 ```bash
-git submodule update --init ggml llama.cpp third_party/cpp-httplib
+git submodule update --init llama.cpp third_party/cpp-httplib
 scripts/configure.sh cuda-server
 cmake --build --preset cuda-server
 ```

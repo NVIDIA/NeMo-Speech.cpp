@@ -1,0 +1,191 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: BF16 depthwise conv and bias/round epilogue
+
+- CONV_2D_DW reads BF16 kernels.
+- Fuses bias add + BF16 rounding (+ ReLU) for the VoiceChat perception stem,
+  which keeps F32 carrier tensors with BF16-representable values.
+
+Upstream: not planned (model-specific BF16 emulation).
+
+diff --git a/ggml/src/ggml-cuda/conv2d-dw.cu b/ggml/src/ggml-cuda/conv2d-dw.cu
+index db7ee6bf62077dc9ed518ad2d4d13fbe1a8f3926..572eb6bf3abb8812133c51456fac6564235a9b4b 100644
+--- a/ggml/src/ggml-cuda/conv2d-dw.cu
++++ b/ggml/src/ggml-cuda/conv2d-dw.cu
+@@ -121,7 +121,8 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const ggml_tensor * input  = dst->src[1];
+ 
+     GGML_ASSERT(input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+-    GGML_ASSERT(kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16);
++    GGML_ASSERT(kernel->type == GGML_TYPE_F32 || kernel->type == GGML_TYPE_F16 ||
++                kernel->type == GGML_TYPE_BF16);
+     const void *  w_d = kernel->data;
+     const float * x_d = (const float *) input->data;
+     float *       y_d = (float *) dst->data;
+@@ -153,6 +154,10 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+             conv2d_dw_kernel<float, half, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                 x_d, (const half *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y,
+                 padding_x, padding_y, dilation_x, dilation_y, channels, batches);
++        } else if (kernel->type == GGML_TYPE_BF16) {
++            conv2d_dw_kernel<float, nv_bfloat16, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
++                x_d, (const nv_bfloat16 *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x,
++                stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches);
+         } else {
+             conv2d_dw_kernel<float, float, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                 x_d, (const float *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y,
+@@ -163,6 +168,10 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+             conv2d_dw_kernel<float, half, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                 x_d, (const half *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y,
+                 padding_x, padding_y, dilation_x, dilation_y, channels, batches);
++        } else if (kernel->type == GGML_TYPE_BF16) {
++            conv2d_dw_kernel<float, nv_bfloat16, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
++                x_d, (const nv_bfloat16 *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x,
++                stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches);
+         } else {
+             conv2d_dw_kernel<float, float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+                 x_d, (const float *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1d31dfa2f5a30488726b907873b3c66450af9cea..1924347f82ae913405ebdab956056c7d6f1a32f1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1410,6 +1410,64 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+ };
+ 
++template<bool apply_relu>
++static __global__ void f32_add_bias_round_bf16_to_f32(
++        const float * __restrict__ src, const float * __restrict__ bias,
++        float * __restrict__ dst, int64_t count,
++        int64_t ne0, int64_t ne1, int64_t ne2,
++        int64_t bne0, int64_t bne1, int64_t bne2, int64_t bne3) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= count) {
++        return;
++    }
++
++    int64_t coordinate = i;
++    const int64_t i0 = coordinate % ne0;
++    coordinate /= ne0;
++    const int64_t i1 = coordinate % ne1;
++    coordinate /= ne1;
++    const int64_t i2 = coordinate % ne2;
++    const int64_t i3 = coordinate / ne2;
++    const int64_t bias_index =
++        (bne0 == 1 ? 0 : i0) + bne0 * (
++        (bne1 == 1 ? 0 : i1) + bne1 * (
++        (bne2 == 1 ? 0 : i2) + bne2 * (bne3 == 1 ? 0 : i3)));
++
++    float value = __bfloat162float(__float2bfloat16(src[i] + bias[bias_index]));
++    if constexpr (apply_relu) {
++        value = fmaxf(value, 0.0f);
++    }
++    dst[i] = value;
++#else
++    GGML_UNUSED_VARS(src, bias, dst, count, ne0, ne1, ne2, bne0, bne1, bne2, bne3);
++    NO_DEVICE_CODE;
++#endif
++}
++
++static void launch_f32_add_bias_round_bf16_to_f32(
++        const ggml_tensor * src, const ggml_tensor * bias, ggml_tensor * dst,
++        bool apply_relu, cudaStream_t stream) {
++    constexpr int block_size = 256;
++    const int64_t count = ggml_nelements(src);
++    const int64_t blocks = (count + block_size - 1) / block_size;
++    if (apply_relu) {
++        f32_add_bias_round_bf16_to_f32<true><<<blocks, block_size, 0, stream>>>(
++            static_cast<const float *>(src->data),
++            static_cast<const float *>(bias->data),
++            static_cast<float *>(dst->data), count,
++            src->ne[0], src->ne[1], src->ne[2],
++            bias->ne[0], bias->ne[1], bias->ne[2], bias->ne[3]);
++    } else {
++        f32_add_bias_round_bf16_to_f32<false><<<blocks, block_size, 0, stream>>>(
++            static_cast<const float *>(src->data),
++            static_cast<const float *>(bias->data),
++            static_cast<float *>(dst->data), count,
++            src->ne[0], src->ne[1], src->ne[2],
++            bias->ne[0], bias->ne[1], bias->ne[2], bias->ne[3]);
++    }
++}
++
+ template<ggml_type compute_type>
+ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     using traits = batched_mul_mat_traits<compute_type>;
+@@ -1694,6 +1752,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+ }
+ 
+ 
++
+ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                           const ggml_tensor * ffn_gate,
+                                           const ggml_tensor * glu,
+@@ -3889,6 +3948,58 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Convolution epilogue: add a broadcast bias and apply the model's BF16
++    // output boundary in one pass. ReLU is folded in when it immediately
++    // consumes that rounded output. The graph retains F32 carrier tensors for
++    // operators that do not natively accept BF16, but every stored value is
++    // exactly BF16-representable.
++    bool round_with_relu = false;
++    bool round_pattern = false;
++    if (ggml_can_fuse(cgraph, i,
++            { GGML_OP_ADD, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_UNARY })) {
++        ggml_tensor * relu_node = cgraph->nodes[i + 3];
++        round_with_relu = ggml_get_unary_op(relu_node) == GGML_UNARY_OP_RELU;
++        round_pattern = round_with_relu;
++    }
++    if (!round_pattern &&
++        ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_CPY, GGML_OP_CPY })) {
++        round_pattern = true;
++    }
++    if (round_pattern) {
++        ggml_tensor * add_node      = cgraph->nodes[i];
++        ggml_tensor * bf16_node     = cgraph->nodes[i + 1];
++        ggml_tensor * rounded_node  = cgraph->nodes[i + 2];
++        ggml_tensor * output_node   = round_with_relu ? cgraph->nodes[i + 3] : rounded_node;
++        const ggml_tensor * activation =
++            ggml_are_same_shape(add_node, add_node->src[0]) ? add_node->src[0] :
++            ggml_are_same_shape(add_node, add_node->src[1]) ? add_node->src[1] : nullptr;
++        const ggml_tensor * bias =
++            activation == add_node->src[0] ? add_node->src[1] :
++            activation == add_node->src[1] ? add_node->src[0] : nullptr;
++        bool broadcast_ok = bias != nullptr;
++        for (int d = 0; broadcast_ok && d < GGML_MAX_DIMS; ++d) {
++            broadcast_ok = bias->ne[d] == 1 || bias->ne[d] == activation->ne[d];
++        }
++        const bool eligible =
++            native_bf16 && activation != nullptr && bias != nullptr &&
++            bf16_node->src[0] == add_node && rounded_node->src[0] == bf16_node &&
++            (!round_with_relu || output_node->src[0] == rounded_node) &&
++            activation->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 &&
++            add_node->type == GGML_TYPE_F32 && bf16_node->type == GGML_TYPE_BF16 &&
++            rounded_node->type == GGML_TYPE_F32 && output_node->type == GGML_TYPE_F32 &&
++            broadcast_ok && ggml_is_contiguous(activation) && ggml_is_contiguous(bias) &&
++            ggml_is_contiguous(add_node) && ggml_is_contiguous(bf16_node) &&
++            ggml_is_contiguous(rounded_node) && ggml_is_contiguous(output_node) &&
++            ggml_are_same_shape(activation, output_node);
++        const int output_index = i + (round_with_relu ? 3 : 2);
++        if (eligible && ggml_cuda_check_fusion_memory_ranges(
++                cgraph, i, round_with_relu ? 4 : 3, &output_index, 1)) {
++            launch_f32_add_bias_round_bf16_to_f32(
++                activation, bias, output_node, round_with_relu, cuda_ctx->stream());
++            return round_with_relu ? 3 : 2;
++        }
++    }
++
+     // multi-(add or mul)
+     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+         int     n_fuse = 0;
+@@ -5987,7 +6098,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_CONV_2D:
+             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+         case GGML_OP_CONV_2D_DW:
+-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
++                    op->src[0]->type == GGML_TYPE_BF16) &&
+                    op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_TRANSPOSE_2D:
+         case GGML_OP_POOL_1D:

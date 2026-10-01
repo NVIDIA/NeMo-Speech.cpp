@@ -3,7 +3,7 @@
 
 add_library(nemo_speech_engine_registry STATIC engine_registry.cpp)
 target_include_directories(nemo_speech_engine_registry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_common)
+target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_common nemo_speech_runtime_ggml)
 
 if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR)
     target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_asr)

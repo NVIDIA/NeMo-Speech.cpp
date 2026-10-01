@@ -230,7 +230,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // the shared merge-heads reshape below.
     ggml_tensor* attn = nullptr;
     bool attn_heads_merged = false;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     // The fused CUDA op accepts both the streaming per-key mask and the
     // offline per-(key,query) band mask. This entire branch is compiled ONLY
     // with a patched ggml: ggml_fused_relpos_attn is a patch-only symbol, so a

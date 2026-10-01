@@ -1,0 +1,78 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: two-column MMVF epilogue
+
+Allows MMVF bias/GLU fusion for up to two destination columns, so MagpieTTS
+paired CFG lanes share every weight-row load.
+
+Upstream: candidate (generalize to ncols <= N, add m=2 fusion tests, perf data).
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ee47bc09e20c299d8813080a48415a2e958d83d6..141caeca47a748ccb3916f98d980d220ee63217f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1783,8 +1783,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
+ 
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    // MMVF supports a two-column epilogue so paired CFG lanes can share each weight-row load.
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > 2) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 1db6b47b406c2615ca76f8adb6befddbe1698ba6..ddb4895df364f97100de2e508f7bb512f0aad215 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -395,7 +395,10 @@ static void mul_mat_vec_f_switch_fusion(
+     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+-    if constexpr (ncols_dst == 1) {
++    // The same epilogue addressing works for two adjacent columns.  This is especially useful
++    // for classifier-free guidance: both lanes share the weight-row load and still fold the
++    // residual/bias writeback into the projection kernel.
++    if constexpr (ncols_dst <= 2) {
+         if (has_fusion) {
+             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
+                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+@@ -405,7 +408,7 @@ static void mul_mat_vec_f_switch_fusion(
+        }
+     }
+ 
+-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
++    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=2");
+ 
+     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
+         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+@@ -448,6 +451,11 @@ void launch_mul_mat_vec_f_cuda(
+             block_size_best = block_size;
+         }
+     }
++    if constexpr (std::is_same_v<T, half>) {
++        if (warp_size == 32 && ncols >= 768 && ncols_dst <= 2) {
++            block_size_best = 96;
++        }
++    }
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+ 
+@@ -662,7 +670,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+ 
+     if (fusion) {
+         GGML_ASSERT( !ids || dst->ne[2] == 1);
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] <= 2);
+         if (fusion->x_bias) {
+             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+@@ -836,7 +844,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+                 }
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                 if (ampere_mma_available(cc)) {
+-                    return src0_small && ne11 == 1;
++                    return src0_small && ne11 <= 2;
+                 }
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                     return src0_small && ne11 <= 4;

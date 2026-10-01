@@ -908,7 +908,8 @@ Session::run_impl(
         }
 
         auto _t2 = _clk::now();
-        if (!ggml_graph_compute_helper_async(sched.get(), cr.gf, 4)) {
+        if (!ggml_graph_compute_helper_async(
+                sched.get(), cr.gf, backend_manager_->get_params().n_threads)) {
             GGMLF_LOG_ERROR("Failed to compute graph\n");
             throw std::runtime_error("failed to compute graph");
         }

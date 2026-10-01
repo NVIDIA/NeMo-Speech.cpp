@@ -14,13 +14,13 @@ target_include_directories(nemo_speech_s2s
     PUBLIC
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/llama.cpp/include
+        ${NEMO_SPEECH_LLAMA_CPP_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/codec
         ${CMAKE_CURRENT_SOURCE_DIR}/eartts
         ${CMAKE_CURRENT_SOURCE_DIR}/llm
         ${CMAKE_CURRENT_SOURCE_DIR}/perception
-        ${CMAKE_SOURCE_DIR}/llama.cpp/vendor
+        ${NEMO_SPEECH_LLAMA_CPP_DIR}/vendor
 )
 
 # The perception/RNN-T side reuses the ASR model implementation and its

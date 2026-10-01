@@ -1292,13 +1292,7 @@ AsrModel::AsrModel(ggml_runtime::BackendManager& bm, Common&& c, const BatchingC
     : bm_(&bm), loader_(std::move(c.loader)), ns_(std::move(c.ns)),
       model_name_(std::move(c.model_name)), enc_cfg_(std::move(c.enc_cfg)),
       fe_cfg_(std::move(c.fe_cfg)), vocab_(std::move(c.vocab)) {
-    // Use the GPU frontend by default; NEMO_SPEECH_STREAM_GPU_FE=0 disables it.
-    static const bool stream_gpu_fe = [] {
-        const char* e = std::getenv("NEMO_SPEECH_STREAM_GPU_FE");
-        return e == nullptr || e[0] != '0';
-    }();
-    const bool gpu_fe = (batching.enabled && batching.max_batch_size > 1) || stream_gpu_fe;
-    fe_ = std::make_unique<MelSpectrogramExtractor>(fe_cfg_, gpu_fe ? &bm : nullptr, batching);
+    fe_ = std::make_unique<MelSpectrogramExtractor>(fe_cfg_, &bm, batching);
 
     apply_model_mel_basis(*fe_);
 

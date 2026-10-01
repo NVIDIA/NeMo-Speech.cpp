@@ -23,27 +23,27 @@ repos:
       - id: check-yaml
       - id: check-merge-conflict
       - id: end-of-file-fixer
-        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/).*'
       - id: trailing-whitespace
-        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/).*'
       - id: mixed-line-ending
         args: ['--fix=lf']
-        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/).*'
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
-        # ggml + vendored riva protos are upstream code — don't reformat.
-        exclude: '^(ggml/|ggml-patches/|proto/riva-common/|build/|build-.*/).*'
+        # llama.cpp patches + vendored riva protos are upstream code — don't reformat.
+        exclude: '^(patches/|proto/riva-common/|build/|build-.*/).*'
 
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
       - id: black
         args: ['--skip-string-normalization', '--line-length=100']
-        exclude: '^(ggml/|proto/riva-common/|build/).*'
+        exclude: '^(proto/riva-common/|build/).*'
 
   - repo: https://github.com/pycqa/isort
     rev: 5.13.2
@@ -53,7 +53,7 @@ repos:
         args:
           - '--profile=black'
           - '--line-length=100'
-          - '--skip=ggml'
+          - '--skip=llama.cpp'
           - '--skip=proto/riva-common'
           - '--skip=build'
 
@@ -62,4 +62,4 @@ repos:
     hooks:
       - id: shellcheck
         args: ['--severity=warning']
-        exclude: '^(ggml/|ggml-patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/).*'

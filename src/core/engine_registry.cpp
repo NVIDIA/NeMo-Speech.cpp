@@ -3,34 +3,17 @@
 
 #include "engine_registry.h"
 
-#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
+#include "runtime.h"
+
 namespace nemo_speech {
-namespace {
-
-#if defined(NEMO_SPEECH_REGISTRY_TTS) || defined(NEMO_SPEECH_REGISTRY_NMT)
-void
-set_environment_default(const char* name, const char* value) {
-    if (std::getenv(name))
-        return;
-#if defined(_WIN32)
-    if (_putenv_s(name, value) != 0)
-        throw std::runtime_error(std::string("could not set process default ") + name);
-#else
-    if (setenv(name, value, 0) != 0)
-        throw std::runtime_error(std::string("could not set process default ") + name);
-#endif
-}
-#endif
-
-}  // namespace
 
 EngineRegistry::EngineRegistry(EngineRegistryConfig config) {
 #if defined(NEMO_SPEECH_REGISTRY_NMT)
-    if (config.nmt)
-        set_environment_default(config.asr ? "GGML_SKINNY_Q8_INPLACE" : "GGML_SKINNY_Q8", "0");
+    if (config.nmt && config.asr)
+        ggml_runtime::keep_skinny_q8_weights_separate();
 #else
     (void)config;
 #endif
@@ -91,7 +74,7 @@ EngineRegistry::asr() const {
 #if defined(NEMO_SPEECH_REGISTRY_TTS)
 std::shared_ptr<tts::Synthesizer>
 EngineRegistry::load_tts(tts::SynthesizerConfig config) {
-    set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", "0");
+    ggml_runtime::keep_cuda_graphs_resident();
     auto engine = std::make_shared<tts::Synthesizer>(std::move(config));
     std::lock_guard<std::mutex> lock(mutex_);
     tts_ = engine;
@@ -111,17 +94,6 @@ EngineRegistry::tts() const {
 #if defined(NEMO_SPEECH_REGISTRY_NMT)
 std::shared_ptr<nmt::Translator>
 EngineRegistry::load_nmt(nmt::TranslatorConfig config) {
-#if defined(NEMO_SPEECH_REGISTRY_ASR)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (asr_)
-            set_environment_default("GGML_SKINNY_Q8_INPLACE", "0");
-        else
-            set_environment_default("GGML_SKINNY_Q8", "0");
-    }
-#else
-    set_environment_default("GGML_SKINNY_Q8", "0");
-#endif
     auto engine = std::make_shared<nmt::Translator>(std::move(config));
     std::lock_guard<std::mutex> lock(mutex_);
     nmt_ = engine;

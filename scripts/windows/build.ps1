@@ -12,8 +12,8 @@
          find the toolset. MSVC is required: nvcc on Windows only supports cl.exe
          as the CUDA host compiler.
       3. Provisions required C++ dependencies.
-      4. For a CUDA build, applies the CUDA-only ggml patches.
-      5. Configures with CMake (Ninja) and builds.
+      4. Initializes the required submodules.
+      5. Configures with CMake (Ninja), which applies patches/ for CUDA and CPU builds, and builds.
 
 .PARAMETER Backend
     cuda | vulkan | cpu. CUDA and Vulkan are separate build trees (different ggml
@@ -342,12 +342,8 @@ function Initialize-RequiredSubmodule {
     }
 }
 
-Initialize-RequiredSubmodule 'ggml' 'CMakeLists.txt'
-if ($BuildNmt) {
-    Initialize-RequiredSubmodule 'llama.cpp' 'CMakeLists.txt'
-} elseif ($BuildAsr) {
-    Initialize-RequiredSubmodule 'llama.cpp' 'vendor\miniaudio\miniaudio.h'
-}
+# llama.cpp also provides ggml, so every build needs it.
+Initialize-RequiredSubmodule 'llama.cpp' 'ggml\CMakeLists.txt'
 if ($BuildHttp) { Initialize-RequiredSubmodule 'third_party\cpp-httplib' 'httplib.h' }
 if ($BuildGrpc) { Initialize-RequiredSubmodule 'proto\riva-common' 'LICENSE' }
 if ($BuildFlashlight) {
@@ -375,13 +371,7 @@ if ($BuildTtsZh) {
     }
 }
 
-# --- 5. CUDA-only: apply the ggml patches ---------------------------------------
-if ($Backend -eq 'cuda') {
-    Write-Host "==> applying ggml patches (CUDA)"
-    & (Join-Path $PSScriptRoot 'apply-ggml-patches.ps1')
-}
-
-# --- 6. Configure + build -------------------------------------------------------
+# --- 5. Configure + build -------------------------------------------------------
 function ConvertTo-CMakeBool([bool]$Value) {
     if ($Value) { return 'ON' }
     return 'OFF'
@@ -393,11 +383,9 @@ $cmakeArgs = @(
     "-DNEMO_SPEECH_BUILD_DIAR=$(ConvertTo-CMakeBool $BuildDiar)",
     "-DNEMO_SPEECH_BUILD_TTS=$(ConvertTo-CMakeBool $BuildTts)",
     "-DNEMO_SPEECH_BUILD_NMT=$(ConvertTo-CMakeBool $BuildNmt)",
-    "-DNEMO_SPEECH_WITH_NMT=$(ConvertTo-CMakeBool $BuildNmt)",
     "-DNEMO_SPEECH_BUILD_HTTP=$(ConvertTo-CMakeBool $BuildHttp)",
     "-DNEMO_SPEECH_HTTP_TLS=$(ConvertTo-CMakeBool $BuildHttpTls)",
     "-DNEMO_SPEECH_BUILD_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
-    "-DNEMO_SPEECH_WITH_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
     "-DNEMO_SPEECH_WITH_FLASHLIGHT=$(ConvertTo-CMakeBool $BuildFlashlight)",
     '-DNEMO_SPEECH_WITH_NORM=OFF',
     "-DNEMO_SPEECH_TTS_WITH_JA=$(ConvertTo-CMakeBool $BuildTtsJa)",
@@ -452,7 +440,6 @@ switch ($Backend) {
     'cpu'    {
         $cmakeArgs += '-DGGML_CUDA=OFF'
         $cmakeArgs += '-DGGML_VULKAN=OFF'
-        $cmakeArgs += '-DNEMO_SPEECH_GGML_PATCHED=OFF'
     }
 }
 

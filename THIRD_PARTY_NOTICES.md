@@ -9,10 +9,11 @@ checkouts and are summarized here.
 
 ### ggml
 
-- Source: [`ggml-org/ggml`](https://github.com/ggml-org/ggml)
-- Path: `ggml`
+- Source: [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) (`ggml/`,
+  developed and vendored in llama.cpp)
+- Path: `llama.cpp/ggml`
 - Copyright (c) 2023-2026 The ggml authors
-- License: MIT; upstream text: [`ggml/LICENSE`](ggml/LICENSE)
+- License: MIT; upstream text: [`llama.cpp/LICENSE`](llama.cpp/LICENSE)
 
 ### llama.cpp
 
@@ -220,9 +221,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## NVIDIA ggml patches
+## NVIDIA llama.cpp and ggml patches
 
-The `ggml-patches/` directory contains NVIDIA-authored changes applied to the
-pinned MIT-licensed ggml source. New source files created by those patches
-carry the NVIDIA Apache-2.0 header; existing ggml files retain their upstream
-notices. The resulting combined source and binaries retain ggml's MIT notice.
+The `patches/` directory contains NVIDIA-authored changes applied to the pinned
+MIT-licensed llama.cpp and ggml source. New source files created by those patches
+carry the NVIDIA Apache-2.0 header; existing files retain their upstream
+notices. The resulting combined source and binaries retain the MIT notice.

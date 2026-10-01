@@ -12,3 +12,23 @@ reviews:
     drafts: true
     base_branches:
       - ".*"
+  path_instructions:
+    - path: "**/*.{cu,cuh,cpp,c,h,hpp}"
+      instructions: |
+        Prioritize correctness, performance and portability:
+        - Correctness: races, uninitialized or stale state, edge cases (empty, masked,
+          boundary sizes), numerical stability, and fallback paths that differ from the fast
+          path.
+        - Performance: regressions on hot paths, redundant work, unnecessary allocations or
+          synchronization, and caches or reuse that do not actually take effect.
+        - Portability: assumptions tied to one GPU, architecture, backend or platform; hardware
+          limits must be queried or guarded, with a working fallback.
+    - path: "patches/**"
+      instructions: |
+        Patches to the pinned llama.cpp submodule. Apply the same correctness, performance and
+        portability checks; also check that op preconditions match what the kernels support
+        and that the patch series stays consistent.
+    - path: "{BENCHMARK.md,README.md,docs/**,app/bench*}"
+      instructions: |
+        Check that measurements are sound and that documented numbers, defaults and flags match
+        the code.

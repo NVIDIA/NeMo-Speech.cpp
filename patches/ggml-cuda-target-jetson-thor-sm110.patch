@@ -1,0 +1,168 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: target Jetson Thor (SM110)
+
+Adds 110a to the default architectures with CUDA 13, maps plain 100/110/12X
+to their architecture-specific targets, detects Thor, and prefers cuBLAS
+over the MMF/MMVF warp kernels there.
+
+Upstream: candidate (needs Thor performance data).
+
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 2254090cbab05c04d8a70e784484d7f5151a1c22..4ec8f415b9ab058975fe7b69716e7c522fabd8e9 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -16,7 +16,8 @@ if (CUDAToolkit_FOUND)
+         # 86     == RTX 3000, needs CUDA v11.1
+         # 89     == RTX 4000, needs CUDA v11.8
+         # 90     == Hopper H100/200, needs CUDA v11.8
+-        # 120    == Blackwell, needs CUDA v12.8, FP4 tensor cores
++        # 110    == Jetson Thor, needs CUDA v13.0, Blackwell tensor cores
++        # 120    == Blackwell, needs CUDA v12.8, SM120 FP4 tensor cores
+         #
+         # XX-virtual == compile CUDA code as PTX, do JIT compilation to binary code on first run
+         # XX-real    == compile CUDA code as device code for this specific architecture
+@@ -37,6 +38,10 @@ if (CUDAToolkit_FOUND)
+                 list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real 90-virtual)
+             endif()
+ 
++            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
++                list(APPEND CMAKE_CUDA_ARCHITECTURES 110a-real)
++            endif()
++
+             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+                 # The CUDA architecture 120f-virtual would in principle work for Blackwell support
+                 #     but the newly added "f" suffix conflicted with a preexising regex for validating CUDA architectures in CMake.
+@@ -72,16 +77,16 @@ if (CUDAToolkit_FOUND)
+         FetchContent_MakeAvailable(CCCL)
+     endif()
+ 
+-    # Replace any plain 12X CUDA architectures with their "architecture-specific" equivalents 12Xa.
+-    # 12X is forwards-compatible, 12Xa is not.
+-    # Notably the Blackwell FP4 tensor core instructions are not forwards compatible and therefore need 12Xa.
++    # Replace plain Blackwell CUDA architectures with their "architecture-specific" equivalents.
++    # 10X/11X/12X are forwards-compatible, 10Xa/11Xa/12Xa are not.
++    # Notably the Blackwell tensor core instructions are not forwards compatible and therefore need architecture-specific targets.
+     # But while 12X vs. 12Xa can be checked in device code there is (to my knowledge) no easy way to do the same check in host code.
+-    # So for now just replace all instances of 12X with 12Xa, this should be fine until Rubin is released.
++    # So for now just replace the supported plain Blackwell targets with architecture-specific targets.
+     foreach(ARCHS IN ITEMS CMAKE_CUDA_ARCHITECTURES CMAKE_CUDA_ARCHITECTURES_NATIVE)
+         set(FIXED_ARCHS "")
+         foreach(ARCH IN LISTS ${ARCHS})
+-            if (ARCH MATCHES "^12[0-9](-real|-virtual)?$")
+-                string(REGEX REPLACE "^(12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
++            if (ARCH MATCHES "^(100|110|12[0-9])(-real|-virtual)?$")
++                string(REGEX REPLACE "^(100|110|12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
+                 message(STATUS "Replacing ${ARCH} in ${ARCHS} with ${FIXED_ARCH}")
+                 list(APPEND FIXED_ARCHS "${FIXED_ARCH}")
+             else()
+@@ -91,8 +96,8 @@ if (CUDAToolkit_FOUND)
+         set(${ARCHS} ${FIXED_ARCHS})
+     endforeach()
+ 
+-    # If we try to compile a "native" build it will use the 12X architectures and fail.
+-    # So we should instead use the native architectures as determined by CMake after replacing 12X with 12Xa.
++    # If we try to compile a "native" build it may use plain Blackwell architectures and fail.
++    # So we should instead use the native architectures as determined by CMake after replacing them with architecture-specific forms.
+     # But if at the time of the build no GPUs are connected at all CMAKE_CUDA_ARCHITECTURES will contain garbage that we should not use.
+     if (CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "^[0-9]+(a|f)?(-real|-virtual)?(;[0-9]+(a|f)?(-real|-virtual)?|;)*$")
+         set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 25893da48941518b5e0a8cfa20c1538fd2a5d305..f5f4465b5e0cade7888d67728b71d8d745eb1939 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -55,7 +55,10 @@
+ #define GGML_CUDA_CC_ORIN            870
+ #define GGML_CUDA_CC_ADA_LOVELACE    890
+ #define GGML_CUDA_CC_HOPPER          900
+-// While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
++// Jetson Thor is Blackwell SM110. The hand-written FP4 block-scale PTX below is currently SM120-only, but SM110
++// should still be detected so ggml can favor CUDA library kernels that may use Thor tcgen05 tensor cores.
++#define GGML_CUDA_CC_THOR            1100
++// While BW spans CC 1000, 1100 & 1200, the hand-written FP4 path integrates Tensor Core instructions available to 1200 family, see
+ // https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
+ #define GGML_CUDA_CC_BLACKWELL       1200
+ #define GGML_CUDA_CC_DGX_SPARK       1210
+@@ -357,6 +360,10 @@ static bool amd_wmma_available(const int cc) {
+     return (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
+ }
+ 
++static bool thor_mma_available(const int cc) {
++    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_THOR;
++}
++
+ static bool volta_mma_available(const int cc) {
+     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA;
+ }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 32b96b5e7fdb48a02ad255dfab688520d86ea884..1c0c25329d832ca97c327df4ab2329dddc2d5013 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5865,6 +5865,12 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ 
+     {
+         const auto & info = ggml_cuda_info();
++        for (int id = 0; id < info.device_count; ++id) {
++            if (thor_mma_available(info.devices[id].cc)) {
++                features.push_back({ "BLACKWELL_THOR_SM110", "1"});
++                break;
++            }
++        }
+         for (int id = 0; id < info.device_count; ++id) {
+             if (blackwell_mma_available(info.devices[id].cc)) {
+                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index 646a5899c803bd337f0e5c05d239af02898da865..741ecbf1da0547ff94f5bf69f4db3c28003d68fd 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -159,6 +159,11 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const
+         return false;
+     }
+ 
++    // Thor's tcgen05 paths are provided by CUDA libraries today; avoid ggml's warp-level matrix kernels there.
++    if (thor_mma_available(cc) && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
++        return false;
++    }
++
+     if (mul_mat_id) {
+         if (src0_ne[1] <= 1024 && src1_ncols > 512) {
+             return false;
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index bd5c5d421a4c9acef77dff6070c5463b1a319b01..1db6b47b406c2615ca76f8adb6befddbe1698ba6 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -806,9 +806,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+         }
+     }
+ 
++    // Thor's tcgen05 paths are provided by CUDA libraries today; avoid ggml's warp-level vector kernels there.
++    const bool prefer_cublas_tcgen05 = thor_mma_available(cc);
++
+     switch (type) {
+         case GGML_TYPE_F32:
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
++                if (prefer_cublas_tcgen05) {
++                    return false;
++                }
+                 if (ampere_mma_available(cc)) {
+                     return ne11 <= 3;
+                 }
+@@ -825,6 +831,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+             return ne11 <= 8;
+         case GGML_TYPE_F16:
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
++                if (prefer_cublas_tcgen05) {
++                    return false;
++                }
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                 if (ampere_mma_available(cc)) {
+                     return src0_small && ne11 == 1;
+@@ -851,6 +860,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+             return ne11 <= 8;
+         case GGML_TYPE_BF16:
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
++                if (prefer_cublas_tcgen05) {
++                    return false;
++                }
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                 if (ampere_mma_available(cc)) {
+                     return src0_small && ne11 == 1;

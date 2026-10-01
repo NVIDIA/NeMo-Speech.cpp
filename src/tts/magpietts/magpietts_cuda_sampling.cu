@@ -8,24 +8,8 @@
 #include <cub/block/block_radix_sort.cuh>
 
 #include "magpietts_cuda_sampling.h"
+#include "magpietts_cuda_sampling_device.cuh"
 
-static constexpr int MAGPIETTS_CUDA_MAX_VOCAB = 4096;
-static constexpr int MAGPIETTS_CUDA_BLOCK_SIZE = 256;
-static constexpr int MAGPIETTS_CUDA_SMALL_VOCAB = 2048;
-static constexpr int MAGPIETTS_CUDA_SMALL_ITEMS_PER_THREAD =
-    MAGPIETTS_CUDA_SMALL_VOCAB / MAGPIETTS_CUDA_BLOCK_SIZE;
-static constexpr int MAGPIETTS_CUDA_MAX_ITEMS_PER_THREAD =
-    MAGPIETTS_CUDA_MAX_VOCAB / MAGPIETTS_CUDA_BLOCK_SIZE;
-
-struct alignas(16) magpietts_cuda_sampling_config {
-    float cfg_scale = 1.0f;
-    float temperature = 0.0f;
-    int top_k = 1;
-    int frame_index = 0;
-    uint64_t seed = 0;
-    int use_cfg = 0;
-    int forbid_audio_eos = 0;
-};
 
 struct magpietts_cuda_sampler {
     int codebooks = 0;
@@ -44,6 +28,7 @@ struct magpietts_cuda_sampler {
     bool sequence_warm = false;
     bool sequence_build_active = false;
     bool sequence_disabled = false;
+    uint64_t sequence_key = 0;
 };
 
 bool
@@ -83,50 +68,9 @@ set_error(char* error, size_t error_size, const char* message, cudaError_t err =
     }
 }
 
-static __device__ __forceinline__ uint64_t
-splitmix64_next(uint64_t& x) {
-    x += 0x9e3779b97f4a7c15ULL;
-    uint64_t z = x;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
-}
-
-static __device__ __forceinline__ double
-uniform01(uint64_t seed, int frame_index, int codebook) {
-    uint64_t state = seed ^ (0xd1b54a32d192ed03ULL * (uint64_t)(frame_index + 1)) ^
-                     (0xabc98388fb8fac03ULL * (uint64_t)(codebook + 1));
-    const uint64_t r = splitmix64_next(state);
-    return (double)(r >> 11) * 0x1.0p-53;
-}
-
-static __device__ __forceinline__ bool
-forbidden_token(int id, int audio_codebook_size, int audio_eos_id, bool forbid_audio_eos) {
-    const int base = audio_codebook_size;
-    if (id == base + 0 || id == base + 2 || id == base + 3 || id == base + 4 || id == base + 5 ||
-        id == base + 6 || id == base + 7) {
-        return true;
-    }
-    return forbid_audio_eos && id == audio_eos_id;
-}
-
-static __device__ __forceinline__ float
-sampled_logit(
-    const float* logits_cond, const float* logits_uncond, int off, int id, int audio_codebook_size,
-    int audio_eos_id, bool use_cfg, float cfg_scale, bool forbid_audio_eos) {
-    float logit = logits_cond[off + id];
-    if (use_cfg && logits_uncond) {
-        logit = cfg_scale * logit + (1.0f - cfg_scale) * logits_uncond[off + id];
-    }
-    if (forbidden_token(id, audio_codebook_size, audio_eos_id, forbid_audio_eos)) {
-        logit = -INFINITY;
-    }
-    return logit;
-}
-
 template <int items_per_thread>
 __global__ void
-magpietts_sample_codebooks_kernel(
+__launch_bounds__(MAGPIETTS_CUDA_BLOCK_SIZE) magpietts_sample_codebooks_kernel(
     const float* logits_cond, const float* logits_uncond, int codebooks, int vocab_size,
     int audio_codebook_size, int audio_eos_id, const magpietts_cuda_sampling_config* config_ptr,
     int codebook_offset, int output_offset, int32_t* top_ids_scratch, float* top_vals_scratch,
@@ -138,9 +82,18 @@ magpietts_sample_codebooks_kernel(
 
     const magpietts_cuda_sampling_config config = *config_ptr;
 
-    using block_sort = cub::BlockRadixSort<float, MAGPIETTS_CUDA_BLOCK_SIZE, items_per_thread, int>;
+    constexpr int block = MAGPIETTS_CUDA_BLOCK_SIZE;
+    constexpr int max_k = MAGPIETTS_CUDA_MAX_FAST_TOPK;
+    using block_sort = cub::BlockRadixSort<float, block, items_per_thread, int>;
     __shared__ typename block_sort::TempStorage sort_storage;
-    __shared__ double s_sums[MAGPIETTS_CUDA_BLOCK_SIZE];
+    __shared__ double s_sums[block];
+    __shared__ double s_exps[max_k];
+    __shared__ int s_hist[256];
+    __shared__ int s_scan[block / 32];
+    __shared__ int s_ctrl[4];
+    __shared__ unsigned long long s_sel[max_k];
+    __shared__ float s_top_vals[max_k];
+    __shared__ int32_t s_top_ids[max_k];
 
     int k = config.top_k < vocab_size ? config.top_k : vocab_size;
     if (k < 1) {
@@ -150,77 +103,214 @@ magpietts_sample_codebooks_kernel(
     const int off = c * vocab_size;
     int32_t* top_ids = top_ids_scratch + (size_t)c * vocab_size;
     float* top_vals = top_vals_scratch + (size_t)c * vocab_size;
+    const int tid = (int)threadIdx.x;
 
-    // Sort once per codebook with work independent of top-k.
     float thread_vals[items_per_thread];
-    int thread_ids[items_per_thread];
 #pragma unroll
     for (int item = 0; item < items_per_thread; ++item) {
-        const int id = (int)threadIdx.x * items_per_thread + item;
+        const int id = tid * items_per_thread + item;
         thread_vals[item] =
             id < vocab_size
                 ? sampled_logit(
                       logits_cond, logits_uncond, off, id, audio_codebook_size, audio_eos_id,
                       config.use_cfg != 0, config.cfg_scale, config.forbid_audio_eos != 0)
                 : -INFINITY;
-        thread_ids[item] = id;
     }
-    block_sort(sort_storage).SortDescendingBlockedToStriped(thread_vals, thread_ids);
-    __syncthreads();
 
+    if (k > max_k) {
+        // Fallback: full descending block radix sort (stable: ties keep ascending id order).
+        int thread_ids[items_per_thread];
+#pragma unroll
+        for (int item = 0; item < items_per_thread; ++item) {
+            thread_ids[item] = tid * items_per_thread + item;
+        }
+        block_sort(sort_storage).SortDescendingBlockedToStriped(thread_vals, thread_ids);
+        __syncthreads();
+#pragma unroll
+        for (int item = 0; item < items_per_thread; ++item) {
+            const int rank = item * block + tid;
+            if (rank < k) {
+                top_vals[rank] = thread_vals[item];
+                top_ids[rank] = thread_ids[item];
+            }
+        }
+        __syncthreads();
+        // exps scratch must hold k entries: reuse the (unused) sort storage is not possible
+        // portably, so sample directly from global scratch with the original serial formula.
+        int sampled = top_ids[0];
+        if (config.temperature > 0.0f) {
+            const float max_logit = top_vals[0];
+            double local_sum = 0.0;
+            for (int i = tid; i < k; i += blockDim.x) {
+                if (isfinite(top_vals[i])) {
+                    local_sum +=
+                        exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
+                }
+            }
+            s_sums[tid] = local_sum;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    s_sums[tid] += s_sums[tid + stride];
+                }
+                __syncthreads();
+            }
+            if (tid == 0 && s_sums[0] > 0.0) {
+                const double target =
+                    uniform01(config.seed, config.frame_index, codebook_offset + c) * s_sums[0];
+                double acc = 0.0;
+                for (int i = 0; i < k; ++i) {
+                    if (isfinite(top_vals[i])) {
+                        acc += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
+                    }
+                    if (target <= acc) {
+                        sampled = top_ids[i];
+                        break;
+                    }
+                }
+            }
+        }
+        if (tid == 0) {
+            codes_out[output_offset + c] = sampled;
+            argmax_out[output_offset + c] = top_ids[0];
+        }
+        return;
+    }
+
+    // ---- Exact radix select of the k-th largest logit (4 x 8-bit MSB-first passes) ----
+    uint32_t keys[items_per_thread];
 #pragma unroll
     for (int item = 0; item < items_per_thread; ++item) {
-        const int rank = item * MAGPIETTS_CUDA_BLOCK_SIZE + (int)threadIdx.x;
-        if (rank < k) {
-            top_vals[rank] = thread_vals[item];
-            top_ids[rank] = thread_ids[item];
+        keys[item] = descending_key(thread_vals[item]);
+    }
+    uint32_t prefix = 0;
+    uint32_t mask = 0;
+    int remaining = k;
+#pragma unroll 1
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        s_hist[tid] = 0;
+        __syncthreads();
+#pragma unroll
+        for (int item = 0; item < items_per_thread; ++item) {
+            if ((keys[item] & mask) == prefix) {
+                atomicAdd(&s_hist[(keys[item] >> shift) & 0xffu], 1);
+            }
+        }
+        __syncthreads();
+        // Warp 0 scans the 256 bins (8 consecutive bins per lane) and locates the bucket
+        // containing the `remaining`-th element.
+        if (tid < 32) {
+            int bins[8];
+            int local = 0;
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                bins[b] = s_hist[tid * 8 + b];
+                local += bins[b];
+            }
+            int inclusive = local;
+#pragma unroll
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                const int other = __shfl_up_sync(0xffffffffu, inclusive, offset);
+                if (tid >= offset) {
+                    inclusive += other;
+                }
+            }
+            int running = inclusive - local;
+            if (running < remaining && remaining <= inclusive) {
+#pragma unroll
+                for (int b = 0; b < 8; ++b) {
+                    if (running < remaining && remaining <= running + bins[b]) {
+                        s_ctrl[0] = tid * 8 + b;
+                        s_ctrl[1] = remaining - running;
+                    }
+                    running += bins[b];
+                }
+            }
+        }
+        __syncthreads();
+        prefix |= (uint32_t)s_ctrl[0] << shift;
+        mask |= 0xffu << shift;
+        remaining = s_ctrl[1];
+    }
+    const uint32_t threshold = prefix;  // key of the k-th largest logit
+    const int need_equal = remaining;   // how many threshold-valued ids to take (ascending id)
+
+    // ---- Gather: all keys < threshold, plus the first `need_equal` keys == threshold ----
+    int n_less = 0;
+    int n_equal = 0;
+#pragma unroll
+    for (int item = 0; item < items_per_thread; ++item) {
+        n_less += keys[item] < threshold ? 1 : 0;
+        n_equal += keys[item] == threshold ? 1 : 0;
+    }
+    // one packed scan: low 16 bits count keys < threshold, high 16 bits keys == threshold
+    const int packed_inclusive = block_inclusive_scan(n_less | (n_equal << 16), s_scan);
+    if (tid == block - 1) {
+        s_ctrl[2] = packed_inclusive & 0xffff;
+    }
+    __syncthreads();
+    const int total_less = s_ctrl[2];
+    int less_pos = (packed_inclusive & 0xffff) - n_less;
+    int equal_rank = (packed_inclusive >> 16) - n_equal;
+#pragma unroll
+    for (int item = 0; item < items_per_thread; ++item) {
+        const int id = tid * items_per_thread + item;
+        const unsigned long long packed = ((unsigned long long)keys[item] << 32) | (uint32_t)id;
+        if (keys[item] < threshold) {
+            s_sel[less_pos++] = packed;
+        } else if (keys[item] == threshold) {
+            if (equal_rank < need_equal) {
+                s_sel[total_less + equal_rank] = packed;
+            }
+            ++equal_rank;
         }
     }
     __syncthreads();
 
-    if (threadIdx.x != 0) {
-        s_sums[threadIdx.x] = 0.0;
+    // ---- Rank sort of the k selected (key, id) pairs: ascending packed key == logits
+    // descending, ties by ascending id. All packed keys are distinct (ids are unique), so
+    // rank = number of smaller keys; k*k shared reads, no synchronization inside.
+    for (int i = tid; i < k; i += block) {
+        const unsigned long long mine = s_sel[i];
+        int rank = 0;
+        for (int j = 0; j < k; ++j) {
+            rank += s_sel[j] < mine ? 1 : 0;
+        }
+        const float value = descending_key_to_float((uint32_t)(mine >> 32));
+        const int32_t id = (int32_t)(uint32_t)mine;
+        s_top_vals[rank] = value;
+        s_top_ids[rank] = id;
+        top_vals[rank] = value;
+        top_ids[rank] = id;
     }
+    __syncthreads();
 
-    int sampled = top_ids[0];
-    if (config.temperature <= 0.0f) {
-        sampled = top_ids[0];
-    } else {
-        const float max_logit = top_vals[0];
-        double local_sum = 0.0;
-        for (int i = threadIdx.x; i < k; i += blockDim.x) {
-            if (isfinite(top_vals[i])) {
-                local_sum += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
-            }
-        }
-        s_sums[threadIdx.x] = local_sum;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                s_sums[threadIdx.x] += s_sums[threadIdx.x + stride];
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0 && s_sums[0] > 0.0) {
-            const double target =
-                uniform01(config.seed, config.frame_index, codebook_offset + c) * s_sums[0];
-            double acc = 0.0;
-            for (int i = 0; i < k; ++i) {
-                if (isfinite(top_vals[i])) {
-                    acc += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
-                }
-                if (target <= acc) {
-                    sampled = top_ids[i];
-                    break;
-                }
-            }
-        }
-    }
-
-    if (threadIdx.x == 0) {
+    const int sampled =
+        sample_from_topk(s_top_vals, s_top_ids, k, config, codebook_offset + c, s_exps, s_sums);
+    if (tid == 0) {
         codes_out[output_offset + c] = sampled;
-        argmax_out[output_offset + c] = top_ids[0];
+        argmax_out[output_offset + c] = s_top_ids[0];
     }
+}
+
+const int32_t*
+magpietts_cuda_sampler_codes_device(const magpietts_cuda_sampler* sampler) {
+    return sampler ? sampler->d_codes : nullptr;
+}
+
+bool
+magpietts_cuda_sampler_device_pointers(
+    const magpietts_cuda_sampler* sampler, magpietts_cuda_sampler_device_pointers_t* out) {
+    if (!sampler || !out)
+        return false;
+    out->config = sampler->d_config;
+    out->codes = sampler->d_codes;
+    out->argmax = sampler->d_argmax;
+    out->top_ids = sampler->d_top_ids;
+    out->top_vals = sampler->d_top_vals;
+    out->top_k = sampler->h_config ? sampler->h_config->top_k : 0;
+    return true;
 }
 
 magpietts_cuda_sampler*
@@ -493,6 +583,28 @@ magpietts_cuda_sampler_sequence_disable(magpietts_cuda_sampler* sampler) {
     }
     sampler->sequence_tail = nullptr;
     sampler->sequence_disabled = true;
+}
+
+uint64_t
+magpietts_cuda_sampler_sequence_key(const magpietts_cuda_sampler* sampler) {
+    return sampler ? sampler->sequence_key : 0;
+}
+
+void
+magpietts_cuda_sampler_sequence_set_key(magpietts_cuda_sampler* sampler, uint64_t key) {
+    if (sampler)
+        sampler->sequence_key = key;
+}
+
+void
+magpietts_cuda_sampler_sequence_reset(magpietts_cuda_sampler* sampler) {
+    if (!sampler)
+        return;
+    const bool disabled = sampler->sequence_disabled;
+    magpietts_cuda_sampler_sequence_disable(sampler);
+    sampler->sequence_disabled = disabled;
+    sampler->sequence_warm = false;
+    sampler->sequence_key = 0;
 }
 
 bool

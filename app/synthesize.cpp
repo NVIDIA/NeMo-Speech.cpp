@@ -6,6 +6,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "commands.h"
 #if defined(_WIN32)
@@ -56,6 +57,53 @@ write_audio(const std::filesystem::path& path, const std::string& audio, bool fo
 }
 
 }  // namespace
+
+nemo_speech::tts::SynthesizerConfig
+make_synthesizer_config(
+    nemo_speech::tts::MagpieTtsServerConfig parsed, const std::string& device_name,
+    bool device_set) {
+    parsed.runtime.magpie_model =
+        resolve_model_file(parsed.runtime.magpie_model, "tts", "MagpieTTS model").string();
+    parsed.runtime.codec_model =
+        resolve_model_file(parsed.runtime.codec_model, "codec", "NanoCodec model").string();
+    parsed.tokenizer_model_dir =
+        resolve_model_directory(parsed.tokenizer_model_dir, "tokenizer", "tokenizer model")
+            .string();
+    if (!parsed.tn_model_dir.empty())
+        parsed.tn_model_dir =
+            require_model_directory(parsed.tn_model_dir, "text normalization model").string();
+    if (device_set) {
+        const int gpu = parse_device(device_name, "--device");
+        bool cuda_device = device_name == "cuda" || device_name.rfind("cuda:", 0) == 0;
+#if defined(NEMO_SPEECH_CLI_CUDA)
+        cuda_device = cuda_device || device_name == "auto" || device_name == "gpu" ||
+                      device_name.rfind("gpu:", 0) == 0;
+#endif
+        if (gpu < 0) {
+            parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
+            parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
+            parsed.runtime.magpie_cpu = true;
+            parsed.runtime.codec_cpu = true;
+        } else if (cuda_device) {
+            parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cuda;
+            parsed.runtime.codec_cpu = false;
+        } else {
+            parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
+            parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
+            parsed.runtime.codec_cpu = false;
+        }
+    }
+    parsed.runtime.verbose = cli_verbose();
+
+    nemo_speech::tts::SynthesizerConfig config;
+    config.runtime = parsed.runtime;
+    config.tokenizer_model_dir = parsed.tokenizer_model_dir;
+    config.text_normalizer_model_dir = parsed.tn_model_dir;
+    config.tokenizer = parsed.tokenizer_config;
+    config.default_language_code = parsed.default_language_code;
+    config.default_voice_name = parsed.default_voice_name;
+    return config;
+}
 
 void
 print_synthesize_help(const char* program) {
@@ -115,7 +163,6 @@ command_synthesize(int argc, char** argv) {
         int output_rate = 0;
         bool device_set = false;
         std::string device_name = "auto";
-        int gpu = default_gpu_index();
         nemo_speech::tts::MagpieSynthesisOptions request_options;
         auto value = [&](int& i, const std::string& option) {
             if (++i >= argc)
@@ -150,7 +197,7 @@ command_synthesize(int argc, char** argv) {
                 output_rate = parse_int(value(i, arg), arg, 8000, 192000);
             else if (arg == "--device" || arg == "--backend") {
                 device_name = value(i, arg);
-                gpu = parse_device(device_name, arg);
+                (void)parse_device(device_name, arg);
                 device_set = true;
             } else if (arg == "--seed")
                 request_options.seed = parse_int(value(i, arg), arg, -1, 2147483647);
@@ -191,49 +238,11 @@ command_synthesize(int argc, char** argv) {
         if (cli_json() && output_path == "-")
             throw std::invalid_argument("--json cannot be combined with --output -");
 
-        parsed.runtime.magpie_model =
-            resolve_model_file(parsed.runtime.magpie_model, "tts", "MagpieTTS model").string();
-        parsed.runtime.codec_model =
-            resolve_model_file(parsed.runtime.codec_model, "codec", "NanoCodec model").string();
-        parsed.tokenizer_model_dir =
-            resolve_model_directory(parsed.tokenizer_model_dir, "tokenizer", "tokenizer model")
-                .string();
-        if (!parsed.tn_model_dir.empty())
-            parsed.tn_model_dir =
-                require_model_directory(parsed.tn_model_dir, "text normalization model").string();
-        if (device_set) {
-            bool cuda_device = device_name == "cuda" || device_name.rfind("cuda:", 0) == 0;
-#if defined(NEMO_SPEECH_CLI_CUDA)
-            cuda_device = cuda_device || device_name == "auto" || device_name == "gpu" ||
-                          device_name.rfind("gpu:", 0) == 0;
-#endif
-            if (gpu < 0) {
-                parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.magpie_cpu = true;
-                parsed.runtime.codec_cpu = true;
-            } else if (cuda_device) {
-                parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cuda;
-                parsed.runtime.codec_cpu = false;
-            } else {
-                parsed.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.sampling_backend = nemo_speech::tts::MagpieBackendPreference::Cpu;
-                parsed.runtime.codec_cpu = false;
-            }
-        }
-        parsed.runtime.verbose = cli_verbose();
-
-        nemo_speech::tts::SynthesizerConfig config;
-        config.runtime = parsed.runtime;
-        config.tokenizer_model_dir = parsed.tokenizer_model_dir;
-        config.text_normalizer_model_dir = parsed.tn_model_dir;
-        config.tokenizer = parsed.tokenizer_config;
-        config.default_language_code = parsed.default_language_code;
-        config.default_voice_name = parsed.default_voice_name;
+        auto config = make_synthesizer_config(std::move(parsed), device_name, device_set);
         nemo_speech::EngineRegistry engines;
         auto synthesizer = engines.load_tts(std::move(config));
         if (warmup)
-            synthesizer->warmup("Hello", 1);
+            synthesizer->warmup("Hello", 8);
 
         nemo_speech::tts::SynthesisRequest request;
         request.text = text;

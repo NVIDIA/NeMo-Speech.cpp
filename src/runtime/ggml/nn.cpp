@@ -20,46 +20,6 @@ round_bf16_output(ggml_context* ctx, ggml_tensor* tensor) {
     return ggml_cast(ctx, ggml_cast(ctx, tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
 }
 
-ggml_tensor*
-cached_q8_input(
-    Session* session, TensorContainer* session_tensor_container, const ggml_bf_tensor& weight,
-    ggml_tensor* input) {
-#ifdef NEMO_SPEECH_GGML_PATCHED
-    static const bool enabled = [] {
-        const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16");
-        return value != nullptr && value[0] != '0';
-    }();
-#else
-    // Stock ggml has no Q8_0 x F16 matmul; the cast would leave no backend.
-    constexpr bool enabled = false;
-#endif
-    static const int min_columns = [] {
-        const char* value = std::getenv("GGML_SKINNY_Q8_CUBLAS_F16_MIN_N");
-        const int parsed = value != nullptr ? std::atoi(value) : 128;
-        return parsed > 0 ? parsed : 1;
-    }();
-    static const bool outer_batch_dispatch = [] {
-        const char* value = std::getenv("GGML_SKINNY_Q8_OUTER_BATCH");
-        return value != nullptr && value[0] != '0';
-    }();
-    const int64_t columns = ggml_nelements(input) / input->ne[0];
-    const bool eligible_columns =
-        outer_batch_dispatch ? columns > 8 : input->ne[1] > 8 && input->ne[1] <= 64;
-    const bool eligible_block_q8 =
-        std::string(weight.tensor->name).rfind("encoder.", 0) == 0 && eligible_columns;
-#ifdef NEMO_SPEECH_GGML_PATCHED
-    const bool planar = (weight.tensor->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
-#else
-    const bool planar = false;
-#endif
-    if (enabled && session->params.use_gpu && weight.tensor->type == GGML_TYPE_Q8_0 &&
-        (planar || eligible_block_q8) && input->type == GGML_TYPE_F32 && columns >= min_columns) {
-        const auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight.buft);
-        return ggml_cast(bf_ctx.ctx, input, GGML_TYPE_F16);
-    }
-    return input;
-}
-
 void
 Conv1D::define_tensors(Session* session) {
     // The converter squeezes pointwise kernels to 2D so they can be quantized.
@@ -102,7 +62,6 @@ Conv1D::build_graph(
         // from ggml_conv_1d.
         auto x_in =
             ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, input_tensor.tensor, 1, 0, 2, 3));
-        x_in = cached_q8_input(session, session_tensor_container, weight_tensor, x_in);
         // Older CTC GGUFs keep the k=1 conv as [1,in,out]; newer quantized
         // pointwise tensors are [in,out].  Both are byte-identical after
         // dropping the unit kernel dimension.
@@ -110,8 +69,8 @@ Conv1D::build_graph(
         out_tensor = ggml_cont(bf_ctx.ctx, ggml_permute(bf_ctx.ctx, matmul, 1, 0, 2, 3));
     } else if (is_dw) {
         bool direct_dw = false;
-#ifdef NEMO_SPEECH_DIRECT_DW_CONV
-        // Patch 0004 adds the F16 direct depthwise kernel only for CUDA; other
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
+        // The F16 depthwise-conv patch adds the direct kernel only for CUDA; other
         // backends require the portable path below.
         direct_dw = session->params.use_gpu;
 #endif
@@ -152,7 +111,7 @@ Conv1D::build_graph(
                 bf_ctx.ctx, weight_tensor.tensor, input_tensor.tensor, stride, padding, dilation);
         }
     } else {
-        out_tensor = ggml_conv_1d(
+        out_tensor = conv_1d(
             bf_ctx.ctx, weight_tensor.tensor, input_tensor.tensor, stride, padding, dilation);
     }
     if (use_bias) {
@@ -259,7 +218,7 @@ Conv2DDW::build_graph(
     ggml_bf_context bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight_tensor.buft);
     ggml_tensor* conv2d_ret = nullptr;
     bool direct_dw = false;
-#ifdef NEMO_SPEECH_DIRECT_DW_CONV
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     // The direct kernel preserves the explicit N dimension (the stock im2col
     // lowering does not support this operator with ne[3] > 1) and reads the
     // F16 weights correctly only on the patched CUDA backend. Same runtime
@@ -343,9 +302,7 @@ Linear::build_graph(
     ggml_bf_tensor weight_tensor = session->model_tensor_container->get_tensor_by_name(weight_name);
     ggml_bf_context bf_ctx = session_tensor_container->get_ctx_of_buffer_type(weight_tensor.buft);
 
-    ggml_tensor* matmul_input =
-        cached_q8_input(session, session_tensor_container, weight_tensor, input_tensor.tensor);
-    ggml_tensor* matmul_ret = ggml_mul_mat(bf_ctx.ctx, weight_tensor.tensor, matmul_input);
+    ggml_tensor* matmul_ret = ggml_mul_mat(bf_ctx.ctx, weight_tensor.tensor, input_tensor.tensor);
 
     ggml_tensor* output_tensor = nullptr;
     if (use_bias) {

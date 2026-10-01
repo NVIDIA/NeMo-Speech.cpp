@@ -2,13 +2,29 @@
 
 We welcome external contributions to NeMo-Speech.cpp.
 
+## AI usage
+
+You may use AI tools as assistants for code, but the contribution must be yours. Pull request descriptions, issues and review replies must be written by you.
+
+- **Disclose it.** If AI was used, mention in the pull request in what capacity it was used.
+- **Write it yourself.** Issues, pull request descriptions and review replies
+  must be your own words, not AI output.
+- **Review it.** Review every line of code before submitting. You should understand and be able to
+  explain the design and any line of code when a reviewer asks.
+- **Verify it.** Build and run the relevant tests and benchmarks yourself, and
+  report the commands and results you actually ran.
+- **Keep it focused.** Don't include unrelated refactors, reformatting or
+  speculative changes that a tool added along the way.
+
+Pull requests that don't follow these guidelines may be closed without review.
+
 ## Development checks
 
 Follow the [source-build guide](docs/build.md) for prerequisites and submodules.
 For a model-independent CPU ASR test build:
 
 ```bash
-git submodule update --init ggml llama.cpp
+git submodule update --init llama.cpp
 scripts/configure.sh cpu-asr -DNEMO_SPEECH_BUILD_TESTS=ON
 cmake --build --preset cpu-asr
 ctest --test-dir build/cpu-asr --output-on-failure
@@ -25,6 +41,12 @@ Use the closest matching CUDA, Metal, Vulkan, server, or component preset when
 the change affects code outside the CPU ASR path. Include the commands and
 results relevant to the change in the pull request.
 
+## Changing llama.cpp or ggml
+
+The `llama.cpp` submodule stays at its pinned upstream commit. Changes to it,
+including ggml, live as patches in [`patches/`](patches/README.md), which
+explains the patch format and the `scripts/llama-patches.sh` workflow.
+
 ## Contribution license and provenance
 
 Unless a file states otherwise, contributions are submitted under the
@@ -40,9 +62,13 @@ may be held for provenance and license review before acceptance.
 
 ## Signing off your work
 
-Every commit must be signed off. The sign-off certifies that you have the right
-to submit the contribution under the license indicated in the file. Commits
-without a `Signed-off-by` line will not be accepted.
+Every commit must be signed off. By adding a `Signed-off-by` line to a commit,
+you agree to the [Developer Certificate of Origin (DCO)
+1.1](#developer-certificate-of-origin) reproduced below: you certify that you
+wrote the contribution or otherwise have the right to submit it under the
+project's open source license, and you acknowledge that the contribution and
+your sign-off are public and kept permanently. Commits without a
+`Signed-off-by` line will not be accepted.
 
 Use Git's `--signoff` (or `-s`) option:
 
@@ -56,6 +82,10 @@ This appends:
 Signed-off-by: Your Name <your@email.com>
 ```
 
+### Developer Certificate of Origin
+
+Signing off certifies that at least one of (a), (b), or (c) below applies to
+your contribution, and that you agree to (d).
 The full, unmodified [Developer Certificate of Origin
 1.1](https://developercertificate.org/) follows:
 
