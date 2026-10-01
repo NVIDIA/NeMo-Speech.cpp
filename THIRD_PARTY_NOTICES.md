@@ -160,7 +160,7 @@ The command-line microphone capture layer compiles miniaudio directly into
 ### SentencePiece
 
 - Source: [`google/sentencepiece`](https://github.com/google/sentencepiece),
-  revision `17d7580d6407802f85855d2cc9190634e2c95624`
+  revision `31646a467d2051eb904e0b45de3a73e91fe1c1e3`
 - Copyright 2018 Google Inc.
 - License: Apache License 2.0
 

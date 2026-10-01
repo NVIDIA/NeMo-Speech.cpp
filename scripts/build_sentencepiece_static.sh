@@ -12,7 +12,7 @@ JOBS="${JOBS:-8}"
 JOBS="$(( JOBS < 4 ? JOBS : 4 ))"
 SOURCE="$WORK/source"
 BUILD="$WORK/build"
-COMMIT=17d7580d6407802f85855d2cc9190634e2c95624
+COMMIT=31646a467d2051eb904e0b45de3a73e91fe1c1e3
 
 if [ ! -d "$SOURCE/.git" ]; then
     git clone --filter=blob:none --no-checkout https://github.com/google/sentencepiece.git "$SOURCE"
