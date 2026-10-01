@@ -40,6 +40,8 @@ permissions:
   contents: read
 
 env:
+  # Release jobs only restore the model cache, so they never write entries that
+  # a later release could read; build.yml and gpu.yml save it from main.
   NEMO_SPEECH_MODEL_DIR: ${{ github.workspace }}/.ci-models
   JFK_AUDIO: test_files/asr/wav/test/jfk.wav
 
@@ -52,6 +54,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
       build: ${{ steps.version.outputs.build }}
+      version_metadata: ${{ steps.version.outputs.version_metadata }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -111,9 +114,14 @@ jobs:
               echo "::notice::nightly is already built from $GITHUB_SHA; skipping"
             fi
           fi
+          # Nightly binaries report VERSION plus build metadata, e.g.
+          # 0.2.0+nightly.a1b2c3d, so they are not mistaken for the release.
+          metadata=""
+          if [ "$channel" = nightly ]; then metadata="nightly.${GITHUB_SHA::7}"; fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "version_metadata=$metadata" >> "$GITHUB_OUTPUT"
           echo "Building $version ($channel): $build"
 
   grammars:
@@ -211,10 +219,12 @@ jobs:
           CUDA_IMAGE: ${{ matrix.cuda_image }}
           CUDA_ARCH: ${{ matrix.cuda_arch }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_METADATA: ${{ needs.prepare.outputs.version_metadata }}
         run: |
           set -euo pipefail
           args=(--build-arg "BACKEND=$BACKEND" --build-arg "ARTIFACT_BACKEND=$ARTIFACT_BACKEND"
-                --build-arg "RELEASE_VERSION=$RELEASE_VERSION" --build-arg "JOBS=$(nproc)")
+                --build-arg "RELEASE_VERSION=$RELEASE_VERSION" --build-arg "JOBS=$(nproc)"
+                --build-arg "VERSION_METADATA=$VERSION_METADATA")
           if [ "$BACKEND" = cuda ]; then
             args+=(--build-arg "CUDA_IMAGE=$CUDA_IMAGE" --build-arg "CUDA_ARCH=$CUDA_ARCH")
           fi
@@ -224,9 +234,9 @@ jobs:
           test "$(find release-artifacts -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
           (cd release-artifacts && sha256sum --check ./*.sha256)
 
-      - name: Cache models
+      - name: Restore cached models
         if: matrix.backend == 'cpu'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}
@@ -305,6 +315,7 @@ jobs:
         env:
           PRESET: ${{ matrix.preset }}
           CMAKE_ARGS: ${{ matrix.cmake_args }}
+          VERSION_METADATA: ${{ needs.prepare.outputs.version_metadata }}
         run: |
           set -euo pipefail
           # configure.sh needs bash 4+; the runner's default bash is 3.2.
@@ -314,6 +325,7 @@ jobs:
             -DNEMO_SPEECH_BUILD_GRPC=OFF -DNEMO_SPEECH_WITH_GRPC=OFF \
             -DNEMO_SPEECH_WITH_NORM=ON \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DNEMO_SPEECH_VERSION_METADATA="$VERSION_METADATA" \
             $CMAKE_ARGS
           cmake --build --preset "$PRESET" --parallel
           cmake --install "build/$PRESET" --prefix "$RUNNER_TEMP/install"
@@ -328,8 +340,8 @@ jobs:
             --backend "$BACKEND" --arch "$ARCH" --version "$RELEASE_VERSION" \
             --min-macos "$MACOSX_DEPLOYMENT_TARGET" --output-dir release-artifacts
 
-      - name: Cache models
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cached models
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}
@@ -417,12 +429,13 @@ jobs:
         shell: pwsh
         env:
           BACKEND: ${{ matrix.backend }}
+          VERSION_METADATA: ${{ needs.prepare.outputs.version_metadata }}
         run: |
           $arguments = @{
             Backend   = $env:BACKEND
             Profile   = 'server'
             BuildDir  = "${{ github.workspace }}\build\release-$env:BACKEND"
-            CMakeArgs = @('-DGGML_NATIVE=OFF')
+            CMakeArgs = @('-DGGML_NATIVE=OFF', "-DNEMO_SPEECH_VERSION_METADATA=$env:VERSION_METADATA")
           }
           if ($env:BACKEND -eq 'cuda') {
             $arguments.CudaArch = '75-real;80-virtual;86-real;89-real;120a-real'
@@ -446,9 +459,9 @@ jobs:
           scripts\windows\package-release.ps1 -BuildDir "build\release-$env:BACKEND" `
             -Backend $env:BACKEND -Version $env:RELEASE_VERSION -OutputDir release-artifacts
 
-      - name: Cache models
+      - name: Restore cached models
         if: matrix.backend == 'cpu'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}
@@ -535,8 +548,8 @@ jobs:
           name: release-linux-x86_64-cpu
           path: dist
 
-      - name: Cache models
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cached models
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}
@@ -582,8 +595,8 @@ jobs:
           name: release-linux-x86_64-cuda
           path: dist
 
-      - name: Cache models
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cached models
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}
@@ -625,8 +638,8 @@ jobs:
           name: release-windows-x86_64-cuda
           path: dist
 
-      - name: Cache models
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore cached models
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}

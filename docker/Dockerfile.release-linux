@@ -153,6 +153,8 @@ COPY . /work
 COPY --from=sentencepiece-dependency /work/.deps/sentencepiece /work/.deps/sentencepiece
 COPY --from=itn-dependency /work/.deps/itn /work/.deps/itn
 
+# Build metadata for the reported version (nightly.<sha> for nightly builds).
+ARG VERSION_METADATA=
 RUN case "${BACKEND}" in cpu|vulkan) ;; \
         *) echo "BACKEND must be cpu or vulkan" >&2; exit 2 ;; \
     esac \
@@ -161,6 +163,7 @@ RUN case "${BACKEND}" in cpu|vulkan) ;; \
         -DNEMO_SPEECH_BUILD_GRPC=OFF \
         -DNEMO_SPEECH_WITH_GRPC=OFF \
         -DNEMO_SPEECH_WITH_NORM=ON \
+        "-DNEMO_SPEECH_VERSION_METADATA=${VERSION_METADATA}" \
         -DCMAKE_INSTALL_PREFIX=/opt/nemo-speech \
         "-DCMAKE_CXX_STANDARD_LIBRARIES:STRING=-lstdc++fs -lanl" \
         "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags" \
@@ -206,6 +209,8 @@ COPY . /work
 COPY --from=sentencepiece-dependency /work/.deps/sentencepiece /work/.deps/sentencepiece
 COPY --from=itn-dependency /work/.deps/itn /work/.deps/itn
 
+# Build metadata for the reported version (nightly.<sha> for nightly builds).
+ARG VERSION_METADATA=
 # The default architectures match the default CUDA 12.8 image; CUDA 13 builds
 # (sm_110, sm_121) pass CUDA_ARCH.
 RUN set -eux; \
@@ -224,6 +229,7 @@ RUN set -eux; \
         -DNEMO_SPEECH_BUILD_GRPC=OFF \
         -DNEMO_SPEECH_WITH_GRPC=OFF \
         -DNEMO_SPEECH_WITH_NORM=ON \
+        "-DNEMO_SPEECH_VERSION_METADATA=${VERSION_METADATA}" \
         -DCMAKE_INSTALL_PREFIX=/opt/nemo-speech \
         "-DCMAKE_CXX_STANDARD_LIBRARIES:STRING=-lstdc++fs -lanl" \
         "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags" \

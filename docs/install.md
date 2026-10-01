@@ -9,10 +9,11 @@ downloads a model only when explicitly enabled with an indexed name. See
 [models and cache](cli.md#models-and-cache).
 
 > [!IMPORTANT]
-> **For the best performance and the latest features, build natively from source** with
-> `--source` (`-Source` on Windows) or by following the [source-build guide](build.md). A native
-> build is compiled for your machine's CPU and GPU, and release tags can be out of sync with the
-> `main` branch.
+> **For the best performance, build natively from source** with `--source` (`-Source` on
+> Windows) or by following the [source-build guide](build.md). A native build is compiled for
+> your machine's CPU and GPU. Tagged releases are cut periodically and can trail the `main`
+> branch; for prebuilt binaries of the latest `main`, pass `--channel nightly`
+> (`-Channel nightly` on Windows) to install the nightly prerelease, which is rebuilt daily.
 
 ## Linux and macOS
 
@@ -43,11 +44,14 @@ The grammars are published with each release as `itn_configs.tar.bz2` and
 `tn_configs.tar.bz2`.
 
 The installer selects CUDA when `nvidia-smi` is available, Metal on Apple
-Silicon, and CPU otherwise. Override the backend or force a source build:
+Silicon, and CPU otherwise. Override the backend, install the nightly
+prerelease, or force a source build:
 
 ```bash
 curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh |
   sh -s -- --backend cpu
+curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh |
+  sh -s -- --channel nightly
 curl -fsSL https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.sh |
   sh -s -- --source
 ```
@@ -96,25 +100,22 @@ irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
 The installer updates the current user's `PATH`. Open a new PowerShell window,
 then run `nemo-speech --version`.
 
-Select a backend explicitly when needed:
+Pass options after the script block. Install the nightly prerelease, or select
+a backend explicitly:
 
 ```powershell
-irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 `
-  -OutFile .\install-nemo-speech.ps1
-powershell -ExecutionPolicy Bypass -File .\install-nemo-speech.ps1 `
-  -Source -Backend cuda
+iex "& {$(irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1)} -Channel nightly"
+iex "& {$(irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1)} -Source -Backend cuda"
 ```
 
 Select the components to install:
 
 ```powershell
 # ASR and diarization only
-powershell -ExecutionPolicy Bypass -File .\install-nemo-speech.ps1 `
-  -Source -Backend cpu -Profile asr
+iex "& {$(irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1)} -Source -Backend cpu -Profile asr"
 
 # Full runtime profile (add -HttpTls for TLS)
-powershell -ExecutionPolicy Bypass -File .\install-nemo-speech.ps1 `
-  -Source -Backend cuda -Profile full
+iex "& {$(irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1)} -Source -Backend cuda -Profile full"
 ```
 
 | Profile | Components |

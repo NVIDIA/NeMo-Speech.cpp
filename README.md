@@ -50,9 +50,11 @@ See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
 ## Installation
 
 > [!IMPORTANT]
-> **For the best performance and the latest features, build natively from source.** A native
-> build is compiled for your machine, and release tags can be out of sync with the
-> `main` branch. See [Build from source](#build-from-source).
+> **For the best performance, build natively from source.** A native build is compiled for
+> your machine. Tagged releases are cut periodically and can trail the `main` branch; for
+> prebuilt binaries of the latest `main`, pass `--channel nightly` (`-Channel nightly` on
+> Windows) to install the nightly prerelease, which is rebuilt daily. See
+> [Build from source](#build-from-source).
 
 Install the `nemo-speech` CLI for the detected platform and backend:
 

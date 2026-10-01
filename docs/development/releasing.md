@@ -36,7 +36,10 @@ them to a release and update the tag and digests there.
 A daily scheduled run publishes the `nightly` prerelease, which
 `install.sh --channel nightly` installs. It is skipped when `main` has not
 moved since the current nightly; running the workflow manually with `nightly`
-always rebuilds.
+always rebuilds. Nightly binaries report the `VERSION` value with build metadata
+(for example `0.2.0+nightly.a1b2c3d`, set through the
+`NEMO_SPEECH_VERSION_METADATA` CMake option), so they are not mistaken for the
+release.
 
 Pull requests that change release packaging (the workflow, the release
 Dockerfile and packagers, the dependency build scripts, the CMake files that
