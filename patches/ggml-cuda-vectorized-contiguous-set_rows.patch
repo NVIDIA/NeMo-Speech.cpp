@@ -7,7 +7,7 @@ row, for the streaming K/V and convolution state arenas.
 Upstream: candidate (needs F16, the PDL launch helper and perf cases).
 
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 4659970651e59538842d72cfb4d30815c1fd7f25..dd6ad32d87db86d502178817c127659109afc3d0 100644
+index 4659970651e59538842d72cfb4d30815c1fd7f25..8563338c0ec74c2aee3b00e0c8e1e9fd18983b1e 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
 @@ -176,6 +176,26 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
@@ -37,7 +37,7 @@ index 4659970651e59538842d72cfb4d30815c1fd7f25..dd6ad32d87db86d502178817c1276591
  template<typename src_t, typename idx_t, typename dst_t>
  static void set_rows_cuda(
          const src_t * src0_d, const idx_t * src1_d, dst_t * dst_d,
-@@ -380,6 +400,31 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -380,6 +400,34 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
      GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
  
@@ -47,6 +47,9 @@ index 4659970651e59538842d72cfb4d30815c1fd7f25..dd6ad32d87db86d502178817c1276591
 +        dst->ne[2] == src0->ne[2] && dst->ne[3] == 1 && src0->ne[0] == dst->ne[0] &&
 +        src0->ne[1] == src1->ne[0] && ggml_is_contiguous(src0) &&
 +        dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float4) == 0 &&
++        dst->nb[2] % sizeof(float4) == 0 && (uintptr_t) dst->data % sizeof(float4) == 0 &&
++        (uintptr_t) src0->data % sizeof(float4) == 0 &&
++        src1->nb[0] == ggml_type_size(src1->type) && src0->ne[2] <= 65535 &&
 +        src0->ne[0] >= 1024 && src0->ne[0] % 4 == 0;
 +    if (contiguous_cache_rows) {
 +        const dim3 grid((unsigned) src0->ne[1], (unsigned) src0->ne[2]);

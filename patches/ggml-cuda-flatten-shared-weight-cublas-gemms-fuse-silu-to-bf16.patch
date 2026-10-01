@@ -8,7 +8,7 @@ Subject: ggml-cuda: flatten shared-weight cuBLAS GEMMs, fuse SiLU to BF16
 Upstream: the GEMM flatten is a candidate; the SiLU/BF16 fusion is NeMo-specific.
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 141caeca47a748ccb3916f98d980d220ee63217f..b602e1db99cc1f5bddcf4a0d697cf6ba300415f3 100644
+index 141caeca47a748ccb3916f98d980d220ee63217f..4c0c0633dd66cc6f717d69cd9f74a1f5d0acc404 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1542,6 +1542,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
@@ -51,17 +51,18 @@ index 141caeca47a748ccb3916f98d980d220ee63217f..b602e1db99cc1f5bddcf4a0d697cf6ba
  static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                            const ggml_tensor * ffn_gate,
                                            const ggml_tensor * glu,
-@@ -3573,6 +3592,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3573,6 +3592,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      }
  
      ggml_tensor * node = cgraph->nodes[i];
 +    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 +    const bool native_bf16 =
-+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
++        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
++        ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE;
  
      if (node->op == GGML_OP_MUL) {
          ggml_cuda_moe_weighted_reduction_match match;
-@@ -4208,6 +4230,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4208,6 +4231,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  

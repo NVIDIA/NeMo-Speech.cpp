@@ -86,10 +86,10 @@ index fbd855dd5ca483874abba3e17db15b77e1f15821..a8bbc07b63d7057a54c7a01a7470e8f8
          return streams[device][stream];
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3f97bec78f7b0f717d04540f1b11e868f0139e4c..449e96ce3c6b9b63b1c3b511948a0960402fb43b 100644
+index 29bddaff6da1ee9f4f6aec73a89b4078641845ee..1d31dfa2f5a30488726b907873b3c66450af9cea 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4852,7 +4852,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4853,7 +4853,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -98,7 +98,7 @@ index 3f97bec78f7b0f717d04540f1b11e868f0139e4c..449e96ce3c6b9b63b1c3b511948a0960
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
-@@ -5015,7 +5015,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5016,7 +5016,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  
  #ifdef USE_CUDA_GRAPH
      const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -107,7 +107,7 @@ index 3f97bec78f7b0f717d04540f1b11e868f0139e4c..449e96ce3c6b9b63b1c3b511948a0960
  #else
      const bool use_cuda_graph = false;
      GGML_UNUSED(cuda_ctx);
-@@ -5284,6 +5284,59 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -5285,6 +5285,59 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  

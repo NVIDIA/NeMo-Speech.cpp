@@ -44,7 +44,7 @@ index db7ee6bf62077dc9ed518ad2d4d13fbe1a8f3926..572eb6bf3abb8812133c51456fac6564
              conv2d_dw_kernel<float, float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
                  x_d, (const float *) w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 449e96ce3c6b9b63b1c3b511948a0960402fb43b..1df911e877dfd9ec1725547f2385086f9bdaf092 100644
+index 1d31dfa2f5a30488726b907873b3c66450af9cea..1924347f82ae913405ebdab956056c7d6f1a32f1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1410,6 +1410,64 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
@@ -120,7 +120,7 @@ index 449e96ce3c6b9b63b1c3b511948a0960402fb43b..1df911e877dfd9ec1725547f2385086f
  static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                            const ggml_tensor * ffn_gate,
                                            const ggml_tensor * glu,
-@@ -3888,6 +3947,58 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3889,6 +3948,58 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -179,7 +179,7 @@ index 449e96ce3c6b9b63b1c3b511948a0960402fb43b..1df911e877dfd9ec1725547f2385086f
      // multi-(add or mul)
      if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
          int     n_fuse = 0;
-@@ -5986,7 +6097,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5987,7 +6098,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
          case GGML_OP_CONV_2D:
              return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
          case GGML_OP_CONV_2D_DW:

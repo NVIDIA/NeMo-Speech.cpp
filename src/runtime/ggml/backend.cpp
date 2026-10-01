@@ -14,25 +14,27 @@
 namespace ggml_runtime {
 
 namespace {
-// putenv retains the supplied storage, so each entry must have static lifetime.
 void
-set_environment_default(const char* name, char* entry) {
-    if (std::getenv(name) == nullptr) {
-        putenv(entry);
+set_environment_default(const char* name, const char* value) {
+    if (std::getenv(name) != nullptr) {
+        return;
     }
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
 }
 }  // namespace
 
 void
 keep_cuda_graphs_resident() {
-    static char entry[] = "GGML_CUDA_GRAPH_EVICT_AFTER_MS=0";
-    set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", entry);
+    set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", "0");
 }
 
 void
 keep_skinny_q8_weights_separate() {
-    static char entry[] = "GGML_SKINNY_Q8_INPLACE=0";
-    set_environment_default("GGML_SKINNY_Q8_INPLACE", entry);
+    set_environment_default("GGML_SKINNY_Q8_INPLACE", "0");
 }
 
 BackendManager::BackendManager(Params params) {
@@ -53,8 +55,7 @@ BackendManager::init_backends() {
 #if defined(GGML_USE_VULKAN)
     // Graph optimization is incompatible with in-place persistent cache tensors.
     // Vulkan reads this setting during device initialization.
-    static char vk_entry[] = "GGML_VK_DISABLE_GRAPH_OPTIMIZE=1";
-    set_environment_default("GGML_VK_DISABLE_GRAPH_OPTIMIZE", vk_entry);
+    set_environment_default("GGML_VK_DISABLE_GRAPH_OPTIMIZE", "1");
 #endif  // GGML_USE_VULKAN
 
     ggml_time_init();

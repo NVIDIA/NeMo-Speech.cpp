@@ -173,10 +173,19 @@ elseif(NEMO_SPEECH_GGML_PATCHED)
     set(NEMO_SPEECH_LLAMA_CPP_DIR "${CMAKE_BINARY_DIR}/_deps/llama.cpp")
     nemo_speech_materialize_llama_cpp(
         "${_nemo_speech_llama_cpp_submodule}" "${CMAKE_SOURCE_DIR}/patches" "${NEMO_SPEECH_LLAMA_CPP_DIR}")
-    # Re-run configuration when patches are edited, added, removed, or reordered.
+    # Re-run configuration when patches are edited, added, removed, or reordered,
+    # or when the submodule moves to another commit.
     nemo_speech_llama_cpp_series("${CMAKE_SOURCE_DIR}/patches" _nemo_speech_patches)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/patches" "${CMAKE_SOURCE_DIR}/patches/series" ${_nemo_speech_patches})
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" -C "${_nemo_speech_llama_cpp_submodule}" rev-parse --absolute-git-dir
+        OUTPUT_VARIABLE _nemo_speech_llama_cpp_git_dir RESULT_VARIABLE _nemo_speech_rc
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_nemo_speech_rc EQUAL 0 AND EXISTS "${_nemo_speech_llama_cpp_git_dir}/HEAD")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${_nemo_speech_llama_cpp_git_dir}/HEAD")
+    endif()
 else()
     set(NEMO_SPEECH_LLAMA_CPP_DIR "${_nemo_speech_llama_cpp_submodule}")
 endif()

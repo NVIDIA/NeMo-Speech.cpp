@@ -771,7 +771,7 @@ index 0000000000000000000000000000000000000000..97bb27e1fced299b96fc57c7bfc4a88d
 +bool ggml_cuda_conv1d_fused_supported(const ggml_tensor * op, int cc);
 +void ggml_cuda_op_conv1d_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1df911e877dfd9ec1725547f2385086f9bdaf092..47fcf320a44b2d5dee072b5efe06c60f68167796 100644
+index 1924347f82ae913405ebdab956056c7d6f1a32f1..538da52595bdd669aa9a601240e9b3bd4ee40e89 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -28,6 +28,7 @@
@@ -904,7 +904,7 @@ index 1df911e877dfd9ec1725547f2385086f9bdaf092..47fcf320a44b2d5dee072b5efe06c60f
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3684,6 +3793,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3685,6 +3794,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -915,7 +915,7 @@ index 1df911e877dfd9ec1725547f2385086f9bdaf092..47fcf320a44b2d5dee072b5efe06c60f
      const std::initializer_list<ggml_op> batch_norm_ops = {
          GGML_OP_SUB, GGML_OP_ADD, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_MUL, GGML_OP_ADD
      };
-@@ -6160,6 +6273,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6161,6 +6274,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FUSED_ATTN:
              return (op->src[0]->ne[0] & (op->src[0]->ne[0] - 1)) == 0;  // d_k power of two

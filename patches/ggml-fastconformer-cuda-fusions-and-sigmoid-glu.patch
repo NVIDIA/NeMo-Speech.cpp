@@ -226,7 +226,7 @@ index 5de9cb5b7e0969bc10a99e40675ed35b0561637b..2a380b7d7345c79780c63ad708f1815f
  inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
      uint16_t t;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b602e1db99cc1f5bddcf4a0d697cf6ba300415f3..3f97bec78f7b0f717d04540f1b11e868f0139e4c 100644
+index 4c0c0633dd66cc6f717d69cd9f74a1f5d0acc404..29bddaff6da1ee9f4f6aec73a89b4078641845ee 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2247,6 +2247,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
@@ -239,7 +239,7 @@ index b602e1db99cc1f5bddcf4a0d697cf6ba300415f3..3f97bec78f7b0f717d04540f1b11e868
                  default:
                      return false;
              }
-@@ -3622,6 +3625,111 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3623,6 +3626,111 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -351,7 +351,7 @@ index b602e1db99cc1f5bddcf4a0d697cf6ba300415f3..3f97bec78f7b0f717d04540f1b11e868
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -3755,6 +3863,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3756,6 +3864,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -383,7 +383,7 @@ index b602e1db99cc1f5bddcf4a0d697cf6ba300415f3..3f97bec78f7b0f717d04540f1b11e868
      // multi-(add or mul)
      if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
          int     n_fuse = 0;
-@@ -4230,21 +4363,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4231,21 +4364,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -413,7 +413,7 @@ index b602e1db99cc1f5bddcf4a0d697cf6ba300415f3..3f97bec78f7b0f717d04540f1b11e868
              return 1;
          }
      }
-@@ -4385,6 +4520,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4386,6 +4521,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -452,7 +452,7 @@ index b602e1db99cc1f5bddcf4a0d697cf6ba300415f3..3f97bec78f7b0f717d04540f1b11e868
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
          ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -5435,6 +5602,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5436,6 +5603,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  case GGML_GLU_OP_GEGLU_ERF:
                  case GGML_GLU_OP_GEGLU_QUICK:
                  case GGML_GLU_OP_SWIGLU_CLAMP:

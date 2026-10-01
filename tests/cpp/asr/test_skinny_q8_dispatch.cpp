@@ -4,7 +4,8 @@
 // Skinny-Q8 dispatch must not depend on call history (the skinny-Q8 ggml patch). The first
 // 9..64-column mul_mat on an eligible Q8_0 weight repacks it in place; every column count must
 // produce the same bits before and after that repack, including MMVQ's range (N <= 8, planar MMVQ
-// after the repack) and widths above 64. Skips itself (exit 77) without a GPU backend.
+// after the repack), the fused MMVQ bias/SiLU epilogues, and widths above 64. Skips itself
+// (exit 77) without a GPU backend.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -20,13 +21,16 @@ constexpr int64_t kK = 512;  // multiple of the skinny kernel's 128-byte k step
 constexpr int64_t kM = 256;  // multiple of its 32-row block
 
 std::vector<float>
-run(ggml_backend_t backend, ggml_tensor* w, ggml_tensor* bias, int64_t n) {
+run(ggml_backend_t backend, ggml_tensor* w, ggml_tensor* bias, int64_t n, bool silu = false) {
     ggml_init_params params{ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true};
     ggml_context* ctx = ggml_init(params);
     ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kK, n);
     ggml_tensor* y = ggml_mul_mat(ctx, w, x);
     if (bias) {
         y = ggml_add(ctx, y, bias);  // mul_mat + add is fused into the skinny-Q8 bias epilogue
+    }
+    if (silu) {
+        y = ggml_silu(ctx, y);  // narrow mul_mat (+ add) + silu is fused into MMVQ
     }
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
@@ -81,26 +85,32 @@ main() {
     // was already repacked: MMVQ's range and wider than the old 64-column cap. A skinny-range call
     // here would repack the weight before the reference outputs are recorded.
     const int64_t widths[] = {1, 2, 4, 8, 65, 69, 128};
-    std::vector<std::vector<float>> before, before_bias;
+    std::vector<std::vector<float>> before, before_bias, before_silu, before_bias_silu;
     for (int64_t n : widths) {
         before.push_back(run(backend, w, nullptr, n));
         before_bias.push_back(run(backend, w, bias, n));
+        before_silu.push_back(run(backend, w, nullptr, n, true));
+        before_bias_silu.push_back(run(backend, w, bias, n, true));
     }
     run(backend, w, nullptr, 16);  // a skinny-range call repacks the weight in place
 
     int failures = 0;
     for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
-        const std::vector<float> after = run(backend, w, nullptr, widths[i]);
-        const std::vector<float> after_bias = run(backend, w, bias, widths[i]);
-        const bool same =
-            std::memcmp(after.data(), before[i].data(), after.size() * sizeof(float)) == 0;
-        const bool same_bias =
-            std::memcmp(
-                after_bias.data(), before_bias[i].data(), after_bias.size() * sizeof(float)) == 0;
-        if (!same || !same_bias) {
+        const auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        const bool plain = same(run(backend, w, nullptr, widths[i]), before[i]);
+        const bool with_bias = same(run(backend, w, bias, widths[i]), before_bias[i]);
+        const bool with_silu = same(run(backend, w, nullptr, widths[i], true), before_silu[i]);
+        const bool with_bias_silu =
+            same(run(backend, w, bias, widths[i], true), before_bias_silu[i]);
+        if (!plain || !with_bias || !with_silu || !with_bias_silu) {
             std::fprintf(
-                stderr, "FAIL: N=%lld output changed after the repack (plain %s, bias %s)\n",
-                (long long)widths[i], same ? "same" : "differs", same_bias ? "same" : "differs");
+                stderr,
+                "FAIL: N=%lld output changed after the repack (plain %s, bias %s, silu %s, "
+                "bias+silu %s)\n",
+                (long long)widths[i], plain ? "same" : "differs", with_bias ? "same" : "differs",
+                with_silu ? "same" : "differs", with_bias_silu ? "same" : "differs");
             ++failures;
         }
     }
