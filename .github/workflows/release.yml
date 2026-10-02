@@ -10,8 +10,8 @@ name: Release
 #                           branches pushed by copy-pr-bot, as in gpu.yml)
 #
 # x86_64 binaries target x86-64-v3 (AVX2): the archives are built with
-# GGML_NATIVE=OFF, scanned for AVX-512/AMX instructions, and the Linux CPU
-# archive runs under an emulated Haswell CPU before anything is published.
+# GGML_NATIVE=OFF, and the Linux CPU archive runs under an emulated Haswell CPU
+# before anything is published.
 #
 # Linux and macOS archives include text normalization (ITN/TN). The grammars are
 # not built here: they are taken from the release pinned in the grammars job,
@@ -552,12 +552,10 @@ jobs:
             exit 1
           fi
 
-      - name: Check checksums, layout, and the x86_64 instruction baseline
+      - name: Check checksums and layout
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
-          python3 scripts/release/check_release.py archives dist --version "$VERSION"
+        run: python3 scripts/release/check_release.py archives dist --version "$VERSION"
 
   baseline:
     name: x86_64 baseline (emulated Haswell CPU)

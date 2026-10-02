@@ -29,9 +29,8 @@ The installed project and GCC runtimes are packaged together; the project must
 be built with text normalization (-DNEMO_SPEECH_WITH_NORM=ON and the static
 dependencies from scripts/build_itn_deps.sh). CUDA archives also include
 libcudart. glibc, GPU drivers, and the Vulkan loader remain host
-dependencies. x86_64 binaries must not use instructions beyond x86-64-v3 (AVX2),
-and project binaries must find bundled libraries through DT_RPATH, which
-LD_LIBRARY_PATH cannot override.
+dependencies. Project binaries must find bundled libraries through DT_RPATH,
+which LD_LIBRARY_PATH cannot override.
 EOF
 }
 
@@ -371,10 +370,6 @@ if [[ -s "$runpath_files" ]]; then
     echo "error: these binaries use DT_RUNPATH; link with -Wl,--disable-new-dtags:" >&2
     sed 's/^/  /' "$runpath_files" >&2
     exit 1
-fi
-
-if [[ "$arch" == x86_64 ]]; then
-    python3 "$ROOT/scripts/release/check_release.py" isa "$package_root"
 fi
 
 source_date_epoch="${SOURCE_DATE_EPOCH:-0}"

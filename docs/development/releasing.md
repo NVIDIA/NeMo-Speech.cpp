@@ -50,11 +50,9 @@ run the workflow as a dry run once copy-pr-bot mirrors them to a
 
 ## What every run checks
 
-- **CPU baseline:** x86_64 archives are built with `GGML_NATIVE=OFF` and must
-  not contain instructions beyond x86-64-v3 (AVX2, FMA, F16C, BMI2);
-  `scripts/release/check_release.py` disassembles every x86_64 binary. The
-  Linux x86_64 CPU archive also transcribes audio under QEMU's Haswell model,
-  which has no AVX-512.
+- **CPU baseline:** x86_64 archives target x86-64-v3 (AVX2, FMA, F16C, BMI2)
+  and are built with `GGML_NATIVE=OFF`. The Linux x86_64 CPU archive
+  transcribes audio under QEMU's Haswell model, which has no AVX-512.
 - **Self-contained packages:** Linux archives need glibc 2.31 or newer and find
   their bundled libraries through `DT_RPATH`, which `LD_LIBRARY_PATH` cannot
   override. Vulkan archives use the host's `libstdc++` and `libgcc_s`, which
