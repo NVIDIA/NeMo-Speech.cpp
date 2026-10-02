@@ -5,8 +5,9 @@
 
 reviews:
   profile: chill
-  # Keep the summary in the walkthrough comment instead of editing the PR description.
-  high_level_summary: false
+  # Generate the summary, and put it in the walkthrough comment instead of the PR
+  # description. (high_level_summary: false would disable it entirely.)
+  high_level_summary: true
   high_level_summary_in_walkthrough: true
   auto_review:
     enabled: true

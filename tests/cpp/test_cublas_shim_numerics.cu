@@ -353,6 +353,12 @@ run_large_batch_case(cublasHandle_t handle) {
                  "cublasSgemmStridedBatched(m=0)") &&
              check_output("zero-sized no-op");
     }
+    if (ok && cublasSgemmStridedBatched(
+                  handle, CUBLAS_OP_N, CUBLAS_OP_N, -1, dim, dim, &alpha, device_a, dim, 0,
+                  device_b, dim, 0, &beta, device_c, dim, 0, 1) != CUBLAS_STATUS_INVALID_VALUE) {
+        std::fprintf(stderr, "FAIL: a negative dimension was not rejected\n");
+        ok = false;
+    }
 
     cudaFree(device);
     cudaFree(device_ptrs);
