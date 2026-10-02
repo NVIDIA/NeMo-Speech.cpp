@@ -74,6 +74,12 @@ try {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     $dumpbin = & $vswhere -latest -products * -find '**\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
     if (-not $dumpbin) { throw 'dumpbin.exe was not found (Visual Studio C++ tools are required)' }
+    # A failed inspection would otherwise read as "no dependencies".
+    function Invoke-Dumpbin([string]$Option, [string]$Path) {
+        $output = & $dumpbin /nologo $Option $Path
+        if ($LASTEXITCODE -ne 0) { throw "dumpbin $Option failed for $Path ($LASTEXITCODE)" }
+        $output
+    }
     $system = '^(api-ms-win-.*|ext-ms-.*|kernel32|kernelbase|user32|gdi32|advapi32|shell32|ole32|oleaut32|' +
               'ws2_32|wsock32|mswsock|bcrypt|crypt32|ncrypt|secur32|dbghelp|shlwapi|winmm|ntdll|userenv|' +
               'psapi|version|iphlpapi|setupapi|cfgmgr32|comctl32|comdlg32|rpcrt4|dnsapi|powrprof|winhttp|' +
@@ -82,7 +88,7 @@ try {
     Get-ChildItem $bin -Filter '*.dll' | ForEach-Object { $bundled[$_.Name.ToLowerInvariant()] = $true }
     $missing = @()
     foreach ($file in Get-ChildItem $bin -Include '*.dll', '*.exe' -Recurse) {
-        $dependencies = & $dumpbin /nologo /dependents $file.FullName | ForEach-Object {
+        $dependencies = Invoke-Dumpbin /dependents $file.FullName | ForEach-Object {
             if ($_ -match '^\s+(\S+\.dll)\s*$') { $Matches[1].ToLowerInvariant() }
         }
         foreach ($dependency in $dependencies) {
@@ -100,12 +106,12 @@ try {
     if ($Backend -eq 'cuda') {
         $shim = (Get-ChildItem $bin -Filter 'cublas64_*.dll' | Select-Object -First 1)
         $exported = @{}
-        & $dumpbin /nologo /exports $shim.FullName | ForEach-Object {
+        Invoke-Dumpbin /exports $shim.FullName | ForEach-Object {
             if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $exported[$Matches[1]] = $true }
         }
         $dll = $null
         $unexported = @()
-        & $dumpbin /nologo /imports (Join-Path $bin 'ggml-cuda.dll') | ForEach-Object {
+        Invoke-Dumpbin /imports (Join-Path $bin 'ggml-cuda.dll') | ForEach-Object {
             if ($_ -match '^\s{4}(\S+\.dll)\s*$') {
                 $dll = $Matches[1]
             } elseif ($dll -ieq $shim.Name -and $_ -match '^\s+[0-9A-Fa-f]+\s+(\S+)\s*$' -and
@@ -113,6 +119,7 @@ try {
                 $unexported += $Matches[1]
             }
         }
+        if (-not $exported.Count) { throw "dumpbin listed no exports for $($shim.Name)" }
         if ($unexported) {
             throw "the cuBLAS shim does not export these functions ggml-cuda.dll calls:`n  $($unexported -join "`n  ")"
         }

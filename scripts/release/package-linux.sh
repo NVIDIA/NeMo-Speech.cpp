@@ -288,10 +288,18 @@ if [[ "$backend" == cuda ]]; then
     }
     # The shim implements only the cuBLAS calls ggml makes; a call added by a
     # llama.cpp update must be added to kernels/ before it can ship.
-    missing_cublas="$(comm -23 \
-        <(nm -D --undefined-only "$ggml_cuda" | awk '{ sub(/@.*/, "", $2); print $2 }' |
-            grep '^cublas' | sort -u) \
-        <(nm -D --defined-only "$cublas_shim" | awk '{ sub(/@.*/, "", $3); print $3 }' | sort -u))"
+    imported_cublas="$work_dir/imported-cublas"
+    exported_cublas="$work_dir/exported-cublas"
+    nm -D --undefined-only "$ggml_cuda" > "$imported_cublas.raw"
+    nm -D --defined-only "$cublas_shim" > "$exported_cublas.raw"
+    awk '{ sub(/@.*/, "", $2); if ($2 ~ /^cublas/) print $2 }' "$imported_cublas.raw" |
+        sort -u > "$imported_cublas"
+    awk '{ sub(/@.*/, "", $3); print $3 }' "$exported_cublas.raw" | sort -u > "$exported_cublas"
+    [[ -s "$imported_cublas" && -s "$exported_cublas" ]] || {
+        echo "error: could not read the cuBLAS symbols of libggml-cuda or the shim" >&2
+        exit 1
+    }
+    missing_cublas="$(comm -23 "$imported_cublas" "$exported_cublas")"
     [[ -z "$missing_cublas" ]] || {
         echo "error: the cuBLAS shim does not export these functions libggml-cuda calls:" >&2
         sed 's/^/  /' <<< "$missing_cublas" >&2

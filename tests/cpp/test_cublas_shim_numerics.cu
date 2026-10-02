@@ -236,7 +236,7 @@ run_pointer_batched_f32_case(cublasHandle_t handle) {
                                 b[item * size_b + (size_t)i * n + col];
                 }
                 const float actual = c[item * size_c + (size_t)col * m + row];
-                if (std::fabs(actual - expected) > 1.0e-3f) {
+                if (!std::isfinite(actual) || std::fabs(actual - expected) > 1.0e-3f) {
                     std::fprintf(
                         stderr, "FAIL: pointer-batched f32 [%d,%d,%d]=%g, expected %g\n", item, row,
                         col, actual, expected);
@@ -246,6 +246,117 @@ run_pointer_batched_f32_case(cublasHandle_t handle) {
         }
     }
     return true;
+}
+
+// More batches than CUDA's grid.z limit (65535), and a zero-sized no-op.
+bool
+run_large_batch_case(cublasHandle_t handle) {
+    constexpr int batch = 70000;
+    constexpr int dim = 2;
+    constexpr size_t size = (size_t)dim * dim;
+    std::vector<float> a(batch * size), b(batch * size), c(batch * size);
+    for (int item = 0; item < batch; ++item) {
+        for (size_t i = 0; i < size; ++i) {
+            a[item * size + i] = (float)(item % 7) + (float)i;
+            b[item * size + i] = i % 3 == 0 ? 1.0f : 0.5f;
+        }
+    }
+
+    float* device = nullptr;
+    const float** device_ptrs = nullptr;
+    bool ok = check_cuda(cudaMalloc(&device, 3 * a.size() * sizeof(float)), "cudaMalloc(large)") &&
+              check_cuda(cudaMalloc(&device_ptrs, 3 * batch * sizeof(float*)), "cudaMalloc(ptrs)");
+    float* device_a = device;
+    float* device_b = device_a + a.size();
+    float* device_c = device_b + b.size();
+    std::vector<const float*> ptrs(3 * batch);
+    for (int item = 0; item < batch; ++item) {
+        ptrs[item] = device_a + item * size;
+        ptrs[batch + item] = device_b + item * size;
+        ptrs[2 * batch + item] = device_c + item * size;
+    }
+    ok = ok &&
+         check_cuda(
+             cudaMemcpy(device_a, a.data(), a.size() * sizeof(float), cudaMemcpyHostToDevice),
+             "cudaMemcpy(A large)") &&
+         check_cuda(
+             cudaMemcpy(device_b, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice),
+             "cudaMemcpy(B large)") &&
+         check_cuda(
+             cudaMemcpy(
+                 device_ptrs, ptrs.data(), ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice),
+             "cudaMemcpy(ptrs large)");
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    std::vector<float> expected(c.size());
+    for (int item = 0; item < batch; ++item) {
+        for (int col = 0; col < dim; ++col) {
+            for (int row = 0; row < dim; ++row) {
+                float sum = 0.0f;
+                for (int i = 0; i < dim; ++i) {
+                    sum += a[item * size + (size_t)i * dim + row] *
+                           b[item * size + (size_t)col * dim + i];
+                }
+                expected[item * size + (size_t)col * dim + row] = sum;
+            }
+        }
+    }
+    const auto check_output = [&](const char* label) {
+        if (!check_cuda(
+                cudaMemcpy(c.data(), device_c, c.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                "cudaMemcpy(C large)")) {
+            return false;
+        }
+        for (size_t i = 0; i < c.size(); ++i) {
+            if (!std::isfinite(c[i]) || std::fabs(c[i] - expected[i]) > 1.0e-4f) {
+                std::fprintf(
+                    stderr, "FAIL: %s output[%zu]=%g, expected %g\n", label, i, c[i], expected[i]);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (ok) {
+        ok = check_cuda(cudaMemset(device_c, 0xff, c.size() * sizeof(float)), "cudaMemset(C)") &&
+             check_cublas(
+                 cublasSgemmBatched(
+                     handle, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &alpha, device_ptrs, dim,
+                     device_ptrs + batch, dim, &beta, (float* const*)(device_ptrs + 2 * batch), dim,
+                     batch),
+                 "cublasSgemmBatched(large)") &&
+             check_output("pointer-batched large");
+    }
+    if (ok) {
+        ok = check_cuda(cudaMemset(device_c, 0xff, c.size() * sizeof(float)), "cudaMemset(C)") &&
+             check_cublas(
+                 cublasSgemmStridedBatched(
+                     handle, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &alpha, device_a, dim,
+                     (long long)size, device_b, dim, (long long)size, &beta, device_c, dim,
+                     (long long)size, batch),
+                 "cublasSgemmStridedBatched(large)") &&
+             check_output("strided-batched large");
+    }
+    // Zero-sized problems complete without touching C.
+    if (ok) {
+        ok = check_cublas(
+                 cublasSgemmBatched(
+                     handle, CUBLAS_OP_N, CUBLAS_OP_N, dim, dim, dim, &alpha, device_ptrs, dim,
+                     device_ptrs + batch, dim, &beta, (float* const*)(device_ptrs + 2 * batch), dim,
+                     0),
+                 "cublasSgemmBatched(batch=0)") &&
+             check_cublas(
+                 cublasSgemmStridedBatched(
+                     handle, CUBLAS_OP_N, CUBLAS_OP_N, 0, dim, dim, &alpha, device_a, dim, 0,
+                     device_b, dim, 0, &beta, device_c, dim, 0, 1),
+                 "cublasSgemmStridedBatched(m=0)") &&
+             check_output("zero-sized no-op");
+    }
+
+    cudaFree(device);
+    cudaFree(device_ptrs);
+    return ok;
 }
 
 bool
@@ -283,6 +394,7 @@ main() {
     ok &= run_cancellation_case(handle, 768, 111, 768);
     ok &= run_batched_f32_case(handle);
     ok &= run_pointer_batched_f32_case(handle);
+    ok &= run_large_batch_case(handle);
     ok &= run_stream_churn_case(handle);
 
     ok &= check_cublas(cublasDestroy(handle), "cublasDestroy");
