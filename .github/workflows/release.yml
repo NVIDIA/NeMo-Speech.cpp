@@ -398,6 +398,34 @@ jobs:
         run: |
           git submodule update --init --depth 1 llama.cpp third_party/cpp-httplib
 
+      - name: Install build prerequisites
+        # Hosted windows-2022 images have these; self-hosted VMs selected with
+        # RELEASE_WINDOWS_CUDA_RUNNER may not (see gpu.yml).
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packages = @()
+          foreach ($tool in @{ cmake = 'cmake'; ninja = 'ninja' }.GetEnumerator()) {
+            if (-not (Get-Command $tool.Key -ErrorAction SilentlyContinue)) { $packages += $tool.Value }
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $hasVc = (Test-Path $vswhere) -and
+            (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if (-not $hasVc) { $packages += 'visualstudio2022-workload-vctools' }
+          if (-not $packages) { exit 0 }
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
+          }
+          choco install -y --no-progress @packages
+          if ($LASTEXITCODE -ne 0) { throw "choco install failed ($LASTEXITCODE)" }
+          # Later steps start with the job's original PATH; publish the new one.
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          "$machine;$user" -split ';' | Where-Object { $_ } | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+
       - name: Install the Vulkan SDK
         if: matrix.backend == 'vulkan'
         shell: pwsh
