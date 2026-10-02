@@ -1414,6 +1414,12 @@ NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSetMathMode(cublasHandle_t, cublasMath_t) {
     return STATUS_SUCCESS;
 }
+// The shim allocates its own split-K workspaces, so a caller-provided
+// workspace is accepted and left unused.
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
+cublasSetWorkspace_v2(cublasHandle_t, void*, size_t) {
+    return STATUS_SUCCESS;
+}
 NEMO_SPEECH_CUBLAS_EXPORT const char*
 cublasGetStatusString(cublasStatus_t) {
     return "EDGE_SHIM_OK";
@@ -1481,6 +1487,19 @@ cublasSgemmStridedBatched(
     launch(
         m, n, k, opA, opB, A, lda, sa, R_32F, B, ldb, sb, R_32F, C, ldc, sc, R_32F, *alpha, *beta,
         batch, stream, sh);
+    return STATUS_SUCCESS;
+}
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
+cublasSgemmBatched(
+    cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
+    const float* alpha, const float* const Aarray[], int lda, const float* const Barray[], int ldb,
+    const float* beta, float* const Carray[], int ldc, int batch) {
+    ShimHandle* sh = (ShimHandle*)h;
+    const cudaStream_t stream = stream_for_handle(sh);
+    dim3 blk(16, 16, 1), grd((m + 15) / 16, (n + 15) / 16, batch);
+    k_ptrs<<<grd, blk, 0, stream>>>(
+        m, n, k, opA, opB, (const void* const*)Aarray, lda, R_32F, (const void* const*)Barray, ldb,
+        R_32F, (void* const*)Carray, ldc, R_32F, *alpha, *beta, batch);
     return STATUS_SUCCESS;
 }
 NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t

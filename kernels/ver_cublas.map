@@ -7,11 +7,13 @@ libcublas.so.@NEMO_SPEECH_CUBLAS_SOVERSION@ {
     cublasDestroy_v2;
     cublasSetStream_v2;
     cublasSetMathMode;
+    cublasSetWorkspace_v2;
     cublasGetStatusString;
     cublasGemmEx;
     cublasGemmStridedBatchedEx;
     cublasGemmBatchedEx;
     cublasSgemm_v2;
+    cublasSgemmBatched;
     cublasSgemmStridedBatched;
     cublasStrsmBatched;
   local: *;

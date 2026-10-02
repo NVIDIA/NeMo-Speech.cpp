@@ -286,6 +286,17 @@ if [[ "$backend" == cuda ]]; then
         echo "error: libggml-cuda requires '$required_cublas'; expected '$cublas_soname'" >&2
         exit 1
     }
+    # The shim implements only the cuBLAS calls ggml makes; a call added by a
+    # llama.cpp update must be added to kernels/ before it can ship.
+    missing_cublas="$(comm -23 \
+        <(nm -D --undefined-only "$ggml_cuda" | awk '{ sub(/@.*/, "", $2); print $2 }' |
+            grep '^cublas' | sort -u) \
+        <(nm -D --defined-only "$cublas_shim" | awk '{ sub(/@.*/, "", $3); print $3 }' | sort -u))"
+    [[ -z "$missing_cublas" ]] || {
+        echo "error: the cuBLAS shim does not export these functions libggml-cuda calls:" >&2
+        sed 's/^/  /' <<< "$missing_cublas" >&2
+        exit 1
+    }
     cuda_license="/usr/share/doc/cuda-cudart-${cuda_version}/copyright"
     [[ -f "$cuda_license" ]] || {
         echo "error: CUDA runtime license was not found: $cuda_license" >&2

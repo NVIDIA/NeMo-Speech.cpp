@@ -167,6 +167,87 @@ run_batched_f32_case(cublasHandle_t handle) {
     return true;
 }
 
+// Pointer-array f32 GEMM with a transposed B, as ggml's OUT_PROD issues it.
+bool
+run_pointer_batched_f32_case(cublasHandle_t handle) {
+    constexpr int m = 37;
+    constexpr int n = 29;
+    constexpr int k = 13;
+    constexpr int batch = 5;
+    constexpr size_t size_a = (size_t)m * k;  // m x k, column-major
+    constexpr size_t size_b = (size_t)n * k;  // n x k, used transposed
+    constexpr size_t size_c = (size_t)m * n;
+
+    std::vector<float> a(batch * size_a), b(batch * size_b), c(batch * size_c);
+    for (size_t i = 0; i < a.size(); ++i) a[i] = (float)((i * 7) % 11) - 5.0f;
+    for (size_t i = 0; i < b.size(); ++i) b[i] = (float)((i * 5) % 13) - 6.0f;
+
+    float* device = nullptr;
+    const float** device_ptrs = nullptr;
+    const size_t total = a.size() + b.size() + c.size();
+    bool ok = check_cuda(cudaMalloc(&device, total * sizeof(float)), "cudaMalloc(batched)") &&
+              check_cuda(cudaMalloc(&device_ptrs, 3 * batch * sizeof(float*)), "cudaMalloc(ptrs)");
+    float* device_a = device;
+    float* device_b = device_a + a.size();
+    float* device_c = device_b + b.size();
+    std::vector<const float*> ptrs(3 * batch);
+    for (int item = 0; item < batch; ++item) {
+        ptrs[item] = device_a + item * size_a;
+        ptrs[batch + item] = device_b + item * size_b;
+        ptrs[2 * batch + item] = device_c + item * size_c;
+    }
+    ok = ok &&
+         check_cuda(
+             cudaMemcpy(device_a, a.data(), a.size() * sizeof(float), cudaMemcpyHostToDevice),
+             "cudaMemcpy(A batched)") &&
+         check_cuda(
+             cudaMemcpy(device_b, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice),
+             "cudaMemcpy(B batched)") &&
+         check_cuda(
+             cudaMemcpy(
+                 device_ptrs, ptrs.data(), ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice),
+             "cudaMemcpy(ptrs)");
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    if (ok) {
+        ok = check_cublas(
+            cublasSgemmBatched(
+                handle, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, &alpha, device_ptrs, m,
+                device_ptrs + batch, n, &beta, (float* const*)(device_ptrs + 2 * batch), m, batch),
+            "cublasSgemmBatched");
+    }
+    if (ok) {
+        ok = check_cuda(
+            cudaMemcpy(c.data(), device_c, c.size() * sizeof(float), cudaMemcpyDeviceToHost),
+            "cudaMemcpy(C batched)");
+    }
+    cudaFree(device);
+    cudaFree(device_ptrs);
+    if (!ok) {
+        return false;
+    }
+    for (int item = 0; item < batch; ++item) {
+        for (int col = 0; col < n; ++col) {
+            for (int row = 0; row < m; ++row) {
+                float expected = 0.0f;
+                for (int i = 0; i < k; ++i) {
+                    expected += a[item * size_a + (size_t)i * m + row] *
+                                b[item * size_b + (size_t)i * n + col];
+                }
+                const float actual = c[item * size_c + (size_t)col * m + row];
+                if (std::fabs(actual - expected) > 1.0e-3f) {
+                    std::fprintf(
+                        stderr, "FAIL: pointer-batched f32 [%d,%d,%d]=%g, expected %g\n", item, row,
+                        col, actual, expected);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool
 run_stream_churn_case(cublasHandle_t handle) {
     bool ok = true;
@@ -201,6 +282,7 @@ main() {
     ok &= run_cancellation_case(handle, 24, 432, 1296);
     ok &= run_cancellation_case(handle, 768, 111, 768);
     ok &= run_batched_f32_case(handle);
+    ok &= run_pointer_batched_f32_case(handle);
     ok &= run_stream_churn_case(handle);
 
     ok &= check_cublas(cublasDestroy(handle), "cublasDestroy");

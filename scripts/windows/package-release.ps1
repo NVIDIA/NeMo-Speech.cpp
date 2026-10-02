@@ -95,6 +95,29 @@ try {
         throw "the package is not self-contained:`n  $($missing -join "`n  ")"
     }
 
+    # The cuBLAS shim implements only the calls ggml makes; a call added by a
+    # llama.cpp update must be added to kernels\ before it can ship.
+    if ($Backend -eq 'cuda') {
+        $shim = (Get-ChildItem $bin -Filter 'cublas64_*.dll' | Select-Object -First 1)
+        $exported = @{}
+        & $dumpbin /nologo /exports $shim.FullName | ForEach-Object {
+            if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $exported[$Matches[1]] = $true }
+        }
+        $dll = $null
+        $unexported = @()
+        & $dumpbin /nologo /imports (Join-Path $bin 'ggml-cuda.dll') | ForEach-Object {
+            if ($_ -match '^\s{4}(\S+\.dll)\s*$') {
+                $dll = $Matches[1]
+            } elseif ($dll -ieq $shim.Name -and $_ -match '^\s+[0-9A-Fa-f]+\s+(\S+)\s*$' -and
+                      -not $exported.ContainsKey($Matches[1])) {
+                $unexported += $Matches[1]
+            }
+        }
+        if ($unexported) {
+            throw "the cuBLAS shim does not export these functions ggml-cuda.dll calls:`n  $($unexported -join "`n  ")"
+        }
+    }
+
     $zip = Join-Path (Resolve-Path $OutputDir) "$name.zip"
     if (Test-Path $zip) { Remove-Item $zip }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
