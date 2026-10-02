@@ -8,8 +8,7 @@ namespace nemo_speech::common {
 
 inline bool
 is_cpu_backend(ggml_backend_t backend) {
-    return ggml_backend_dev_type(ggml_backend_get_device(backend)) ==
-           GGML_BACKEND_DEVICE_TYPE_CPU;
+    return ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
 inline void

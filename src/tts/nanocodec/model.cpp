@@ -20,8 +20,8 @@
 #endif
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "gguf.h"
 #include "ggml_backend_utils.h"
+#include "gguf.h"
 #include "model_logging.h"
 #include "nvtx_utils.h"
 
