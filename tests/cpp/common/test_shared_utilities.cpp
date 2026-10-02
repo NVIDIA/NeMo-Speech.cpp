@@ -18,6 +18,7 @@
 #include "engine_registry.h"
 #include "ggml_log_filter.h"
 #include "json.h"
+#include "runtime.h"
 
 namespace {
 
@@ -140,6 +141,16 @@ main() {
             "unsupported container conversion guidance");
         require(nemo_speech::audio::is_wav_path("VOICE.WAVE"), "case-insensitive WAV path");
         require(!nemo_speech::audio::is_wav_path("voice.mp3"), "codec path rejection");
+
+        ggml_runtime::BackendManager backends({});
+        auto* cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        require(cpu != nullptr, "CPU backend discovery");
+        bool found_cpu_buffer = false;
+        for (const auto& entry : backends.get_buft_list()) {
+            if (entry.first == cpu && entry.second == ggml_backend_dev_buffer_type(cpu))
+                found_cpu_buffer = true;
+        }
+        require(found_cpu_buffer, "CPU device buffer selection");
 
         nemo_speech::EngineRegistry registry;
         require(!registry.ready(), "empty engine registry readiness");

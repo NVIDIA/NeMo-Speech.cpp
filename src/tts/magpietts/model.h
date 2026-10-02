@@ -4,7 +4,6 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
 #if defined(MAGPIETTS_CUDA_SAMPLING)

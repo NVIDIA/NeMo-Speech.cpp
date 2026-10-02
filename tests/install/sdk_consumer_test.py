@@ -4,6 +4,7 @@
 
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,17 @@ def main() -> None:
         run(*install_command)
         install_prefix.rename(prefix)
         cache = build / "CMakeCache.txt"
+        bin_directory = prefix / cache_value(cache, "CMAKE_INSTALL_BINDIR")
+        lib_directory = prefix / cache_value(cache, "CMAKE_INSTALL_LIBDIR")
+        if cache_bool(cache, "GGML_BACKEND_DL"):
+            plugin_directory = cache_value(cache, "GGML_BACKEND_DIR")
+            plugin_root = prefix / plugin_directory if plugin_directory else bin_directory
+            for backend in cache_value(cache, "GGML_AVAILABLE_BACKENDS").split(";"):
+                if backend:
+                    plugins = list(plugin_root.glob(f"*{backend}*"))
+                    assert any(
+                        p.is_file() for p in plugins
+                    ), f"missing installed backend: {backend}"
         expected = {
             "ASR": cache_bool(cache, "NEMO_SPEECH_BUILD_ASR"),
             "Diarization": cache_bool(cache, "NEMO_SPEECH_BUILD_DIAR"),
@@ -79,22 +91,30 @@ def main() -> None:
         consumer_environment = os.environ.copy()
         if os.name == "nt":
             consumer_environment["PATH"] = (
-                str(prefix / "bin") + os.pathsep + consumer_environment.get("PATH", "")
+                str(bin_directory) + os.pathsep + consumer_environment.get("PATH", "")
             )
         subprocess.run([str(consumer_binary)], check=True, env=consumer_environment)
+
+        # Exercise backend discovery beside the installed plugins, outside the build tree.
+        if cache_bool(cache, "GGML_BACKEND_DL"):
+            runtime_test = bin_directory / f"test_shared_utilities{suffix}"
+            shutil.copy2(build / "bin" / config / runtime_test.name, runtime_test)
+            library_path = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+            consumer_environment[library_path] = str(lib_directory)
+            subprocess.run([str(runtime_test)], check=True, env=consumer_environment, cwd=root)
 
         include = prefix / "include"
         assert not (include / "ggml.h").exists(), "internal ggml headers leaked into SDK"
         assert not (include / "llama.h").exists(), "internal llama headers leaked into SDK"
-        assert not (prefix / "bin" / "convert_hf_to_gguf.py").exists()
+        assert not (bin_directory / "convert_hf_to_gguf.py").exists()
 
-        if cache_bool(cache, "GGML_BLAS"):
+        if cache_bool(cache, "GGML_BLAS") and not cache_bool(cache, "GGML_BACKEND_DL"):
             if os.name == "nt":
-                blas_libraries = list((prefix / "bin").glob("*ggml-blas*.dll"))
+                blas_libraries = list(bin_directory.glob("*ggml-blas*.dll"))
             elif sys.platform == "darwin":
-                blas_libraries = list((prefix / "lib").glob("libggml-blas*.dylib"))
+                blas_libraries = list(lib_directory.glob("libggml-blas*.dylib"))
             else:
-                blas_libraries = list((prefix / "lib").glob("libggml-blas.so*"))
+                blas_libraries = list(lib_directory.glob("libggml-blas.so*"))
             assert blas_libraries, "installed runtime is missing the ggml BLAS backend"
 
 
