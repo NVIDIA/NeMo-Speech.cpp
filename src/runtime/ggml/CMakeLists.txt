@@ -25,7 +25,13 @@ target_include_directories(nemo_speech_runtime_ggml PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common
 )
 
-target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
+# ggml propagates linked backends and builds plugins when GGML_BACKEND_DL is enabled.
+target_link_libraries(nemo_speech_runtime_ggml PUBLIC ggml)
+
+# ggml exports this definition only for directly linked backends.
+if(GGML_VULKAN)
+    target_compile_definitions(nemo_speech_runtime_ggml PRIVATE GGML_USE_VULKAN)
+endif()
 
 # Consumers use the patched operations only when patches/ was applied; runtime.h
 # derives NEMO_SPEECH_CUDA_FAST_PATHS from this and GGML_USE_CUDA.
@@ -38,6 +44,6 @@ endif()
 # here so tests/ and riva_server inherit it and ld can resolve libggml-cuda's
 # NEEDED libcuda.so.1 at link time. CUDAToolkit was found in the top-level
 # CMakeLists.txt under the same GGML_CUDA gate.
-if(GGML_CUDA)
+if(GGML_CUDA AND NOT GGML_BACKEND_DL)
     target_link_libraries(nemo_speech_runtime_ggml PUBLIC CUDA::cuda_driver)
 endif()

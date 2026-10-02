@@ -57,6 +57,10 @@ BackendManager::init_backends() {
     // Vulkan reads this setting during device initialization.
     set_environment_default("GGML_VK_DISABLE_GRAPH_OPTIMIZE", "1");
 #endif  // GGML_USE_VULKAN
+#ifdef GGML_BACKEND_DL
+    static std::once_flag load_backends;
+    std::call_once(load_backends, [] { ggml_backend_load_all(); });
+#endif
 
     ggml_time_init();
 
@@ -153,7 +157,7 @@ BackendManager::init_backends() {
             ++extra_bufts;
         }
     }
-    buft_list.emplace_back(cpu_dev, ggml_backend_cpu_buffer_type());
+    buft_list.emplace_back(cpu_dev, ggml_backend_dev_buffer_type(cpu_dev));
 
     for (const auto& buft : buft_list) {
         ggml_backend_dev_t dev = buft.first;

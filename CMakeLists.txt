@@ -200,9 +200,7 @@ if(NEMO_SPEECH_BUILD_S2S AND NOT NEMO_SPEECH_GGML_PATCHED AND NOT NEMO_SPEECH_LL
     message(FATAL_ERROR "NEMO_SPEECH_BUILD_S2S requires NEMO_SPEECH_GGML_PATCHED=ON")
 endif()
 
-set(GGML_DEPENDENCIES ggml ggml-base ggml-cpu)
 if(GGML_CUDA)
-    list(APPEND GGML_DEPENDENCIES ggml-cuda)
     # libggml-cuda.so has libcuda.so.1 (the CUDA driver) as a NEEDED entry.
     # The driver is provided at runtime by NVIDIA's container toolkit and is
     # absent from the devel image - only the stub at
@@ -217,47 +215,41 @@ if(GGML_CUDA)
     # can't capture (e.g. shapes that change between calls).
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable ggml-cuda CUDA Graphs")
 endif()
-if(GGML_VULKAN)
-    list(APPEND GGML_DEPENDENCIES ggml-vulkan)
-endif()
-if(GGML_METAL)
-    list(APPEND GGML_DEPENDENCIES ggml-metal)
-endif()
 
 # Tiled CPU GEMM (llamafile tinyBLAS) for F16/F32/Q8_0 matmuls. Stock ggml leaves it off; without
 # it CPU matmuls run one dot product per output.
 set(GGML_LLAMAFILE ON CACHE BOOL "ggml: use llamafile SGEMM")
 
 include(cmake/llama_cpp.cmake)
+# Rebuild ggml's cached backend list when options change between configurations.
+unset(GGML_AVAILABLE_BACKENDS CACHE)
 add_subdirectory("${NEMO_SPEECH_LLAMA_CPP_DIR}/ggml" "${CMAKE_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
 
 # ggml is an implementation dependency, so install only the runtime libraries
 # required by our shared libraries. Its C++ headers, CMake package, pkg-config
 # metadata, and tools are not part of the public NeMo-Speech.cpp SDK.
 set_property(TARGET ggml PROPERTY PUBLIC_HEADER "")
-install(TARGETS ggml ggml-base ggml-cpu
+install(TARGETS ggml ggml-base
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-if(TARGET ggml-blas)
-    install(TARGETS ggml-blas
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+# ggml is EXCLUDE_FROM_ALL, so install its backends explicitly.
+# Match ggml's plugin destination; linked backends go beside the other libraries.
+if(GGML_BACKEND_DL)
+    if(GGML_BACKEND_DIR)
+        set(_nemo_backend_install_dir "${GGML_BACKEND_DIR}")
+    else()
+        set(_nemo_backend_install_dir "${CMAKE_INSTALL_BINDIR}")
+    endif()
+else()
+    set(_nemo_backend_install_dir "${CMAKE_INSTALL_LIBDIR}")
 endif()
-if(GGML_CUDA)
-    install(TARGETS ggml-cuda
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-endif()
-if(GGML_VULKAN)
-    install(TARGETS ggml-vulkan
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-endif()
-if(GGML_METAL)
-    install(TARGETS ggml-metal
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-endif()
+foreach(backend IN LISTS GGML_AVAILABLE_BACKENDS)
+    if(TARGET ${backend})
+        install(TARGETS ${backend}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            LIBRARY DESTINATION ${_nemo_backend_install_dir})
+    endif()
+endforeach()
 
 # In-tree cuBLAS shim backed by native GEMM kernels (no cuBLASLt). ggml-cuda
 # links real cuBLAS at build time. At runtime the loader resolves its cuBLAS
