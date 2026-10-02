@@ -34,8 +34,10 @@ ARCHIVE = re.compile(
 # x86-64-v3 has no EVEX (AVX-512) instructions, and in 64-bit code a leading 0x62 opcode byte
 # after legacy prefixes is always EVEX, so the encoding catches every AVX-512 instruction
 # whatever its registers. The mnemonics below add the VEX-encoded extensions beyond v3
-# (AVX-VNNI, AMX) and AVX-512 forms reported by name.
-INSTRUCTION = re.compile(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*(\S.*)$")
+# (AVX-VNNI, AMX) and AVX-512 forms reported by name. Both disassemblers put a tab before the
+# mnemonic; GNU objdump continues a long instruction's bytes on lines without one, which are
+# not instructions.
+INSTRUCTION = re.compile(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(\S.*)$")
 LEGACY_PREFIXES = {"26", "2e", "36", "3e", "64", "65", "66", "67", "f0", "f2", "f3"}
 
 # AT&T syntax, as printed by objdump and llvm-objdump.

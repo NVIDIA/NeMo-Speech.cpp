@@ -644,6 +644,24 @@ jobs:
           path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
           key: models-${{ hashFiles('models/index.json') }}
 
+      - name: Install Python
+        # The ephemeral VM does not necessarily ship Python (see gpu.yml).
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command python -ErrorAction SilentlyContinue) { exit 0 }
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
+          }
+          choco install -y --no-progress python
+          # Later steps start with the job's original PATH; publish the new one.
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          "$machine;$user" -split ';' | Where-Object { $_ } | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+
       - name: Model smoke test
         shell: pwsh
         run: |
