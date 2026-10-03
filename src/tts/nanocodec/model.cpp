@@ -1689,6 +1689,8 @@ decode_eval_stream(
         ggml_backend_tensor_set(
             graph.latent, graph.latent_data.data(), 0, graph.latent_data.size() * sizeof(float));
     }
+    // Streaming history is device-resident and updated inside the graph.
+
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, threads);
     }
