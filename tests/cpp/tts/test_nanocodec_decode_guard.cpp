@@ -24,9 +24,7 @@ expect(const char* name, const std::vector<float>& audio, bool want_finite) {
     }
 }
 
-// Runs one sample buffer through a graph tail shaped like the decoder's, with
-// and without the clamp this change removes, and returns what the host reads
-// back. Forces the CPU backend so the result is the same on every platform.
+// Runs `input` through a CPU graph, optionally ending in ggml_clamp(-1, 1).
 bool
 graph_tail(const std::vector<float>& input, bool with_clamp, std::vector<float>& output) {
     ggml_backend_t backend = ggml_backend_cpu_init();
@@ -92,8 +90,6 @@ main() {
     expect("digital silence", std::vector<float>(4096, 0.0f), true);
     expect("empty", {}, true);
 
-    // A decode that legitimately reaches full scale is audio, not a fault. The
-    // guard the writer would need if the clamp stayed could not tell them apart.
     expect("uniform negative full scale", std::vector<float>(1024, -1.0f), true);
     expect("uniform positive full scale", std::vector<float>(1024, 1.0f), true);
     expect("beyond full scale", {-1.7f, 2.4f, 0.1f}, true);
@@ -104,10 +100,7 @@ main() {
     expect("positive infinity", {0.2f, inf_value}, false);
     expect("negative infinity", {0.2f, -inf_value}, false);
 
-    // Why the clamp had to go. Terminating the decoder graph in
-    // ggml_clamp(-1, 1) folds a NaN onto a bound, so the buffer the host reads
-    // back is finite and no downstream isfinite check can ever see the fault.
-    // Without it the NaN survives the graph and this guard catches it.
+    // An in-graph clamp folds NaN onto a bound; without it the NaN reaches the host.
     {
         std::vector<float> input = {0.2f, nan_value, -0.4f, 0.9f};
         std::vector<float> clamped;

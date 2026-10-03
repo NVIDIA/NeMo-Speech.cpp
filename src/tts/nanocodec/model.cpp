@@ -30,9 +30,7 @@ static constexpr int NANO_CODEC_MAX_NODES = 32768;
 
 using nc_hparams = nemo_speech::tts::nanocodec::NanoCodecHParams;
 
-// The graph no longer clamps, so a NaN or an infinity is still visible here.
-// Reject those, then restore the bound the graph used to apply, so callers get
-// the same range they always did.
+// Bound to [-1, 1] on the host, after the check: an in-graph clamp would hide NaN.
 static bool
 require_finite_audio(std::vector<float>& audio) {
     if (!nemo_speech::tts::nanocodec::is_finite_audio(audio)) {
@@ -1691,8 +1689,6 @@ decode_eval_stream(
         ggml_backend_tensor_set(
             graph.latent, graph.latent_data.data(), 0, graph.latent_data.size() * sizeof(float));
     }
-    // Streaming history is device-resident and updated inside the graph.
-
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, threads);
     }
@@ -1713,14 +1709,9 @@ decode_eval_stream(
             graph.audio, graph.audio_data.data(), 0, graph.audio_data.size() * sizeof(float));
     }
 
-    // Validate everything the graph produced, not just the part this chunk
-    // returns. A partial final chunk leaves a padded suffix that feeds no
-    // audio but shares the convolution state the graph wrote back.
+    // Check the padded tail too: it also feeds the stream state.
     if (!require_finite_audio(graph.audio_data)) {
-        // The graph has already written this chunk into the device-resident
-        // stream state, so a NaN may now sit in the convolution history. Zero
-        // it rather than let a rejected chunk poison whatever decodes next.
-        state.clear();
+        state.clear();  // the graph already wrote this chunk into the stream history
         return false;
     }
 
