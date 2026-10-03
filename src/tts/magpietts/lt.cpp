@@ -12,6 +12,7 @@
 #include <string>
 #include <utility>
 
+#include "ggml_backend_utils.h"
 #include "graph.h"
 #include "nvtx_utils.h"
 
@@ -986,9 +987,7 @@ local_transformer_graph_eval(
         }
     }
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
-    }
+    nemo_speech::common::set_cpu_backend_n_threads(model.backend, threads);
 
     ggml_status status = GGML_STATUS_FAILED;
     {
@@ -1107,9 +1106,7 @@ local_transformer_graph_eval_cuda(
         }
     }
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
-    }
+    nemo_speech::common::set_cpu_backend_n_threads(model.backend, threads);
 
     ggml_status status = GGML_STATUS_FAILED;
     {

@@ -20,8 +20,8 @@
 #include "ggml-cuda.h"
 #endif
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml_backend_utils.h"
 #include "gguf.h"
 #include "model_logging.h"
 #include "nvtx_utils.h"
@@ -486,7 +486,7 @@ nc_pack_fused_conv_weights(nc_model& model, bool verbose) {
 // backend.
 static bool
 nc_cpu_gemm_transposed(const nc_model& model, const nc_conv& c) {
-    return model.backend && ggml_backend_is_cpu(model.backend) && c.w &&
+    return model.backend && nemo_speech::common::is_cpu_backend(model.backend) && c.w &&
            c.w->type == GGML_TYPE_F16 && ggml_is_contiguous(c.w) && c.stride > 0 &&
            c.w->ne[0] % c.stride == 0;
 }
@@ -500,7 +500,7 @@ nc_cpu_gemm_transposed(const nc_model& model, const nc_conv& c) {
 //    conv_transpose_1d re-permutes the whole weight on a single thread on every call.
 static void
 nc_prepare_cpu_conv_weights(nc_model& model, bool verbose) {
-    if (!model.backend || !ggml_backend_is_cpu(model.backend)) {
+    if (!model.backend || !nemo_speech::common::is_cpu_backend(model.backend)) {
         return;
     }
     std::vector<nc_conv*> pending;
@@ -1535,9 +1535,7 @@ decode_eval(
         ggml_backend_tensor_set(inp, latent.data(), 0, latent.size() * sizeof(float));
     }
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
-    }
+    nemo_speech::common::set_cpu_backend_n_threads(model.backend, threads);
 
     ggml_status status = GGML_STATUS_FAILED;
     {
@@ -1691,9 +1689,7 @@ decode_eval_stream(
     }
     // Streaming history is device-resident and updated inside the graph.
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
-    }
+    nemo_speech::common::set_cpu_backend_n_threads(model.backend, threads);
 
     ggml_status status = GGML_STATUS_FAILED;
     {
@@ -1849,7 +1845,7 @@ NanoCodecModel::loaded() const {
 
 bool
 NanoCodecModel::onAccelerator() const {
-    return loaded() && !ggml_backend_is_cpu(impl_->model.backend);
+    return loaded() && !nemo_speech::common::is_cpu_backend(impl_->model.backend);
 }
 
 const NanoCodecHParams&
