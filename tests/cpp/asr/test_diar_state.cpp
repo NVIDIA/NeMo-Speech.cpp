@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -213,6 +214,56 @@ test_learned_silence_embedding() {
     return state.n_sil_frames() == 0 && state.mean_sil_emb() == learned;
 }
 
+// Replays DiarStream's buffer trim: `pushed` samples arrive `push` at a time,
+// each chunk consumes `chunk` and keeps `lookback` before the next one. Every
+// sample stores its global index, so a wrong base shows up as a wrong value.
+// Returns the samples moved by erases; `peak` gets the largest buffer seen.
+size_t
+replay_trim(size_t pushed, size_t push, size_t chunk, size_t lookback, size_t& peak) {
+    std::vector<int> buf;
+    size_t base = 0, produced = 0, consumed = 0, moved = 0;
+    peak = 0;
+    while (consumed + chunk <= pushed) {
+        while (produced < consumed + chunk) {
+            const size_t n = std::min(push, pushed - produced);
+            for (size_t i = 0; i < n; i++) buf.push_back(static_cast<int>(produced + i));
+            produced += n;
+        }
+        peak = std::max(peak, buf.size());
+        require(
+            buf.size() == produced - base && buf[consumed - base] == static_cast<int>(consumed),
+            "compaction: the buffer holds [base, produced)");
+        consumed += chunk;
+        const size_t keep = consumed > lookback ? consumed - lookback : 0;
+        if (keep > base && compact_front(buf, keep - base)) {
+            moved += buf.size();
+            base = keep;
+        }
+    }
+    return moved;
+}
+
+void
+test_buffer_compaction() {
+    std::vector<int> buf{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    require(!compact_front(buf, 4) && buf.size() == 10, "compaction: a short dead prefix stays");
+    require(
+        compact_front(buf, 5) && buf == std::vector<int>({5, 6, 7, 8, 9}),
+        "compaction: a dead prefix as long as the live tail is erased");
+
+    // A whole 10 minute file pushed at once: erasing after every 160 ms chunk
+    // would move about 1.8e10 samples; the lazy rule must stay linear.
+    const size_t file = 600 * 16000, chunk = 2560, lookback = 16000;
+    size_t peak = 0;
+    require(
+        replay_trim(file, file, chunk, lookback, peak) <= file,
+        "compaction: a whole-file push moves each sample at most once on average");
+
+    // Live audio pushed 160 ms at a time: the buffer must stay bounded.
+    replay_trim(file, chunk, chunk, lookback, peak);
+    require(peak <= 2 * (lookback + 2 * chunk), "compaction: a live stream's buffer stays bounded");
+}
+
 }  // namespace
 
 int
@@ -225,6 +276,7 @@ main() {
     test_geometry_and_word_cadence();
     test_finite_parity();
     test_invalid_rotary_geometry();
+    test_buffer_compaction();
     if (!test_learned_silence_embedding()) {
         std::fprintf(stderr, "[FAIL] learned silence embedding was not retained\n");
         return 1;

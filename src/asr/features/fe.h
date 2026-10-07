@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "batching.h"
@@ -122,8 +123,14 @@ class MelSpectrogramExtractor {
     std::vector<float> window_;     // Hann window of length win_length
     std::vector<float> mel_basis_;  // (n_mels, n_fft/2 + 1) row-major
 
+    // CPU fast-path tables, built once and rebuilt whenever mel_basis_ changes.
+    std::vector<std::pair<int, int>> fft_swaps_;  // bit-reversal swap list
+    std::vector<float> fft_tw_re_, fft_tw_im_;    // per-stage FFT twiddles
+    std::vector<int> mel_kbeg_, mel_kend_;        // nonzero span of each mel row
+
     void init_window();
     void init_mel_basis();
+    void init_cpu_tables();
 
     // GPU log-mel for one window - runs through session_->run(). Output
     // layout matches the CPU path: `out` is resized to (n_mels * n_frames),

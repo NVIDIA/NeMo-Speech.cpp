@@ -12,6 +12,7 @@
 // serializes on the BackendManager mutex.
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -116,6 +117,18 @@ struct DiarSegment {
 std::vector<DiarSegment> diar_segments_from_probs(
     const float* probs, int64_t n_frames, int n_spk, double sec_per_frame,
     const DiarSegmentationCfg& cfg);
+
+// Drops the first `dead` elements of `buf`, but only once they are at least as
+// many as the elements after them, so trimming after every chunk costs
+// amortized O(1) moves per element. Returns whether it erased.
+template <typename T>
+bool
+compact_front(std::vector<T>& buf, size_t dead) {
+    if (dead < buf.size() - dead)
+        return false;
+    buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(dead));
+    return true;
+}
 
 // Per-stream streaming state + timeline.
 class DiarStream {

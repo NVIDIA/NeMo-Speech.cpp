@@ -264,19 +264,18 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
 
     // Trim consumed buffers. The next window starts at mel_consumed_ -
     // lc_mel_max; its first FE sample sits n_fft/2 before that frame's hop
-    // position.
+    // position. compact_front erases lazily, so a whole-file push costs
+    // amortized O(N) moves instead of one full-buffer memmove per chunk. The
+    // buffers keep holding [base, produced), so every index below stays valid.
     const int64_t keep_mel = std::max<int64_t>(mel_consumed_ - lc_mel_max, 0);
-    if (keep_mel > mel_base_) {
-        mel_buf_.erase(
-            mel_buf_.begin(), mel_buf_.begin() + (keep_mel - mel_base_) * m_.fe().n_mels());
+    if (keep_mel > mel_base_ &&
+        compact_front(mel_buf_, static_cast<size_t>(keep_mel - mel_base_) * m_.fe().n_mels()))
         mel_base_ = keep_mel;
-    }
     const int64_t keep_sample =
         std::max<int64_t>(keep_mel * m_.fe().hop_length() - m_.fe().n_fft() / 2, 0);
-    if (keep_sample > static_cast<int64_t>(audio_base_)) {
-        audio_buf_.erase(audio_buf_.begin(), audio_buf_.begin() + (keep_sample - audio_base_));
+    if (keep_sample > static_cast<int64_t>(audio_base_) &&
+        compact_front(audio_buf_, static_cast<size_t>(keep_sample) - audio_base_))
         audio_base_ = static_cast<size_t>(keep_sample);
-    }
     return true;
 }
 
