@@ -17,6 +17,7 @@
 
 #include "decoder.h"
 #include "encoder.h"
+#include "ggml_backend_utils.h"
 #include "graph.h"
 #include "lt.h"
 #include "model_logging.h"
@@ -1468,9 +1469,7 @@ compute_graph(
         }
     }
 
-    if (ggml_backend_is_cpu(backend)) {
-        ggml_backend_cpu_set_n_threads(backend, threads);
-    }
+    nemo_speech::common::set_cpu_backend_n_threads(backend, threads);
 
     ggml_status status = GGML_STATUS_FAILED;
     {
