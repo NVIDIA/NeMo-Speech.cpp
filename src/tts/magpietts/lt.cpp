@@ -276,7 +276,8 @@ magpietts_model_init_local_transformer_copy(
     if (use_cuda) {
         ggml_backend_dev_t device = ggml_backend_get_device(src.backend);
         const auto dev_type = device ? ggml_backend_dev_type(device) : GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (!device || (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+        if (!device || (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                        dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
             fprintf(stderr, "cannot create CUDA local-transformer mirror from a non-GPU model\n");
             return false;
         }
