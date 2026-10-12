@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check release archives before they are published.
 
-  check_release.py archives DIR --version VERSION
-                                          Check every archive in DIR: checksum, name, layout,
-                                          and required files.
+check_release.py archives DIR --version VERSION
+                                        Check every archive in DIR: checksum, name, layout,
+                                        and required files.
 """
+
 from __future__ import annotations
 
 import argparse
