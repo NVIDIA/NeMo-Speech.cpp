@@ -25,11 +25,16 @@ import numpy as np
 import torch
 from gguf.quants import quantize
 
-from .source import extract_archive, find_checkpoint_files, load_state_dict, read_checkpoint_config
+from .source import (
+    extract_archive,
+    find_checkpoint_files,
+    load_state_dict,
+    read_checkpoint_config,
+    read_nemo_config,
+)
 from .tts_tokenizer_profiles import tokenizer_profile
 
 SPECIAL_AUDIO_TOKENS = 8
-SPEAKER_NAMES = ["John", "Sofia", "Aria", "Jason", "Leo"]
 
 # 2-D projection weights stored as Q8_0 by ``--outtype q8_0``: the attention and feed-forward
 # projections (per-tap Conv1d slices) of the text encoder, the decoder and the local
@@ -53,7 +58,15 @@ def extract_nemo(path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | N
 
     tmp = tempfile.TemporaryDirectory(prefix="magpietts-nemo-")
     out = Path(tmp.name)
-    extract_archive(path, out, basenames={"model_config.yaml", "model_weights.ckpt"})
+    try:
+        basenames = {"model_config.yaml", "config.yaml", "model_weights.ckpt"}
+        speaker_map = read_nemo_config(path).get("speaker_map")
+        if isinstance(speaker_map, str) and speaker_map:
+            basenames.add(Path(speaker_map.removeprefix("nemo:")).name)
+        extract_archive(path, out, basenames=basenames)
+    except Exception:
+        tmp.cleanup()
+        raise
     return out, tmp
 
 
@@ -66,6 +79,38 @@ def read_state_dict(root: Path) -> dict[str, torch.Tensor]:
     if checkpoint is None:
         raise RuntimeError(f"checkpoint contains no model_weights.ckpt: {root}")
     return load_state_dict(checkpoint, weights_only=True)
+
+
+def read_speaker_names(
+    cfg: dict[str, Any], speaker_count: int, root: Path | None = None
+) -> list[str]:
+    """Return checkpoint names in baked speaker ID order, never JSON key order."""
+    speaker_map = cfg.get("speaker_map")
+    if isinstance(speaker_map, str) and speaker_map:
+        if root is None:
+            raise ValueError("speaker_map requires the extracted checkpoint directory")
+        # NeMo packages artifacts under a generated basename and records a
+        # nemo: URI; original absolute paths may also survive in older configs.
+        basename = Path(speaker_map.removeprefix("nemo:")).name
+        candidates = sorted(root.rglob(basename))
+        if len(candidates) != 1:
+            raise ValueError(
+                f"speaker_map artifact {basename!r}: expected one file in {root}, "
+                f"found {len(candidates)}"
+            )
+        with candidates[0].open(encoding="utf-8") as stream:
+            speaker_map = json.load(stream)
+    if not isinstance(speaker_map, dict) or not speaker_map:
+        raise ValueError("checkpoint must provide a non-empty speaker_map; cannot infer voice IDs")
+    names: set[str] = set()
+    for name, index in speaker_map.items():
+        if not isinstance(name, str) or not name.strip() or name.casefold() in names:
+            raise ValueError("speaker_map names must be non-empty and unique ignoring case")
+        names.add(name.casefold())
+        if type(index) is not int:
+            raise ValueError(f"speaker_map ID for {name!r} must be an integer")
+    _require_contiguous_indices("speaker_map", list(speaker_map.values()), speaker_count)
+    return sorted(speaker_map, key=speaker_map.__getitem__)
 
 
 def cfg_get(cfg: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -121,7 +166,10 @@ def _require_contiguous_indices(label: str, indices: list[int], expected_count: 
 
 
 def add_metadata(
-    writer: gguf.GGUFWriter, cfg: dict[str, Any], sd: dict[str, torch.Tensor]
+    writer: gguf.GGUFWriter,
+    cfg: dict[str, Any],
+    sd: dict[str, torch.Tensor],
+    checkpoint_root: Path | None = None,
 ) -> dict[str, Any]:
     encoder = cfg["encoder"]
     decoder = cfg["decoder"]
@@ -160,6 +208,10 @@ def add_metadata(
     _require_contiguous_indices(
         "local transformer output projection", lt_head_indices, n_stacked_codebooks
     )
+    speaker_count = int(sd["baked_context_embedding.weight"].shape[0])
+    speaker_names = read_speaker_names(cfg, speaker_count, checkpoint_root)
+    if len(baked_lens) != speaker_count:
+        raise ValueError("baked context length count does not match baked speaker count")
 
     inf = cfg.get("inference_parameters", {})
 
@@ -180,7 +232,7 @@ def add_metadata(
         "encoder_layers": int(encoder["n_layers"]),
         "decoder_layers": int(decoder["n_layers"]),
         "context_length": int(decoder["max_length_causal_mask"]),
-        "speaker_names": SPEAKER_NAMES,
+        "speaker_names": speaker_names,
         "baked_context_length": baked_t,
         "baked_context_dim": baked_d,
         "baked_context_lens": baked_lens,
@@ -196,7 +248,7 @@ def add_metadata(
     writer.add_string("magpietts.model_type", str(cfg.get("model_type", "")))
     writer.add_string("magpietts.codec_model", str(cfg.get("codecmodel_path", "")))
     writer.add_string("magpietts.config_json", json.dumps(cfg, ensure_ascii=False, sort_keys=True))
-    writer.add_array("magpietts.speaker_names", SPEAKER_NAMES)
+    writer.add_array("magpietts.speaker_names", speaker_names)
     writer.add_array("magpietts.baked_context_lens", baked_lens)
 
     add_i32(writer, "magpietts.text_vocab_size", text_vocab)
@@ -235,7 +287,7 @@ def add_metadata(
     )
     add_i32(writer, "magpietts.baked_context_length", baked_t)
     add_i32(writer, "magpietts.baked_context_dim", baked_d)
-    add_i32(writer, "magpietts.baked_speakers", int(sd["baked_context_embedding.weight"].shape[0]))
+    add_i32(writer, "magpietts.baked_speakers", speaker_count)
     add_i32(writer, "magpietts.inference.max_decoder_steps", inf.get("max_decoder_steps", 500))
     add_i32(writer, "magpietts.inference.topk", inf.get("topk", 80))
     add_i32(writer, "magpietts.inference.min_generated_frames", inf.get("min_generated_frames", 4))
@@ -398,7 +450,7 @@ def convert(
 
         output.parent.mkdir(parents=True, exist_ok=True)
         writer = gguf.GGUFWriter(output, "magpietts")
-        summary = add_metadata(writer, cfg, sd)
+        summary = add_metadata(writer, cfg, sd, root)
         n_written, skipped = add_tensors(writer, sd, outtype, local_transformer_outtype)
 
         writer.write_header_to_file()

@@ -112,6 +112,33 @@ environment setup.
 python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.q8_0.gguf
 ```
 
+Voice names are read from the checkpoint's `speaker_map` (including its bundled
+`speakers.json`) and stored in `magpietts.speaker_names` in numeric speaker ID
+order. Conversion rejects missing maps or IDs that do not match the baked
+speaker count. Extracted checkpoints must retain the referenced speaker file.
+The mappings differ between releases:
+
+| Speaker ID | v2602 | v2607 |
+|---|---|---|
+| 0 | John | Aria |
+| 1 | Sofia | Jason |
+| 2 | Aria | John |
+| 3 | Jason | Leo |
+| 4 | Leo | Sofia |
+
+Older converters wrote the v2602 names into every GGUF, causing v2607 named
+voices to select the wrong speaker. Reconvert the v2607 `.nemo` with the updated
+converter and select the new GGUF, then restart the runtime:
+
+```bash
+python3 convert_model.py magpie_tts_multilingual_357m.nemo \
+    --outtype f16 --outfile magpie_tts_multilingual_357m.v2607.fixed.f16.gguf
+```
+
+Updating the converter does not change existing GGUFs or published downloads.
+Until the affected GGUF is replaced, requesting the numeric voice `"2"` selects
+John on v2607. v2602's John remains at ID 0.
+
 Conversion does not require `nemo_toolkit`. The optional
 `scripts/tts/tokenize-magpietts.py` debugging helper does.
 
