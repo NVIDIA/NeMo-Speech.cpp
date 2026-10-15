@@ -8,9 +8,10 @@ import threading
 
 
 class MockWorker:
-    def __init__(self, path, float_audio=False):
+    def __init__(self, path, float_audio=False, preparation=None):
         self.path = str(path)
         self.float_audio = float_audio
+        self.preparation = preparation
         self.ready = threading.Event()
         self.release_stream = threading.Event()
         self.parallel_ready = threading.Event()
@@ -78,9 +79,12 @@ class MockWorker:
                         batch_size=32,
                         mode="inflight",
                         text_normalization_enabled=False,
+                        **({"text_preparation": self.preparation} if self.preparation else {}),
                     )
                     self.ready.set()
-                elif kind == "submit":
+                elif kind in ("submit", "submit_prepared"):
+                    if kind != ("submit_prepared" if self.preparation else "submit"):
+                        raise ValueError("incorrect preparation dispatch")
                     request_id = message["request_id"]
                     event = threading.Event()
                     with self.lock:
@@ -113,10 +117,17 @@ class MockWorker:
         try:
             if text == "failure":
                 self._json(
-                    kind="failed", request_id=request_id, message="injected preparation failure"
+                    kind="failed",
+                    request_id=request_id,
+                    message="injected preparation failure",
                 )
                 return
-            self._json(kind="accepted", request_id=request_id, processed_text=text, token_count=3)
+            self._json(
+                kind="accepted",
+                request_id=request_id,
+                processed_text=text,
+                token_count=len(message.get("token_ids", [0, 0, 0])),
+            )
             audio_kind = b"F" if self.float_audio else b"A"
             if text == "malformed":
                 invalid = (
@@ -142,7 +153,12 @@ class MockWorker:
                     raise RuntimeError("HTTP withheld first audio until completion")
                 if text == "cancel":
                     abort.wait(0.01)
-            self._json(kind="complete", request_id=request_id, total_samples=count, chunk_count=2)
+            self._json(
+                kind="complete",
+                request_id=request_id,
+                total_samples=count,
+                chunk_count=2,
+            )
             with self.lock:
                 self.completed.append(request_id)
         except (OSError, EOFError):

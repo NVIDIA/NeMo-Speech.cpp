@@ -6,11 +6,14 @@ EasyMagpie checkpoint, `english_sample` voice, English text, and mono 22050 Hz
 PCM16 output. It is a different model from the default MagpieTTS/NanoCodec GGUF
 backend.
 
-The Python controller is retained (Python 3.11 or newer; the pinned image uses Python 3.12). Python owns native package loading, GPU
-state, in-flight scheduling, and the bridge's tokenization and normalization.
-The C++ frontend owns public HTTP handling and multiplexes requests over one
-Unix socket. This integration is not a pure C++/CUDA rewrite of that controller.
-There is no TensorRT-LLM execution dependency in the retained native path.
+The Python controller is retained (Python 3.11 or newer; the pinned image uses
+Python 3.12). Python owns native package loading, GPU state, in-flight
+scheduling, and the compatibility bridge. The C++ frontend owns public HTTP
+handling and, in the Nemotron image, calls the native normalization/tokenization
+library before multiplexing prepared requests over one Unix socket. The
+bridge-side preparation path remains available for diagnostics. This
+integration is not a pure C++/CUDA rewrite of the controller. The neural
+megakernels do not execute through GGML, vLLM, TensorRT, or TensorRT-LLM.
 
 The vendored controller, kernels, and native normalizer retain their source
 notices. Their licensing and redistribution review is pending; a successful
@@ -103,6 +106,32 @@ Do not substitute the default `nemo-speech pull magpie` assets.
 
 ## Run
 
+The Nemotron Docker image enables native frontend text preparation. It uses
+the retained normalization ABI and tokenizer 0.21.4 directly from the C++
+request path, then forwards validated text/token IDs through the bridge.
+Preparation remains inside each HTTP request's measured lifetime. There is no
+text-result cache or normalization bypass. Other model backends do not load
+this library or use its protocol.
+
+For an equivalent source-built deployment, build and select the preparation
+library before launching:
+
+```bash
+cargo build --manifest-path native/text_preparation/Cargo.toml --release --locked
+export NEMOTRON_NATIVE_PREPARATION_LIBRARY="$PWD/native/text_preparation/target/release/libnemotron_text_preparation.so"
+export NEMOTRON_FRONTEND_PREPARATION=1
+export NEMOTRON_BRIDGE_FORWARD_F32=1
+export NEMOTRON_BRIDGE_FAIR_BATCH=64
+export NEMOTRON_HTTP_TCP_NODELAY=1
+```
+
+The Docker builder pins Rust 1.88.0 and the dependency lockfile. Setting
+`NEMOTRON_FRONTEND_PREPARATION=0` retains bridge-side preparation for diagnostic
+comparisons. `NEMOTRON_BRIDGE_FAIR_BATCH` yields between bounded groups of ready
+messages without introducing a batching timer. `NEMOTRON_HTTP_TCP_NODELAY`
+affects only the Nemotron HTTP backend. Raw-F32 forwarding preserves the
+existing PCM16 conversion and moves that conversion into the C++ reader.
+
 Start the controller and bridge in the qualified Python/CUDA environment:
 
 ```bash
@@ -122,6 +151,28 @@ C++ HTTP frontend when `--http-port` is present. The receipts directory must be
 new or empty, and existing socket paths are never replaced. Keep the launcher
 running while serving. It sets `TOKENIZERS_PARALLELISM=false`; concurrent requests
 use the bounded preparation pool instead of nested tokenizer worker pools.
+
+CPU placement affects end-to-end latency even when the CUDA binaries are
+identical. The optional `--native-cpus` controls the worker and bridge;
+`--frontend-cpus` controls the C++ frontend. Both use Linux `taskset` before
+starting child threads, must be subsets of the launcher's allowed CPUs, and
+are recorded in `LAUNCH.json` and `EXIT.json`. Unset options inherit affinity.
+Inspect `lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE` before selecting CPU IDs.
+
+On the measured EPYC 7413 host, the following options let preparation use all
+eight allocated physical server cores and their SMT siblings, while retaining
+four of those cores for native control and the bridge:
+
+```text
+--native-cpus 0-3,24-27 --frontend-cpus 0-7,24-31
+```
+
+The container or parent process must allow `0-7,24-31`. The measured client used
+separate cores `8-11,32-35`. These IDs describe that host, not a portable CPU
+topology. The placement shares existing server cores; it does not add cores or
+remove preparation/admission time from TTFA. Keep B512 HTTP worker capacity at
+least 512 (`--http-threads 520` in the measurements), because fixed cohorts must
+admit a complete physical wave.
 
 The Docker image uses this launcher as its entrypoint, with the package at
 `/package` and `nemo-speech` on `PATH`. Pass `--http-port`, `--http-host`, and
@@ -185,13 +236,13 @@ directory for another launch. For serving without normalization, omit the
 grammar/config mounts and `--normalization-config`. The container's native
 worker still requires the qualified model and GPU configuration.
 
-To reproduce the optional float32-forwarding benchmark candidate, add
-`-e NEMOTRON_BRIDGE_FORWARD_F32=1` before the image name in the `docker run`
-command above. This moves float32-to-PCM16 conversion to the C++ frontend;
-public HTTP audio remains PCM16. Leave the variable unset for the default
-PCM16 bridge path, and record the selected value with benchmark receipts.
-The [results report](nemotron-integration-results.md) distinguishes this
-candidate from the default and records its qualification limits.
+The Nemotron image enables `NEMOTRON_BRIDGE_FORWARD_F32=1`, moving
+float32-to-PCM16 conversion to the C++ frontend; public HTTP audio remains
+PCM16. Override it with `-e NEMOTRON_BRIDGE_FORWARD_F32=0` to reproduce the
+bridge-side conversion control. Outside the image, an unset variable retains
+bridge-side conversion. Record the selected values with benchmark receipts.
+The [results report](nemotron-integration-results.md) preserves the earlier
+candidate measurements and the subsequent complete host-path comparison.
 
 Alternatively omit `--http-port` from the launcher and start the frontend in
 another terminal:

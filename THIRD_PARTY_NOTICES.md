@@ -157,6 +157,13 @@ The legacy NVIDIA notice is preserved in
 [`native/tts-normalizer/LICENSE.legacy`](native/tts-normalizer/LICENSE.legacy).
 The normalizer also preserves the Riva source notice in
 [`native/tts-normalizer/LICENSE.riva`](native/tts-normalizer/LICENSE.riva).
+The processor ABI and media-schema sources used by the native preparation
+library retain the same legacy terms in
+[`native/text_preparation/LICENSE.imported`](native/text_preparation/LICENSE.imported),
+with their source revision recorded in
+[`native/text_preparation/NOTICE`](native/text_preparation/NOTICE). The library
+pins Hugging Face tokenizers 0.21.4 and its transitive dependencies through
+`native/text_preparation/Cargo.lock`; their upstream licenses also apply.
 These notices reserve NVIDIA's proprietary rights and require an express
 license agreement for use, reproduction, disclosure, or distribution. Licensing
 and redistribution review of the imported closure is pending; this notice and

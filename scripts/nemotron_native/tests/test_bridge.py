@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -25,9 +26,45 @@ from nemotron_cpp_bridge.protocol import (
     pcm16_scalar,
     read_control,
 )
-from nemotron_cpp_bridge.server import Bridge, Request, Session, parse_args
+from nemotron_cpp_bridge.server import (
+    Bridge,
+    Request,
+    Session,
+    initialize_preparation_worker,
+    parse_args,
+    preparation_cpus,
+)
 from nemotron_cpp_bridge.slabs import SlabReader
 from nemotron_native_backend.protocol import message, read_frame, write_frame
+
+
+class PreparationAffinityTests(unittest.TestCase):
+    def test_default_does_not_change_affinity(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(preparation_cpus())
+        with mock.patch.object(os, "sched_setaffinity", create=True) as setter:
+            initialize_preparation_worker(None)
+            setter.assert_not_called()
+
+    def test_cpu_list_validation(self):
+        with mock.patch.object(os, "sched_getaffinity", return_value={1, 2, 4, 5}, create=True):
+            for invalid in ("", "-1", "1,,2", "2-1", "0", "1-4", "9999999999", "1.5"):
+                with self.subTest(value=invalid), mock.patch.dict(
+                    os.environ, {"NEMOTRON_BRIDGE_PREPARATION_CPUS": invalid}
+                ), self.assertRaises(ValueError):
+                    preparation_cpus()
+            with mock.patch.dict(os.environ, {"NEMOTRON_BRIDGE_PREPARATION_CPUS": "1-2, 4,5"}):
+                self.assertEqual(preparation_cpus(), frozenset({1, 2, 4, 5}))
+
+    @unittest.skipUnless(hasattr(os, "sched_getaffinity"), "Linux affinity required")
+    def test_only_executor_workers_receive_affinity(self):
+        original = os.sched_getaffinity(0)
+        chosen = frozenset({min(original)})
+        with ThreadPoolExecutor(
+            max_workers=1, initializer=initialize_preparation_worker, initargs=(chosen,)
+        ) as executor:
+            self.assertEqual(executor.submit(os.sched_getaffinity, 0).result(), chosen)
+            self.assertEqual(os.sched_getaffinity(0), original)
 
 
 class Tokenizer:
@@ -165,6 +202,9 @@ class SlabTests(unittest.TestCase):
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        environment = mock.patch.dict(os.environ, {"NEMOTRON_BRIDGE_FORWARD_F32": "0"})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.native_path = self.root / "worker.sock"
@@ -189,6 +229,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         self.bridge = Bridge(self.args, tokenizer=Tokenizer(), preparer=Preparer())
+        self.bridge.frontend_preparation = getattr(self, "frontend_metadata", None)
         self.submitted = []
         self.aborted = []
         self.acknowledged = []
@@ -467,6 +508,16 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.bridge.preparation_slots.locked())
             self.assertFalse(self.submitted)
 
+    async def test_prepared_submit_is_rejected_without_negotiation(self):
+        self.assertNotIn("text_preparation", self.ready)
+        self.writer.write(
+            control_frame("submit_prepared", request_id=1, text="hello", token_ids=[42, 131073])
+        )
+        event = await asyncio.wait_for(receive(self.reader), 3)
+        self.assertEqual((event["kind"], event["code"]), ("failed", "invalid_request"))
+        self.assertIn("negotiated mode", event["message"])
+        self.assertFalse(self.submitted)
+
     async def test_invalid_voice_fails_without_native_submission(self):
         self.writer.write(control_frame("submit", request_id=10, text="hello", voice="other"))
         event = await asyncio.wait_for(receive(self.reader), 3)
@@ -501,6 +552,115 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 Bridge(self.args, preparer=Preparer())
             self.assertEqual(factory.call_count, 1)
 
+    async def test_continuous_workers_advance_without_event_loop_permits(self):
+        self.bridge.continuous_preparation = True
+        self.bridge.executor.shutdown()
+        self.bridge.executor = ThreadPoolExecutor(max_workers=1)
+        first_started, release, second_started = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        original = self.bridge.prepare_text
+
+        def work(value):
+            if value["text"] == "first":
+                first_started.set()
+                if not release.wait(5):
+                    raise TimeoutError("first preparation was not released")
+            else:
+                second_started.set()
+            return original(value)
+
+        with mock.patch.object(self.bridge, "prepare_text", side_effect=work):
+            try:
+                self.writer.write(control_frame("submit", request_id=1, text="first"))
+                await wait_until(first_started.is_set)
+                self.writer.write(control_frame("submit", request_id=2, text="second"))
+                await wait_until(lambda: len(self.bridge.session.dispatched_preparations) == 2)
+                release.set()
+                self.assertTrue(second_started.wait(1))
+                events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(6)]
+                self.assertEqual(sum(event["kind"] == "complete" for event in events), 2)
+            finally:
+                release.set()
+        self.assertEqual({item["normalized_text"] for item in self.submitted}, {"first", "second"})
+
+    async def test_continuous_canceled_queue_is_bounded_and_skips_normalization(self):
+        self.bridge.continuous_preparation = True
+        self.bridge.executor.shutdown()
+        self.bridge.executor = ThreadPoolExecutor(max_workers=1)
+        self.args.max_pending_requests = 2
+        session = self.bridge.session
+        started, release = threading.Event(), threading.Event()
+        original = self.bridge.prepare_text
+
+        def work(value):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("preparation was not released")
+            return original(value)
+
+        with mock.patch.object(self.bridge, "prepare_text", side_effect=work) as prepare:
+            try:
+                self.writer.write(control_frame("submit", request_id=1, text="running"))
+                await wait_until(started.is_set)
+                self.writer.write(control_frame("submit", request_id=2, text="queued"))
+                await wait_until(lambda: len(session.dispatched_preparations) == 2)
+                self.writer.write(control_frame("abort", request_id=2))
+                self.assertEqual(
+                    (await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted"
+                )
+                self.assertEqual(len(session.preparations), 2)
+                self.assertEqual(prepare.call_count, 1)
+                with self.assertLogs("nemotron_cpp_bridge.server", "ERROR") as errors:
+                    self.writer.write(control_frame("submit", request_id=3, text="over limit"))
+                    await wait_until(lambda: session.closed)
+                self.assertIn("client pending request limit exceeded", "\n".join(errors.output))
+                self.assertEqual(len(session.dispatched_preparations), 2)
+                release.set()
+                self.assertEqual(await asyncio.wait_for(self.reader.read(), 3), b"")
+                self.assertFalse(session.dispatched_preparations)
+                self.assertFalse(session.preparations)
+                self.assertEqual(prepare.call_count, 1)
+                self.assertFalse(self.submitted)
+            finally:
+                release.set()
+
+    async def test_continuous_shutdown_drains_active_preparation(self):
+        self.bridge.continuous_preparation = True
+        started, release = threading.Event(), threading.Event()
+        original = self.bridge.prepare_text
+        session = self.bridge.session
+
+        def work(value):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("preparation was not released")
+            return original(value)
+
+        with mock.patch.object(self.bridge, "prepare_text", side_effect=work):
+            try:
+                self.writer.write(control_frame("submit", request_id=1, text="running"))
+                await wait_until(started.is_set)
+                self.writer.close()
+                await self.writer.wait_closed()
+                await wait_until(lambda: session.closed)
+                self.assertEqual(len(session.dispatched_preparations), 1)
+                self.assertFalse(self.worker_done.is_set())
+                release.set()
+                await asyncio.wait_for(self.worker_done.wait(), 3)
+                self.assertFalse(session.dispatched_preparations)
+                self.assertFalse(session.preparations)
+                self.assertFalse(self.submitted)
+            finally:
+                release.set()
+
+    async def test_continuous_configuration_rejects_ambiguous_value(self):
+        with mock.patch.dict(os.environ, {"NEMOTRON_BRIDGE_CONTINUOUS_PREPARATION": "true"}):
+            with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+                Bridge(self.args, tokenizer=Tokenizer(), preparer=Preparer())
+
     async def test_completion_accounting_failure_closes_connection(self):
         self.bad_completion = True
         self.writer.write(control_frame("submit", request_id=11, text="hello"))
@@ -527,6 +687,105 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(request.terminal)
         self.assertTrue(request.canceled)
         self.assertEqual(session.output_bytes, len(request.output[0][0]))
+
+
+class FrontendBridgeTests(unittest.IsolatedAsyncioTestCase):
+    frontend_metadata = {
+        "library": "/test/preparation.so",
+        "tokenizer": "/test/tokenizer.json",
+        "normalization_config": "null",
+    }
+    asyncSetUp = BridgeTests.asyncSetUp
+    asyncTearDown = BridgeTests.asyncTearDown
+    worker = BridgeTests.worker
+
+    async def test_prepared_submission_preserves_tokens_and_skips_preparation(self):
+        self.assertEqual(self.ready["text_preparation"], self.frontend_metadata)
+        with mock.patch.object(
+            self.bridge, "prepare_text", side_effect=AssertionError("unexpected preparation")
+        ) as prepare:
+            self.writer.write(
+                control_frame(
+                    "submit_prepared",
+                    request_id=1,
+                    text="Already normalized.",
+                    token_ids=[42, 43, 131073],
+                    seed=7,
+                )
+            )
+            events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(3)]
+            prepare.assert_not_called()
+        self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+        self.assertEqual(events[0]["processed_text"], "Already normalized.")
+        self.assertEqual(events[0]["token_count"], 3)
+        self.assertEqual(self.submitted[0]["normalized_text"], "Already normalized.")
+        self.assertEqual(self.submitted[0]["token_ids"], [42, 43, 131073])
+        self.assertEqual(self.submitted[0]["seed"], 7)
+
+    async def test_ordinary_submission_is_rejected_in_prepared_mode(self):
+        self.writer.write(control_frame("submit", request_id=1, text="hello"))
+        event = await asyncio.wait_for(receive(self.reader), 3)
+        self.assertEqual((event["kind"], event["code"]), ("failed", "invalid_request"))
+        self.assertIn("negotiated mode", event["message"])
+        self.assertFalse(self.submitted)
+        self.writer.write(
+            control_frame("submit_prepared", request_id=2, text="recovery", token_ids=[42, 131073])
+        )
+        events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(3)]
+        self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+
+    async def test_invalid_prepared_token_contract_is_rejected_before_dispatch(self):
+        for ident, tokens in enumerate(
+            (
+                None,
+                [],
+                [1, 2],
+                [True, 131073],
+                [-1, 131073],
+                [131075, 131073],
+                [1.0, 131073],
+                ["1", 131073],
+                [131073] * 513,
+                {"id": 131073},
+            ),
+            start=1,
+        ):
+            with self.subTest(tokens=str(tokens)[:60]):
+                self.writer.write(
+                    control_frame(
+                        "submit_prepared", request_id=ident, text="hello", token_ids=tokens
+                    )
+                )
+                event = await asyncio.wait_for(receive(self.reader), 3)
+                self.assertEqual((event["kind"], event["code"]), ("failed", "invalid_request"))
+                self.assertIn("prepared token", event["message"])
+                self.assertFalse(self.submitted)
+        self.bridge.validate_input(
+            {"kind": "submit_prepared", "text": "hello", "token_ids": [0] * 511 + [131073]}
+        )
+        with self.assertRaisesRegex(ValueError, "prepared token"):
+            self.bridge.validate_input(
+                {"kind": "submit_prepared", "text": "hello", "token_ids": (42, 131073)}
+            )
+
+    async def test_prepared_request_cancellation_reaches_native_worker(self):
+        self.writer.write(
+            control_frame("submit_prepared", request_id=1, text="cancel", token_ids=[42, 131073])
+        )
+        self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "accepted")
+        self.writer.write(control_frame("abort", request_id=1))
+        self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted")
+        await wait_until(lambda: bool(self.aborted))
+        self.assertEqual(self.aborted, [self.submitted[0]["request_id"]])
+
+    async def test_cancel_buffered_prepared_request_skips_native_submission(self):
+        self.writer.write(
+            control_frame("submit_prepared", request_id=1, text="hello", token_ids=[42, 131073])
+            + control_frame("abort", request_id=1)
+        )
+        self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted")
+        await wait_until(lambda: not self.bridge.session.preparations)
+        self.assertFalse(self.submitted)
 
 
 if __name__ == "__main__":

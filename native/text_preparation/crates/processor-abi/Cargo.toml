@@ -1,0 +1,13 @@
+[package]
+name = "processor-abi"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+libloading.workspace = true
+media-schema = { path = "../media-schema" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

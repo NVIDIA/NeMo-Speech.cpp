@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import time
 import uuid
@@ -25,6 +26,33 @@ from .slabs import SlabReader
 LOG = logging.getLogger(__name__)
 
 
+def preparation_cpus():
+    value = os.environ.get("NEMOTRON_BRIDGE_PREPARATION_CPUS")
+    if value is None:
+        return None
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        raise ValueError("preparation CPU affinity is unsupported on this platform")
+    available = os.sched_getaffinity(0)
+    selected = set()
+    for part in value.split(","):
+        match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", part.strip())
+        if match is None:
+            raise ValueError("invalid NEMOTRON_BRIDGE_PREPARATION_CPUS CPU list")
+        first = int(match[1])
+        last = int(match[2]) if match[2] else first
+        if first > last or last > max(available):
+            raise ValueError("preparation CPUs must be within the process CPU allocation")
+        selected.update(range(first, last + 1))
+    if not selected or not selected.issubset(available):
+        raise ValueError("preparation CPUs must be within the process CPU allocation")
+    return frozenset(selected)
+
+
+def initialize_preparation_worker(cpus):
+    if cpus is not None:
+        os.sched_setaffinity(0, cpus)
+
+
 @dataclass(eq=False)
 class Request:
     request_id: int
@@ -40,6 +68,7 @@ class Request:
     scheduled: bool = False
     preparation_task: asyncio.Task | None = None
     preparation_started: bool = False
+    preparation_dispatched: bool = False
     output: collections.deque = field(default_factory=collections.deque)
     trace: dict = field(default_factory=dict)
 
@@ -59,6 +88,7 @@ class Session:
         self.output_bytes = 0
         self.preparations = set()
         self.running_preparations = set()
+        self.dispatched_preparations = set()
         self.background = set()
         self.slabs = SlabReader()
         self.closed = False
@@ -108,7 +138,11 @@ class Session:
         if request.terminal:
             return
         request.canceled = True
-        if request.preparation_task is not None and not request.preparation_started:
+        if (
+            request.preparation_task is not None
+            and not request.preparation_started
+            and not request.preparation_dispatched
+        ):
             request.preparation_task.cancel()
         self.discard_output(request)
         if aborted:
@@ -148,8 +182,14 @@ class Session:
             request.trace[event] = time.monotonic_ns()
 
     async def write_output(self):
+        fair_batch = self.bridge.fair_batch
+        processed = 0
         while True:
+            if fair_batch and processed == fair_batch:
+                processed = 0
+                await asyncio.sleep(0)
             request = await self.ready.get()
+            processed += 1
             if not request.output:
                 request.scheduled = False
                 continue
@@ -167,24 +207,51 @@ class Session:
                 request.scheduled = True
                 self.ready.put_nowait(request)
 
+    def prepare_queued(self, request, value):
+        if request.canceled or self.closed:
+            return None
+        started = time.monotonic_ns()
+        text, tokens = self.bridge.prepare_text(value)
+        return started, time.monotonic_ns(), text, tokens
+
     async def prepare(self, request, value):
         try:
             if request.canceled or self.closed:
                 return
             loop = asyncio.get_running_loop()
-            async with self.bridge.preparation_slots:
-                if request.canceled or self.closed:
-                    return
-                request.preparation_started = True
-                self.running_preparations.add(request.preparation_task)
+            if value.get("kind") == "submit_prepared":
                 self.mark(request, "preparation_started")
+                text, tokens = value["text"], value["token_ids"]
+                self.mark(request, "preparation_finished")
+            elif self.bridge.continuous_preparation:
+                request.preparation_dispatched = True
+                self.dispatched_preparations.add(request.preparation_task)
                 try:
-                    text, tokens = await loop.run_in_executor(
-                        self.bridge.executor, self.bridge.prepare_text, value
+                    result = await loop.run_in_executor(
+                        self.bridge.executor, self.prepare_queued, request, value
                     )
                 finally:
-                    self.running_preparations.discard(request.preparation_task)
-                self.mark(request, "preparation_finished")
+                    self.dispatched_preparations.discard(request.preparation_task)
+                if result is None:
+                    return
+                started, finished, text, tokens = result
+                if self.bridge.diagnostics is not None:
+                    request.trace.setdefault("preparation_started", started)
+                    request.trace.setdefault("preparation_finished", finished)
+            else:
+                async with self.bridge.preparation_slots:
+                    if request.canceled or self.closed:
+                        return
+                    request.preparation_started = True
+                    self.running_preparations.add(request.preparation_task)
+                    self.mark(request, "preparation_started")
+                    try:
+                        text, tokens = await loop.run_in_executor(
+                            self.bridge.executor, self.bridge.prepare_text, value
+                        )
+                    finally:
+                        self.running_preparations.discard(request.preparation_task)
+                    self.mark(request, "preparation_finished")
             if request.canceled or self.closed:
                 return
             request.text = text
@@ -210,13 +277,19 @@ class Session:
             await self.fail(request, "preparation_failed", str(error))
 
     async def read_client(self):
+        fair_batch = self.bridge.fair_batch
+        processed = 0
         while True:
+            if fair_batch and processed == fair_batch:
+                processed = 0
+                await asyncio.sleep(0)
             value = await read_control(self.reader)
+            processed += 1
             kind = value.get("kind")
             ident = value.get("request_id")
             if type(ident) is not int or not 0 <= ident <= 0xFFFFFFFFFFFFFFFF:
                 raise ValueError("request_id must be a uint64 integer")
-            if kind == "submit":
+            if kind in {"submit", "submit_prepared"}:
                 if ident in self.requests:
                     raise ValueError("request_id is already active")
                 if (
@@ -229,7 +302,7 @@ class Session:
                 self.requests[ident] = request
                 self.native_requests[request.native_id] = request
                 try:
-                    self.bridge.validate_submit(value)
+                    self.bridge.validate_input(value)
                 except ValueError as error:
                     await self.fail(request, "invalid_request", str(error), abort=False)
                     continue
@@ -245,8 +318,14 @@ class Session:
                 raise ValueError("unsupported bridge client message")
 
     async def read_native(self):
+        fair_batch = self.bridge.fair_batch
+        processed = 0
         while True:
+            if fair_batch and processed == fair_batch:
+                processed = 0
+                await asyncio.sleep(0)
             value = await read_frame(self.native_reader)
+            processed += 1
             if value.get("protocol_version") != 1:
                 raise ValueError("native protocol version changed")
             kind = value.get("kind")
@@ -327,7 +406,11 @@ class Session:
                 )
             elif kind == "aborted":
                 await self.fail(
-                    request, "aborted", "native request aborted", abort=False, aborted=True
+                    request,
+                    "aborted",
+                    "native request aborted",
+                    abort=False,
+                    aborted=True,
                 )
             else:
                 raise ValueError("unsupported native output message")
@@ -358,6 +441,11 @@ class Session:
                     batch_size=self.bridge.args.width,
                     mode=self.bridge.args.mode,
                     text_normalization_enabled=self.bridge.preparer.enabled,
+                    **(
+                        {"text_preparation": self.bridge.frontend_preparation}
+                        if self.bridge.frontend_preparation is not None
+                        else {}
+                    ),
                 )
             )
             await asyncio.wait_for(self.writer.drain(), self.bridge.args.write_timeout)
@@ -377,7 +465,10 @@ class Session:
         finally:
             self.closed = True
             for task in (*tasks, *self.background):
-                if task not in self.running_preparations:
+                if (
+                    task not in self.running_preparations
+                    and task not in self.dispatched_preparations
+                ):
                     task.cancel()
             await asyncio.gather(*tasks, *self.background, return_exceptions=True)
             if self.native_writer is not None:
@@ -393,6 +484,19 @@ class Session:
 class Bridge:
     def __init__(self, args, *, tokenizer=None, preparer=None):
         self.args = args
+        fair_batch = os.environ.get("NEMOTRON_BRIDGE_FAIR_BATCH", "0")
+        if re.fullmatch(r"[0-9]{1,4}", fair_batch) is None or int(fair_batch) > 1024:
+            raise ValueError("NEMOTRON_BRIDGE_FAIR_BATCH must be an integer from 0 through 1024")
+        self.fair_batch = int(fair_batch)
+        worker_cpus = preparation_cpus()
+        continuous = os.environ.get("NEMOTRON_BRIDGE_CONTINUOUS_PREPARATION", "0")
+        if continuous not in {"0", "1"}:
+            raise ValueError("NEMOTRON_BRIDGE_CONTINUOUS_PREPARATION must be 0 or 1")
+        self.continuous_preparation = continuous == "1"
+        frontend = os.environ.get("NEMOTRON_FRONTEND_PREPARATION", "0")
+        if frontend not in {"0", "1"}:
+            raise ValueError("NEMOTRON_FRONTEND_PREPARATION must be 0 or 1")
+        self.frontend_preparation = None
         raw = args.manifest.read_bytes()
         self.manifest_hash = hashlib.sha256(raw).hexdigest()
         self.manifest = json.loads(raw)
@@ -405,8 +509,6 @@ class Bridge:
         ):
             raise ValueError("bridge requires the native streaming-v3 output contract")
         if tokenizer is None:
-            from tokenizers import Tokenizer
-
             seal_path = args.model_seal or args.model / "model-seal.json"
             seal = json.loads(seal_path.read_text())
             tokenizer_path = (args.model / "tokenizer.json").resolve(strict=True)
@@ -419,7 +521,27 @@ class Bridge:
                 != tokenizer_seal["sha256"]
             ):
                 raise ValueError("tokenizer does not match the selected sealed model")
-            tokenizer = Tokenizer.from_file(str(args.model / "tokenizer.json"))
+            preparation_library = os.environ.get("NEMOTRON_NATIVE_PREPARATION_LIBRARY")
+            if frontend == "1" and not preparation_library:
+                raise ValueError("frontend preparation requires the native preparation library")
+            if preparation_library and preparer is None:
+                if frontend == "1":
+                    from .native_preparation import FrontendPreparation
+
+                    preparer = FrontendPreparation(
+                        preparation_library, tokenizer_path, args.normalization_config
+                    )
+                    self.frontend_preparation = preparer.metadata
+                else:
+                    from .native_preparation import NativePreparation
+
+                    preparer = NativePreparation(
+                        preparation_library, tokenizer_path, args.normalization_config
+                    )
+            else:
+                from tokenizers import Tokenizer
+
+                tokenizer = Tokenizer.from_file(str(tokenizer_path))
         if preparer is None:
             from .normalization import TextPreparer
 
@@ -427,13 +549,33 @@ class Bridge:
         self.tokenizer = tokenizer
         self.preparer = preparer
         self.executor = ThreadPoolExecutor(
-            max_workers=args.preparation_threads, thread_name_prefix="native-text"
+            max_workers=args.preparation_threads,
+            thread_name_prefix="native-text",
+            initializer=initialize_preparation_worker,
+            initargs=(worker_cpus,),
         )
         self.preparation_slots = asyncio.Semaphore(args.preparation_threads)
         self.session = None
         self.tasks = set()
         diagnostic_path = os.environ.get("NEMOTRON_BRIDGE_DIAGNOSTICS")
         self.diagnostics = open(diagnostic_path, "x") if diagnostic_path else None
+
+    def validate_input(self, value):
+        prepared = value.get("kind") == "submit_prepared"
+        if prepared != (self.frontend_preparation is not None):
+            raise ValueError("request preparation does not match the negotiated mode")
+        if prepared:
+            tokens = value.get("token_ids")
+            if (
+                not isinstance(tokens, list)
+                or not 1 <= len(tokens) <= 512
+                or any(type(token) is not int or not 0 <= token < 131075 for token in tokens)
+                or tokens[-1] != 131073
+            ):
+                raise ValueError("invalid prepared token IDs")
+            self.validate_submit({key: item for key, item in value.items() if key != "token_ids"})
+        else:
+            self.validate_submit(value)
 
     @staticmethod
     def validate_submit(value):
@@ -454,7 +596,13 @@ class Bridge:
             raise ValueError("text must contain 1..1000000 UTF-8 bytes")
         if value.get("voice", "english_sample") != "english_sample":
             raise ValueError("native TTS supports only voice english_sample")
-        if value.get("language", "en-US") not in ("en", "en-US", "english", "English", ""):
+        if value.get("language", "en-US") not in (
+            "en",
+            "en-US",
+            "english",
+            "English",
+            "",
+        ):
             raise ValueError("the native package supports English only")
         seed = value.get("seed", 0)
         if type(seed) is not int or not 0 <= seed <= 0xFFFFFFFFFFFFFFFF:
@@ -463,10 +611,15 @@ class Bridge:
             raise ValueError("apply_normalize must be boolean")
 
     def prepare_text(self, value):
-        text = self.preparer.prepare(value["text"], "en-US", value.get("apply_normalize", True))
+        if hasattr(self.preparer, "prepare_tokens"):
+            text, tokens = self.preparer.prepare_tokens(
+                value["text"], value.get("apply_normalize", True)
+            )
+        else:
+            text = self.preparer.prepare(value["text"], "en-US", value.get("apply_normalize", True))
+            tokens = self.tokenizer.encode_batch([text], add_special_tokens=False)[0].ids + [131073]
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text preparation returned empty text")
-        tokens = self.tokenizer.encode_batch([text], add_special_tokens=False)[0].ids + [131073]
         if not 1 <= len(tokens) <= 512:
             raise ValueError("native TTS supports at most 512 text tokens including EOS")
         if any(type(token) is not int or not 0 <= token < 131075 for token in tokens):
@@ -518,7 +671,9 @@ def parse_args(argv=None):
     for name in ("native-worker-socket", "manifest", "model", "listen"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument(
-        "--mode", choices=("fixed_cohort", "fixed_request", "inflight"), default="inflight"
+        "--mode",
+        choices=("fixed_cohort", "fixed_request", "inflight"),
+        default="inflight",
     )
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--normalization-config", type=Path)
@@ -560,7 +715,10 @@ async def serve(args):
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stopping.set)
-        print(json.dumps({"status": "BRIDGE_LISTENING", "socket": str(args.listen)}), flush=True)
+        print(
+            json.dumps({"status": "BRIDGE_LISTENING", "socket": str(args.listen)}),
+            flush=True,
+        )
         await stopping.wait()
     finally:
         if server is not None:
@@ -573,7 +731,10 @@ async def serve(args):
 
 def main(argv=None):
     logging.basicConfig(level=logging.INFO)
-    print(json.dumps({"serialization": install_serialization(native_protocol)}), flush=True)
+    print(
+        json.dumps({"serialization": install_serialization(native_protocol)}),
+        flush=True,
+    )
     asyncio.run(serve(parse_args(argv)))
 
 

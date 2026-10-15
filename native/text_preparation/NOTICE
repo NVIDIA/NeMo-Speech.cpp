@@ -1,0 +1,1 @@
+processor-abi and media-schema are adapted from NVIDIA Nemotron Speech commit 2cc27a4e6b06e5e6bf33020ce4faa1fc00bfd25b. Original copyright and license are retained in LICENSE.imported. Only explanatory comments were removed. The native text normalizer remains a separately loaded library under its existing license.

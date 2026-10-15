@@ -10,6 +10,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import wave
@@ -77,10 +78,12 @@ def failed_stream(port, text, require_no_audio=False):
         connection.close()
 
 
-def run(binary, float_audio=False, runtime_seed=None):
+def run(binary, float_audio=False, runtime_seed=None, preparation=None):
     with tempfile.TemporaryDirectory(prefix="nemo-native-http-") as temporary:
         folder = Path(temporary)
-        worker = MockWorker(folder / "worker.sock", float_audio=float_audio)
+        worker = MockWorker(
+            folder / "worker.sock", float_audio=float_audio, preparation=preparation
+        )
         port = free_port()
         with (folder / "server.log").open("w+") as log:
             process = subprocess.Popen(
@@ -137,13 +140,22 @@ def run(binary, float_audio=False, runtime_seed=None):
                     )
                     first = response.read(512)
                     require(len(first) == 512, "missing first PCM chunk")
-                    require(not worker.completed, "worker completed before first audio arrived")
+                    require(
+                        not worker.completed,
+                        "worker completed before first audio arrived",
+                    )
                     worker.release_stream.set()
                     rest = response.read()
-                    require(len(first + rest) == 1024, "stream PCM was truncated or duplicated")
+                    require(
+                        len(first + rest) == 1024,
+                        "stream PCM was truncated or duplicated",
+                    )
                     if float_audio:
                         expected = struct.pack("<512h", *([-16384] * 256 + [16384] * 256))
-                        require(first + rest == expected, "F32 conversion changed PCM16 bytes")
+                        require(
+                            first + rest == expected,
+                            "F32 conversion changed PCM16 bytes",
+                        )
                 finally:
                     worker.release_stream.set()
                     response.close()
@@ -155,7 +167,8 @@ def run(binary, float_audio=False, runtime_seed=None):
                     ]
                     results = [future.result(timeout=10) for future in futures]
                 require(
-                    worker.parallel_ready.is_set(), "requests did not overlap inside the worker"
+                    worker.parallel_ready.is_set(),
+                    "requests did not overlap inside the worker",
                 )
                 require(
                     all(status == 200 and len(pcm) == 1024 for status, pcm, _ in results),
@@ -178,10 +191,14 @@ def run(binary, float_audio=False, runtime_seed=None):
 
                 status, payload, _ = speech(port, "failure", "wav")
                 require(status >= 400, "worker preparation failure became HTTP success")
-                require(b"injected preparation failure" in payload, "worker error message was lost")
+                require(
+                    b"injected preparation failure" in payload,
+                    "worker error message was lost",
+                )
                 failed_stream(port, "failure")
                 require(
-                    speech(port, "recovery")[0] == 200, "request failure poisoned other requests"
+                    speech(port, "recovery")[0] == 200,
+                    "request failure poisoned other requests",
                 )
 
                 connection, response = open_speech(port, "cancel")
@@ -191,7 +208,10 @@ def run(binary, float_audio=False, runtime_seed=None):
                 )
                 response.close()
                 connection.close()
-                require(worker.aborted.wait(5), "HTTP disconnect did not abort backend request")
+                require(
+                    worker.aborted.wait(5),
+                    "HTTP disconnect did not abort backend request",
+                )
                 require(
                     speech(port, "after-cancel")[0] == 200,
                     "cancellation poisoned subsequent requests",
@@ -200,6 +220,35 @@ def run(binary, float_audio=False, runtime_seed=None):
                     speech(port, "seed-override", seed=11)[0] == 200,
                     "explicit request seed failed",
                 )
+
+                if preparation:
+                    require(
+                        speech(port, "  prepared-trim  ")[0] == 200,
+                        "prepared request failed",
+                    )
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+                    from nemotron_cpp_bridge.native_preparation import NativePreparation
+
+                    reference = NativePreparation(
+                        preparation["library"], Path(preparation["tokenizer"])
+                    )
+                    try:
+                        for request in worker.submissions:
+                            text, tokens = reference.prepare_tokens(request["text"])
+                            require(
+                                request["kind"] == "submit_prepared",
+                                "frontend skipped native preparation",
+                            )
+                            require(
+                                (request["text"], request.get("token_ids")) == (text, tokens),
+                                "frontend changed prepared text/tokens",
+                            )
+                        require(
+                            worker.submissions[-1]["text"] == "prepared-trim",
+                            "frontend did not normalize whitespace",
+                        )
+                    finally:
+                        reference.close()
 
                 failed_stream(port, "malformed", require_no_audio=float_audio)
                 require(not worker.errors, "mock protocol errors: " + repr(worker.errors))
@@ -273,8 +322,19 @@ def reject_runtime_options(binary):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
+    parser.add_argument("--preparation-library", type=Path)
+    parser.add_argument("--tokenizer", type=Path)
     arguments = parser.parse_args()
+    if bool(arguments.preparation_library) != bool(arguments.tokenizer):
+        parser.error("--preparation-library and --tokenizer are required together")
     binary = arguments.binary.resolve(strict=True)
     run(binary, runtime_seed=7)
     run(binary, float_audio=True)
+    if arguments.preparation_library:
+        preparation = {
+            "library": str(arguments.preparation_library.resolve(strict=True)),
+            "tokenizer": str(arguments.tokenizer.resolve(strict=True)),
+            "normalization_config": "null",
+        }
+        run(binary, float_audio=True, runtime_seed=7, preparation=preparation)
     reject_runtime_options(binary)

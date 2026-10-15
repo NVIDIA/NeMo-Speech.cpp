@@ -2,6 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 ARG NATIVE_RUNTIME=nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
 ARG NORMALIZER_BUILDER=gcr.io/bazel-public/bazel:6.2.1@sha256:e25493c1c3bf74e0612a34cf6ae23c67243117aa1c42bc7730f46effd0a89006
+ARG TEXT_PREPARATION_BUILDER=rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
+
+FROM ${TEXT_PREPARATION_BUILDER} AS text-preparation-builder
+WORKDIR /build
+COPY native/text_preparation/ ./
+ARG NATIVE_BUILD_JOBS=2
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo test --release --locked --workspace --jobs "${NATIVE_BUILD_JOBS}" \
+    && cargo build --release --locked --jobs "${NATIVE_BUILD_JOBS}" \
+    && install -D --mode=0555 target/release/libnemotron_text_preparation.so /out/libnemotron_text_preparation.so
 
 FROM ${NORMALIZER_BUILDER} AS normalizer-builder
 USER root
@@ -52,6 +62,7 @@ RUN python3 /opt/nemotron-native/runtime_dependencies.py --remove-tensorrt --out
 COPY --from=cpp-builder /opt/nemo-speech /opt/nemo-speech
 COPY --from=kernel-builder /package /package
 COPY --from=normalizer-builder /out/libnemotron_speech_tts_text_preprocessor.so /opt/nemotron-speech/lib/processors/libnemotron_speech_tts_text_preprocessor.so
+COPY --from=text-preparation-builder /out/libnemotron_text_preparation.so /opt/nemotron-speech/lib/processors/libnemotron_text_preparation.so
 COPY python /opt/nemotron-speech/python
 COPY deploy/nemotron_native/serve.py /opt/nemotron-speech/deploy/nemotron_native/serve.py
 COPY deploy/nemotron_native/LICENSE /opt/nemotron-speech/deploy/nemotron_native/LICENSE
@@ -60,6 +71,8 @@ COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /opt/nemo-speech/share/licenses/nemo-
 COPY deploy/nemotron_native/LICENSE /opt/nemo-speech/share/licenses/nemo-speech/third_party/nemotron-native/LICENSE
 COPY native/tts-normalizer/LICENSE.legacy native/tts-normalizer/LICENSE.riva native/tts-normalizer/THIRD_PARTY_NOTICES.md \
     /opt/nemo-speech/share/licenses/nemo-speech/third_party/nemotron-normalizer/
+COPY native/text_preparation/LICENSE.imported native/text_preparation/NOTICE \
+    /opt/nemo-speech/share/licenses/nemo-speech/third_party/nemotron-text-preparation/
 COPY deploy/nemotron_native/kernels/third_party/thunderkittens/LICENSE \
     /opt/nemo-speech/share/licenses/nemo-speech/third_party/thunderkittens/LICENSE
 COPY deploy/nemotron_native/kernels/third_party/thunderkittens-v4-prefill/LICENSE \
@@ -68,5 +81,10 @@ ENV PATH=/opt/nemo-speech/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/loc
     PYTHONPATH=/opt/nemotron-speech/python \
     PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility NVIDIA_TF32_OVERRIDE=0 CUDA_MODULE_LOADING=LAZY \
-    NEMOTRON_TN_STRING_MATCHER=1
+    NEMOTRON_TN_STRING_MATCHER=1 \
+    NEMOTRON_NATIVE_PREPARATION_LIBRARY=/opt/nemotron-speech/lib/processors/libnemotron_text_preparation.so \
+    NEMOTRON_FRONTEND_PREPARATION=1 \
+    NEMOTRON_BRIDGE_FORWARD_F32=1 \
+    NEMOTRON_BRIDGE_FAIR_BATCH=64 \
+    NEMOTRON_HTTP_TCP_NODELAY=1
 ENTRYPOINT ["python3", "/opt/nemotron-speech/scripts/nemotron_native/launch.py"]

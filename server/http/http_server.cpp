@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -404,6 +405,15 @@ struct Server::Impl {
         } else {
             server = std::make_unique<httplib::Server>();
         }
+#if defined(NEMO_SPEECH_REGISTRY_TTS)
+        if (const char* value = std::getenv("NEMOTRON_HTTP_TCP_NODELAY");
+            value && std::strcmp(value, "1") == 0) {
+            const auto capabilities = this->models.capabilities();
+            if (std::find(capabilities.begin(), capabilities.end(), "tts") != capabilities.end() &&
+                this->models.tts()->backend_name() == "nemotron")
+                server->set_tcp_nodelay(true);
+        }
+#endif
         server->set_payload_max_length(this->config.max_upload_bytes);
         server->set_read_timeout(this->config.read_timeout_seconds);
         server->set_write_timeout(this->config.write_timeout_seconds);

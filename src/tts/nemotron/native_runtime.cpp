@@ -19,6 +19,7 @@
 #include "pcm_conversion.h"
 
 #ifndef _WIN32
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -67,6 +68,112 @@ double
 milliseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
 }
+
+#ifndef _WIN32
+class TextPreparation {
+   public:
+    explicit TextPreparation(const Value& metadata) {
+        if (!metadata.is_object() || metadata.object().size() != 3)
+            throw std::runtime_error("invalid native text preparation metadata");
+        const auto library = metadata.at("library").string();
+        const auto tokenizer = metadata.at("tokenizer").string();
+        const auto config = metadata.at("normalization_config").string();
+        for (const auto* path : {&library, &tokenizer}) {
+            if (path->empty() || path->front() != '/' || path->find('\0') != std::string::npos)
+                throw std::runtime_error("native preparation paths must be absolute");
+        }
+        if (config.empty() || config.size() > 1024 * 1024 || config.find('\0') != std::string::npos)
+            throw std::runtime_error("invalid native preparation configuration");
+        library_ = ::dlopen(library.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!library_)
+            throw std::runtime_error("cannot load native text preparation library");
+        try {
+            auto create = symbol<Create>("nemotron_text_create");
+            prepare_ = symbol<Prepare>("nemotron_text_prepare");
+            free_ = symbol<Free>("nemotron_text_free");
+            destroy_ = symbol<Destroy>("nemotron_text_destroy");
+            char* error = nullptr;
+            const int status = create(config.c_str(), tokenizer.c_str(), &handle_, &error);
+            std::unique_ptr<char, Free> owned_error(error, free_);
+            check(status, error);
+            if (!handle_)
+                throw std::runtime_error("native preparation returned an empty handle");
+        }
+        catch (...) {
+            release();
+            throw;
+        }
+    }
+
+    ~TextPreparation() { release(); }
+    TextPreparation(const TextPreparation&) = delete;
+    TextPreparation& operator=(const TextPreparation&) = delete;
+
+    Value prepare(const std::string& input, bool normalize) const {
+        char* output = nullptr;
+        char* error = nullptr;
+        const int status = prepare_(
+            handle_, reinterpret_cast<const uint8_t*>(input.data()), input.size(), normalize,
+            &output, &error);
+        std::unique_ptr<char, Free> owned_output(output, free_);
+        std::unique_ptr<char, Free> owned_error(error, free_);
+        check(status, error);
+        if (!output || ::strnlen(output, kMaxFrameBytes) >= kMaxFrameBytes)
+            throw std::runtime_error("native preparation returned an invalid result");
+        auto result = Value::parse(output);
+        const auto& text = result.at("text").string();
+        const auto& tokens = result.at("tokens").array();
+        if (text.empty() || text.size() > kMaxFrameBytes || tokens.empty() || tokens.size() > 512)
+            throw std::runtime_error("native preparation returned invalid text or token count");
+        for (const auto& token : tokens) {
+            if (!token.is_number() || !std::isfinite(token.number()) || token.number() < 0 ||
+                token.number() >= 131075 || token.number() != std::floor(token.number()))
+                throw std::runtime_error("native preparation returned an invalid token ID");
+        }
+        if (tokens.back().number() != 131073)
+            throw std::runtime_error("native preparation omitted the text EOS token");
+        return result;
+    }
+
+   private:
+    using Create = int (*)(const char*, const char*, void**, char**);
+    using Prepare = int (*)(void*, const uint8_t*, size_t, uint8_t, char**, char**);
+    using Free = void (*)(char*);
+    using Destroy = void (*)(void*);
+
+    template <class Function>
+    Function symbol(const char* name) {
+        auto address = ::dlsym(library_, name);
+        if (!address)
+            throw std::runtime_error(std::string("native preparation missing symbol: ") + name);
+        return reinterpret_cast<Function>(address);
+    }
+
+    static void check(int status, const char* error) {
+        if (status == 0)
+            return;
+        const std::string message = error ? error : "native text preparation failed";
+        if (status == 1)
+            throw std::invalid_argument(message);
+        throw std::runtime_error(message);
+    }
+
+    void release() {
+        if (handle_ && destroy_)
+            destroy_(handle_);
+        handle_ = nullptr;
+        if (library_)
+            ::dlclose(library_);
+        library_ = nullptr;
+    }
+
+    void* library_ = nullptr;
+    void* handle_ = nullptr;
+    Prepare prepare_ = nullptr;
+    Free free_ = nullptr;
+    Destroy destroy_ = nullptr;
+};
+#endif
 
 }  // namespace
 
@@ -146,6 +253,8 @@ struct NativeRuntime::Impl {
             if (execution_mode.empty())
                 throw std::runtime_error("native worker mode is empty");
             normalizes = ready.at("text_normalization_enabled").boolean();
+            if (const auto* preparation = ready.find("text_preparation"))
+                text_preparation = std::make_unique<TextPreparation>(*preparation);
             reader = std::thread([this] { read_loop(); });
         }
         catch (...) {
@@ -381,6 +490,13 @@ struct NativeRuntime::Impl {
         const PreparedSynthesis& prepared, const Synthesizer::PcmCallback& callback) {
         const auto started = Clock::now();
         const auto deadline = started + std::chrono::seconds(timeout_seconds);
+        Value prepared_text;
+        if (text_preparation) {
+            prepared_text = text_preparation->prepare(
+                prepared.metadata.original_text, prepared.apply_normalize != 0);
+            if (Clock::now() >= deadline)
+                throw std::runtime_error("native text preparation timed out");
+        }
         std::shared_ptr<Request> request;
         uint64_t id;
         {
@@ -394,8 +510,11 @@ struct NativeRuntime::Impl {
             request = std::make_shared<Request>();
             pending.emplace(id, request);
         }
-        Value submit = control("submit", id);
-        submit["text"] = prepared.metadata.original_text;
+        Value submit = control(text_preparation ? "submit_prepared" : "submit", id);
+        submit["text"] =
+            text_preparation ? prepared_text.at("text") : Value(prepared.metadata.original_text);
+        if (text_preparation)
+            submit["token_ids"] = std::move(prepared_text["tokens"]);
         submit["voice"] = "english_sample";
         submit["language"] = prepared.metadata.language_code;
         submit["seed"] = prepared.options.seed < 0 ? 0 : prepared.options.seed;
@@ -479,6 +598,7 @@ struct NativeRuntime::Impl {
     bool normalizes = false;
     int width = 1;
     std::string execution_mode;
+    std::unique_ptr<TextPreparation> text_preparation;
     std::thread reader;
     std::timed_mutex writes;
     std::mutex pending_mutex;

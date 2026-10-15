@@ -5,6 +5,8 @@ import asyncio
 import contextlib
 import json
 import os
+import re
+import shutil
 import signal
 import sys
 from pathlib import Path
@@ -30,6 +32,8 @@ def parse_args(argv=None):
     parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-threads", type=int)
     parser.add_argument("--frontend-binary", default="nemo-speech")
+    parser.add_argument("--native-cpus")
+    parser.add_argument("--frontend-cpus")
     parser.add_argument("--startup-timeout", type=float, default=900)
     parser.add_argument("--shutdown-timeout", type=float, default=30)
     args = parser.parse_args(argv)
@@ -39,6 +43,10 @@ def parse_args(argv=None):
         parser.error("http-port must be in 1..65535")
     if args.http_threads is not None and args.http_threads <= 0:
         parser.error("http-threads must be positive")
+    try:
+        cpu_configuration(args)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     args.package = args.package.resolve()
     args.model = args.model.resolve()
     args.model_seal = (args.model_seal or args.model / "model-seal.json").resolve()
@@ -48,6 +56,68 @@ def parse_args(argv=None):
     ).resolve()
     args.receipts = args.receipts.resolve()
     return args
+
+
+def parse_cpus(value, available):
+    selected = set()
+    for part in value.split(","):
+        match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", part.strip())
+        if match is None:
+            raise ValueError("CPU sets must use comma-separated CPU IDs or inclusive ranges")
+        first = int(match[1])
+        last = int(match[2]) if match[2] else first
+        if first > last or last > max(available, default=-1):
+            raise ValueError("requested CPUs must be within the launcher CPU affinity")
+        selected.update(range(first, last + 1))
+    if not selected or not selected.issubset(available):
+        raise ValueError("requested CPUs must be within the launcher CPU affinity")
+    return sorted(selected)
+
+
+def cpu_configuration(args):
+    native = args.native_cpus
+    frontend = args.frontend_cpus
+    if frontend is not None and args.http_port is None:
+        raise ValueError("frontend-cpus requires http-port")
+    supported = sys.platform == "linux" and hasattr(os, "sched_getaffinity")
+    requested = native is not None or frontend is not None
+    if requested and not supported:
+        raise ValueError("CPU role controls require Linux CPU affinity support")
+    available = set(os.sched_getaffinity(0)) if supported else None
+    taskset = shutil.which("taskset") if requested else None
+    if requested and taskset is None:
+        raise ValueError("CPU role controls require taskset in PATH")
+    roles = {"worker": native, "bridge": native}
+    if args.http_port is not None:
+        roles["frontend"] = frontend
+    configuration = {
+        "available_cpus": sorted(available) if available is not None else None,
+        "roles": {
+            role: {
+                "requested_cpus": parse_cpus(value, available) if value is not None else None,
+                "effective_cpus": None,
+            }
+            for role, value in roles.items()
+        },
+    }
+    return taskset, configuration
+
+
+def cpu_command(command, role, taskset, configuration):
+    cpus = configuration["roles"][role]["requested_cpus"]
+    return [taskset, "--cpu-list", ",".join(map(str, cpus)), *command] if cpus else command
+
+
+def record_cpu_affinity(configuration, role, process):
+    record = configuration["roles"][role]
+    record["pid"] = process.pid
+    if configuration["available_cpus"] is not None:
+        record["effective_cpus"] = sorted(os.sched_getaffinity(process.pid))
+        if (
+            record["requested_cpus"] is not None
+            and record["effective_cpus"] != record["requested_cpus"]
+        ):
+            raise RuntimeError(role + " CPU affinity differs from its requested CPUs")
 
 
 def commands(args):
@@ -146,7 +216,10 @@ async def wait_http(host, port, processes, timeout, stopping):
 
 
 async def run(args):
+    taskset, affinity = cpu_configuration(args)
     worker_command, bridge_command = commands(args)
+    worker_command = cpu_command(worker_command, "worker", taskset, affinity)
+    bridge_command = cpu_command(bridge_command, "bridge", taskset, affinity)
     if args.listen == args.native_worker_socket:
         raise ValueError("worker and bridge sockets must differ")
     for path in (args.listen, args.native_worker_socket):
@@ -178,7 +251,12 @@ async def run(args):
     processes = []
     logs = []
     tasks = []
-    report = {"status": "STARTING", "width": args.width, "mode": args.mode}
+    report = {
+        "status": "STARTING",
+        "width": args.width,
+        "mode": args.mode,
+        "cpu_affinity": affinity,
+    }
     try:
         log = (args.receipts / "worker.log").open("wb")
         logs.append(log)
@@ -192,6 +270,7 @@ async def run(args):
         await wait_ready(
             args.receipts / "worker/NATIVE_READY.json", processes, args.startup_timeout, stopping
         )
+        record_cpu_affinity(affinity, "worker", worker)
         log = (args.receipts / "bridge.log").open("wb")
         logs.append(log)
         bridge = await asyncio.create_subprocess_exec(
@@ -202,6 +281,7 @@ async def run(args):
         )
         processes.append(bridge)
         await wait_ready(args.listen, processes, args.startup_timeout, stopping)
+        record_cpu_affinity(affinity, "bridge", bridge)
         if args.http_port is not None:
             frontend_command = [
                 args.frontend_binary,
@@ -218,6 +298,7 @@ async def run(args):
             ]
             if args.http_threads is not None:
                 frontend_command.extend(["--http-threads", str(args.http_threads)])
+            frontend_command = cpu_command(frontend_command, "frontend", taskset, affinity)
             log = (args.receipts / "frontend.log").open("wb")
             logs.append(log)
             frontend = await asyncio.create_subprocess_exec(
@@ -230,6 +311,7 @@ async def run(args):
             await wait_http(
                 args.http_host, args.http_port, processes, args.startup_timeout, stopping
             )
+            record_cpu_affinity(affinity, "frontend", frontend)
             report["frontend"] = {
                 "command": frontend_command,
                 "pid": frontend.pid,

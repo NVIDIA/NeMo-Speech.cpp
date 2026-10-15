@@ -1,0 +1,37 @@
+[package]
+name = "nemotron-text-preparation"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[workspace]
+members = ["crates/processor-abi", "crates/media-schema"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+libloading = "=0.8.9"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[dependencies]
+processor-abi = { path = "crates/processor-abi" }
+media-schema = { path = "crates/media-schema" }
+serde = { workspace = true }
+serde_json = "1"
+regex = "1"
+tokenizers = { version = "=0.21.4", default-features = false, features = ["onig"] }

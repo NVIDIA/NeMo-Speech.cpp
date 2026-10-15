@@ -225,3 +225,272 @@ Every timing arm retains its launch command, image identity, worker receipts,
 client records, GPU telemetry, and shutdown result. Repeating a performance
 claim requires additional independent boots and matched measurement conditions;
 the current one-boot samples have no confidence intervals.
+
+## Subsequent B512 host-path repair
+
+The following campaign supersedes the v6 performance samples for the repaired
+host path; the earlier observations above remain unchanged. With the same native
+CUDA package, moving normalization and tokenization into the C++ frontend's
+native preparation path reduced B512 HTTP TTFA p95 from **274.60 to 224.30 ms**
+for fixed cohorts and from **335.23 to 229.95 ms** for in-flight requests. This
+repairs most of the port's measured host overhead, but does not establish parity
+with the legacy frontend or a change in neural execution speed.
+
+### Repair and executable scope
+
+The repaired path is C++ HTTP → native normalization/tokenization → validated
+prepared-request transport → Python bridge → unchanged native controller and
+CUDA. Preparation uses the retained English normalizer and a native tokenizer
+binding, with the same trimming, punctuation, tokenizer assets, token budget,
+and EOS rules. The bridge negotiates prepared-input support and validates token
+IDs before submission. Its event loop no longer performs each request's text
+preparation. This backend-specific path does not replace preparation for other
+models.
+
+The tested bundle also enables bounded bridge event-loop yielding, TCP_NODELAY
+on this frontend's HTTP connections, and float32 forwarding with exact PCM16
+conversion in C++. Both comparison arms already used float32 forwarding.
+Consequently, the table attributes the improvement to the complete tested host
+bundle; it does not assign independent HTTP gains to these mechanisms. Worker
+affinity changes and process-pool preparation were investigated but are not
+enabled by the selected configuration.
+
+There are **no CUDA kernel, native controller, state-format, generation, or
+chunk-schedule changes** in this comparison. Both arms use the exact retained v6
+native package, built for `sm_90a` at widths 1, 32, and 512. Its kernel source
+manifest SHA-256 is
+`3976dd371b717d3a5c3b7bb3c2ec1e8dbdada2ffec6f4b9f5cee7f542f3ed222`.
+The previously verified 15 packaged shared libraries are reused, rather than
+substituted with independently rebuilt binaries. The fixed-cohort and in-flight
+serving policies remain distinct, with the same policy package used by both
+arms of each comparison.
+
+| Tested image | Image index SHA-256 |
+|---|---|
+| v6 baseline | `af3ce40c4f1ee973630da290fcf4f6d1ec96fb4b9f1c2d6ab0de7b03a5fb1474` |
+| v7 repaired host | `dea07919df447b9ca57ab15a390d5b592c95a3287d35fe8301554b4f8da6433d` |
+
+The v7 image rebuilt the C++ frontend and native preparation component while
+copying `/package` from v6. The C++ build passed all 13 CTests. The Python suite
+ran 44 tests with three fixture-dependent skips, and a separate real-fixture
+qualification ran nine tests successfully. The latter checks normalization and
+token-ID agreement, native allocation ownership, and concurrent preparation.
+The normalizer/tokenizer comparison includes the corpus and edge cases with
+normalization both enabled and disabled. No fresh acoustic scoring was performed.
+
+The complete source-build recipe remains `docker/Dockerfile.nemotron`, including
+CUDA compilation. This host-only campaign deliberately canceled its redundant
+CUDA rebuild and reused the qualified v6 package; it does not certify a newly
+completed clean build of every component at v7. Remote CI, gRPC, other GPU
+architectures, and widths beyond the recorded cases remain outside this result.
+
+### Matched HTTP comparison
+
+Each B512 arm and mode used **two fresh server boots and three measured trials
+per boot**, ordered baseline/repaired/repaired/baseline. Fixed-cohort trials used
+one synchronized 512-request wave; in-flight trials used 2,048 requests at
+concurrency 512 with refills. Two warmup rounds were excluded. The ten-text
+corpus, normalization, voice, generation cap, 2/3/4/5 → 8 chunk schedule, and
+publication behavior were unchanged. The clients' existing timers were
+preserved, including admission delay; no interval was subtracted.
+
+CPU placement remained four physical cores plus SMT for the worker/bridge
+(0–3/24–27), another four for C++ HTTP and preparation (4–7/28–31), and four for
+the client (8–11/32–35). This is a **4+4 server-core comparison**. It does not
+include the separate shared-eight-core frontend-placement control.
+
+Statistics are equal means of per-trial values across both boots, not pooled
+request percentiles. Latency and ITL are in milliseconds; peak memory is the
+maximum telemetry after readiness, including warmups.
+
+| B | Host | Mode | RTFx | req/s | TTFA p50 | p95 | p99 | ITL avg | ITL p95 | Peak MiB | Requests | Failures | Deficit responses |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | v6 baseline | Fixed cohort | 471.21 | 62.43 | 259.61 | 274.60 | 281.01 | 19.64 | 23.36 | 28,585 | 3,072 | 0 | — |
+| 512 | v7 repaired | Fixed cohort | 543.67 | 72.74 | 203.77 | 224.30 | 231.48 | 19.51 | 23.39 | 28,621 | 3,072 | 0 | — |
+| 512 | v6 baseline | In-flight | 1252.60 | 172.77 | 146.15 | 335.23 | 364.24 | 28.38 | 36.95 | 24,673 | 12,288 | 0 | 0 |
+| 512 | v7 repaired | In-flight | 1263.37 | 174.26 | 147.26 | 229.95 | 249.26 | 28.23 | 36.61 | 24,673 | 12,288 | 0 | 0 |
+
+All **30,720 measured B512 requests completed**. Both in-flight arms recorded
+zero playback-deficit responses. The historical fixed-cohort client does not
+measure playback deficits; the dashes do not imply zero.
+
+| Mode | TTFA p95 change | Repaired / baseline | 95% matched interval for ratio |
+|---|---:|---:|---:|
+| Fixed cohort | −50.30 ms (−18.32%) | 0.8168 | [0.7576, 0.8621] |
+| In-flight | −105.28 ms (−31.41%) | 0.6859 | [0.6453, 0.7216] |
+
+Intervals use 20,000 paired hierarchical bootstrap draws, resampling matched
+boot pairs and then trial positions within each pair. Two boot pairs on one GPU
+provide limited uncertainty evidence, not independent hardware replication.
+In-flight p50 changed little: this repair primarily reduced startup/tail
+preparation delay in that workload.
+
+Fixed-cohort RTFx must not be interpreted as a kernel speedup. Asynchronous
+preparation changes lane order and therefore batch-seeded generated trajectories.
+The baseline's six measured cohorts all reached 511 producer steps; repaired
+cohorts ran for 483/511/511 and 435/511/275 steps. Length-limit terminations were
+8/3 for baseline/repaired, respectively, with the remaining requests ending at
+EOS. All 12,288 requests in each B512 in-flight arm ended at EOS. These
+differences are retained in the result rather than removed from throughput.
+
+### Legacy residual and B32 check
+
+A fresh same-host legacy fixed-cohort control used one boot and three trials,
+with the same four-plus-four server-core assignment and retained native package.
+Its TTFA p95 was **204.19 ms**, versus the repaired port's **224.30 ms**: a
+remaining **20.10 ms, or 9.84%**, difference. The legacy control is not a matched
+two-boot arm and has different lane/seed trajectories, so this comparison has
+no matched confidence interval and does not demonstrate performance parity.
+The earlier 191.70-ms legacy result remains a historical observation above.
+
+The repaired B32 regression check used one boot and three trials per mode.
+Fixed cohorts retained seven waves per trial; in-flight trials contained 128
+requests. It is a smoke/regression sample, not a new matched improvement claim.
+
+| B | Mode | RTFx | req/s | TTFA p50 | p95 | p99 | ITL avg | ITL p95 | Peak MiB | Requests | Failures | Deficit responses |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | Fixed cohort | 233.72 | 31.28 | 32.68 | 45.16 | 46.35 | 3.90 | 4.73 | 10,335 | 672 | 0 | — |
+| 32 | In-flight | 298.11 | 41.84 | 26.08 | 39.98 | 41.34 | 7.51 | 13.05 | 6,835 | 384 | 0 | 0 |
+
+There are no new CER, WER, speaker-similarity, or other acoustic figures for
+these arms. Exact text/token preparation tests and unchanged neural binaries
+do not replace acoustic evaluation. Additional CPU-placement controls should
+be reported separately from this frozen 4+4 comparison.
+
+### Repair evidence inventory
+
+The following receipts are relative to the external host-repair evidence
+directory. They supplement the earlier validation inventory.
+
+| Evidence | Receipt |
+|---|---|
+| Frozen campaign and independent summary | `FINAL_REGISTRATION.json`, `FINAL_COMPARISON.json`, `FINAL_COMPARISON.md`, `summarize_final.py` |
+| Per-boot clients, telemetry, commands, termination records | `http-final/` |
+| Fresh legacy control | `legacy-fixed-refresh/REGISTRATION.json`, `legacy-fixed-refresh/RECEIPT.json`, `legacy-fixed-refresh/historical.json` |
+| Host-only build scope and image | `HOST_BUILD_SCOPE.json`, `Dockerfile.host-only`, `build-v7-host-only.log` |
+| C++ and Python test receipts | `build-v7.log`, `tests-frontend-preparation-all.log`, `native-v7-qualification.log` |
+| Native preparation source/fixture qualification | `preparation-process/native-qualification-formatted.log` |
+| Retained negative process-pool experiment | `preparation-process/result.json` |
+
+## Subsequent shared-eight-core placement
+
+A separate placement experiment allowed the C++ frontend and its native
+preparation workers to use **all eight existing server cores**, 0–7/24–31,
+while keeping the worker and bridge on 0–3/24–27. The total service allocation
+remains eight physical cores plus SMT. This relaxes the earlier rigid split;
+it does not add CPU cores or change GPU execution. The v7 image, native package,
+client commands, normalization, and generation contract were unchanged.
+
+After an exploratory placement screen, two fresh boots per mode each ran three
+measured trials with the same warmups and request counts as the comparison
+above. These measurements were collected **after** that comparison, without
+interleaving another baseline. Differences against the earlier arms are
+therefore descriptive chronological comparisons, not matched randomized
+estimates of the placement's isolated effect.
+
+| B | Mode | RTFx | req/s | TTFA p50 | p95 | p99 | ITL avg | ITL p95 | Peak MiB | Requests | Failures | Deficit responses |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | Fixed cohort | 621.76 | 83.45 | 160.36 | 176.80 | 184.06 | 19.70 | 24.52 | 28,613 | 3,072 | 0 | — |
+| 512 | In-flight | 1310.30 | 180.73 | 140.95 | 224.45 | 239.73 | 27.03 | 36.06 | 24,673 | 12,288 | 0 | 0 |
+
+Fixed-cohort boot means were **173.77 and 179.84 ms** TTFA p95; in-flight boot
+means were **217.30 and 231.61 ms**. Within-arm hierarchical bootstrap intervals
+from 20,000 draws were [170.21, 182.93] ms and [216.16, 235.40] ms, respectively.
+These describe the limited two-boot sample on one GPU and do not account for
+placement selection or chronological effects.
+
+The fixed-cohort mean is 47.49 ms below the earlier repaired 4+4 sample and
+27.39 ms below the fresh 204.19-ms legacy control. The in-flight mean is 5.49 ms
+below the repaired 4+4 sample; its boot-to-boot variation prevents attributing
+that small difference confidently to placement. Relative to the earlier v6
+baseline, the observed complete-stack p95 differences are −97.80 ms fixed and
+−110.78 ms in-flight. No paired confidence interval is claimed for these
+chronological contrasts.
+
+All **15,360 measured requests completed**. Fixed cohorts recorded 3,071 EOS
+terminations and one length limit; cohort steps were 436/387/332 and
+511/363/307. All 12,288 in-flight requests ended at EOS with zero measured
+playback-deficit responses. As above, fixed-cohort RTFx varies with generated
+trajectories and cap tails, and its client does not record playback deficits.
+
+No fresh acoustic scores or measured cross-frontend PCM identity are claimed.
+The in-flight population matches normalized texts, sample counts, and
+termination reasons between the original baseline and repaired arms. Measured
+request receipts do not contain PCM hashes; hashes in HTTP preparation receipts
+belong to pre-serving qualification and cannot establish exact audio identity
+for the timed requests.
+
+This separate sample is recorded by
+`HTTP_REGISTRATION-shared-cpu-final.json`, `shared-cpu-final/`,
+`SHARED_CPU_COMPARISON.json`, `SHARED_CPU_COMPARISON.md`, and
+`summarize_shared_cpu.py` in the external host-repair evidence directory. The
+frozen 4+4 comparison above remains the matched evidence for the code repair.
+
+## Fresh legacy in-flight control
+
+A subsequent legacy Rust frontend control completed one fresh boot with three
+unchanged `tts_perf_client` trials: 2,048 measured requests at concurrency 512
+per trial, after two warmup rounds. Its TTFA p95 was **212.93 ms**, versus
+**224.45 ms** for the selected C++ host path above. The remaining point-estimate
+difference is **11.53 ms, or 5.41%**. The selected fixed-cohort point estimate
+remains 176.80 ms versus the fresh legacy control's 204.19 ms.
+
+| Frontend | Mode | Boots | RTFx | req/s | TTFA p50 | p95 | p99 | ITL avg | ITL p95 | Peak MiB | Requests | Failures | Deficit responses |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Legacy Rust | Fixed cohort | 1 | 490.04 | 64.74 | 191.48 | 204.19 | 209.66 | 18.88 | 22.13 | 28,615 | 1,536 | 0 | — |
+| Selected C++ | Fixed cohort | 2 | 621.76 | 83.45 | 160.36 | 176.80 | 184.06 | 19.70 | 24.52 | 28,613 | 3,072 | 0 | — |
+| Legacy Rust | In-flight | 1 | 1308.91 | 180.54 | 141.35 | 212.93 | 224.95 | 27.14 | 35.26 | 24,673 | 6,144 | 0 | 0 |
+| Selected C++ | In-flight | 2 | 1310.30 | 180.73 | 140.95 | 224.45 | 239.73 | 27.03 | 36.06 | 24,673 | 12,288 | 0 | 0 |
+
+Both implementations used the same H100, native package, model, normalization
+assets, corpus, and client timing definitions. Both had eight physical service
+cores plus SMT. Legacy kept frontend and worker on disjoint four-core sets;
+selected C++ allowed frontend preparation to share all eight cores while its
+worker/bridge retained four. Legacy also performed one excluded readiness
+synthesis before the registered client warmups. These are chronological samples
+with **one legacy boot versus two C++ boots**, not interleaved matched pairs.
+There is no resolved parity or superiority claim, and no matched confidence
+interval is assigned to the legacy comparison.
+
+All 6,144 measured legacy in-flight requests ended at EOS with no failures or
+playback-deficit responses. Each selected C++ in-flight boot matched that
+control's complete normalized-text/sample-count/termination population and
+**44,544.72 seconds of generated audio** across 6,144 measured requests. This
+comparison explicitly excludes legacy readiness and each client's warmups.
+It verifies population and duration agreement, not PCM identity or acoustic
+quality. Fixed-cohort lane-order/seed trajectories still differ, so their RTFx
+difference cannot be attributed solely to frontend speed.
+
+The additional receipts are `legacy-inflight-refresh/REGISTRATION.json`,
+`legacy-inflight-refresh/RECEIPT.json`, the three client results under
+`legacy-inflight-refresh/`, and the independently reconstructed
+`LEGACY_COMPARISON.json`, `LEGACY_COMPARISON.md`, and `summarize_legacy.py` in
+the external host-repair evidence directory.
+
+### Launcher and small-width checks
+
+The optional `--native-cpus` and `--frontend-cpus` controls were subsequently
+added to the Nemotron launcher. Image `nemo-speech-cpp:nemotron-v7.1` changes
+only that launcher relative to v7; CUDA, the C++ frontend, and native text
+preparation binaries are identical. The launch options reproduce the selected
+CPU masks before child threads initialize and record their effective affinity.
+No placement is imposed when the options are absent.
+
+Live checks using these options measured B1 fixed-cohort p95 **21.11 ms**
+(21 measured requests) and B32 in-flight p95 **33.40 ms** (384 measured requests),
+with three trials per fresh boot and normalization enabled. All requests
+completed, and B32 recorded zero playback deficits. These are regression
+samples, not matched cross-width performance claims. All existing child-thread
+affinities matched the requested role masks. Commands, results, and launch
+receipts are retained in `launcher-regression/`.
+
+Validation includes 13 CMake tests, six Rust tests, and 51 Python controller,
+bridge, and launcher tests (three optional model-fixture tests skipped in that
+generic invocation). The separate nine-test model/native-library invocation
+passed with those fixtures available. Formatting and repository hooks passed.
+An initial test run inherited the image's F32 forwarding default while one
+test expected PCM16; the test now explicitly selects its PCM16 control, while
+the separate F32 test retains coverage of the selected path. Runtime behavior
+was unchanged by that test correction. Logs are retained in `build-v7.log`,
+`tests-final.log`, `tests-final-r2.log`, `native-v7-qualification.log`, and
+`precommit-final.log`.
