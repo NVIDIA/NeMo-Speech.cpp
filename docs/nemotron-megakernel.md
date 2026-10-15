@@ -152,6 +152,16 @@ new or empty, and existing socket paths are never replaced. Keep the launcher
 running while serving. It sets `TOKENIZERS_PARALLELISM=false`; concurrent requests
 use the bounded preparation pool instead of nested tokenizer worker pools.
 
+`--direct-worker` connects the C++ HTTP frontend directly to the native worker,
+bypassing the Python compatibility bridge. It requires `--http-port` and the
+native text-preparation library. The launcher seals tokenizer and transport
+identity before startup and writes the private `DIRECT_WORKER.json` configuration
+only for the frontend. Audio is copied from the worker's shared slabs into owned
+PCM16 before acknowledging reuse. Native inference, request seeds, text
+normalization and the public HTTP contract remain unchanged. Omitting the flag
+retains the compatibility bridge. In direct mode, `--native-cpus` applies only
+to the worker.
+
 CPU placement affects end-to-end latency even when the CUDA binaries are
 identical. The optional `--native-cpus` controls the worker and bridge;
 `--frontend-cpus` controls the C++ frontend. Both use Linux `taskset` before
@@ -357,6 +367,61 @@ four refill cohorts after two warmup rounds:
   --codec-frame-samples 1764 --startup-chunk-frames 2,3,4,5 \
   --steady-chunk-frames 8 --json-output /results/inflight-b512.json
 ```
+
+### Direct-worker B512 comparison
+
+After completing the build, package and normalization setup above, start the
+opt-in direct transport with a B512 in-flight package. This example uses the
+measured host's eight physical server cores and their SMT siblings; adapt the
+CPU IDs to the actual topology. It does not change GPU execution or HTTP timing.
+
+```bash
+export NEMOTRON_NATIVE_PREPARATION_LIBRARY="$PWD/native/text_preparation/target/release/libnemotron_text_preparation.so"
+export NEMOTRON_FRONTEND_PREPARATION=1
+export NEMOTRON_BRIDGE_FORWARD_F32=1
+export NEMOTRON_BRIDGE_FAIR_BATCH=64
+export NEMOTRON_HTTP_TCP_NODELAY=1
+export NEMOTRON_TN_STRING_MATCHER=1
+taskset -c 0-7,24-31 python3 scripts/nemotron_native/launch.py \
+  --package /tmp/nemotron-package \
+  --model /models/nemotron --model-seal /models/model-seal.json \
+  --normalization-config /config/normalization.json \
+  --width 512 --mode inflight --direct-worker \
+  --listen /tmp/nemotron-b512-direct.sock \
+  --receipts /results/b512-direct-boot1 \
+  --http-host 127.0.0.1 --http-port 8080 --http-threads 520 \
+  --native-cpus 0-3,24-27 --frontend-cpus 0-7,24-31 \
+  --frontend-binary build-native/bin/nemo-speech
+```
+
+In a separate terminal, run three unchanged historical-client trials. The
+normalizer pool remains 16. The bridge-specific environment settings above are
+ignored in direct mode and retained for the matched bridge control.
+
+```bash
+sha256sum /opt/nemotron-speech/bin/tts_perf_client
+for trial in 0 1 2; do
+  taskset -c 8-11,32-35 /opt/nemotron-speech/bin/tts_perf_client \
+    --base-url http://127.0.0.1:8080 --transport speech-http \
+    --concurrency 512 --num-requests 2048 --warmup-rounds 2 \
+    --model easymagpie --voice english_sample --corpus-tsv /data/corpus.tsv \
+    --legacy-speech-request --disable-http-pooling \
+    --request-timeout-seconds 300 --record-audio-arrivals \
+    --codec-frame-samples 1764 --startup-chunk-frames 2,3,4,5 \
+    --steady-chunk-frames 8 \
+    --json-output "/results/b512-direct-boot1/inflight-${trial}.json"
+done
+```
+
+The reported comparison used client SHA-256
+`d7713f0bbd418c95395959ebd7497bc3c1110c5313da41f0b0dacf019730abbf`.
+Stop each launcher cleanly before starting the next arm. For the compatibility
+control, omit only `--direct-worker`, choose a new socket and empty receipt
+directory, and keep package, assets, CPU masks and client arguments identical.
+Collect two fresh boots per arm in bridge/direct/direct/bridge order. Preserve
+every trial, then average its TTFA p95 values rather than pooling requests.
+The [recorded result](nemotron-integration-results.md#subsequent-direct-worker-transport)
+is a single-device comparison and does not establish a ≤200-ms bound.
 
 For a small width sweep, boot separate B1/B32/B512 controllers and use 32/128/2048
 measured requests respectively. Freeze client binaries and the corpus; the

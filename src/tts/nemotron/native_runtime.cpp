@@ -6,11 +6,14 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <random>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -27,6 +30,8 @@
 #include <unistd.h>
 
 #include <cerrno>
+
+#include "native_worker_protocol.h"
 #endif
 
 namespace nemo_speech::tts::nemotron {
@@ -180,6 +185,8 @@ class TextPreparation {
 #ifndef _WIN32
 
 struct NativeRuntime::Impl {
+    using Message = worker_protocol::Message;
+
     struct Request {
         std::mutex mutex;
         std::condition_variable changed;
@@ -200,6 +207,8 @@ struct NativeRuntime::Impl {
             throw std::invalid_argument("native_timeout_seconds must be positive");
         if (socket_path.empty())
             throw std::invalid_argument("Nemotron backend requires native_socket");
+        if (const char* config = std::getenv("NEMOTRON_DIRECT_WORKER_CONFIG"))
+            configure_direct(config);
         sockaddr_un address{};
         address.sun_family = AF_UNIX;
         if (socket_path.size() >= sizeof(address.sun_path))
@@ -226,35 +235,46 @@ struct NativeRuntime::Impl {
                 if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) < 0 || error != 0)
                     throw std::runtime_error("cannot connect to native worker: " + socket_path);
             }
-            Value hello(Value::Object{});
-            hello["kind"] = "hello";
-            hello["protocol_version"] = 1;
-            send(hello, deadline);
-            const auto frame = read_frame(deadline);
-            if (frame.front() != 'J')
-                throw std::runtime_error("native worker did not send ready metadata");
-            const auto ready = Value::parse(frame.substr(1));
-            if (ready.string_or("kind") != "ready")
-                throw std::runtime_error(
-                    "native worker handshake failed: " + ready.string_or("message", "not ready"));
-            name = ready.at("model_name").string();
-            if (const auto* version = ready.find("protocol_version");
-                version && integer(ready, "protocol_version") != 1)
-                throw std::runtime_error("native worker protocol version is unsupported");
-            if (name != "nemotron-tts" || integer(ready, "sample_rate") != 22050)
-                throw std::runtime_error("native worker model or sample rate is unsupported");
-            for (const auto& voice : ready.at("voices").array()) voices.push_back(voice.string());
-            if (voices != std::vector<std::string>{"english_sample"})
-                throw std::runtime_error("native worker voices are unsupported");
-            width = static_cast<int>(integer(ready, "batch_size", 4096));
-            if (width < 1)
-                throw std::runtime_error("native worker batch_size must be positive");
-            execution_mode = ready.at("mode").string();
-            if (execution_mode.empty())
-                throw std::runtime_error("native worker mode is empty");
-            normalizes = ready.at("text_normalization_enabled").boolean();
-            if (const auto* preparation = ready.find("text_preparation"))
-                text_preparation = std::make_unique<TextPreparation>(*preparation);
+            if (direct) {
+                send_direct(
+                    {{"kind", "client_hello"},
+                     {"expected_manifest_sha256", direct_config.at("manifest_sha256")},
+                     {"client_instance_id", "nemo-speech-cpp-direct-" + request_prefix}},
+                    deadline);
+                validate_direct_ready(worker_protocol::unpack(read_frame(deadline)));
+            } else {
+                Value hello(Value::Object{});
+                hello["kind"] = "hello";
+                hello["protocol_version"] = 1;
+                send(hello, deadline);
+                const auto frame = read_frame(deadline);
+                if (frame.front() != 'J')
+                    throw std::runtime_error("native worker did not send ready metadata");
+                const auto ready = Value::parse(frame.substr(1));
+                if (ready.string_or("kind") != "ready")
+                    throw std::runtime_error(
+                        "native worker handshake failed: " +
+                        ready.string_or("message", "not ready"));
+                name = ready.at("model_name").string();
+                if (const auto* version = ready.find("protocol_version");
+                    version && integer(ready, "protocol_version") != 1)
+                    throw std::runtime_error("native worker protocol version is unsupported");
+                if (name != "nemotron-tts" || integer(ready, "sample_rate") != 22050)
+                    throw std::runtime_error("native worker model or sample rate is unsupported");
+                for (const auto& voice : ready.at("voices").array())
+                    voices.push_back(voice.string());
+                if (voices != std::vector<std::string>{"english_sample"})
+                    throw std::runtime_error("native worker voices are unsupported");
+                width = static_cast<int>(integer(ready, "batch_size", 4096));
+                if (width < 1)
+                    throw std::runtime_error("native worker batch_size must be positive");
+                execution_mode = ready.at("mode").string();
+                if (execution_mode.empty())
+                    throw std::runtime_error("native worker mode is empty");
+                normalizes = ready.at("text_normalization_enabled").boolean();
+                if (const auto* preparation = ready.find("text_preparation"))
+                    text_preparation = std::make_unique<TextPreparation>(*preparation);
+            }
             reader = std::thread([this] { read_loop(); });
         }
         catch (...) {
@@ -270,6 +290,121 @@ struct NativeRuntime::Impl {
             reader.join();
         if (fd >= 0)
             ::close(fd);
+    }
+
+    static std::string hex_id(uint64_t value) {
+        std::string result(16, '0');
+        constexpr char digits[] = "0123456789abcdef";
+        for (size_t index = 0; index < result.size(); ++index) {
+            result[15 - index] = digits[value & 15];
+            value >>= 4;
+        }
+        return result;
+    }
+
+    void configure_direct(const std::string& path) {
+        direct_config = worker_protocol::load_config(path);
+        const std::set<std::string> required = {
+            "schema",
+            "width",
+            "mode",
+            "manifest_sha256",
+            "model_sha256",
+            "output_contract",
+            "enabled_buckets",
+            "installed_transport_versions",
+            "text_normalization_enabled",
+            "text_preparation"};
+        std::set<std::string> found;
+        for (auto it = direct_config.begin(); it != direct_config.end(); ++it)
+            found.insert(it.key());
+        if (found != required ||
+            worker_protocol::string(direct_config, "schema") != "nemotron.direct_worker.v1")
+            throw std::runtime_error("invalid direct native worker configuration schema");
+        width = static_cast<int>(worker_protocol::integer(direct_config, "width", 4096));
+        if (width < 1 || (width & (width - 1)) != 0)
+            throw std::runtime_error("invalid direct native worker width");
+        execution_mode = worker_protocol::string(direct_config, "mode");
+        if (execution_mode != "fixed_cohort" && execution_mode != "fixed_request" &&
+            execution_mode != "inflight")
+            throw std::runtime_error("invalid direct native worker mode");
+        for (const char* key : {"manifest_sha256", "model_sha256"}) {
+            const auto digest = worker_protocol::string(direct_config, key, 64);
+            if (digest.size() != 64 ||
+                digest.find_first_not_of("0123456789abcdef") != std::string::npos)
+                throw std::runtime_error("invalid direct native worker identity hash");
+        }
+        if (worker_protocol::string(direct_config, "output_contract") !=
+            "pcm_f32_le_22050_mono_variable_streaming_v3")
+            throw std::runtime_error("unsupported direct native output contract");
+        const Message expected_buckets =
+            width == 1 ? Message::array({1}) : Message::array({1, width});
+        if (direct_config.at("enabled_buckets") != expected_buckets)
+            throw std::runtime_error("invalid direct native worker buckets");
+        const auto& versions = direct_config.at("installed_transport_versions");
+        const std::set<std::string> version_keys = {
+            "trt_version", "trtllm_version", "trtllm_commit"};
+        std::set<std::string> actual_keys;
+        if (!versions.is_object())
+            throw std::runtime_error("invalid direct native transport versions");
+        for (auto it = versions.begin(); it != versions.end(); ++it) {
+            actual_keys.insert(it.key());
+            if (!it.value().is_string() || it.value().get_ref<const std::string&>().empty() ||
+                it.value().get_ref<const std::string&>().size() > 1024)
+                throw std::runtime_error("invalid direct native transport version");
+        }
+        if (actual_keys != version_keys ||
+            !direct_config.at("text_normalization_enabled").is_boolean())
+            throw std::runtime_error("invalid direct native transport configuration");
+        const auto metadata = Value::parse(direct_config.at("text_preparation").dump());
+        text_preparation = std::make_unique<TextPreparation>(metadata);
+        const auto normalizer = Message::parse(metadata.at("normalization_config").string());
+        normalizes = !normalizer.is_null() && normalizer.value("enabled", true);
+        if (normalizes != direct_config.at("text_normalization_enabled").get<bool>())
+            throw std::runtime_error("direct native normalization configuration differs");
+        name = "nemotron-tts";
+        voices = {"english_sample"};
+        std::random_device random;
+        request_prefix = hex_id((static_cast<uint64_t>(random()) << 32) | random());
+        direct = true;
+    }
+
+    void validate_direct_ready(const Message& ready) {
+        if (worker_protocol::integer(ready, "protocol_version") != 1 ||
+            worker_protocol::string(ready, "kind") != "worker_ready")
+            throw std::runtime_error("invalid direct native worker handshake");
+        for (const char* key :
+             {"manifest_sha256", "model_sha256", "output_contract", "enabled_buckets"})
+            if (ready.at(key) != direct_config.at(key))
+                throw std::runtime_error(
+                    std::string("direct native worker identity mismatch: ") + key);
+        for (auto it = direct_config.at("installed_transport_versions").begin();
+             it != direct_config.at("installed_transport_versions").end(); ++it)
+            if (ready.at(it.key()) != it.value())
+                throw std::runtime_error("direct native worker transport version mismatch");
+    }
+
+    uint64_t direct_id(const Message& value) const {
+        const auto id = worker_protocol::string(value, "request_id", 32);
+        if (id.size() != 32 || id.compare(0, 16, request_prefix) != 0)
+            throw std::runtime_error("direct native worker returned an unknown request identity");
+        uint64_t result = 0;
+        for (size_t index = 16; index < id.size(); ++index) {
+            const auto digit = id[index];
+            if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f')))
+                throw std::runtime_error(
+                    "direct native worker returned an invalid request identity");
+            result = (result << 4) |
+                     static_cast<uint64_t>(digit <= '9' ? digit - '0' : digit - 'a' + 10);
+        }
+        if (result == 0)
+            throw std::runtime_error("direct native worker returned a zero request identity");
+        return result;
+    }
+
+    void send_direct(Message value, Clock::time_point deadline) {
+        value["protocol_version"] = 1;
+        send_payload(worker_protocol::pack(value), deadline);
     }
 
     void wait_socket(short events, Clock::time_point deadline) {
@@ -321,7 +456,10 @@ struct NativeRuntime::Impl {
     }
 
     void send(const Value& value, Clock::time_point deadline) {
-        const std::string payload = "J" + value.dump();
+        send_payload("J" + value.dump(), deadline);
+    }
+
+    void send_payload(const std::string& payload, Clock::time_point deadline) {
         if (payload.size() > kMaxFrameBytes)
             throw std::invalid_argument("native worker request is too large");
         std::string frame(4, '\0');
@@ -365,14 +503,24 @@ struct NativeRuntime::Impl {
     std::shared_ptr<Request> lookup(uint64_t id) {
         std::lock_guard<std::mutex> lock(pending_mutex);
         const auto found = pending.find(id);
-        if (found == pending.end())
+        if (found == pending.end()) {
+            if (direct && retired.count(id))
+                return {};
             throw std::runtime_error("native worker returned an unknown request ID");
+        }
         return found->second;
     }
 
     void retire(uint64_t id) {
         std::lock_guard<std::mutex> lock(pending_mutex);
         pending.erase(id);
+        if (direct && retired.insert(id).second) {
+            retired_order.push_back(id);
+            if (retired_order.size() > 4096) {
+                retired.erase(retired_order.front());
+                retired_order.pop_front();
+            }
+        }
     }
 
     void receive_audio(const std::string& frame) {
@@ -451,12 +599,95 @@ struct NativeRuntime::Impl {
             retire(id);
     }
 
+    void receive_direct_audio(const Message& value) {
+        const auto slab = slabs.read(value);
+        auto request = lookup(direct_id(value));
+        bool discard = !request;
+        if (request) {
+            std::lock_guard<std::mutex> lock(request->mutex);
+            if (!request->accepted || request->complete ||
+                slab.sequence != request->received_chunks)
+                throw std::runtime_error("direct native audio sequence is invalid");
+            ++request->received_chunks;
+            request->received_samples += slab.samples;
+            discard = request->discard;
+        }
+        auto pcm = discard ? std::string{} : pcm_f32_to_s16(slab.data, slab.bytes);
+        send_direct(
+            {{"kind", "audio_ack"},
+             {"arena", value.at("arena")},
+             {"slot", value.at("slot")},
+             {"generation", value.at("generation")}},
+            Clock::now() + std::chrono::seconds(timeout_seconds));
+        if (!request)
+            return;
+        std::lock_guard<std::mutex> lock(request->mutex);
+        if (request->discard)
+            return;
+        if (pcm.size() > kMaxQueuedBytes - request->queued_bytes ||
+            request->chunks.size() >= kMaxQueuedChunks) {
+            request->error = "native worker audio consumer exceeded its bounded queue";
+            request->discard = true;
+            request->chunks.clear();
+            request->queued_bytes = 0;
+        } else {
+            request->queued_bytes += pcm.size();
+            request->chunks.emplace_back(std::move(pcm));
+        }
+        request->changed.notify_all();
+    }
+
+    void receive_direct(const Message& value) {
+        if (worker_protocol::integer(value, "protocol_version") != 1)
+            throw std::runtime_error("direct native worker protocol version changed");
+        const auto kind = worker_protocol::string(value, "kind", 64);
+        if (kind == "audio_slab") {
+            receive_direct_audio(value);
+            return;
+        }
+        const auto id = direct_id(value);
+        auto request = lookup(id);
+        if (!request)
+            return;
+        bool terminal = false;
+        {
+            std::lock_guard<std::mutex> lock(request->mutex);
+            if (kind == "accepted") {
+                if (request->accepted || request->complete)
+                    throw std::runtime_error("direct native request was accepted twice");
+                request->accepted = true;
+            } else if (kind == "stream_complete_v1") {
+                if (!request->accepted || request->received_samples == 0 ||
+                    worker_protocol::integer(value, "next_sequence") != request->received_chunks ||
+                    worker_protocol::integer(value, "chunk_count") != request->received_chunks ||
+                    worker_protocol::integer(value, "total_samples") != request->received_samples)
+                    throw std::runtime_error("direct native completion does not match audio");
+                request->complete = true;
+                terminal = true;
+            } else if (kind == "failed" || kind == "aborted") {
+                request->error = kind == "failed" ? worker_protocol::string(value, "message")
+                                                  : "native worker synthesis aborted";
+                if (request->error.empty())
+                    request->error = "native worker synthesis failed";
+                request->complete = true;
+                terminal = true;
+            } else {
+                throw std::runtime_error("unsupported direct native worker message: " + kind);
+            }
+            request->changed.notify_all();
+        }
+        if (terminal)
+            retire(id);
+    }
+
     void read_loop() {
         try {
             while (true) {
                 wait_socket(POLLIN, Clock::time_point::max());
                 const auto frame = read_frame(Clock::now() + std::chrono::seconds(timeout_seconds));
-                if (frame.front() == 'A' || frame.front() == 'F')
+                if (direct)
+                    receive_direct(worker_protocol::unpack(frame));
+                else if (frame.front() == 'A' || frame.front() == 'F')
                     receive_audio(frame);
                 else if (frame.front() == 'J')
                     receive_control(Value::parse(frame.substr(1)));
@@ -479,7 +710,12 @@ struct NativeRuntime::Impl {
                 return;
         }
         try {
-            send(control("abort", id), Clock::now() + std::chrono::seconds(timeout_seconds));
+            if (direct)
+                send_direct(
+                    {{"kind", "abort"}, {"request_id", request_prefix + hex_id(id)}},
+                    Clock::now() + std::chrono::seconds(timeout_seconds));
+            else
+                send(control("abort", id), Clock::now() + std::chrono::seconds(timeout_seconds));
         }
         catch (const std::exception& error) {
             fail_connection(error.what());
@@ -508,6 +744,10 @@ struct NativeRuntime::Impl {
                 throw std::runtime_error("native worker request capacity exhausted");
             id = next_id++;
             request = std::make_shared<Request>();
+            if (direct) {
+                request->processed_text = prepared_text.at("text").string();
+                request->token_count = prepared_text.at("tokens").array().size();
+            }
             pending.emplace(id, request);
         }
         Value submit = control(text_preparation ? "submit_prepared" : "submit", id);
@@ -521,7 +761,26 @@ struct NativeRuntime::Impl {
         if (prepared.apply_normalize >= 0)
             submit["apply_normalize"] = prepared.apply_normalize != 0;
         try {
-            send(submit, deadline);
+            if (direct) {
+                auto tokens = Message::array();
+                for (const auto& token : submit.at("token_ids").array())
+                    tokens.push_back(static_cast<uint32_t>(token.number()));
+                send_direct(
+                    {{"kind", "submit"},
+                     {"request_id", request_prefix + hex_id(id)},
+                     {"session_id", nullptr},
+                     {"normalized_text", request->processed_text},
+                     {"token_ids", std::move(tokens)},
+                     {"speaker_id", "english_sample"},
+                     {"max_tokens", 512},
+                     {"temperature", 0.7},
+                     {"top_k", 80},
+                     {"sample_rate_hz", 22050},
+                     {"seed", prepared.options.seed < 0 ? 0 : prepared.options.seed}},
+                    deadline);
+            } else {
+                send(submit, deadline);
+            }
         }
         catch (const std::exception& error) {
             fail_connection(error.what());
@@ -591,6 +850,12 @@ struct NativeRuntime::Impl {
         return result;
     }
 
+    bool direct = false;
+    Message direct_config;
+    std::string request_prefix;
+    worker_protocol::SlabReader slabs;
+    std::set<uint64_t> retired;
+    std::deque<uint64_t> retired_order;
     int fd = -1;
     int timeout_seconds;
     std::string name;

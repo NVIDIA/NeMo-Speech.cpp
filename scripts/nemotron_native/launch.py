@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ def parse_args(argv=None):
     parser.add_argument("--http-host", default="127.0.0.1")
     parser.add_argument("--http-threads", type=int)
     parser.add_argument("--frontend-binary", default="nemo-speech")
+    parser.add_argument("--direct-worker", action="store_true")
     parser.add_argument("--native-cpus")
     parser.add_argument("--frontend-cpus")
     parser.add_argument("--startup-timeout", type=float, default=900)
@@ -41,6 +43,8 @@ def parse_args(argv=None):
         parser.error("timeouts must be positive")
     if args.http_port is not None and not 1 <= args.http_port <= 65535:
         parser.error("http-port must be in 1..65535")
+    if args.direct_worker and args.http_port is None:
+        parser.error("direct-worker requires http-port")
     if args.http_threads is not None and args.http_threads <= 0:
         parser.error("http-threads must be positive")
     try:
@@ -87,7 +91,9 @@ def cpu_configuration(args):
     taskset = shutil.which("taskset") if requested else None
     if requested and taskset is None:
         raise ValueError("CPU role controls require taskset in PATH")
-    roles = {"worker": native, "bridge": native}
+    roles = {"worker": native}
+    if not getattr(args, "direct_worker", False):
+        roles["bridge"] = native
     if args.http_port is not None:
         roles["frontend"] = frontend
     configuration = {
@@ -183,6 +189,66 @@ def commands(args):
     return worker, bridge
 
 
+def direct_worker_configuration(args):
+    from nemotron_cpp_bridge.native_preparation import FrontendPreparation
+
+    serving = args.package / "programs" / f"b{args.width}" / "serving.json"
+    raw = serving.read_bytes()
+    plan = json.loads(raw)
+    if (
+        type(plan["physical_width"]) is not int
+        or not 1 <= args.width <= 4096
+        or args.width & (args.width - 1)
+        or plan["physical_width"] != args.width
+        or plan["host"].get("batching_mode", "fixed_cohort") != args.mode
+    ):
+        raise ValueError("direct worker width or mode differs from package")
+    transport = plan["transport_compatibility"]
+    if transport["output_contract"] != "pcm_f32_le_22050_mono_variable_streaming_v3":
+        raise ValueError("direct worker requires streaming-v3 output")
+    versions = transport["installed_transport_versions"]
+    if (
+        not isinstance(versions, dict)
+        or set(versions) != {"trt_version", "trtllm_version", "trtllm_commit"}
+        or any(
+            not isinstance(value, str) or not 1 <= len(value) <= 1024 for value in versions.values()
+        )
+    ):
+        raise ValueError("invalid direct worker transport versions")
+    if (
+        not isinstance(plan["model"]["checkpoint_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", plan["model"]["checkpoint_sha256"]) is None
+    ):
+        raise ValueError("invalid direct worker model identity")
+    seal = json.loads(args.model_seal.read_text())
+    model = args.model.resolve(strict=True)
+    tokenizer = (model / "tokenizer.json").resolve(strict=True)
+    expected = seal["files"]["tokenizer.json"]
+    if (
+        seal["model_identity"] != plan["model"]["checkpoint_sha256"]
+        or not tokenizer.is_relative_to(model)
+        or tokenizer.stat().st_size != expected["bytes"]
+        or hashlib.sha256(tokenizer.read_bytes()).hexdigest() != expected["sha256"]
+    ):
+        raise ValueError("tokenizer does not match the selected sealed model")
+    library = os.environ.get("NEMOTRON_NATIVE_PREPARATION_LIBRARY")
+    if not library:
+        raise ValueError("direct-worker requires the native preparation library")
+    preparation = FrontendPreparation(library, tokenizer, args.normalization_config)
+    return {
+        "schema": "nemotron.direct_worker.v1",
+        "width": args.width,
+        "mode": args.mode,
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "model_sha256": plan["model"]["checkpoint_sha256"],
+        "output_contract": transport["output_contract"],
+        "enabled_buckets": sorted({1, args.width}),
+        "installed_transport_versions": versions,
+        "text_normalization_enabled": preparation.enabled,
+        "text_preparation": preparation.metadata,
+    }
+
+
 async def wait_ready(path, processes, timeout, stopping):
     async def observe():
         while not path.exists():
@@ -219,7 +285,10 @@ async def run(args):
     taskset, affinity = cpu_configuration(args)
     worker_command, bridge_command = commands(args)
     worker_command = cpu_command(worker_command, "worker", taskset, affinity)
-    bridge_command = cpu_command(bridge_command, "bridge", taskset, affinity)
+    direct = getattr(args, "direct_worker", False)
+    direct_metadata = direct_worker_configuration(args) if direct else None
+    if not direct:
+        bridge_command = cpu_command(bridge_command, "bridge", taskset, affinity)
     if args.listen == args.native_worker_socket:
         raise ValueError("worker and bridge sockets must differ")
     for path in (args.listen, args.native_worker_socket):
@@ -234,6 +303,7 @@ async def run(args):
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stopping.set)
     environment = os.environ.copy()
+    environment.pop("NEMOTRON_DIRECT_WORKER_CONFIG", None)
     environment.update(
         PYTHONPATH=str(REPOSITORY / "python")
         + (os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""),
@@ -248,6 +318,12 @@ async def run(args):
     for key, value in profile.get("environment", {}).items():
         if value is not None:
             environment.setdefault(key, value)
+    frontend_environment = environment.copy()
+    if direct:
+        direct_path = args.receipts / "DIRECT_WORKER.json"
+        direct_path.write_text(json.dumps(direct_metadata, indent=2) + "\n")
+        direct_path.chmod(0o600)
+        frontend_environment["NEMOTRON_DIRECT_WORKER_CONFIG"] = str(direct_path)
     processes = []
     logs = []
     tasks = []
@@ -256,6 +332,7 @@ async def run(args):
         "width": args.width,
         "mode": args.mode,
         "cpu_affinity": affinity,
+        "transport": "direct_worker" if direct else "compatibility_bridge",
     }
     try:
         log = (args.receipts / "worker.log").open("wb")
@@ -271,17 +348,18 @@ async def run(args):
             args.receipts / "worker/NATIVE_READY.json", processes, args.startup_timeout, stopping
         )
         record_cpu_affinity(affinity, "worker", worker)
-        log = (args.receipts / "bridge.log").open("wb")
-        logs.append(log)
-        bridge = await asyncio.create_subprocess_exec(
-            *bridge_command,
-            env=environment,
-            stdout=log,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        processes.append(bridge)
-        await wait_ready(args.listen, processes, args.startup_timeout, stopping)
-        record_cpu_affinity(affinity, "bridge", bridge)
+        if not direct:
+            log = (args.receipts / "bridge.log").open("wb")
+            logs.append(log)
+            bridge = await asyncio.create_subprocess_exec(
+                *bridge_command,
+                env=environment,
+                stdout=log,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            processes.append(bridge)
+            await wait_ready(args.listen, processes, args.startup_timeout, stopping)
+            record_cpu_affinity(affinity, "bridge", bridge)
         if args.http_port is not None:
             frontend_command = [
                 args.frontend_binary,
@@ -289,7 +367,7 @@ async def run(args):
                 "--tts-backend",
                 "nemotron",
                 "--native-socket",
-                str(args.listen),
+                str(args.native_worker_socket if direct else args.listen),
                 "--port",
                 str(args.http_port),
                 "--host",
@@ -303,7 +381,7 @@ async def run(args):
             logs.append(log)
             frontend = await asyncio.create_subprocess_exec(
                 *frontend_command,
-                env=environment,
+                env=frontend_environment,
                 stdout=log,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -318,7 +396,9 @@ async def run(args):
                 "host": args.http_host,
                 "port": args.http_port,
             }
-        report.update(status="READY", socket=str(args.listen))
+        report.update(
+            status="READY", socket=str(args.native_worker_socket if direct else args.listen)
+        )
         (args.receipts / "LAUNCH.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report), flush=True)
         stop_task = asyncio.create_task(stopping.wait())

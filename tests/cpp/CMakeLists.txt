@@ -138,6 +138,16 @@ if(NEMO_SPEECH_BUILD_TTS)
     add_executable(test_nemotron_pcm common/test_nemotron_pcm.cpp)
     target_include_directories(test_nemotron_pcm PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME nemotron_pcm COMMAND test_nemotron_pcm)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_nemotron_worker_protocol
+            common/test_nemotron_worker_protocol.cpp
+            ${CMAKE_SOURCE_DIR}/src/tts/nemotron/native_worker_protocol.cpp)
+        target_include_directories(test_nemotron_worker_protocol PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/llama.cpp/vendor)
+        add_test(NAME nemotron_worker_protocol COMMAND test_nemotron_worker_protocol)
+        set_tests_properties(nemotron_worker_protocol PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    endif()
     add_subdirectory(tts)
 endif()
 if(NEMO_SPEECH_BUILD_NMT)

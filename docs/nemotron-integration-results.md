@@ -2,10 +2,10 @@
 
 This report records local integration checks and performance samples from
 October 15, 2026. The C++ frontend successfully serves the retained native
-Nemotron backend, including concurrent streaming and cancellation. B512
-startup latency remains higher than the legacy frontend in the same-host
-control. These samples do not establish production readiness, acoustic
-quality, or a performance improvement over the legacy deployment.
+Nemotron backend, including concurrent streaming and cancellation. Initial
+B512 host overhead and its subsequent repairs are retained below. The latest
+matched direct-worker comparison measures 205.04 ms in-flight TTFA p95; it does
+not establish the 200-ms target, production readiness, or fresh acoustic quality.
 
 Use the [build and run guide](nemotron-megakernel.md) for reproducible setup and
 the [measurement instructions](nemotron-megakernel.md#validate-and-measure) for
@@ -494,3 +494,98 @@ the separate F32 test retains coverage of the selected path. Runtime behavior
 was unchanged by that test correction. Logs are retained in `build-v7.log`,
 `tests-final.log`, `tests-final-r2.log`, `native-v7-qualification.log`, and
 `precommit-final.log`.
+
+## Subsequent direct-worker transport
+
+The opt-in `--direct-worker` path removes the Python compatibility bridge from
+request submission and audio delivery. C++ prepares and validates text, sends
+the native controller's existing MessagePack protocol, and copies shared-memory
+audio into owned PCM16 before acknowledging slab reuse. The native controller
+still owns admission, request slots, GPU work and retirement. No CUDA kernel,
+arithmetic, RNG, state format, generation policy or chunk schedule changed.
+The default remains the compatibility bridge; other models are unaffected.
+
+This section reports the selected direct **base** implementation. Experimental
+descriptor batching, publication-before-ACK and other development candidates
+are excluded. Both arms retain normalization and the shared-eight-core placement:
+frontend/preparation on 0–7/24–31 and native worker on 0–3/24–27. The baseline's
+bridge shares the worker's mask. The total service allocation is eight physical
+cores plus SMT, with the client on separate cores 8–11/32–35.
+
+### Matched B512 in-flight result
+
+The comparison used two fresh boots per arm in baseline/direct/direct/baseline
+order, three measured trials per boot, 2,048 requests per trial at concurrency
+512, and two excluded warmup rounds. Both arms used the exact retained external
+`tts_perf_client` binary, SHA-256
+`d7713f0bbd418c95395959ebd7497bc3c1110c5313da41f0b0dacf019730abbf`.
+The client stopwatch, arrivals, preparation and admission accounting were
+unchanged. Values are equal means of six per-trial statistics, not pooled
+request percentiles; latency and ITL are milliseconds.
+
+| B | Transport | RTFx | req/s | TTFA p50 | p95 | p99 | ITL avg | ITL p95 | Peak MiB | Requests | Failures | Deficit responses |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | Compatibility bridge | 1332.86 | 183.84 | 138.40 | 218.53 | 235.37 | 26.60 | 35.79 | 24,673 | 12,288 | 0 | 0 |
+| 512 | Direct worker | 1353.61 | 186.70 | 135.59 | 205.04 | 217.24 | 26.06 | 34.94 | 24,673 | 12,288 | 0 | 0 |
+
+Direct transport reduces the primary statistic by **13.49 ms (6.17%)**. The
+95% matched bootstrap interval is **[−20.36, −4.22] ms**, with a direct/baseline
+ratio interval of **[0.9068, 0.9801]**. The calculation uses 20,000 draws of
+matched boot blocks and paired trial positions. Only two blocks on one GPU
+were measured, so this is limited single-device evidence.
+
+Baseline boot means were 211.50 and 225.57 ms; direct boot means were 199.59
+and 210.50 ms. The direct mean's within-arm interval is [191.20, 214.58] ms.
+Consequently, **TTFA p95 ≤200 ms is not established**. Development screens and
+diagnostics do not enter this comparison. The older 212.93-ms legacy Rust
+sample was collected separately and is not a paired arm of this experiment.
+
+### Separate supporting checks
+
+The direct path also completed the following single-boot, three-trial samples.
+They are regression/smoke measurements, not matched improvement estimates.
+
+| B | Mode | RTFx | req/s | TTFA p50 | p95 | p99 | Requests | Failures | Deficit responses |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | In-flight | 17.54 | 2.51 | 18.32 | 19.25 | 19.33 | 96 | 0 | 0 |
+| 512 | Fixed cohort | 485.26 | 63.87 | 154.16 | 171.09 | 177.34 | 1,536 | 0 | — |
+
+Fixed-cohort lane ordering and batch-seeded output lengths differ across
+separate runs; the RTFx above is not evidence of a kernel or transport throughput
+gain. Its historical client does not measure playback deficits.
+
+B32 received a separate same-seed HTTP qualification, not a fresh timing claim.
+Each arm served 64 requests, including four client cancellations and four slow
+readers. All 60 uncancelled requests completed; the four cancellations were
+intentional. All 64 corresponding received PCM hashes and sample counts matched
+between bridge and direct paths, including the cancelled prefixes. Native
+receipts checked physical B32, request seeds, slot generations, cancellations
+and completed sample totals. These checks establish this fixture's exact
+output/lifecycle agreement, not fresh CER, WER or speaker-similarity scores.
+
+A clean CPU-only CMake build passed all **14 CTests**, including 121 native
+transport checks and the 59-test bridge/launcher suite (three optional fixture
+tests skipped). It does not rebuild or requalify CUDA kernels. Live execution
+reused the same qualified native package; remote CI and additional widths or
+GPU architectures remain outside this result.
+
+### Direct-worker evidence and reproduction
+
+The following receipts are relative to the external in-flight-r2 evidence
+directory. The tested direct frontend library SHA-256 is
+`5577751830e46b0defdcd903eeae13a86207d308d41b59558dcd1f3f5c7dd8de`;
+the B512 in-flight serving manifest SHA-256 is
+`f7d92e89925ddca8ee8f419700456e2700e6d82b629a67364c6776f76a8caee5`.
+
+| Evidence | Receipt |
+|---|---|
+| Registration, identities and matched statistics | `FROZEN_CLIENT_COMPARISON.json`, `DIRECT_COMPARISON.json` |
+| Matched client observations, telemetry and launch commands | `screens/{baseline_frozen_client,direct_frozen_client}-boot{1,2}/` |
+| B1 and fixed-cohort supporting samples | `screens/direct_b1-boot1/`, `screens/direct_fixed512-boot1/` |
+| B32 exact PCM and lifecycle comparison | `screens/{qual_baseline,qual_direct}-boot1/pcm-qualification/RESULT.json` |
+| Clean CPU build and full CTest results | `ci-build/RECEIPT.json`, `ci-build/ctest.log` |
+
+Follow [direct-worker B512 reproduction](nemotron-megakernel.md#direct-worker-b512-comparison)
+with the sealed package, model, normalization assets and frozen client. Remove
+only `--direct-worker` for the bridge control, keep all other settings matched,
+and use fresh server boots and new receipt directories for each arm.
