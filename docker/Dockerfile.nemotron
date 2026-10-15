@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+ARG NATIVE_RUNTIME=nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
+ARG NORMALIZER_BUILDER=gcr.io/bazel-public/bazel:6.2.1@sha256:e25493c1c3bf74e0612a34cf6ae23c67243117aa1c42bc7730f46effd0a89006
+
+FROM ${NORMALIZER_BUILDER} AS normalizer-builder
+USER root
+RUN apt-get update && apt-get install --yes --no-install-recommends libboost-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY native/tts-normalizer/ ./
+ARG NATIVE_BUILD_JOBS=2
+RUN --mount=type=cache,target=/root/.cache/bazel,sharing=locked \
+    bazel test --config=release --jobs="${NATIVE_BUILD_JOBS}" //:normalize_test //:speech_hints_test //:text_preprocessor_test //:text_preprocessor_c_test //:string_matcher_test \
+    && bazel build --config=release --jobs="${NATIVE_BUILD_JOBS}" //:text_preprocessor_c \
+    && install -D --mode=0555 bazel-bin/libtext_preprocessor_c.so /out/libnemotron_speech_tts_text_preprocessor.so
+
+FROM ${NATIVE_RUNTIME} AS cpp-builder
+WORKDIR /source
+COPY . .
+ARG NATIVE_BUILD_JOBS=2
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opt/nemo-speech \
+    -DNEMO_SPEECH_BUILD_ASR=OFF -DNEMO_SPEECH_BUILD_DIAR=OFF \
+    -DNEMO_SPEECH_BUILD_TTS=ON -DNEMO_SPEECH_BUILD_HTTP=ON \
+    -DNEMO_SPEECH_BUILD_MIC_CAPTURE=OFF -DNEMO_SPEECH_BUILD_TESTS=ON \
+    -DGGML_CUDA=OFF -DGGML_NATIVE=OFF \
+    && cmake --build build --parallel "${NATIVE_BUILD_JOBS}" \
+    && ctest --test-dir build --output-on-failure \
+    && cmake --install build
+
+FROM ${NATIVE_RUNTIME} AS kernel-builder
+WORKDIR /source
+COPY deploy/nemotron_native /source/deploy/nemotron_native
+COPY scripts/nemotron_native /source/scripts/nemotron_native
+COPY python/nemotron_native_backend /source/python/nemotron_native_backend
+ARG NATIVE_WIDTHS=1,32,512
+ARG NATIVE_BUILD_JOBS=2
+ARG NATIVE_BATCHING_MODE=inflight
+ARG NATIVE_INFLIGHT_PROFILE=retained
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+RUN python3 scripts/nemotron_native/build_kernels.py --output /kernel-build --widths "${NATIVE_WIDTHS}" --jobs "${NATIVE_BUILD_JOBS}" \
+    && python3 scripts/nemotron_native/build_package.py --kernels /kernel-build --output /package --widths "${NATIVE_WIDTHS}" --batching-mode "${NATIVE_BATCHING_MODE}" --inflight-profile "${NATIVE_INFLIGHT_PROFILE}"
+
+FROM ${NATIVE_RUNTIME} AS runtime
+USER root
+ENV PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
+    TRT_VERSION= TRTOSS_VERSION= POLYGRAPHY_VERSION=
+COPY scripts/nemotron_native/runtime_dependencies.py /opt/nemotron-native/runtime_dependencies.py
+RUN python3 /opt/nemotron-native/runtime_dependencies.py --remove-tensorrt --output /opt/nemotron-native/dependencies.json \
+    && python3 -m pip install --no-cache-dir msgpack==1.2.2 numpy==2.3.5 safetensors==0.8.0 tokenizers==0.23.1
+COPY --from=cpp-builder /opt/nemo-speech /opt/nemo-speech
+COPY --from=kernel-builder /package /package
+COPY --from=normalizer-builder /out/libnemotron_speech_tts_text_preprocessor.so /opt/nemotron-speech/lib/processors/libnemotron_speech_tts_text_preprocessor.so
+COPY python /opt/nemotron-speech/python
+COPY deploy/nemotron_native/serve.py /opt/nemotron-speech/deploy/nemotron_native/serve.py
+COPY deploy/nemotron_native/LICENSE /opt/nemotron-speech/deploy/nemotron_native/LICENSE
+COPY scripts/nemotron_native/launch.py /opt/nemotron-speech/scripts/nemotron_native/launch.py
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /opt/nemo-speech/share/licenses/nemo-speech/
+COPY deploy/nemotron_native/LICENSE /opt/nemo-speech/share/licenses/nemo-speech/third_party/nemotron-native/LICENSE
+COPY native/tts-normalizer/LICENSE.legacy native/tts-normalizer/LICENSE.riva native/tts-normalizer/THIRD_PARTY_NOTICES.md \
+    /opt/nemo-speech/share/licenses/nemo-speech/third_party/nemotron-normalizer/
+COPY deploy/nemotron_native/kernels/third_party/thunderkittens/LICENSE \
+    /opt/nemo-speech/share/licenses/nemo-speech/third_party/thunderkittens/LICENSE
+COPY deploy/nemotron_native/kernels/third_party/thunderkittens-v4-prefill/LICENSE \
+    /opt/nemo-speech/share/licenses/nemo-speech/third_party/thunderkittens-v4-prefill/LICENSE
+ENV PATH=/opt/nemo-speech/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONPATH=/opt/nemotron-speech/python \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility NVIDIA_TF32_OVERRIDE=0 CUDA_MODULE_LOADING=LAZY \
+    NEMOTRON_TN_STRING_MATCHER=1
+ENTRYPOINT ["python3", "/opt/nemotron-speech/scripts/nemotron_native/launch.py"]

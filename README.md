@@ -21,6 +21,7 @@
 | Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) and [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), standalone or combined with ASR |
 | Text and speech translation | [Riva Translate 4B Instruct v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2), with composed ASR-to-NMT-to-TTS speech translation |
 | Speech synthesis | [MagpieTTS Multilingual 357M](https://huggingface.co/nvidia/magpie_tts_multilingual_357m) with [NeMo NanoCodec](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) |
+| Nemotron-TTS megakernels | Optional H100 backend with fixed cohorts or in-flight admission; [integration and benchmarks](docs/nemotron-megakernel.md) |
 | Full-duplex voicechat | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
 | Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
 

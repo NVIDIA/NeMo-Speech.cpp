@@ -1,0 +1,1943 @@
+{
+  "schema": "nemotron.native-program-catalog.v1",
+  "architecture": "sm_90a",
+  "startup": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "steady": 8,
+  "programs": {
+    "1": {
+      "neural": {
+        "schema": "nemotron.native-readiness-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 1,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": "prefill",
+          "stage0": "stage0",
+          "codec": "codec"
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 96,
+          "full_stage0_grid": 96,
+          "codec_grid": 48
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false
+        },
+        "state": {
+          "format": "FP32-private",
+          "recurrence_arithmetic": "FP32",
+          "canonical_binding": false,
+          "prefix_cache": false,
+          "initialization": "prefill-per-cohort"
+        },
+        "hooks": [
+          "predictor_active_mask",
+          "helper_graphs",
+          "controller_queues",
+          "admission_receipt"
+        ],
+        "id": "native-source-b1-recurrent-staging",
+        "source_build": 1
+      },
+      "serving": {
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 4,
+          "torch_interop_threads": 4,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          },
+          "fp32_prefix_snapshot": "immutable-fp32-v3"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 1,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 1,
+        "neural_cohort_partitioning": false,
+        "family": "readiness",
+        "id": "native-source-b1-recurrent-staging-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b1/artifacts/kernels/b1/prefill.so",
+        "stage0": "programs/b1/artifacts/kernels/b1/stage0.so",
+        "codec": "programs/b1/artifacts/kernels/b1/codec.so",
+        "stage0_inflight": "programs/b1/artifacts/kernels/b1/inflight.so"
+      }
+    },
+    "2": {
+      "neural": {
+        "schema": "nemotron.small-width-plan.r22.v1",
+        "status": "BUILT_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 2,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": "prefill",
+          "stage0": "stage0",
+          "codec": "codec"
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "static",
+          "stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "resources": {
+          "occupancy_qualified": false,
+          "admission_checked_at_construction": true,
+          "compiled_arch": "sm_90a",
+          "producer_barrier": "actual-gridDim.x"
+        },
+        "geometry": {
+          "physical_requests": 2,
+          "producer_tile_rows": 16,
+          "prefill_tile_rows": 64,
+          "sparse_expert_tile_rows": 16
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false
+        },
+        "state": {
+          "format": "FP32-private",
+          "recurrence_arithmetic": "FP32",
+          "canonical_binding": false,
+          "prefix_cache": false,
+          "initialization": "prefill-per-cohort"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le"
+        },
+        "hooks": [
+          "predictor_active_mask",
+          "helper_graphs",
+          "controller_queues",
+          "publication_receipt"
+        ],
+        "rng": {
+          "groups": 1,
+          "generated_rows_per_draw": 64,
+          "consumed_rows": 2,
+          "unused_rows": 62,
+          "context_draws": 1,
+          "all_physical_generations_advance": true,
+          "regrouping_equivalence": false
+        },
+        "id": "native-source-b2",
+        "source_build": 1
+      },
+      "serving": {
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 4,
+          "torch_interop_threads": 4,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          },
+          "fp32_prefix_snapshot": "immutable-fp32-v3"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 2,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 2,
+        "neural_cohort_partitioning": false,
+        "family": "small",
+        "id": "native-source-b2-streaming-v3"
+      },
+      "libraries": {
+        "stage0": "programs/b2/artifacts/kernels/stage0/native.so",
+        "prefill": "programs/b2/artifacts/kernels/prefill/native.so",
+        "codec": "programs/b2/artifacts/kernels/codec/native.so",
+        "stage0_inflight": "programs/b2/artifacts/kernels/stage0/inflight.so"
+      }
+    },
+    "4": {
+      "neural": {
+        "schema": "nemotron.small-width-plan.r22.v1",
+        "status": "BUILT_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 4,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": "prefill",
+          "stage0": "stage0",
+          "codec": "codec"
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "static",
+          "stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "resources": {
+          "occupancy_qualified": false,
+          "admission_checked_at_construction": true,
+          "compiled_arch": "sm_90a",
+          "producer_barrier": "actual-gridDim.x"
+        },
+        "geometry": {
+          "physical_requests": 4,
+          "producer_tile_rows": 16,
+          "prefill_tile_rows": 64,
+          "sparse_expert_tile_rows": 16
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false
+        },
+        "state": {
+          "format": "FP32-private",
+          "recurrence_arithmetic": "FP32",
+          "canonical_binding": false,
+          "prefix_cache": false,
+          "initialization": "prefill-per-cohort"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le"
+        },
+        "hooks": [
+          "predictor_active_mask",
+          "helper_graphs",
+          "controller_queues",
+          "publication_receipt"
+        ],
+        "rng": {
+          "groups": 1,
+          "generated_rows_per_draw": 64,
+          "consumed_rows": 4,
+          "unused_rows": 60,
+          "context_draws": 1,
+          "all_physical_generations_advance": true,
+          "regrouping_equivalence": false
+        },
+        "id": "native-source-b4",
+        "source_build": 1
+      },
+      "serving": {
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 4,
+          "torch_interop_threads": 4,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          },
+          "fp32_prefix_snapshot": "immutable-fp32-v3"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 4,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 4,
+        "neural_cohort_partitioning": false,
+        "family": "small",
+        "id": "native-source-b4-streaming-v3"
+      },
+      "libraries": {
+        "stage0": "programs/b4/artifacts/kernels/stage0/native.so",
+        "prefill": "programs/b4/artifacts/kernels/prefill/native.so",
+        "codec": "programs/b4/artifacts/kernels/codec/native.so",
+        "stage0_inflight": "programs/b4/artifacts/kernels/stage0/inflight.so"
+      }
+    },
+    "8": {
+      "neural": {
+        "schema": "nemotron.small-width-plan.r22.v1",
+        "status": "BUILT_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 8,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": "prefill",
+          "stage0": "stage0",
+          "codec": "codec"
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "static",
+          "stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "resources": {
+          "occupancy_qualified": false,
+          "admission_checked_at_construction": true,
+          "compiled_arch": "sm_90a",
+          "producer_barrier": "actual-gridDim.x"
+        },
+        "geometry": {
+          "physical_requests": 8,
+          "producer_tile_rows": 16,
+          "prefill_tile_rows": 64,
+          "sparse_expert_tile_rows": 16
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false
+        },
+        "state": {
+          "format": "FP32-private",
+          "recurrence_arithmetic": "FP32",
+          "canonical_binding": false,
+          "prefix_cache": false,
+          "initialization": "prefill-per-cohort"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le"
+        },
+        "hooks": [
+          "predictor_active_mask",
+          "helper_graphs",
+          "controller_queues",
+          "publication_receipt"
+        ],
+        "rng": {
+          "groups": 1,
+          "generated_rows_per_draw": 64,
+          "consumed_rows": 8,
+          "unused_rows": 56,
+          "context_draws": 1,
+          "all_physical_generations_advance": true,
+          "regrouping_equivalence": false
+        },
+        "id": "native-source-b8",
+        "source_build": 1
+      },
+      "serving": {
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 4,
+          "torch_interop_threads": 4,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          },
+          "fp32_prefix_snapshot": "immutable-fp32-v3"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 8,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 8,
+        "neural_cohort_partitioning": false,
+        "family": "small",
+        "id": "native-source-b8-streaming-v3"
+      },
+      "libraries": {
+        "stage0": "programs/b8/artifacts/kernels/stage0/native.so",
+        "prefill": "programs/b8/artifacts/kernels/prefill/native.so",
+        "codec": "programs/b8/artifacts/kernels/codec/native.so",
+        "stage0_inflight": "programs/b8/artifacts/kernels/stage0/inflight.so"
+      }
+    },
+    "16": {
+      "neural": {
+        "schema": "nemotron.retained-narrow.r22.v1",
+        "enabled": false,
+        "physical_width": 16,
+        "neural_cohort_partitioning": false,
+        "execution": {
+          "mode": "overlap",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 80,
+          "codec_grid": 52,
+          "full_stage0_grid": 132
+        },
+        "active_lanes": {
+          "mode": "disabled"
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ]
+        },
+        "state": {
+          "format": "FP32-private",
+          "recurrence": "FP32",
+          "prefix_cache": false
+        },
+        "predictor": {
+          "full_width": "BF16",
+          "contracted": "BF16"
+        },
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "status": "PROPOSED_UNQUALIFIED",
+        "id": "native-source-b16",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 16,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          },
+          "fp32_prefix_snapshot": "immutable-fp32-v3"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 16,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "narrow",
+        "id": "native-source-b16-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b16/artifacts/kernels/b16/prefill/native.so",
+        "stage0": "programs/b16/artifacts/kernels/b16/stage0/native.so",
+        "codec": "programs/b16/artifacts/kernels/b16/codec/libnative_stage1.so",
+        "stage0_inflight": "programs/b16/artifacts/kernels/b16/stage0/inflight.so"
+      }
+    },
+    "32": {
+      "neural": {
+        "schema": "nemotron.retained-narrow.r22.v1",
+        "enabled": false,
+        "physical_width": 32,
+        "neural_cohort_partitioning": false,
+        "execution": {
+          "mode": "overlap",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 80,
+          "codec_grid": 52,
+          "full_stage0_grid": 132
+        },
+        "active_lanes": {
+          "mode": "fixed-subset",
+          "target_batch": 16,
+          "after_chunk0": true,
+          "narrow_grid": 80,
+          "grid_policy": "follow-stage0"
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ]
+        },
+        "state": {
+          "format": "BF16-private",
+          "recurrence": "FP32",
+          "prefix_cache": true
+        },
+        "predictor": {
+          "full_width": "FP8-FFN",
+          "contracted": "BF16"
+        },
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "status": "PROPOSED_UNQUALIFIED",
+        "id": "native-source-b32",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 32,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 32,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "narrow",
+        "id": "native-source-b32-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b32/artifacts/kernels/b32/prefill/native.so",
+        "stage0": "programs/b32/artifacts/kernels/b32/stage0/native.so",
+        "codec": "programs/b32/artifacts/kernels/b32/codec/native.so",
+        "contraction_stage0": "programs/b32/artifacts/contraction/b32/stage0.so",
+        "contraction_transfer": "programs/b32/artifacts/contraction/b32/transfer.so",
+        "contraction_bf16": "programs/b32/artifacts/contraction/b32/bf16-native.so",
+        "stage0_inflight": "programs/b32/artifacts/kernels/b32/stage0/inflight.so"
+      }
+    },
+    "64": {
+      "neural": {
+        "schema": "nemotron.retained-narrow.r22.v1",
+        "enabled": false,
+        "physical_width": 64,
+        "neural_cohort_partitioning": false,
+        "execution": {
+          "mode": "overlap",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 80,
+          "codec_grid": 48,
+          "full_stage0_grid": 132
+        },
+        "active_lanes": {
+          "mode": "fixed-subset",
+          "target_batch": 16,
+          "after_chunk0": true,
+          "narrow_grid": 80,
+          "grid_policy": "follow-stage0"
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ]
+        },
+        "state": {
+          "format": "FP32-private",
+          "recurrence": "FP32",
+          "prefix_cache": false
+        },
+        "predictor": {
+          "full_width": "BF16",
+          "contracted": "BF16"
+        },
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "status": "PROPOSED_UNQUALIFIED",
+        "id": "native-source-b64",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 64,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "retained-engine-token-packing",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          },
+          "fp32_prefix_snapshot": "immutable-fp32-v3"
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 64,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "narrow",
+        "id": "native-source-b64-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b64/artifacts/kernels/b64/prefill/native.so",
+        "stage0": "programs/b64/artifacts/kernels/b64/stage0/native.so",
+        "codec": "programs/b64/artifacts/kernels/b64/codec/libnative_stage1.so",
+        "contraction_stage0": "programs/b64/artifacts/contraction/b64/stage0.so",
+        "contraction_transfer": "programs/b64/artifacts/contraction/b64/transfer.so",
+        "stage0_inflight": "programs/b64/artifacts/kernels/b64/stage0/inflight.so"
+      }
+    },
+    "128": {
+      "neural": {
+        "schema": "nemotron.native-package-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 128,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": {
+            "artifact": "prefill",
+            "physical_width": 128,
+            "entrypoint": "mk2_native_prefill_run",
+            "workspace_sequences": 1
+          },
+          "stage0": {
+            "artifact": "stage0",
+            "physical_width": 128,
+            "entrypoint": "mk2_run_native_stage0",
+            "barrier_participants": 132,
+            "row_tiles": 2,
+            "row_tile": 64,
+            "k_tile": 128,
+            "pipeline_stages": 3
+          },
+          "codec": {
+            "artifact": "codec",
+            "physical_width": 128,
+            "entrypoint": "native_stage1_run",
+            "max_frames": 8,
+            "state_banks": 2
+          }
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false,
+          "rng": "independent64-lane-streams-with-retained-consumption"
+        },
+        "state": {
+          "mode": 1,
+          "format": "canonical-FP32-private-BF16",
+          "recurrence_arithmetic": "FP32",
+          "scales_artifact": "state_scales",
+          "map_artifact": "state_map",
+          "map_kind": "identity",
+          "prefix_cache": "immutable-context-snapshot-with-qualified-key-and-lifetime"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 132,
+          "full_stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 128,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v2",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "id": "native-source-b128",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 128,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 128,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "wide",
+        "id": "native-source-b128-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b128/artifacts/kernels/b128/prefill.so",
+        "stage0": "programs/b128/artifacts/kernels/b128/stage0.so",
+        "codec": "programs/b128/artifacts/kernels/b128/codec.so",
+        "stage0_inflight": "programs/b128/artifacts/kernels/b128/inflight.so"
+      },
+      "inflight_policy": {
+        "startup_phase_alignment": true,
+        "codec_first_packet_f2": false,
+        "startup_max_steps": 2,
+        "startup_budget_ms": 20.0,
+        "codec_merge_ready": false,
+        "partial_startup_single_step": false,
+        "serial_prefetch": true,
+        "codec_local_packing": true,
+        "codec_packed_transfer": true,
+        "defer_admission_reset": true
+      }
+    },
+    "256": {
+      "neural": {
+        "schema": "nemotron.native-package-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 256,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": {
+            "artifact": "prefill",
+            "physical_width": 256,
+            "entrypoint": "mk2_native_prefill_run",
+            "workspace_sequences": 1
+          },
+          "stage0": {
+            "artifact": "stage0",
+            "physical_width": 256,
+            "entrypoint": "mk2_run_native_stage0",
+            "barrier_participants": 132,
+            "row_tiles": 4,
+            "row_tile": 64,
+            "k_tile": 128,
+            "pipeline_stages": 3
+          },
+          "codec": {
+            "artifact": "codec",
+            "physical_width": 256,
+            "entrypoint": "native_stage1_run",
+            "max_frames": 8,
+            "state_banks": 2
+          }
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false,
+          "rng": "independent64-lane-streams-with-retained-consumption"
+        },
+        "state": {
+          "mode": 1,
+          "format": "canonical-FP32-private-BF16",
+          "recurrence_arithmetic": "FP32",
+          "scales_artifact": "state_scales",
+          "map_artifact": "state_map",
+          "map_kind": "identity",
+          "prefix_cache": "immutable-context-snapshot-with-qualified-key-and-lifetime"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 132,
+          "full_stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 256,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v2",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "id": "native-source-b256",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 256,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 256,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "wide",
+        "id": "native-source-b256-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b256/artifacts/kernels/b256/prefill.so",
+        "stage0": "programs/b256/artifacts/kernels/b256/stage0.so",
+        "codec": "programs/b256/artifacts/kernels/b256/codec.so",
+        "stage0_inflight": "programs/b256/artifacts/kernels/b256/inflight.so"
+      },
+      "inflight_policy": {
+        "startup_phase_alignment": true,
+        "codec_first_packet_f2": false,
+        "startup_max_steps": 2,
+        "startup_budget_ms": 20.0,
+        "codec_merge_ready": false,
+        "partial_startup_single_step": false,
+        "serial_prefetch": true,
+        "codec_local_packing": true,
+        "codec_packed_transfer": true,
+        "defer_admission_reset": true
+      }
+    },
+    "512": {
+      "neural": {
+        "schema": "nemotron.native-package-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 512,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": {
+            "artifact": "prefill",
+            "physical_width": 512,
+            "entrypoint": "mk2_native_prefill_run",
+            "workspace_sequences": 512,
+            "validation_kind": "retained-device-dedup"
+          },
+          "stage0": {
+            "artifact": "stage0",
+            "physical_width": 512,
+            "entrypoint": "mk2_run_native_stage0",
+            "barrier_participants": 132,
+            "row_tiles": 8,
+            "row_tile": 64,
+            "k_tile": 128,
+            "pipeline_stages": 3
+          },
+          "codec": {
+            "artifact": "codec",
+            "physical_width": 512,
+            "entrypoint": "native_stage1_run",
+            "max_frames": 8,
+            "state_banks": 2
+          }
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false,
+          "rng": "independent64-lane-streams-with-retained-consumption"
+        },
+        "state": {
+          "mode": 1,
+          "format": "canonical-FP32-private-BF16",
+          "recurrence_arithmetic": "FP32",
+          "scales_artifact": "state_scales",
+          "map_artifact": "state_map",
+          "map_kind": "identity",
+          "prefix_cache": "immutable-context-snapshot-with-qualified-key-and-lifetime"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 132,
+          "full_stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 512,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v2",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "id": "native-source-b512",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 512,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 512,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "wide",
+        "id": "native-source-b512-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b512/artifacts/kernels/b512/prefill.so",
+        "stage0": "programs/b512/artifacts/kernels/b512/stage0.so",
+        "codec": "programs/b512/artifacts/kernels/b512/codec.so",
+        "stage0_inflight": "programs/b512/artifacts/kernels/b512/inflight.so"
+      },
+      "inflight_policy": {
+        "startup_phase_alignment": true,
+        "codec_first_packet_f2": false,
+        "startup_max_steps": 2,
+        "startup_budget_ms": 20.0,
+        "codec_merge_ready": false,
+        "partial_startup_single_step": false,
+        "serial_prefetch": true,
+        "codec_local_packing": true,
+        "codec_packed_transfer": true,
+        "defer_admission_reset": true
+      }
+    },
+    "1024": {
+      "neural": {
+        "schema": "nemotron.native-package-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 1024,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": {
+            "artifact": "prefill",
+            "physical_width": 1024,
+            "entrypoint": "mk2_native_prefill_run",
+            "workspace_sequences": 1
+          },
+          "stage0": {
+            "artifact": "stage0",
+            "physical_width": 1024,
+            "entrypoint": "mk2_run_native_stage0",
+            "barrier_participants": 132,
+            "row_tiles": 16,
+            "row_tile": 64,
+            "k_tile": 128,
+            "pipeline_stages": 3
+          },
+          "codec": {
+            "artifact": "codec",
+            "physical_width": 1024,
+            "entrypoint": "native_stage1_run",
+            "max_frames": 8,
+            "state_banks": 2
+          }
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false,
+          "rng": "independent64-lane-streams-with-retained-consumption"
+        },
+        "state": {
+          "mode": 1,
+          "format": "canonical-FP32-private-BF16",
+          "recurrence_arithmetic": "FP32",
+          "scales_artifact": "state_scales",
+          "map_artifact": "state_map",
+          "map_kind": "identity",
+          "prefix_cache": "immutable-context-snapshot-with-qualified-key-and-lifetime"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 132,
+          "full_stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 1024,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v2",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "id": "native-source-b1024",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 1024,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 1024,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "wide",
+        "id": "native-source-b1024-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b1024/artifacts/kernels/b1024/prefill.so",
+        "stage0": "programs/b1024/artifacts/kernels/b1024/stage0.so",
+        "codec": "programs/b1024/artifacts/kernels/b1024/codec.so",
+        "stage0_inflight": "programs/b1024/artifacts/kernels/b1024/inflight.so"
+      },
+      "inflight_policy": {
+        "startup_phase_alignment": true,
+        "codec_first_packet_f2": false,
+        "startup_max_steps": 2,
+        "startup_budget_ms": 20.0,
+        "codec_merge_ready": false,
+        "partial_startup_single_step": false,
+        "serial_prefetch": true,
+        "codec_local_packing": true,
+        "codec_packed_transfer": true,
+        "defer_admission_reset": true
+      }
+    },
+    "2048": {
+      "neural": {
+        "schema": "nemotron.native-package-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 2048,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": {
+            "artifact": "prefill",
+            "physical_width": 2048,
+            "entrypoint": "mk2_native_prefill_run",
+            "workspace_sequences": 1
+          },
+          "stage0": {
+            "artifact": "stage0",
+            "physical_width": 2048,
+            "entrypoint": "mk2_run_native_stage0",
+            "barrier_participants": 132,
+            "row_tiles": 32,
+            "row_tile": 64,
+            "k_tile": 128,
+            "pipeline_stages": 3
+          },
+          "codec": {
+            "artifact": "codec",
+            "physical_width": 2048,
+            "entrypoint": "native_stage1_run",
+            "max_frames": 8,
+            "state_banks": 2
+          }
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false,
+          "rng": "independent64-lane-streams-with-retained-consumption"
+        },
+        "state": {
+          "mode": 1,
+          "format": "canonical-FP32-private-BF16",
+          "recurrence_arithmetic": "FP32",
+          "scales_artifact": "state_scales",
+          "map_artifact": "state_map",
+          "map_kind": "identity",
+          "prefix_cache": "immutable-context-snapshot-with-qualified-key-and-lifetime"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 132,
+          "full_stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 2048,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v2",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "id": "native-source-b2048",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 2048,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 2048,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "wide",
+        "id": "native-source-b2048-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b2048/artifacts/kernels/b2048/prefill.so",
+        "stage0": "programs/b2048/artifacts/kernels/b2048/stage0.so",
+        "codec": "programs/b2048/artifacts/kernels/b2048/codec.so",
+        "stage0_inflight": "programs/b2048/artifacts/kernels/b2048/inflight.so"
+      },
+      "inflight_policy": {
+        "startup_phase_alignment": true,
+        "codec_first_packet_f2": false,
+        "startup_max_steps": 2,
+        "startup_budget_ms": 20.0,
+        "codec_merge_ready": false,
+        "partial_startup_single_step": false,
+        "serial_prefetch": true,
+        "codec_local_packing": true,
+        "codec_packed_transfer": true,
+        "defer_admission_reset": true
+      }
+    },
+    "4096": {
+      "neural": {
+        "schema": "nemotron.native-package-plan.r22.v1",
+        "status": "PROPOSED_UNQUALIFIED",
+        "enabled": false,
+        "physical_width": 4096,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "kernels": {
+          "prefill": {
+            "artifact": "prefill",
+            "physical_width": 4096,
+            "entrypoint": "mk2_native_prefill_run",
+            "workspace_sequences": 1
+          },
+          "stage0": {
+            "artifact": "stage0",
+            "physical_width": 4096,
+            "entrypoint": "mk2_run_native_stage0",
+            "barrier_participants": 132,
+            "row_tiles": 64,
+            "row_tile": 64,
+            "k_tile": 128,
+            "pipeline_stages": 3
+          },
+          "codec": {
+            "artifact": "codec",
+            "physical_width": 4096,
+            "entrypoint": "native_stage1_run",
+            "max_frames": 8,
+            "state_banks": 2
+          }
+        },
+        "generation": {
+          "cap": 511,
+          "startup_skip": true,
+          "chunk_frames": [
+            3,
+            5,
+            8
+          ],
+          "contraction": false,
+          "rng": "independent64-lane-streams-with-retained-consumption"
+        },
+        "state": {
+          "mode": 1,
+          "format": "canonical-FP32-private-BF16",
+          "recurrence_arithmetic": "FP32",
+          "scales_artifact": "state_scales",
+          "map_artifact": "state_map",
+          "map_kind": "identity",
+          "prefix_cache": "immutable-context-snapshot-with-qualified-key-and-lifetime"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "execution": {
+          "mode": "serial",
+          "grid_policy": "overlap-only",
+          "stage0_grid": 132,
+          "full_stage0_grid": 132,
+          "codec_grid": 132
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 4096,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v2",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "id": "native-source-b4096",
+        "source_build": 1
+      },
+      "serving": {
+        "schema": "nemotron.unified-serving.r22.v1",
+        "enabled": false,
+        "physical_width": 4096,
+        "neural_cohort_partitioning": false,
+        "model": {
+          "checkpoint_sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+        },
+        "host": {
+          "tokens": "pinned",
+          "serialization": "msgpack-c-1.2.2",
+          "pcm_conversion": "exact-avx2-with-scalar-fallback",
+          "backend_delivery_group": 64,
+          "batching_timer_ms": 0,
+          "deferred_audit": false,
+          "descriptor_ipc": true,
+          "torch_intra_threads": 8,
+          "torch_interop_threads": 16,
+          "tokio_threads": 8,
+          "backend_executor_threads": 1,
+          "cpu_policy": {
+            "server_physical_cores": 8,
+            "client_physical_cores": 4,
+            "include_smt_siblings": true,
+            "resolve_topology_at_launch": true
+          },
+          "transport_options": {
+            "f5": true
+          }
+        },
+        "publication": {
+          "continuation_proof_required": true,
+          "sample_rate": 22050,
+          "neural_output": "pcm_f32_le",
+          "http_output": "pcm_s16_le",
+          "ownership": "immutable payload or retained slab lease until transport ACK",
+          "initial_singleton_readiness": true,
+          "readiness_bundle": "separate qualified physical-B1 bundle required",
+          "post_readiness_width": 4096,
+          "incomplete_deadline_ms": 10000
+        },
+        "transport_compatibility": {
+          "identity_migration_enabled": false,
+          "execution_contract": "native_full_prefill_full_stage0_full_stage1_streaming_v1",
+          "output_contract": "pcm_f32_le_22050_mono_variable_streaming_v3",
+          "installed_transport_versions": {
+            "trt_version": "10.16.1.11",
+            "trtllm_version": "1.3.0rc25",
+            "trtllm_commit": "0b14c6bb0d2f2e9e6e8c76cf0667f0306ba68baa"
+          },
+          "version_fields_describe_transport_image_not_neural_execution": true
+        },
+        "family": "wide",
+        "id": "native-source-b4096-streaming-v3"
+      },
+      "libraries": {
+        "prefill": "programs/b4096/artifacts/kernels/b4096/prefill.so",
+        "stage0": "programs/b4096/artifacts/kernels/b4096/stage0.so",
+        "codec": "programs/b4096/artifacts/kernels/b4096/codec.so",
+        "stage0_inflight": "programs/b4096/artifacts/kernels/b4096/inflight.so"
+      }
+    }
+  }
+}

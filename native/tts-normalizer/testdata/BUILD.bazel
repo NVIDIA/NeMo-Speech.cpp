@@ -1,0 +1,5 @@
+filegroup(
+    name = "english_assets",
+    srcs = glob(["en-US/**"]),
+    visibility = ["//visibility:public"],
+)

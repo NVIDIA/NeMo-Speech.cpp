@@ -1,0 +1,5 @@
+grammar_file: "post_process.far"
+
+grammar_name: "PostProcessor"
+
+rules { main: "POSTPROCESSOR" }

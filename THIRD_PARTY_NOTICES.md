@@ -119,7 +119,7 @@ include each selected dependency's license.
 
 ### Container system libraries
 
-The Linux container copies the shared libraries required by its executables
+The default Linux container copies the shared libraries required by its executables
 from the CUDA/Ubuntu builder into a `FROM scratch` runtime. This includes the
 GNU C Library, GCC runtime libraries, c-ares, zlib, bzip2, and XZ Utils/liblzma,
 subject to the exact feature set and package revisions in the built image.
@@ -141,6 +141,44 @@ applicable agreement is installed with the archive under
 `share/licenses/nemo-speech/nvidia/cuda-runtime/`.
 
 ## Other incorporated third-party code and data
+
+### Imported Nemotron native deployment closure
+
+The retained deployment code in `deploy/nemotron_native/`, the Python controller
+in `python/nemotron_native_backend/`, the native normalizer in
+`native/tts-normalizer/`, and their imported build utilities retain their original
+license terms and file-level notices. Importing these components does not
+relicense them under this repository's Apache-2.0 license. Apache-2.0 headers on
+new integration files do not change the terms of the imported code or its
+dependencies.
+
+The legacy NVIDIA notice is preserved in
+[`deploy/nemotron_native/LICENSE`](deploy/nemotron_native/LICENSE) and
+[`native/tts-normalizer/LICENSE.legacy`](native/tts-normalizer/LICENSE.legacy).
+The normalizer also preserves the Riva source notice in
+[`native/tts-normalizer/LICENSE.riva`](native/tts-normalizer/LICENSE.riva).
+These notices reserve NVIDIA's proprietary rights and require an express
+license agreement for use, reproduction, disclosure, or distribution. Licensing
+and redistribution review of the imported closure is pending; this notice and
+a successful build do not grant publication or redistribution permission.
+
+The imported kernel dependencies include two ThunderKittens snapshots,
+Copyright (c) 2024-2026 HazyResearch, under the MIT License. Their complete
+notices remain in
+[`thunderkittens/LICENSE`](deploy/nemotron_native/kernels/third_party/thunderkittens/LICENSE)
+and
+[`thunderkittens-v4-prefill/LICENSE`](deploy/nemotron_native/kernels/third_party/thunderkittens-v4-prefill/LICENSE).
+The normalizer's pinned OpenFst, Sparrowhawk, Thrax, Abseil, protobuf, RE2,
+and other dependencies are listed separately in
+[`native/tts-normalizer/THIRD_PARTY_NOTICES.md`](native/tts-normalizer/THIRD_PARTY_NOTICES.md).
+Their individual license terms remain applicable.
+
+The optional `docker/Dockerfile.nemotron` runtime uses the pinned NVIDIA PyTorch
+container rather than the default scratch image described above. Its CUDA,
+PyTorch, Python packages, and operating-system dependencies retain their own
+licenses and notices. Model weights, tokenizer files, voice context, and
+production normalization grammars are supplied separately; this repository does
+not grant rights to those assets.
 
 ### miniaudio
 

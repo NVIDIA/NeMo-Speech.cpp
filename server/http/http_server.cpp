@@ -712,8 +712,21 @@ struct Server::Impl {
                 auto synthesizer = this->models.tts();
                 tts::SynthesisRequest synthesis;
                 synthesis.text = body.string_or("input");
-                synthesis.language_code = body.string_or("language");
+                synthesis.language_code =
+                    body.string_or("language", body.string_or("language_code"));
                 synthesis.voice_name = openai_voice(*synthesizer, body.string_or("voice"));
+                if (const auto* normalize = body.find("apply_normalize")) {
+                    if (!normalize->is_bool())
+                        throw std::invalid_argument("apply_normalize must be boolean");
+                    synthesis.apply_normalize = normalize->boolean() ? 1 : 0;
+                }
+                if (const auto* seed = body.find("seed")) {
+                    if (!seed->is_number() || seed->number() != std::floor(seed->number()) ||
+                        seed->number() < 0 || seed->number() > 2147483647)
+                        throw std::invalid_argument(
+                            "seed must be an integer between 0 and 2147483647");
+                    synthesis.options.seed = static_cast<int>(seed->number());
+                }
                 if (const auto* sample_rate = body.find("sample_rate")) {
                     if (!sample_rate->is_number())
                         throw std::invalid_argument("sample_rate must be a positive integer");
@@ -733,6 +746,32 @@ struct Server::Impl {
                 const std::string format = body.string_or("response_format", "wav");
                 if (format != "wav" && format != "pcm")
                     throw std::invalid_argument("response_format must be wav or pcm");
+
+                if (format == "pcm" && synthesizer->backend_name() == "nemotron") {
+                    const auto prepared = synthesizer->prepare(synthesis);
+                    response.set_header(
+                        "x-audio-sample-rate", std::to_string(prepared.metadata.sample_rate));
+                    response.set_header("Cache-Control", "no-store");
+                    response.set_chunked_content_provider(
+                        "audio/pcm", [synthesizer, prepared](size_t, httplib::DataSink& sink) {
+                            try {
+                                const auto result = synthesizer->synthesize(
+                                    prepared, [&](const auto&, const std::string& chunk) {
+                                        return sink.is_writable() &&
+                                               sink.write(chunk.data(), chunk.size());
+                                    });
+                                if (result.cancelled)
+                                    return false;
+                                sink.done();
+                                return true;
+                            }
+                            catch (const std::exception& error) {
+                                std::fprintf(stderr, "Nemotron stream failed: %s\n", error.what());
+                                return false;
+                            }
+                        });
+                    return;
+                }
 
                 uint64_t generation = 0;
                 if (this->config.preempt_tts) {
@@ -785,6 +824,8 @@ struct Server::Impl {
                               << " e2e_ttfa_ms=" << stats.e2e_ttfa_ms
                               << " e2e_rtfx=" << stats.e2e_rtfx << '\n';
                 }
+                response.set_header(
+                    "x-audio-sample-rate", std::to_string(result.metadata.sample_rate));
                 if (format == "pcm")
                     response.set_content(std::move(pcm), "audio/pcm");
                 else

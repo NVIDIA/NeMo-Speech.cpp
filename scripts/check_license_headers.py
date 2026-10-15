@@ -40,6 +40,18 @@ DERIVED_FILES = {
     "src/asr/encoder/rel_pos_attention.cpp",
     "src/asr/encoder/rel_pos_attention.h",
 }
+IMPORTED_SOURCE_PREFIXES = (
+    "deploy/nemotron_native/kernels/",
+    "native/tts-normalizer/",
+    "python/nemotron_native_backend/",
+)
+IMPORTED_SOURCE_FILES = {
+    "deploy/nemotron_native/convert_model.py",
+    "deploy/nemotron_native/serve.py",
+    "scripts/nemotron_native/build_kernels.py",
+    "scripts/nemotron_native/build_package.py",
+    "scripts/nemotron_native/runtime_dependencies.py",
+}
 
 
 def repository_root() -> Path:
@@ -74,6 +86,9 @@ def tracked_source_files(root: Path) -> list[Path]:
 
 
 def is_source_file(path: Path) -> bool:
+    relative = path.as_posix()
+    if relative.startswith(IMPORTED_SOURCE_PREFIXES) or relative in IMPORTED_SOURCE_FILES:
+        return False
     name = path.name
     return (
         path.suffix.lower() in SOURCE_SUFFIXES

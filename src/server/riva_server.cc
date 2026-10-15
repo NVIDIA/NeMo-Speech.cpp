@@ -131,6 +131,8 @@ asr_configured(const AsrServerConfig& cfg) {
 #if defined(NEMO_SPEECH_BUILD_TTS)
 bool
 tts_configured(const TtsServerConfig& cfg) {
+    if (cfg.server.backend == "nemotron")
+        return !cfg.server.native_socket.empty();
     return !cfg.server.runtime.magpie_model.empty() && !cfg.server.runtime.codec_model.empty() &&
            !cfg.server.tokenizer_model_dir.empty();
 }
@@ -380,6 +382,9 @@ main(int argc, char** argv) {
                   << "\n";
         try {
             nemo_speech::tts::SynthesizerConfig synthesizer_config;
+            synthesizer_config.backend = cfg.tts.server.backend;
+            synthesizer_config.native_socket = cfg.tts.server.native_socket;
+            synthesizer_config.native_timeout_seconds = cfg.tts.server.native_timeout_seconds;
             synthesizer_config.runtime = std::move(cfg.tts.server.runtime);
             synthesizer_config.tokenizer_model_dir = std::move(cfg.tts.server.tokenizer_model_dir);
             synthesizer_config.text_normalizer_model_dir = std::move(cfg.tts.server.tn_model_dir);

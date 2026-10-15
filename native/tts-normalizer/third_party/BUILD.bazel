@@ -1,0 +1,3 @@
+# Repository BUILD definitions referenced by WORKSPACE.bazel live beside this file.
+
+exports_files(["sparrowhawk_normalizer.cc", "sparrowhawk_rule_system.cc", "sparrowhawk_string_matcher.h"])

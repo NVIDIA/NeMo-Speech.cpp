@@ -71,6 +71,9 @@ typedef struct nemo_speech_tts_model_config {
     const char* tokenizer_model_dir;
     // Optional written-to-spoken TN grammar root. Empty keeps text unchanged.
     const char* text_normalizer_model_dir;
+    const char* model_backend;
+    const char* native_socket;
+    int32_t native_timeout_seconds;
 } nemo_speech_tts_model_config;
 
 typedef struct nemo_speech_tts_runtime_config {

@@ -1,0 +1,122 @@
+{
+  "schema": "nemotron-native-model-lock.v1",
+  "model_identity": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa",
+  "inputs": {
+    "repository": "nvidia/easymagpietts_NEXT",
+    "revision": "3f12eb7fedcef8d432bd83d0a82525e8de6b3d39",
+    "token_environment_variable": "HF_TOKEN",
+    "files": [
+      {
+        "id": "easymagpie_predictor_nemo",
+        "path": "2605_NemotronTTS_V0.2/v2/2605_EMTTS_SmallMamba_Step150k.nemo",
+        "sha256": "73f1591f9029624960dafd8e94f46f9cce7cc8141ba854f102d346fa2a8f4d01",
+        "bytes": 5067622400
+      },
+      {
+        "id": "codec_25fps_nemo",
+        "path": "25fps_spectral_codec_with_bandwidth_extension.nemo",
+        "sha256": "385dbccbb9eb94865c9745f28f2748845a9a567de7338375825fa2727095d243",
+        "bytes": 320471040
+      },
+      {
+        "id": "ipa_bpe_tokenizer",
+        "path": "2605_NemotronTTS_V0.2/bpe_ipa_tokenizer_2048_en_de_es_fr_hi_it_vi_zh_ko-KR_pt-BR_ar.json",
+        "sha256": "ba573df82176a963c56928e25166723e370e1af24f4aac70aa020c7bcf0ff0c5",
+        "bytes": 142076
+      },
+      {
+        "id": "english_sample_context_wav",
+        "path": "context_audios/english_sample.wav",
+        "sha256": "923f3265c8fc68940b88ce1e4bdc4860a579f447d90330b84bcb472d0e180466",
+        "bytes": 402286
+      }
+    ]
+  },
+  "converter": {
+    "repository": "https://github.com/styagi130/NeMo.git",
+    "commit": "bf562c17d255fc47ef41ce497fd4c2fb3b35f35d",
+    "script": "examples/tts/easymagpie_vllm_omni/scripts/convert_to_vllm.py",
+    "script_sha256": "6038d18a650f29a970b117e446a6db39908aa4470112c33717948ae7ec61ff62",
+    "image": "nvcr.io/nvidia/nemo@sha256:55f356677237cc7bcd318e505aa202022078fd4f0bb5ef527ed5d2ec8b3c5dd6",
+    "extra_pip_requirements": [
+      "kaldialign==0.12.0"
+    ]
+  },
+  "argv": [
+    "python3",
+    "examples/tts/easymagpie_vllm_omni/scripts/convert_to_vllm.py",
+    "--nemo_file",
+    "/ckpt/2605_NemotronTTS_V0.2/v2/2605_EMTTS_SmallMamba_Step150k.nemo",
+    "--codec_model_path",
+    "/ckpt/25fps_spectral_codec_with_bandwidth_extension.nemo",
+    "--phoneme_tokenizer_path",
+    "/ckpt/2605_NemotronTTS_V0.2/bpe_ipa_tokenizer_2048_en_de_es_fr_hi_it_vi_zh_ko-KR_pt-BR_ar.json",
+    "--context_audio",
+    "/ckpt/context_audios/english_sample.wav",
+    "--speaker_name",
+    "english_sample",
+    "--context_audio_duration",
+    "5.0",
+    "--precompute_batch_size",
+    "1024",
+    "--dtype",
+    "bfloat16",
+    "--bundle_codec",
+    "--device",
+    "cuda",
+    "--outdir",
+    "/out"
+  ],
+  "outputs": [
+    {
+      "path": "config.json",
+      "bytes": 1740,
+      "sha256": "5b0679ea0ec5d63b276ed40d17666d0b0fecbce4365595f078d323aa4278aaf2"
+    },
+    {
+      "path": "model.safetensors",
+      "bytes": 2776868102,
+      "sha256": "8bb6bfeb9cd4335f014a70bf87059af58945399be454a4c4e353a983d09eeffa"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "bytes": 71508,
+      "sha256": "a788e4e66aecf772059c68de035ca45d4ece163fbf9b63b2107c1461a5124eb5"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 17077484,
+      "sha256": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 177180,
+      "sha256": "50d5c40a1e06a86e8d0fc2d4c6a9bf73ed0ffca7bdad3c9b42cedca48baa25dc"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "bytes": 420,
+      "sha256": "e3a4f63da745f02317a45e00e6476c17fc66ac41faf14bb1b0be1f3211b0ca53"
+    },
+    {
+      "path": "chat_template.jinja",
+      "bytes": 10504,
+      "sha256": "ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862"
+    },
+    {
+      "path": "codec_native/config.json",
+      "bytes": 763,
+      "sha256": "3223ffaab2ae326acf9604e3c57c1477906d759242c209a242bdb2f9dc2a258a"
+    },
+    {
+      "path": "codec_native/model.safetensors",
+      "bytes": 217238188,
+      "sha256": "7b855b3d8589a62ee9ce48462a1fbfe2f0fd44db55b4ecf5a36364a7735c9fc7"
+    },
+    {
+      "path": "speaker_embeddings/english_sample.pt",
+      "bytes": 395034,
+      "sha256": "585ff1abb90e2200feedf9dbade84e5b64e0f4b2c7978482d1e2ef0005573401"
+    }
+  ]
+}

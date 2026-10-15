@@ -102,7 +102,8 @@ validate_compiled_feature_options(int argc, char** argv) {
             add(option, "NEMO_SPEECH_BUILD_NMT=ON");
 #endif
 #if !defined(NEMO_SPEECH_CLI_TTS)
-        if (option == "--tts-model" || option == "--codec-model" || option == "--tokenizer-dir" ||
+        if (option == "--tts-backend" || option == "--native-socket" || option == "--tts-model" ||
+            option == "--codec-model" || option == "--tokenizer-dir" ||
             option == "--tn-model-dir" || option.rfind("--tts.", 0) == 0)
             add(option, "NEMO_SPEECH_BUILD_TTS=ON");
 #endif
@@ -304,7 +305,7 @@ run_server(int argc, char** argv) {
             server_config.address = value(i, arg);
         else if (arg == "--port")
             server_config.port = parse_int(value(i, arg), arg, 1, 65535);
-        else if (arg == "--threads") {
+        else if (arg == "--threads" || arg == "--http-threads") {
             server_config.threads = parse_int(value(i, arg), arg, 1, 1024);
             http_threads_set = true;
         } else if (arg == "--max-upload-mb")
@@ -365,6 +366,10 @@ run_server(int argc, char** argv) {
             nmt_model = value(i, arg);
 #endif
 #if defined(NEMO_SPEECH_CLI_TTS)
+        else if (arg == "--tts-backend")
+            tts_config.backend = value(i, arg);
+        else if (arg == "--native-socket")
+            tts_config.native_socket = value(i, arg);
         else if (arg == "--tts-model")
             tts_model = value(i, arg);
         else if (arg == "--codec-model")
@@ -482,15 +487,19 @@ run_server(int argc, char** argv) {
     }
 #endif
 #if defined(NEMO_SPEECH_CLI_TTS)
+    const bool native_tts = tts_enabled != 0 && tts_config.backend == "nemotron";
+    if (tts_config.backend != "magpie" && tts_config.backend != "nemotron")
+        throw std::invalid_argument("tts.backend must be magpie or nemotron");
     const bool tts_requested = tts_enabled > 0 || !tts_model.empty() ||
                                !tts_config.runtime.magpie_model.empty() || !codec_model.empty() ||
                                !tokenizer_model.empty() || !tn_model.empty();
-    const auto magpie_path = tts_enabled == 0 ? std::string() : resolve("TTS model", [&] {
-        return optional_model(
-            tts_model.empty() ? tts_config.runtime.magpie_model : tts_model, "tts",
-            "MagpieTTS model", tts_requested);
-    });
-    if (tts_enabled != 0 && (tts_requested || !magpie_path.empty())) {
+    const auto magpie_path =
+        (tts_enabled == 0 || native_tts) ? std::string() : resolve("TTS model", [&] {
+            return optional_model(
+                tts_model.empty() ? tts_config.runtime.magpie_model : tts_model, "tts",
+                "MagpieTTS model", tts_requested);
+        });
+    if (!native_tts && tts_enabled != 0 && (tts_requested || !magpie_path.empty())) {
         tts_config.runtime.codec_model = resolve("TTS codec model", [&] {
             return optional_model(
                 codec_model.empty() ? tts_config.runtime.codec_model : codec_model, "codec",
@@ -579,6 +588,25 @@ run_server(int argc, char** argv) {
     }
 #endif
 #if defined(NEMO_SPEECH_CLI_TTS)
+    if (native_tts) {
+        nemo_speech::tts::SynthesizerConfig config;
+        config.backend = "nemotron";
+        config.runtime = tts_config.runtime;
+        config.native_socket = tts_config.native_socket;
+        config.native_timeout_seconds = tts_config.native_timeout_seconds;
+        config.default_language_code = tts_config.default_language_code;
+        config.default_voice_name = tts_config.default_voice_name;
+        engines.load_tts(std::move(config));
+        const int needed = engines.tts()->backend_batch_size() + 8;
+        if (!http_threads_set)
+            server_config.threads = std::max(server_config.threads, needed);
+        if (engines.tts()->backend_mode() == "fixed_cohort" &&
+            server_config.threads < engines.tts()->backend_batch_size())
+            throw std::invalid_argument(
+                "fixed cohorts require at least physical-width HTTP workers");
+        if (server_config.preempt_tts)
+            throw std::invalid_argument("Nemotron batching does not support tts.preempt");
+    }
     if (!magpie_path.empty()) {
         bool tts_cuda = false;
 #if defined(NEMO_SPEECH_CLI_CUDA)
@@ -735,6 +763,8 @@ print_serve_help(const char* program) {
         "  --diar-model MODEL      Optional Sortformer path or indexed model\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_TTS)
+        "  --tts-backend NAME      magpie (default) or nemotron\n"
+        "  --native-socket PATH    Nemotron controller bridge Unix socket\n"
         "  --tts-model MODEL       Optional MagpieTTS path or indexed model\n"
         "  --codec-model MODEL     NanoCodec path or indexed model\n"
         "  --tokenizer-dir MODEL   TTS tokenizer directory or indexed model\n"

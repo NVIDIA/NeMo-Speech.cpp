@@ -1,0 +1,89 @@
+workspace(name = "nemotron_tts_normalizer")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+# Versions match the extracted NemotronSpeech normalizer dependency set.
+http_archive(
+    name = "googletest",
+    sha256 = "b4870bf121ff7795ba20d20bcdd8627b8e088f2d1dab299a031c1034eddc93d5",
+    strip_prefix = "googletest-release-1.11.0",
+    urls = ["https://github.com/google/googletest/archive/refs/tags/release-1.11.0.tar.gz"],
+)
+
+http_archive(
+    name = "com_github_gflags_gflags",
+    sha256 = "34af2f15cf7367513b352bdcd2493ab14ce43692d2dcd9dfc499492966c64dcf",
+    strip_prefix = "gflags-2.2.2",
+    urls = ["https://github.com/gflags/gflags/archive/v2.2.2.tar.gz"],
+)
+
+http_archive(
+    name = "glog",
+    sha256 = "f28359aeba12f30d73d9e4711ef356dc842886968112162bc73002645139c39c",
+    strip_prefix = "glog-0.4.0",
+    urls = ["https://github.com/google/glog/archive/v0.4.0.tar.gz"],
+)
+
+http_archive(
+    name = "com_google_absl",
+    sha256 = "91ac87d30cc6d79f9ab974c51874a704de9c2647c40f6932597329a282217ba8",
+    strip_prefix = "abseil-cpp-20220623.1",
+    urls = ["https://github.com/abseil/abseil-cpp/archive/refs/tags/20220623.1.tar.gz"],
+)
+
+http_archive(
+    name = "com_googlesource_code_re2",
+    build_file = "//third_party:BUILD.re2",
+    sha256 = "8675f33ef3dcac24692821edf21a56ef0112c95c4ec50b472e68efe0ff5dda1e",
+    strip_prefix = "re2-ccdbd348259434cca6c66c66a35c5ef71ff3ee1a",
+    urls = ["https://github.com/google/re2/archive/ccdbd348259434cca6c66c66a35c5ef71ff3ee1a.zip"],
+)
+
+# gRPC's dependency macros provide the protobuf and Bazel rule versions used by
+# the pinned Sparrowhawk BUILD definition.
+http_archive(
+    name = "com_github_grpc_grpc",
+    sha256 = "fb1ed98eb3555877d55eb2b948caca44bc8601c6704896594de81558639709ef",
+    strip_prefix = "grpc-1.50.1",
+    urls = ["https://github.com/grpc/grpc/archive/refs/tags/v1.50.1.tar.gz"],
+)
+
+load("@com_github_grpc_grpc//bazel:grpc_deps.bzl", "grpc_deps")
+
+grpc_deps()
+
+load("@com_github_grpc_grpc//bazel:grpc_extra_deps.bzl", "grpc_extra_deps")
+
+grpc_extra_deps()
+
+http_archive(
+    name = "openfst",
+    build_file = "//third_party:BUILD.openfst",
+    sha256 = "9d1afcfe72ccded0e846a5883eed9dfcd7593e6cd935ad55a94fec69270d7540",
+    strip_prefix = "openfst-fc23b4cf529429284b874a26f28b15c6cc94f404",
+    urls = ["https://github.com/sarane22/openfst/archive/fc23b4cf529429284b874a26f28b15c6cc94f404.tar.gz"],
+)
+
+http_archive(
+    name = "thrax_1_2_7",
+    build_file = "//third_party:BUILD.thrax_1_2_7",
+    sha256 = "be2307b4aee07a8596e74743ef9f7a51459242b1a82bf84648782966d0ea6ec9",
+    strip_prefix = "thrax-21407b7ccbd5dbaa45f34b26f286bc28d57c47fb",
+    urls = ["https://github.com/sarane22/thrax/archive/21407b7ccbd5dbaa45f34b26f286bc28d57c47fb.tar.gz"],
+)
+
+http_archive(
+    name = "sparrowhawk",
+    build_file = "//third_party:BUILD.sparrowhawk_0_1",
+    sha256 = "5168968b1a9f277b52f189e9aca1aa84f13082333d1ed3e96e9e653de7a5c3f4",
+    strip_prefix = "sparrowhawk-d9d68e7155b2b2cd64f578144c32b4e09674f43d",
+    urls = ["https://github.com/anand-nv/sparrowhawk/archive/d9d68e7155b2b2cd64f578144c32b4e09674f43d.tar.gz"],
+)
+
+http_archive(
+    name = "pugixml",
+    build_file = "//third_party:BUILD.pugixml",
+    sha256 = "017139251c122dbff400a507cddc4cb74120a431a50c6c524f30edcc5b331ade",
+    strip_prefix = "pugixml-1.11.4",
+    urls = ["https://github.com/zeux/pugixml/archive/refs/tags/v1.11.4.tar.gz"],
+)

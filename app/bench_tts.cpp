@@ -59,6 +59,10 @@ class TtsWorkload : public Workload {
             texts_.push_back(value());
         } else if (arg == "--text-file") {
             text_files_.push_back(value());
+        } else if (arg == "--tts-backend") {
+            parsed_.backend = value();
+        } else if (arg == "--native-socket") {
+            parsed_.native_socket = value();
         } else if (arg == "--magpie-model" || arg == "--model" || arg == "-m") {
             parsed_.runtime.magpie_model = value();
         } else if (arg == "--codec-model") {

@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 
 #include "audio_resampler.h"
+#include "nemotron/native_runtime.h"
 #include "tts/preproc/text_normalizer.h"
 
 namespace nemo_speech::tts {
@@ -48,47 +50,113 @@ add_preparation_timing(MagpieSynthesisStats& stats, const PreparedSynthesis& req
     stats.e2e_rtfx = stats.rtfx;
 }
 
+MagpieSynthesisOptions
+native_options(MagpieSynthesisOptions options, const MagpieRuntimeConfig& defaults) {
+    if (options.seed < 0)
+        options.seed = defaults.seed < 0 ? 0 : defaults.seed;
+    if (options.steps <= 0)
+        options.steps = defaults.steps;
+    if (options.top_k <= 0)
+        options.top_k = defaults.top_k;
+    if (!options.override_temperature && defaults.override_temperature) {
+        options.temperature = defaults.temperature;
+        options.override_temperature = true;
+    }
+    if (options.steps > 0 && options.steps != 512)
+        throw std::invalid_argument("Nemotron requires steps=512");
+    if (options.top_k > 0 && options.top_k != 80)
+        throw std::invalid_argument("Nemotron requires top_k=80");
+    if (options.override_temperature &&
+        (!std::isfinite(options.temperature) || std::abs(options.temperature - 0.7f) > 1e-6f))
+        throw std::invalid_argument("Nemotron requires temperature=0.7");
+    if (options.override_cfg_scale || defaults.override_cfg_scale)
+        throw std::invalid_argument("Nemotron does not support cfg_scale");
+    return options;
+}
+
+bool
+valid_utf8(const std::string& text) {
+    size_t offset = 0;
+    while (offset < text.size()) {
+        const auto first = static_cast<unsigned char>(text[offset++]);
+        if (first < 0x80)
+            continue;
+        const int continuation = first >= 0xc2 && first <= 0xdf   ? 1
+                                 : first >= 0xe0 && first <= 0xef ? 2
+                                 : first >= 0xf0 && first <= 0xf4 ? 3
+                                                                  : 0;
+        if (continuation == 0 || text.size() - offset < static_cast<size_t>(continuation))
+            return false;
+        const auto second = static_cast<unsigned char>(text[offset]);
+        if ((first == 0xe0 && second < 0xa0) || (first == 0xed && second >= 0xa0) ||
+            (first == 0xf0 && second < 0x90) || (first == 0xf4 && second >= 0x90))
+            return false;
+        for (int i = 0; i < continuation; ++i)
+            if ((static_cast<unsigned char>(text[offset++]) & 0xc0) != 0x80)
+                return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 struct Synthesizer::Impl {
     explicit Impl(SynthesizerConfig config)
-        : default_language_code(
+        : backend(std::move(config.backend)), defaults(config.runtime),
+          default_language_code(
               config.default_language_code.empty() ? "en-US"
                                                    : std::move(config.default_language_code)),
           default_voice_name(std::move(config.default_voice_name)),
-          default_speaker(config.runtime.speaker), runtime(std::move(config.runtime)),
-          text_normalizer(std::move(config.text_normalizer_model_dir)) {
+          default_speaker(config.runtime.speaker) {
+        if (backend == "nemotron") {
+            native_options({}, defaults);
+            const auto language = lower_ascii(default_language_code);
+            if (language != "en-us" && language != "en" && language != "english")
+                throw std::invalid_argument("Nemotron supports only English");
+            default_language_code = "en-US";
+            native = std::make_unique<nemotron::NativeRuntime>(
+                config.native_socket, config.native_timeout_seconds);
+            return;
+        }
+        if (backend != "magpie")
+            throw std::invalid_argument("unknown TTS backend '" + backend + "'");
+        runtime = std::make_unique<MagpieTtsRuntime>(std::move(config.runtime));
+        text_normalizer =
+            std::make_unique<preproc::TextNormalizer>(std::move(config.text_normalizer_model_dir));
         if (!config.tokenizer_model_dir.empty()) {
             tokenizer = std::make_unique<MagpieNativeTokenizer>(
                 std::move(config.tokenizer_model_dir), config.tokenizer);
-            if (tokenizer->profile_id() != runtime.tokenizer_profile() ||
-                tokenizer->text_vocab_size() != runtime.text_vocab_size()) {
+            if (tokenizer->profile_id() != runtime->tokenizer_profile() ||
+                tokenizer->text_vocab_size() != runtime->text_vocab_size()) {
                 throw std::invalid_argument(
                     "Magpie model/tokenizer mismatch: GGUF requires tokenizer profile '" +
-                    runtime.tokenizer_profile() + "' with text vocabulary " +
-                    std::to_string(runtime.text_vocab_size()) + ", but tokenizer directory is '" +
+                    runtime->tokenizer_profile() + "' with text vocabulary " +
+                    std::to_string(runtime->text_vocab_size()) + ", but tokenizer directory is '" +
                     tokenizer->profile_id() + "' with text vocabulary " +
                     std::to_string(tokenizer->text_vocab_size()));
             }
         }
     }
 
+    std::string backend;
+    MagpieRuntimeConfig defaults;
     std::string default_language_code;
     std::string default_voice_name;
     int default_speaker = 0;
-    MagpieTtsRuntime runtime;
+    std::unique_ptr<MagpieTtsRuntime> runtime;
+    std::unique_ptr<nemotron::NativeRuntime> native;
     std::unique_ptr<MagpieNativeTokenizer> tokenizer;
-    preproc::TextNormalizer text_normalizer;
+    std::unique_ptr<preproc::TextNormalizer> text_normalizer;
 };
 
 Synthesizer::Synthesizer(SynthesizerConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {
     if (!impl_->default_voice_name.empty())
         impl_->default_speaker = resolve_speaker(impl_->default_voice_name);
-    if (impl_->default_speaker < 0 || impl_->default_speaker >= impl_->runtime.speaker_count()) {
+    if (impl_->default_speaker < 0 || impl_->default_speaker >= speaker_count()) {
         throw std::invalid_argument(
             "default speaker " + std::to_string(impl_->default_speaker) + " must be in [0, " +
-            std::to_string(impl_->runtime.speaker_count() - 1) + "]");
+            std::to_string(speaker_count() - 1) + "]");
     }
 }
 
@@ -103,7 +171,7 @@ Synthesizer::resolve_speaker(const std::string& voice_name) const {
     try {
         const int value = std::stoi(voice_name, &consumed);
         if (consumed == voice_name.size()) {
-            if (value >= 0 && value < impl_->runtime.speaker_count())
+            if (value >= 0 && value < speaker_count())
                 return value;
             throw std::invalid_argument("voice speaker index is outside the model speaker range");
         }
@@ -117,10 +185,10 @@ Synthesizer::resolve_speaker(const std::string& voice_name) const {
     }
 
     std::string wanted = lower_ascii(voice_name);
-    const std::string model_prefix = lower_ascii(impl_->runtime.model_name()) + ".";
+    const std::string model_prefix = lower_ascii(model_name()) + ".";
     if (wanted.rfind(model_prefix, 0) == 0)
         wanted.erase(0, model_prefix.size());
-    const auto& names = impl_->runtime.speaker_names();
+    const auto& names = speaker_names();
     for (size_t i = 0; i < names.size(); ++i) {
         if (lower_ascii(names[i]) == wanted)
             return static_cast<int>(i);
@@ -132,6 +200,36 @@ PreparedSynthesis
 Synthesizer::prepare(const SynthesisRequest& request) const {
     if (request.text.empty())
         throw std::invalid_argument("text is required");
+    if (impl_->native) {
+        if (request.text.find_first_not_of(" \t\r\n") == std::string::npos)
+            throw std::invalid_argument("text is required");
+        if (request.text.size() > 1000000 || !valid_utf8(request.text))
+            throw std::invalid_argument(
+                "Nemotron text must be valid UTF-8 and at most 1000000 bytes");
+        if (request.output_sample_rate != 0 && request.output_sample_rate != 22050)
+            throw std::invalid_argument("Nemotron requires sample_rate=22050");
+        if (request.apply_normalize < -1 || request.apply_normalize > 1)
+            throw std::invalid_argument("apply_normalize must be -1, 0, or 1");
+        const auto language = lower_ascii(
+            request.language_code.empty() ? impl_->default_language_code : request.language_code);
+        if (language != "en" && language != "en-us" && language != "english")
+            throw std::invalid_argument("Nemotron supports only English");
+        PreparedSynthesis prepared;
+        prepared.metadata.original_text = request.text;
+        prepared.metadata.language_code = "en-US";
+        prepared.metadata.sample_rate = 22050;
+        prepared.metadata.tokenizer_name = "nemotron-native";
+        prepared.metadata.chunk_count = 1;
+        prepared.options = native_options(request.options, impl_->defaults);
+        if (prepared.options.speaker < 0)
+            prepared.options.speaker = resolve_speaker(
+                request.voice_name.empty() ? impl_->default_voice_name : request.voice_name);
+        if (prepared.options.speaker != 0)
+            throw std::invalid_argument("Nemotron supports only voice english_sample");
+        prepared.metadata.speaker = prepared.options.speaker;
+        prepared.apply_normalize = request.apply_normalize;
+        return prepared;
+    }
     if (!impl_->tokenizer) {
         throw std::invalid_argument("text synthesis requires a tokenizer model directory");
     }
@@ -163,7 +261,7 @@ Synthesizer::prepare(const SynthesisRequest& request) const {
         [&](const std::string& chunk, bool is_final) {
             const auto normalizer_start = std::chrono::steady_clock::now();
             std::string normalized =
-                impl_->text_normalizer.normalize(chunk, prepared.metadata.language_code);
+                impl_->text_normalizer->normalize(chunk, prepared.metadata.language_code);
             prepared.normalizer_ms += std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - normalizer_start)
                                           .count();
@@ -201,6 +299,17 @@ Synthesizer::prepare(const SynthesisRequest& request) const {
 
 SynthesisResult
 Synthesizer::synthesize(const PreparedSynthesis& request, const PcmCallback& callback) {
+    if (impl_->native) {
+        if (!request.tokens.empty() || !request.token_chunks.empty())
+            throw std::invalid_argument("Nemotron does not support pretokenized synthesis");
+        SynthesisRequest validation;
+        validation.text = request.metadata.original_text;
+        validation.language_code = request.metadata.language_code;
+        validation.output_sample_rate = request.metadata.sample_rate;
+        validation.options = request.options;
+        validation.apply_normalize = request.apply_normalize;
+        return impl_->native->synthesize(prepare(validation), callback);
+    }
     SynthesisResult result;
     result.metadata = request.metadata;
     const int output_rate = request.metadata.sample_rate;
@@ -229,7 +338,7 @@ Synthesizer::synthesize(const PreparedSynthesis& request, const PcmCallback& cal
         return emit(std::string(reinterpret_cast<const char*>(converted.data()), converted.size()));
     };
 
-    result.stats = impl_->runtime.synthesize(request.token_chunks, request.options, process);
+    result.stats = impl_->runtime->synthesize(request.token_chunks, request.options, process);
     if (!result.cancelled && resampler) {
         std::vector<uint8_t> tail;
         resampler->finish(&tail);
@@ -259,6 +368,8 @@ SynthesisResult
 Synthesizer::synthesize_tokens(
     const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,
     int output_sample_rate, const PcmCallback& callback) {
+    if (impl_->native)
+        throw std::invalid_argument("Nemotron does not support pretokenized synthesis");
     if (tokens.empty())
         throw std::invalid_argument("text token list is empty");
     const int output_rate = output_sample_rate == 0 ? sample_rate() : output_sample_rate;
@@ -288,38 +399,43 @@ SynthesisResult
 Synthesizer::warmup(const std::string& text, int steps) {
     if (text.empty())
         return {};
+    if (impl_->native && impl_->native->batch_size() > 1)
+        return {};
     SynthesisRequest request;
     request.text = text;
     request.language_code = impl_->default_language_code;
     request.options.speaker = impl_->default_speaker;
-    request.options.steps = steps;
+    request.options.steps = impl_->native ? -1 : steps;
     return synthesize(request);
 }
 
 int
 Synthesizer::sample_rate() const {
-    return impl_->runtime.sample_rate();
+    return impl_->native ? 22050 : impl_->runtime->sample_rate();
 }
 
 int
 Synthesizer::speaker_count() const {
-    return impl_->runtime.speaker_count();
+    return impl_->native ? static_cast<int>(impl_->native->speaker_names().size())
+                         : impl_->runtime->speaker_count();
 }
 
 const std::vector<std::string>&
 Synthesizer::speaker_names() const {
-    return impl_->runtime.speaker_names();
+    return impl_->native ? impl_->native->speaker_names() : impl_->runtime->speaker_names();
 }
 
 std::vector<std::string>
 Synthesizer::supported_language_codes() const {
+    if (impl_->native)
+        return {"en-US"};
     return impl_->tokenizer ? impl_->tokenizer->supported_language_codes()
                             : std::vector<std::string>{};
 }
 
 const std::string&
 Synthesizer::model_name() const {
-    return impl_->runtime.model_name();
+    return impl_->native ? impl_->native->model_name() : impl_->runtime->model_name();
 }
 
 const std::string&
@@ -334,7 +450,24 @@ Synthesizer::default_speaker() const {
 
 bool
 Synthesizer::text_normalization_enabled() const {
-    return impl_->text_normalizer.enabled();
+    return impl_->native ? impl_->native->text_normalization_enabled()
+                         : impl_->text_normalizer->enabled();
+}
+
+const std::string&
+Synthesizer::backend_name() const {
+    return impl_->backend;
+}
+
+int
+Synthesizer::backend_batch_size() const {
+    return impl_->native ? impl_->native->batch_size() : 1;
+}
+
+const std::string&
+Synthesizer::backend_mode() const {
+    static const std::string serial = "serial";
+    return impl_->native ? impl_->native->mode() : serial;
 }
 
 }  // namespace nemo_speech::tts

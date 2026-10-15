@@ -217,6 +217,13 @@ synthesizer_config_of(const nemo_speech_tts_synthesizer_config* c) {
     cfg.tokenizer_model_dir = tokenizer_dir_of(c);
     if (c && HAS_FIELD(c, nemo_speech_tts_synthesizer_config, model) && c->model) {
         const auto* model = c->model;
+        if (HAS_FIELD(model, nemo_speech_tts_model_config, model_backend) && model->model_backend)
+            cfg.backend = model->model_backend;
+        if (HAS_FIELD(model, nemo_speech_tts_model_config, native_socket))
+            cfg.native_socket = str_or_empty(model->native_socket);
+        if (HAS_FIELD(model, nemo_speech_tts_model_config, native_timeout_seconds) &&
+            model->native_timeout_seconds > 0)
+            cfg.native_timeout_seconds = model->native_timeout_seconds;
         if (HAS_FIELD(model, nemo_speech_tts_model_config, text_normalizer_model_dir)) {
             cfg.text_normalizer_model_dir = str_or_empty(model->text_normalizer_model_dir);
         }

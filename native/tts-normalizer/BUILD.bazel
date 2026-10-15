@@ -1,0 +1,97 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_test(
+    name = "string_matcher_test",
+    srcs = ["tests/string_matcher_test.cc", "//third_party:sparrowhawk_string_matcher.h"],
+    includes = ["third_party"],
+    deps = ["@openfst//:fst"],
+)
+
+cc_library(
+    name = "processor_abi",
+    hdrs = ["include/processor_abi.h"],
+    includes = ["include"],
+)
+
+cc_library(
+    name = "text_preprocessor",
+    srcs = [
+        "src/normalize.cc",
+        "src/speech_hints.cc",
+        "src/text_preprocessor.cc",
+    ],
+    hdrs = [
+        "src/normalize.h",
+        "src/speech_hints.h",
+        "src/text_preprocessor.h",
+    ],
+    copts = [
+        "-O3",
+        "-fPIC",
+        "-Wno-deprecated-declarations",
+    ],
+    includes = ["src"],
+    linkstatic = True,
+    deps = [
+        "@com_google_absl//absl/strings",
+        "@openfst//:fst",
+        "@pugixml//:pugixml",
+        "@sparrowhawk//:sparrowhawk",
+        "@thrax_1_2_7//:thrax_1_2_7",
+    ],
+)
+
+cc_binary(
+    name = "text_preprocessor_c",
+    srcs = ["src/text_preprocessor_c.cc"],
+    linkshared = True,
+    linkstatic = True,
+    deps = [
+        ":processor_abi",
+        ":text_preprocessor",
+    ],
+)
+
+cc_test(
+    name = "text_preprocessor_test",
+    srcs = ["tests/text_preprocessor_test.cc"],
+    data = ["//testdata:english_assets"],
+    deps = [
+        ":text_preprocessor",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "normalize_test",
+    srcs = ["tests/normalize_test.cc"],
+    data = ["//testdata:english_assets"],
+    deps = [
+        ":text_preprocessor",
+        "@googletest//:gtest_main",
+        "@openfst//:far_base",
+    ],
+)
+
+cc_test(
+    name = "speech_hints_test",
+    srcs = ["tests/speech_hints_test.cc"],
+    deps = [
+        ":text_preprocessor",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "text_preprocessor_c_test",
+    srcs = [
+        "src/text_preprocessor_c.cc",
+        "tests/text_preprocessor_c_test.cc",
+    ],
+    data = ["//testdata:english_assets"],
+    deps = [
+        ":processor_abi",
+        ":text_preprocessor",
+        "@googletest//:gtest_main",
+    ],
+)

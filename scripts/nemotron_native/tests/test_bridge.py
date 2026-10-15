@@ -1,0 +1,533 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+import asyncio
+import contextlib
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "python"))
+
+from nemotron_cpp_bridge.protocol import (
+    control_frame,
+    float_audio_frame,
+    pcm16,
+    pcm16_scalar,
+    read_control,
+)
+from nemotron_cpp_bridge.server import Bridge, Request, Session, parse_args
+from nemotron_cpp_bridge.slabs import SlabReader
+from nemotron_native_backend.protocol import message, read_frame, write_frame
+
+
+class Tokenizer:
+    def encode_batch(self, texts, *, add_special_tokens):
+        if add_special_tokens:
+            raise AssertionError("target text must not add special tokens")
+        if len(texts) != 1:
+            raise AssertionError("text preparation must not wait for a request batch")
+        return [SimpleNamespace(ids=[ord(char) for char in texts[0]])]
+
+
+class Preparer:
+    enabled = False
+
+    def prepare(self, text, language, apply_normalize=True):
+        return text.strip()
+
+    def close(self):
+        pass
+
+
+async def receive(reader):
+    size = struct.unpack(">I", await reader.readexactly(4))[0]
+    payload = await reader.readexactly(size)
+    if payload[:1] == b"J":
+        return json.loads(payload[1:])
+    request_id, sequence = struct.unpack(">QI", payload[1:13])
+    return {
+        "kind": "audio",
+        "request_id": request_id,
+        "sequence": sequence,
+        "data": payload[13:],
+        "encoding": payload[:1],
+    }
+
+
+async def wait_until(predicate):
+    async with asyncio.timeout(3):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+
+class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def test_float_audio_frame_preserves_extent_and_header(self):
+        pcm = struct.pack("<4f", -1, 0, 0.5, 1)
+        encoded = float_audio_frame(123, 7, pcm)
+        self.assertEqual(struct.unpack(">I", encoded[:4])[0], 13 + len(pcm))
+        self.assertEqual(encoded[4:17], b"F" + struct.pack(">QI", 123, 7))
+        self.assertEqual(encoded[17:], pcm)
+        for malformed in (b"", b"x", b"abc", b"abcde"):
+            with self.assertRaises(ValueError):
+                float_audio_frame(123, 7, malformed)
+
+    async def test_valid_text_budget_survives_json_escaping(self):
+        text = "\x01" * 1_000_000
+        encoded = control_frame("submit", request_id=1, text=text)
+        self.assertGreater(len(encoded), 2 * 1024 * 1024)
+        reader = asyncio.StreamReader()
+        reader.feed_data(encoded)
+        reader.feed_eof()
+        self.assertEqual((await read_control(reader))["text"], text)
+
+
+class PCMTests(unittest.TestCase):
+    def test_matches_asymmetric_half_away_rounding_and_saturation(self):
+        values = [-2, -1, -0.5, -0.5 / 32768, -0.0, 0, 0.5 / 32767, 0.5, 1, 2]
+        payload = struct.pack("<" + "f" * len(values), *values)
+        expected = [-32768, -32768, -16384, -1, 0, 0, 1, 16384, 32767, 32767]
+        self.assertEqual(list(struct.unpack("<10h", pcm16_scalar(payload))), expected)
+        self.assertEqual(pcm16(payload), pcm16_scalar(payload))
+
+    def test_rejects_nan_infinity_and_misaligned_input(self):
+        for payload in (
+            b"abc",
+            *(struct.pack("<f", value) for value in (math.nan, math.inf, -math.inf)),
+        ):
+            with self.assertRaises(ValueError):
+                pcm16(payload)
+
+
+class SlabTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.slab = SlabReader(self.temp.name)
+        self.addCleanup(self.slab.close)
+        self.arena = "r20-pcm-" + "a" * 32
+        self.path = Path(self.temp.name, self.arena)
+        self.path.write_bytes(struct.pack("<4f", -1, 0, 0.5, 1) + bytes(SlabReader.SLOT_BYTES - 16))
+        self.descriptor = dict(
+            slab_version=1,
+            arena=self.arena,
+            slot=0,
+            generation=1,
+            arena_bytes=SlabReader.SLOT_BYTES,
+            slot_bytes=SlabReader.SLOT_BYTES,
+            offset=0,
+            data_bytes=16,
+            samples=4,
+            sequence=0,
+            sample_rate_hz=22050,
+            channels=1,
+            encoding="pcm_f32_le",
+            is_final=False,
+        )
+
+    def test_copy_is_owned_and_duplicate_lease_rejected(self):
+        payload = self.slab.copy(self.descriptor)
+        with self.path.open("r+b") as stream:
+            stream.write(bytes(16))
+        self.assertEqual(payload, struct.pack("<4f", -1, 0, 0.5, 1))
+        with self.assertRaises(ValueError):
+            self.slab.copy(self.descriptor)
+
+    def test_rejects_invalid_extent_type_identity_and_symlink(self):
+        for key, value in (
+            ("offset", 1),
+            ("data_bytes", 20),
+            ("slot", 1),
+            ("generation", 0),
+            ("samples", True),
+            ("arena", "../secret"),
+            ("arena_bytes", 1 << 40),
+            ("encoding", "pcm16"),
+            ("sample_rate_hz", 24000),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.slab.copy({**self.descriptor, key: value})
+        target = self.path.with_suffix(".backing")
+        self.path.rename(target)
+        self.path.symlink_to(target)
+        with self.assertRaises(OSError):
+            self.slab.copy(self.descriptor)
+
+
+class BridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.native_path = self.root / "worker.sock"
+        self.client_path = self.root / "bridge.sock"
+        catalog = json.loads((ROOT / "deploy/nemotron_native/programs.json").read_text())
+        plan = catalog["programs"]["1"]["serving"]
+        plan["host"]["batching_mode"] = "inflight"
+        self.manifest = self.root / "serving.json"
+        self.manifest.write_text(json.dumps(plan))
+        self.args = parse_args(
+            [
+                "--native-worker-socket",
+                str(self.native_path),
+                "--manifest",
+                str(self.manifest),
+                "--model",
+                str(self.root),
+                "--listen",
+                str(self.client_path),
+                "--width",
+                "1",
+            ]
+        )
+        self.bridge = Bridge(self.args, tokenizer=Tokenizer(), preparer=Preparer())
+        self.submitted = []
+        self.aborted = []
+        self.acknowledged = []
+        self.bad_completion = False
+        self.worker_done = asyncio.Event()
+        self.worker_errors = []
+        self.native = await asyncio.start_unix_server(self.worker, path=str(self.native_path))
+        self.client_server = await asyncio.start_unix_server(
+            self.bridge.accept, path=str(self.client_path)
+        )
+        self.slab_patch = mock.patch(
+            "nemotron_cpp_bridge.server.SlabReader", lambda: SlabReader(self.root)
+        )
+        self.slab_patch.start()
+        self.reader, self.writer = await asyncio.open_unix_connection(str(self.client_path))
+        self.writer.write(control_frame("hello"))
+        self.ready = await asyncio.wait_for(receive(self.reader), 3)
+
+    async def asyncTearDown(self):
+        self.writer.close()
+        await self.writer.wait_closed()
+        await self.bridge.close()
+        self.client_server.close()
+        self.native.close()
+        await self.client_server.wait_closed()
+        await self.native.wait_closed()
+        await asyncio.wait_for(self.worker_done.wait(), 3)
+        self.slab_patch.stop()
+        self.temp.cleanup()
+        self.assertEqual(self.worker_errors, [])
+
+    async def worker(self, reader, writer):
+        arena = "r20-pcm-" + "b" * 32
+        path = self.root / arena
+        path.write_bytes(bytes(SlabReader.SLOT_BYTES * 4))
+        requests = {}
+        try:
+            hello = await read_frame(reader)
+            if hello["expected_manifest_sha256"] != self.bridge.manifest_hash:
+                raise AssertionError("manifest identity mismatch")
+            plan = self.bridge.manifest
+            await write_frame(
+                writer,
+                message(
+                    "worker_ready",
+                    manifest_sha256=self.bridge.manifest_hash,
+                    model_sha256=plan["model"]["checkpoint_sha256"],
+                    enabled_buckets=[1],
+                    output_contract=plan["transport_compatibility"]["output_contract"],
+                    **plan["transport_compatibility"]["installed_transport_versions"],
+                ),
+            )
+            while True:
+                incoming = await read_frame(reader)
+                kind = incoming["kind"]
+                if kind == "submit":
+                    self.submitted.append(incoming)
+                    slot = len(self.submitted) - 1
+                    requests[slot] = incoming["request_id"]
+                    await write_frame(
+                        writer, message("accepted", request_id=incoming["request_id"])
+                    )
+                    if incoming["normalized_text"] == "cancel":
+                        continue
+                    with path.open("r+b") as stream:
+                        stream.seek(slot * SlabReader.SLOT_BYTES)
+                        stream.write(struct.pack("<4f", -1, 0, 0.5, 1))
+                    await write_frame(
+                        writer,
+                        message(
+                            "audio_slab",
+                            request_id=incoming["request_id"],
+                            sequence=0,
+                            encoding="pcm_f32_le",
+                            sample_rate_hz=22050,
+                            channels=1,
+                            samples=4,
+                            is_final=False,
+                            slab_version=1,
+                            arena=arena,
+                            slot=slot,
+                            generation=1,
+                            arena_bytes=SlabReader.SLOT_BYTES * 4,
+                            slot_bytes=SlabReader.SLOT_BYTES,
+                            offset=slot * SlabReader.SLOT_BYTES,
+                            data_bytes=16,
+                        ),
+                    )
+                elif kind == "audio_ack":
+                    self.acknowledged.append(incoming)
+                    with path.open("r+b") as stream:
+                        stream.seek(incoming["slot"] * SlabReader.SLOT_BYTES)
+                        stream.write(bytes(16))
+                    await write_frame(
+                        writer,
+                        message(
+                            "stream_complete_v1",
+                            request_id=requests[incoming["slot"]],
+                            next_sequence=1,
+                            chunk_count=1,
+                            total_samples=5 if self.bad_completion else 4,
+                        ),
+                    )
+                elif kind == "abort":
+                    self.aborted.append(incoming["request_id"])
+                    await write_frame(writer, message("aborted", request_id=incoming["request_id"]))
+                else:
+                    raise AssertionError("unexpected worker command")
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        except BaseException as error:
+            self.worker_errors.append(repr(error))
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            self.worker_done.set()
+
+    async def test_multiplexes_tokenized_requests_and_copies_audio_before_ack(self):
+        self.assertEqual(self.ready["sample_rate"], 22050)
+        self.assertEqual(self.ready["mode"], "inflight")
+        for ident, text in ((5, " hello "), (9, "world")):
+            self.writer.write(
+                control_frame(
+                    "submit",
+                    request_id=ident,
+                    text=text,
+                    voice="english_sample",
+                    language="en-US",
+                    seed=0,
+                )
+            )
+        observed = {5: [], 9: []}
+        complete = set()
+        while len(complete) < 2:
+            event = await asyncio.wait_for(receive(self.reader), 3)
+            observed[event["request_id"]].append(event)
+            if event["kind"] == "complete":
+                complete.add(event["request_id"])
+        for events in observed.values():
+            self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+            self.assertEqual(events[1]["data"], struct.pack("<4h", -32768, 0, 16384, 32767))
+            self.assertEqual(events[2]["total_samples"], 4)
+        self.assertEqual({item["normalized_text"] for item in self.submitted}, {"hello", "world"})
+        self.assertTrue(all(item["token_ids"][-1] == 131073 for item in self.submitted))
+        self.assertEqual(len(self.acknowledged), 2)
+
+    async def test_float_forwarding_copies_before_ack_and_preserves_sample_count(self):
+        with mock.patch.dict(os.environ, {"NEMOTRON_BRIDGE_FORWARD_F32": "1"}):
+            self.writer.write(control_frame("submit", request_id=11, text="float audio"))
+            events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(3)]
+        self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+        self.assertEqual(events[1]["encoding"], b"F")
+        self.assertEqual(events[1]["data"], struct.pack("<4f", -1, 0, 0.5, 1))
+        self.assertEqual(events[2]["total_samples"], 4)
+        self.assertEqual(events[2]["chunk_count"], 1)
+        self.assertEqual(len(self.acknowledged), 1)
+
+    async def test_cancel_propagates_and_unknown_abort_is_ignored(self):
+        self.writer.write(control_frame("submit", request_id=7, text="cancel"))
+        self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "accepted")
+        self.writer.write(control_frame("abort", request_id=7))
+        self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted")
+        for _ in range(100):
+            if self.aborted:
+                break
+            await asyncio.sleep(0.001)
+        self.assertEqual(self.aborted, [self.submitted[0]["request_id"]])
+        self.writer.write(control_frame("abort", request_id=123))
+        self.writer.write(control_frame("submit", request_id=8, text="next"))
+        events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(3)]
+        self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+
+    async def test_waiting_cancellation_reclaims_preparation_tasks(self):
+        self.args.max_pending_requests = 2
+        self.bridge.preparation_slots = asyncio.Semaphore(0)
+        session = self.bridge.session
+        for ident in (1, 2):
+            self.writer.write(control_frame("submit", request_id=ident, text="waiting"))
+        await wait_until(lambda: len(session.preparations) == 2)
+        for ident in (1, 2):
+            self.writer.write(control_frame("abort", request_id=ident))
+        for _ in range(2):
+            self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted")
+        await wait_until(lambda: not session.preparations)
+        for ident in range(3, 53):
+            self.writer.write(control_frame("submit", request_id=ident, text="waiting"))
+            self.writer.write(control_frame("abort", request_id=ident))
+            self.assertEqual((await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted")
+            await wait_until(lambda: not session.preparations)
+        self.assertFalse(session.background)
+        self.assertFalse(session.requests)
+        self.assertFalse(self.submitted)
+        self.bridge.preparation_slots = asyncio.Semaphore(1)
+        self.writer.write(control_frame("submit", request_id=53, text="recovery"))
+        events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(3)]
+        self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+
+    async def test_running_cancellation_retains_slot_until_normalizer_finishes(self):
+        self.args.max_pending_requests = 2
+        self.bridge.preparation_slots = asyncio.Semaphore(1)
+        session = self.bridge.session
+        started, release = threading.Event(), threading.Event()
+        original = self.bridge.prepare_text
+
+        def blocked(value):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("normalizer was not released")
+            return original(value)
+
+        with mock.patch.object(self.bridge, "prepare_text", side_effect=blocked) as prepare:
+            try:
+                self.writer.write(control_frame("submit", request_id=1, text="running"))
+                await wait_until(started.is_set)
+                self.writer.write(control_frame("abort", request_id=1))
+                self.assertEqual(
+                    (await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted"
+                )
+                self.assertFalse(session.requests)
+                self.assertEqual(len(session.preparations), 1)
+                self.assertEqual(len(session.running_preparations), 1)
+                self.assertTrue(self.bridge.preparation_slots.locked())
+                self.writer.write(control_frame("submit", request_id=2, text="waiting"))
+                await wait_until(lambda: len(session.preparations) == 2)
+                self.writer.write(control_frame("abort", request_id=2))
+                self.assertEqual(
+                    (await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted"
+                )
+                await wait_until(lambda: len(session.preparations) == 1)
+                self.assertEqual(prepare.call_count, 1)
+                self.assertTrue(self.bridge.preparation_slots.locked())
+            finally:
+                release.set()
+            await wait_until(lambda: not session.preparations)
+            self.assertFalse(session.running_preparations)
+            self.assertFalse(self.bridge.preparation_slots.locked())
+            self.assertFalse(self.submitted)
+            self.writer.write(control_frame("submit", request_id=3, text="recovery"))
+            events = [await asyncio.wait_for(receive(self.reader), 3) for _ in range(3)]
+            self.assertEqual([event["kind"] for event in events], ["accepted", "audio", "complete"])
+
+    async def test_canceled_running_preparation_still_counts_toward_admission(self):
+        self.args.max_pending_requests = 1
+        self.bridge.preparation_slots = asyncio.Semaphore(1)
+        session = self.bridge.session
+        started, release = threading.Event(), threading.Event()
+        original = self.bridge.prepare_text
+
+        def blocked(value):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("normalizer was not released")
+            return original(value)
+
+        with mock.patch.object(self.bridge, "prepare_text", side_effect=blocked):
+            try:
+                self.writer.write(control_frame("submit", request_id=1, text="running"))
+                await wait_until(started.is_set)
+                self.writer.write(control_frame("abort", request_id=1))
+                self.assertEqual(
+                    (await asyncio.wait_for(receive(self.reader), 3))["kind"], "aborted"
+                )
+                with self.assertLogs("nemotron_cpp_bridge.server", "ERROR") as errors:
+                    self.writer.write(control_frame("submit", request_id=2, text="over limit"))
+                    await wait_until(lambda: session.closed)
+                self.assertIn("client pending request limit exceeded", "\n".join(errors.output))
+                self.assertEqual(len(session.preparations), 1)
+                self.assertEqual(len(session.running_preparations), 1)
+                self.assertTrue(self.bridge.preparation_slots.locked())
+            finally:
+                release.set()
+            self.assertEqual(await asyncio.wait_for(self.reader.read(), 3), b"")
+            self.assertFalse(session.preparations)
+            self.assertFalse(session.running_preparations)
+            self.assertFalse(self.bridge.preparation_slots.locked())
+            self.assertFalse(self.submitted)
+
+    async def test_invalid_voice_fails_without_native_submission(self):
+        self.writer.write(control_frame("submit", request_id=10, text="hello", voice="other"))
+        event = await asyncio.wait_for(receive(self.reader), 3)
+        self.assertEqual(event["kind"], "failed")
+        self.assertEqual(event["code"], "invalid_request")
+        self.assertEqual(self.submitted, [])
+
+    async def test_tokenizer_identity_is_verified_before_loading(self):
+        tokenizer_path = self.root / "tokenizer.json"
+        tokenizer_path.write_bytes(b"sealed-tokenizer")
+        (self.root / "model-seal.json").write_text(
+            json.dumps(
+                {
+                    "model_identity": self.bridge.manifest["model"]["checkpoint_sha256"],
+                    "files": {
+                        "tokenizer.json": {
+                            "bytes": tokenizer_path.stat().st_size,
+                            "sha256": hashlib.sha256(tokenizer_path.read_bytes()).hexdigest(),
+                        }
+                    },
+                }
+            )
+        )
+        factory = mock.Mock(return_value=Tokenizer())
+        module = SimpleNamespace(Tokenizer=SimpleNamespace(from_file=factory))
+        with mock.patch.dict(sys.modules, {"tokenizers": module}):
+            valid = Bridge(self.args, preparer=Preparer())
+            await valid.close()
+            self.assertEqual(factory.call_count, 1)
+            tokenizer_path.write_bytes(b"changed-tokenizer")
+            with self.assertRaisesRegex(ValueError, "tokenizer does not match"):
+                Bridge(self.args, preparer=Preparer())
+            self.assertEqual(factory.call_count, 1)
+
+    async def test_completion_accounting_failure_closes_connection(self):
+        self.bad_completion = True
+        self.writer.write(control_frame("submit", request_id=11, text="hello"))
+        terminal = []
+        with self.assertLogs("nemotron_cpp_bridge.server", "ERROR"):
+            try:
+                while True:
+                    terminal.append(await asyncio.wait_for(receive(self.reader), 3))
+            except asyncio.IncompleteReadError:
+                pass
+        self.assertNotIn("complete", [event["kind"] for event in terminal])
+
+    async def test_slow_request_queue_is_replaced_by_failure(self):
+        session = Session(self.bridge, None, None)
+        self.args.request_queue_chunks = 2
+        request = Request(99, "native", "hello")
+        self.assertTrue(session.enqueue(request, b"audio-one"))
+        self.assertTrue(session.enqueue(request, b"audio-two"))
+        self.assertFalse(session.enqueue(request, b"audio-three"))
+        await session.fail(
+            request, "output_backpressure", "client output queue is full", abort=False
+        )
+        self.assertEqual(len(request.output), 1)
+        self.assertTrue(request.terminal)
+        self.assertTrue(request.canceled)
+        self.assertEqual(session.output_bytes, len(request.output[0][0]))
+
+
+if __name__ == "__main__":
+    unittest.main()

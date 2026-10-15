@@ -19,16 +19,16 @@ repos:
     hooks:
       - id: check-added-large-files
         args: ['--maxkb=512']
-        exclude: '^(test_files/|src/tts/tokenizer/mandarin_data/)'
+        exclude: '^(test_files/|src/tts/tokenizer/mandarin_data/|native/tts-normalizer/testdata/en-US/(tokenize_and_classify|verbalize)\.far$)'
       - id: check-yaml
       - id: check-merge-conflict
       - id: end-of-file-fixer
-        exclude: '^(patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/|deploy/nemotron_native/kernels/|native/tts-normalizer/|python/nemotron_native_backend/|deploy/nemotron_native/(convert_model|serve)\.py$|scripts/nemotron_native/(build_kernels|build_package|runtime_dependencies)\.py$)'
       - id: trailing-whitespace
-        exclude: '^(patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/|deploy/nemotron_native/kernels/|native/tts-normalizer/|python/nemotron_native_backend/|deploy/nemotron_native/(convert_model|serve)\.py$|scripts/nemotron_native/(build_kernels|build_package|runtime_dependencies)\.py$)'
       - id: mixed-line-ending
         args: ['--fix=lf']
-        exclude: '^(patches/|proto/riva-common/).*'
+        exclude: '^(patches/|proto/riva-common/|deploy/nemotron_native/kernels/|native/tts-normalizer/|python/nemotron_native_backend/|deploy/nemotron_native/(convert_model|serve)\.py$|scripts/nemotron_native/(build_kernels|build_package|runtime_dependencies)\.py$)'
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
@@ -36,20 +36,21 @@ repos:
       - id: clang-format
         types_or: [c++, c, cuda]
         # llama.cpp patches + vendored riva protos are upstream code — don't reformat.
-        exclude: '^(patches/|proto/riva-common/|build/|build-.*/).*'
+        exclude: '^(patches/|proto/riva-common/|build/|build-.*/|deploy/nemotron_native/kernels/|native/tts-normalizer/)'
 
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
       - id: black
         args: ['--skip-string-normalization', '--line-length=100']
-        exclude: '^(proto/riva-common/|build/).*'
+        exclude: '^(proto/riva-common/|build/|python/nemotron_native_backend/|native/tts-normalizer/|deploy/nemotron_native/kernels/|deploy/nemotron_native/(convert_model|serve)\.py$|scripts/nemotron_native/(build_kernels|build_package|runtime_dependencies)\.py$)'
 
   - repo: https://github.com/pycqa/isort
     rev: 5.13.2
     hooks:
       - id: isort
         name: isort (python)
+        exclude: '^(python/nemotron_native_backend/|native/tts-normalizer/|deploy/nemotron_native/kernels/|deploy/nemotron_native/(convert_model|serve)\.py$|scripts/nemotron_native/(build_kernels|build_package|runtime_dependencies)\.py$)'
         args:
           - '--profile=black'
           - '--line-length=100'

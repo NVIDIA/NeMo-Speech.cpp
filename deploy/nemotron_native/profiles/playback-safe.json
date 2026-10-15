@@ -1,0 +1,28 @@
+{
+  "schema": "nemotron.playback-profile.v1",
+  "profiles": {
+    "1024": {
+      "physical_width": 1024,
+      "policy": {
+        "playback_reserve_guard": true,
+        "codec_deadline_priority": true,
+        "retire_batch": true
+      },
+      "environment": {
+        "NEMOTRON_INITIAL_AUDIO_HOLD_MS": "40",
+        "NEMOTRON_MAX_ACTIVE_REQUESTS": null
+      }
+    },
+    "2048": {
+      "physical_width": 2048,
+      "policy": {
+        "playback_reserve_guard": true,
+        "codec_deadline_priority": true
+      },
+      "environment": {
+        "NEMOTRON_INITIAL_AUDIO_HOLD_MS": "300",
+        "NEMOTRON_MAX_ACTIVE_REQUESTS": "1024"
+      }
+    }
+  }
+}

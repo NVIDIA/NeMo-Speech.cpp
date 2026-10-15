@@ -1,0 +1,4 @@
+msgpack==1.2.2
+numpy==2.3.5
+safetensors==0.8.0
+tokenizers==0.23.1

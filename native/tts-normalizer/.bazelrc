@@ -1,0 +1,8 @@
+build --announce_rc
+build --color=yes
+build --cxxopt=-std=c++17
+build --keep_going
+build --show_timestamps
+build --strip=always
+build:release --compilation_mode=opt --copt=-O3
+test --test_output=errors

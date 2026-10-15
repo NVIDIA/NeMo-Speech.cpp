@@ -1,0 +1,224 @@
+
+
+
+
+
+template<int N=0> __device__ static inline void load_async_wait(int bar_id) {
+    asm volatile("cp.async.wait_group %0;\n" : : "n"(N) : "memory");
+    sync(bar_id);
+}
+template<int N=0> __device__ static inline void load_async_wait() {
+    KITTENS_CHECK_WARP
+    asm volatile("cp.async.wait_group %0;\n" : : "n"(N) : "memory");
+    __syncwarp();
+}
+
+__device__ static inline void arrive(barrier<GROUP_WARPS> bar) {
+    asm volatile("bar.arrive %0, %1;\n" :: "r"(bar.barrier_id), "n"(GROUP_WARPS*WARP_THREADS) : "memory");
+}
+__device__ static inline void arrive_and_wait(barrier<GROUP_WARPS> bar) {
+    asm volatile("bar.sync %0, %1;\n" :: "r"(bar.barrier_id), "n"(GROUP_WARPS*WARP_THREADS) : "memory");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+__device__ static inline void init_semaphore(semaphore& bar, int thread_count, int transaction_count=0) {
+    if (laneid() == 0) {
+        void const* const ptr = &bar;
+        uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+
+        asm volatile (
+            "mbarrier.init.shared::cta.b64 [%0], %1;\n"
+            :: "r"(bar_ptr), "r"(thread_count+transaction_count)
+        );
+    }
+}
+
+
+
+
+
+__device__ static inline void invalidate_semaphore(semaphore& bar) {
+    if (laneid() == 0) {
+        void const* const ptr = &bar;
+        uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+        asm volatile (
+            "mbarrier.inval.shared::cta.b64 [%0];\n"
+            :: "r"(bar_ptr)
+        );
+    }
+}
+
+
+
+
+
+
+
+
+__device__ static inline void arrive(semaphore& sem) {
+    if(laneid() == 0) {
+            uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
+            asm volatile (
+                "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n"
+            :
+            : "r"(mbar_ptr)
+            : "memory"
+        );
+    }
+}
+template<int num_warps> __device__ static inline void arrive(barrier<num_warps> bar) {
+    asm volatile("bar.arrive %0, %1;\n" :: "r"(bar.barrier_id), "n"(num_warps*WARP_THREADS) : "memory");
+}
+
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+
+
+
+
+
+
+
+
+__device__ static inline void arrive(semaphore& sem, uint32_t count) {
+    if(laneid() == 0) {
+        uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&sem));
+        asm volatile (
+            "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
+            :
+            : "r"(mbar_ptr), "r"(count)
+            : "memory"
+        );
+    }
+}
+#endif
+
+
+
+
+
+
+
+__device__ static inline void wait(semaphore& sem, int kPhaseBit) {
+    void const* const ptr = &sem;
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+    asm volatile (
+        "{\n"
+        ".reg .pred                P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
+        "@P1                       bra.uni DONE;\n"
+        "bra.uni                   LAB_WAIT;\n"
+        "DONE:\n"
+        "}\n"
+        :: "r"(mbar_ptr),
+        "r"(kPhaseBit)
+    );
+#else
+    asm volatile (
+        "{\n"
+        ".reg .pred                P1;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.test_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
+        "@P1                       bra.uni DONE;\n"
+        "nanosleep.u32 5;\n"
+        "bra.uni                   LAB_WAIT;\n"
+        "DONE:\n"
+        "}\n"
+        :: "r"(mbar_ptr),
+        "r"(kPhaseBit)
+    );
+#endif
+}
+
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+__device__ static inline bool try_wait(semaphore &sem, int kPhaseBit) {
+    void const* const ptr = &sem;
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    uint32_t success;
+
+    asm volatile(
+        "{\n"
+        ".reg .pred P1; \n"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2; \n"
+        "selp.b32 %0, 1, 0, P1; \n"
+        "}\n"
+        : "=r"(success)
+        : "r"(mbar_ptr), "r"(kPhaseBit)
+        : "memory"
+    );
+
+    return static_cast<bool>(success);
+}
+#endif
+
+
+
+
+
+
+
+__device__ static inline int test_wait(semaphore& sem, int kPhaseBit) {
+    void const* const ptr = &sem;
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    int result;
+    asm volatile (
+        "{\n"
+        ".reg .pred P1;\n"
+        "mbarrier.test_wait.parity.shared::cta.b64 P1, [%1], %2;\n"
+        "selp.u32 %0,1,0,P1;"
+        "}\n"
+        : "=r"(result)
+        : "r"(mbar_ptr), "r"(kPhaseBit)
+    );
+    return result;
+}
+
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+
+__device__ static inline bool elect_leader() {
+    if constexpr (GROUP_WARPS == 1) {
+        uint32_t elected = 0;
+        asm volatile(
+            "{.reg .pred P;\n"
+            " elect.sync _|P, %1;\n"
+            " selp.u32 %0, 1, 0, P;}\n"
+            : "+r"(elected)
+            : "r"(0xFFFFFFFF)
+        );
+        return static_cast<bool>(elected);
+    } else {
+        return (warpid() == 0 && ::kittens::group<1>::elect_leader());
+    }
+}
+
+__device__ static inline bool elect_leader_from_active() {
+    if constexpr (GROUP_WARPS == 1) {
+        uint32_t elected = 0;
+        asm volatile(
+            "{.reg .pred P;\n"
+            " .reg .u32 mask;\n"
+            " activemask.b32 mask;\n"
+            " elect.sync _|P, mask;\n"
+            " selp.u32 %0, 1, 0, P;}\n"
+            : "+r"(elected)
+        );
+        return static_cast<bool>(elected);
+    } else {
+        return (warpid() == 0 && ::kittens::group<1>::elect_leader_from_active());
+    }
+}
+
+#endif

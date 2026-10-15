@@ -16,6 +16,9 @@
 namespace nemo_speech::tts {
 
 struct SynthesizerConfig {
+    std::string backend = "magpie";
+    std::string native_socket;
+    int native_timeout_seconds = 300;
     MagpieRuntimeConfig runtime;
     std::string tokenizer_model_dir;
     std::string text_normalizer_model_dir;
@@ -29,6 +32,7 @@ struct SynthesisRequest {
     std::string language_code;
     std::string voice_name;
     int output_sample_rate = 0;  // 0 = model rate
+    int apply_normalize = -1;
     MagpieSynthesisOptions options;
 };
 
@@ -48,6 +52,7 @@ struct PreparedSynthesis {
     std::vector<int32_t> tokens;
     std::vector<std::vector<int32_t>> token_chunks;
     MagpieSynthesisOptions options;
+    int apply_normalize = -1;
     double normalizer_ms = 0.0;
     double tokenizer_ms = 0.0;
 };
@@ -87,6 +92,9 @@ class Synthesizer {
     const std::string& default_language_code() const;
     int default_speaker() const;
     bool text_normalization_enabled() const;
+    const std::string& backend_name() const;
+    int backend_batch_size() const;
+    const std::string& backend_mode() const;
 
    private:
     int resolve_speaker(const std::string& voice_name) const;

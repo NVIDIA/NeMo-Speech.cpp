@@ -1,0 +1,121 @@
+"""
+Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+NVIDIA CORPORATION and its licensors retain all intellectual property
+and proprietary rights in and to this software, related documentation
+and any modifications thereto.  Any use, reproduction, disclosure or
+distribution of this software and related documentation without an express
+license agreement from NVIDIA CORPORATION is strictly prohibited.
+"""
+
+package(
+    default_visibility = ["//visibility:public"],
+)
+
+load("@com_google_protobuf//:protobuf.bzl", "cc_proto_library")
+
+cc_proto_library(
+    name = "sparrowhawk_configuration_cc_proto",
+    srcs = ["src/proto/sparrowhawk_configuration.proto"],
+    include = "src/proto",
+    default_runtime = "@com_google_protobuf//:protobuf",
+    protoc = "@com_google_protobuf//:protoc"
+)
+
+cc_proto_library(
+    name = "rule_order_cc_proto",
+    srcs = ["src/proto/rule_order.proto"],
+     include = "src/proto",
+     default_runtime = "@com_google_protobuf//:protobuf",
+     protoc = "@com_google_protobuf//:protoc"
+)
+
+cc_proto_library(
+    name = "links_cc_proto",
+    srcs = ["src/proto/links.proto"],
+     include = "src/proto",
+     default_runtime = "@com_google_protobuf//:protobuf",
+     protoc = "@com_google_protobuf//:protoc"
+)
+
+cc_proto_library(
+    name = "semiotic_classes_cc_proto",
+    srcs = ["src/proto/semiotic_classes.proto"],
+     include = "src/proto",
+     default_runtime = "@com_google_protobuf//:protobuf",
+     protoc = "@com_google_protobuf//:protoc",
+)
+cc_proto_library(
+    name = "items_cc_proto",
+    srcs = ["src/proto/items.proto"],
+    include = "src/proto",
+    default_runtime = "@com_google_protobuf//:protobuf",
+    protoc = "@com_google_protobuf//:protoc",
+    deps = [
+        ":links_cc_proto",
+        ":semiotic_classes_cc_proto",
+    ],
+)
+
+cc_proto_library(
+    name = "serialization_spec_cc_proto",
+    srcs = ["src/proto/serialization_spec.proto"],
+    include = "src/proto",
+    default_runtime = "@com_google_protobuf//:protobuf",
+    protoc = "@com_google_protobuf//:protoc",
+    deps = [
+        ":links_cc_proto",
+        ":semiotic_classes_cc_proto",
+    ],
+)
+
+genrule(
+    name = "make_compatibility_headers",
+    outs = [
+        "sparrowhawk/items.pb.h",
+        "sparrowhawk/rule_order.pb.h",
+        "sparrowhawk/sparrowhawk_configuration.pb.h",
+        "sparrowhawk/serialization_spec.pb.h",
+    ],
+    cmd = """
+        for f in $(OUTS); do
+          echo "#include <src/proto/$$(basename $$f)>" > $$f
+        done
+    """,
+)
+
+cc_library(
+    name = "protos",
+    hdrs = [
+        "sparrowhawk/items.pb.h",
+        "sparrowhawk/rule_order.pb.h",
+        "sparrowhawk/serialization_spec.pb.h",
+        "sparrowhawk/sparrowhawk_configuration.pb.h",
+    ],
+    includes = ["."],
+    deps = [
+        ":items_cc_proto",
+        ":rule_order_cc_proto",
+        ":serialization_spec_cc_proto",
+        ":sparrowhawk_configuration_cc_proto",
+    ],
+)
+
+cc_library(
+    name = "sparrowhawk",
+    srcs = glob ([
+         "src/lib/*.cc",
+    ], exclude = ["src/lib/normalizer.cc", "src/lib/rule_system.cc"]) + ["@nemotron_tts_normalizer//third_party:sparrowhawk_normalizer.cc", "@nemotron_tts_normalizer//third_party:sparrowhawk_rule_system.cc"],
+    hdrs = glob ([
+         "src/include/sparrowhawk/*.h",
+    ]) + ["@nemotron_tts_normalizer//third_party:sparrowhawk_string_matcher.h"],
+    includes = ["src/include/sparrowhawk",  "src/include", "."],
+    copts = ["-funsigned-char", "-Wno-sign-compare", "-Wno-maybe-uninitialized", "-Wno-deprecated-declarations"],
+    deps = [
+         "@openfst//:fst",
+         "@openfst//:far_base",
+         "@thrax_1_2_7//:thrax_1_2_7",
+         ":protos",
+         "@com_googlesource_code_re2//:re2",
+    ],
+    linkstatic=True,
+)

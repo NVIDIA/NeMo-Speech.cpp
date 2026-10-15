@@ -28,6 +28,18 @@ if(TARGET nemo_speech_http_server)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND TARGET nemo_speech_cli AND NEMO_SPEECH_BUILD_TTS AND NEMO_SPEECH_BUILD_HTTP AND UNIX)
+    add_test(NAME nemotron_http COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tests/nemotron_http_test.py --binary $<TARGET_FILE:nemo_speech_cli>)
+    set_tests_properties(nemotron_http PROPERTIES TIMEOUT 60)
+    add_test(NAME nemotron_normalization COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tests/nemotron_normalization_test.py)
+    if(Python3_VERSION VERSION_GREATER_EQUAL 3.11)
+        add_test(NAME nemotron_bridge COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_SOURCE_DIR}/scripts/nemotron_native/tests -v)
+        set_tests_properties(nemotron_bridge PROPERTIES TIMEOUT 60)
+    endif()
+endif()
 if(Python3_Interpreter_FOUND AND
    (NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR OR
     NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_TTS))
@@ -123,6 +135,9 @@ if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR)
     add_subdirectory(asr)
 endif()
 if(NEMO_SPEECH_BUILD_TTS)
+    add_executable(test_nemotron_pcm common/test_nemotron_pcm.cpp)
+    target_include_directories(test_nemotron_pcm PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME nemotron_pcm COMMAND test_nemotron_pcm)
     add_subdirectory(tts)
 endif()
 if(NEMO_SPEECH_BUILD_NMT)

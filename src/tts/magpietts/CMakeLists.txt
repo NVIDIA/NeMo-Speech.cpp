@@ -13,9 +13,13 @@ add_library(nemo_speech_tts SHARED
     config.cpp
     ../c_api.cpp
     ../synthesizer.cpp
+    ../nemotron/native_runtime.cpp
     magpietts.cpp
     runtime.cpp
 )
+
+find_package(Threads REQUIRED)
+target_link_libraries(nemo_speech_tts PRIVATE Threads::Threads)
 
 # Windows: this DLL relies on Linux default symbol visibility to export its C++ API.
 # MSVC/clang-cl export nothing from a DLL unless annotated, so direct C++

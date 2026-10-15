@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 add_library(nemo_speech_http_server STATIC http_server.cpp)
+target_compile_definitions(nemo_speech_http_server PUBLIC CPPHTTPLIB_LISTEN_BACKLOG=4096)
 if(NEMO_SPEECH_BUILD_S2S)
     target_sources(nemo_speech_http_server PRIVATE s2s_realtime.cpp)
 endif()

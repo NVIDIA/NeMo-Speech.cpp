@@ -14,6 +14,9 @@ class ParameterParser;
 namespace nemo_speech::tts {
 
 struct MagpieTtsServerConfig {
+    std::string backend = "magpie";
+    std::string native_socket;
+    int native_timeout_seconds = 300;
     MagpieRuntimeConfig runtime;
     std::string tokenizer_model_dir;
     std::string tn_model_dir;

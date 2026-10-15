@@ -319,6 +319,9 @@ struct MagpieStreamParamsConfig {
 
 void
 MagpieTtsServerConfig::Register(common::ParameterParser& parser) {
+    parser.Register("backend", &backend, "TTS model backend: magpie or nemotron");
+    parser.Register("native-socket", &native_socket, "Nemotron controller bridge Unix socket");
+    parser.Register("native-timeout-seconds", &native_timeout_seconds, "Native request timeout");
     register_runtime_config(parser, runtime);
     parser.Register(
         "tokenizer-model-dir", &tokenizer_model_dir, "Extracted Magpie .nemo directory");

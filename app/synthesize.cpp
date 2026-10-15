@@ -62,6 +62,17 @@ nemo_speech::tts::SynthesizerConfig
 make_synthesizer_config(
     nemo_speech::tts::MagpieTtsServerConfig parsed, const std::string& device_name,
     bool device_set) {
+    if (parsed.backend == "nemotron") {
+        nemo_speech::tts::SynthesizerConfig config;
+        config.backend = parsed.backend;
+        config.native_socket = parsed.native_socket;
+        config.native_timeout_seconds = parsed.native_timeout_seconds;
+        config.default_language_code = parsed.default_language_code;
+        config.default_voice_name = parsed.default_voice_name;
+        return config;
+    }
+    if (parsed.backend != "magpie")
+        throw std::invalid_argument("tts.backend must be magpie or nemotron");
     parsed.runtime.magpie_model =
         resolve_model_file(parsed.runtime.magpie_model, "tts", "MagpieTTS model").string();
     parsed.runtime.codec_model =
@@ -110,6 +121,8 @@ print_synthesize_help(const char* program) {
     std::printf(
         "Usage: %s synthesize TEXT [options]\n\n"
         "Options:\n"
+        "  --tts-backend NAME        magpie (default) or nemotron\n"
+        "  --native-socket PATH      Nemotron controller bridge Unix socket\n"
         "  --magpie-model MODEL      MagpieTTS GGUF path or indexed HF repo\n"
         "                            (default: nvidia/magpie_tts_multilingual_357m)\n"
         "  --codec-model MODEL       NanoCodec GGUF path or indexed HF repo\n"
@@ -173,6 +186,10 @@ command_synthesize(int argc, char** argv) {
             const std::string arg = argv[i];
             if (arg == "--config")
                 ++i;
+            else if (arg == "--tts-backend")
+                parsed.backend = value(i, arg);
+            else if (arg == "--native-socket")
+                parsed.native_socket = value(i, arg);
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
