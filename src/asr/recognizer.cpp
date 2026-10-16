@@ -537,10 +537,14 @@ RecognitionStream::next() {
         flush_diar_deficit_(u);
         last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
         auto result = build_result_(u, /*is_final=*/true);
-        if (diar_) {
-            // This final's words are tagged; later words start after it.
+        if (diar_ && !u.words.empty()) {
+            // This final's words are tagged and later words start at or after
+            // its last one. Not audio_processed_sec: the cache runner sets it
+            // to all pushed audio, which can hold utterances not decoded yet.
+            const double last_start_sec =
+                u.words.back().start_frame * recognizer_->ms_per_enc_frame() / 1000.0;
             diar_->hold_frames_from(
-                static_cast<int64_t>(u.audio_processed_sec / diar_->seconds_per_frame()));
+                static_cast<int64_t>(last_start_sec / diar_->seconds_per_frame()));
         }
         result.late_punctuation = std::exchange(late_punctuation_, {});
         return result;
