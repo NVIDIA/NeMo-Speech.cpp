@@ -95,13 +95,13 @@ def main() -> None:
             )
         subprocess.run([str(consumer_binary)], check=True, env=consumer_environment)
 
-        # Exercise backend discovery beside the installed plugins, outside the build tree.
+        # Resolve relative plugin directories from the relocated installation prefix.
         if cache_bool(cache, "GGML_BACKEND_DL"):
             runtime_test = bin_directory / f"test_shared_utilities{suffix}"
             shutil.copy2(build / "bin" / config / runtime_test.name, runtime_test)
             library_path = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
             consumer_environment[library_path] = str(lib_directory)
-            subprocess.run([str(runtime_test)], check=True, env=consumer_environment, cwd=root)
+            subprocess.run([str(runtime_test)], check=True, env=consumer_environment, cwd=prefix)
 
         include = prefix / "include"
         assert not (include / "ggml.h").exists(), "internal ggml headers leaked into SDK"
