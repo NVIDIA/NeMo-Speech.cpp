@@ -88,8 +88,9 @@ main() {
         source_path("models/magpie_tts_multilingual_357m/magpie_tts_multilingual_357m.f16.gguf"));
     const std::string codec_model = env_or_default(
         "NEMO_SPEECH_TEST_TTS_CODEC_MODEL",
-        source_path("models/nemo_nano_codec_22khz_1.89kbps_21.5fps/"
-                    "nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf"));
+        source_path(
+            "models/nemo_nano_codec_22khz_1.89kbps_21.5fps/"
+            "nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf"));
     const std::string tokenizer_dir = env_or_default(
         "NEMO_SPEECH_TEST_TTS_TOKENIZER_DIR",
         source_path("models/magpie_tts_multilingual_357m/extracted"));
