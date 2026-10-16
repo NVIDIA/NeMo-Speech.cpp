@@ -73,8 +73,8 @@ fi
 mkdir -p "$WORK"
 cd "$WORK"
 # Pinned OpenFST and Sparrowhawk compatibility revisions.
-clone https://github.com/sarane22/openfst.git     openfst     fc23b4cf529429284b874a26f28b15c6cc94f404
-clone https://github.com/sarane22/sparrowhawk.git sparrowhawk 8b082acc507312077a096be8398584a13832c490
+clone https://github.com/anand-nv/openfst.git    openfst    nv_riva_main
+clone https://github.com/anand-nv/sparrowhawk.git sparrowhawk nv_riva_main
 
 # --------------------------------------------------------- protobuf and RE2
 # The last releases that do not require Abseil.
