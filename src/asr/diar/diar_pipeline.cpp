@@ -116,6 +116,8 @@ DiarStream::reset() {
     probs_.clear();
     probs_base_ = 0;
     frozen_segs_.clear();
+    if (hold_from_ != std::numeric_limits<int64_t>::max())
+        hold_from_ = 0;
 }
 
 void
@@ -307,10 +309,9 @@ DiarStream::speaker_for_frames(int64_t start_frame, int64_t end_frame) const {
     if (n == 0 || probs_.empty())
         return -1;
     // riva extrapolates words past the diarized frontier with the last frame;
-    // symmetrically, ranges before the retained window (only reachable when a
-    // caller tags words hours after they were spoken) clamp to its first
-    // frame. Word tagging happens near the frontier, so the clamp is inert in
-    // practice.
+    // symmetrically, ranges before the retained window clamp to its first
+    // frame. Callers that tag late hold their frames (hold_frames_from), so
+    // the clamp only affects ranges nobody held.
     start_frame = std::min(std::max<int64_t>(start_frame, probs_base_), n - 1);
     end_frame = std::max(start_frame + 1, std::min(end_frame, n));
     std::vector<double> mean(n_spk_, 0.0);
@@ -422,7 +423,7 @@ DiarStream::maybe_compact() {
     const float thr = std::min(cfg.onset, cfg.offset);
     const int64_t gap_need = static_cast<int64_t>(
         std::ceil((cfg.min_duration_off + cfg.pad_onset + cfg.pad_offset + 0.5) / sec_per_frame_));
-    const int64_t cut_limit = retained - compact_retain_frames_;
+    const int64_t cut_limit = std::min(retained - compact_retain_frames_, hold_from_ - probs_base_);
     int64_t run = 0, best_cut = -1;
     for (int64_t f = 0; f < cut_limit; f++) {
         bool silent = true;

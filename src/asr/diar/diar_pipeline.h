@@ -13,6 +13,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -173,6 +175,12 @@ class DiarStream {
     // retained tail. If no such gap exists yet, compaction retries later.
     // Defaults retain roughly the latest 10 minutes after a 20-minute trigger.
     void set_compaction(int64_t trigger_frames, int64_t retain_frames);
+    // Compaction never drops frames at or after `frame`. A caller that tags
+    // words only once their result is final holds the first frame it may
+    // still tag, so those words read raw probabilities instead of the clamped
+    // first retained frame. Unset (the default), only the retain window
+    // limits the cut. reset() rewinds a set hold to frame 0.
+    void hold_frames_from(int64_t frame) { hold_from_ = frame; }
 
     // Speaker id (0-based) for a [start, end) frame range: mean probability
     // over the range, argmax. Frames beyond the emitted timeline use the last
@@ -225,6 +233,7 @@ class DiarStream {
     // Initialized to ~20 min trigger / ~10 min retained at native cadence.
     int64_t compact_trigger_frames_ = 0;
     int64_t compact_retain_frames_ = 0;
+    int64_t hold_from_ = std::numeric_limits<int64_t>::max();
 };
 
 }  // namespace nemo_speech::asr

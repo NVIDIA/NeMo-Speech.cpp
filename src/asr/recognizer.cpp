@@ -340,6 +340,9 @@ RecognitionStream::RecognitionStream(
         }
         diar_ = std::make_unique<DiarStream>(
             *recognizer_->diar_model(), recognizer_->config().diar.resolved_geometry());
+        // Words are tagged when their final is built, which for a stream
+        // without endpointing is at finish(). Keep their frames until then.
+        diar_->hold_frames_from(0);
     }
     if (coordinate_ingress_)
         recognizer_->register_streaming_ingress();
@@ -534,6 +537,11 @@ RecognitionStream::next() {
         flush_diar_deficit_(u);
         last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
         auto result = build_result_(u, /*is_final=*/true);
+        if (diar_) {
+            // This final's words are tagged; later words start after it.
+            diar_->hold_frames_from(
+                static_cast<int64_t>(u.audio_processed_sec / diar_->seconds_per_frame()));
+        }
         result.late_punctuation = std::exchange(late_punctuation_, {});
         return result;
     }
