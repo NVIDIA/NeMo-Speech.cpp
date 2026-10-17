@@ -118,6 +118,28 @@ adapters and separate `riva_server` executable are needed.
 
 The preset selects which components and ggml backend are compiled.
 
+For portable CPU binaries on platforms supported by ggml's multi-variant build,
+enable ggml's dynamically loaded backends instead of tuning for the build host:
+
+```bash
+scripts/configure.sh cpu-asr \
+  -DGGML_NATIVE=OFF \
+  -DGGML_BACKEND_DL=ON \
+  -DGGML_CPU_ALL_VARIANTS=ON
+cmake --build --preset cpu-asr
+cmake --install build/cpu-asr --prefix "$PWD/install"
+```
+
+ggml selects a compatible CPU plugin at runtime. `GGML_BACKEND_DL` makes all
+enabled backends plugins; CPU variants can coexist with GPU backend plugins.
+Keep the installed plugins beside the executable, including when embedding the
+SDK in an application. An explicit `GGML_BACKEND_DIR` sets their installation
+directory and adds it to ggml's search paths. Absolute paths are not updated
+when relocating the package.
+For CUDA TTS, keep `GGML_BACKEND_DL=OFF`; its optimized paths still call
+CUDA backend functions directly.
+The default directly linked backend configuration remains unchanged.
+
 Additional CMake definitions can follow the preset:
 
 ```bash
