@@ -9,6 +9,9 @@ target_link_libraries(test_ctc_streaming PRIVATE nemo_speech_asr)
 add_executable(test_rnnt_streaming test_rnnt_streaming.cpp)
 target_link_libraries(test_rnnt_streaming PRIVATE nemo_speech_asr)
 
+add_executable(test_gguf_mmap_loader test_gguf_mmap_loader.cpp)
+target_link_libraries(test_gguf_mmap_loader PRIVATE nemo_speech_asr)
+
 # Multi-threaded crosstalk / deadlock stress test for the shared cache-aware
 # encoder Session driven by many per-stream SessionStates at once.
 find_package(Threads REQUIRED)

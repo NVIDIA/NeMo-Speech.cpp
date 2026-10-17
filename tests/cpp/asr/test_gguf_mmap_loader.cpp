@@ -1,0 +1,83 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+// GGUFLoader mmap smoke test: mapped_tensor_ptr() bytes must match the
+// buffered-fread path for every tensor.
+// Usage: ./test_gguf_mmap_loader <model.gguf>   (skips if no model arg)
+#include <cstdio>
+#include <cstring>
+#include <string>
+
+#include "runtime.h"
+
+int
+main(int argc, char** argv) {
+    if (argc < 2) {
+        std::fprintf(stdout, "[SKIP] usage: %s <model.gguf>\n", argv[0]);
+        return 0;
+    }
+    const std::string model_path = argv[1];
+
+    ggml_runtime::GGUFLoader loader(model_path);
+
+    if (!loader.is_mmapped()) {
+        std::fprintf(
+            stderr,
+            "[FAIL] GGUFLoader did not mmap %s (llama_mmap::SUPPORTED false on this "
+            "platform?)\n",
+            model_path.c_str());
+        return 1;
+    }
+    if (loader.mapped_base() == nullptr) {
+        std::fprintf(stderr, "[FAIL] is_mmapped() true but mapped_base() is null\n");
+        return 1;
+    }
+
+    struct gguf_init_params params = {/*no_alloc=*/true, /*ctx=*/nullptr};
+    gguf_context_ptr ctx(gguf_init_from_file(model_path.c_str(), params));
+    const int64_t n_tensors = ctx ? gguf_get_n_tensors(ctx.get()) : 0;
+    if (n_tensors == 0) {
+        std::fprintf(stderr, "[FAIL] GGUF has no tensors: %s\n", model_path.c_str());
+        return 1;
+    }
+
+    int checked = 0;
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const std::string name = gguf_get_tensor_name(ctx.get(), i);
+        const ggml_type type = loader.get_tensor_type(name);
+        const auto ne = loader.get_tensor_ne(name);
+        if (ne.empty()) {
+            continue;
+        }
+        size_t n_elems = 1;
+        for (int64_t d : ne) n_elems *= static_cast<size_t>(d);
+        const size_t n_rows = n_elems / static_cast<size_t>(ne[0]);
+        const size_t nbytes = ggml_row_size(type, static_cast<size_t>(ne[0])) * n_rows;
+        if (nbytes == 0) {
+            continue;
+        }
+
+        const void* mapped = loader.mapped_tensor_ptr(name);
+        const char* fread_data = loader.get_tensor_file_data(name, nbytes);
+
+        if (std::memcmp(mapped, fread_data, nbytes) != 0) {
+            std::fprintf(
+                stderr,
+                "[FAIL] mmap'd bytes for tensor '%s' (%zu bytes) don't match the buffered-fread "
+                "path -- mmap offset/base arithmetic is wrong\n",
+                name.c_str(), nbytes);
+            return 1;
+        }
+        checked++;
+    }
+
+    if (checked == 0) {
+        std::fprintf(
+            stderr, "[FAIL] no tensor in %s had decodable extents to check\n", model_path.c_str());
+        return 1;
+    }
+
+    std::fprintf(
+        stdout, "[PASS] mmap'd %d/%lld tensors match buffered-read bytes\n", checked,
+        (long long)n_tensors);
+    return 0;
+}
