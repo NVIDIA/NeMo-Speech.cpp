@@ -11,6 +11,9 @@ target_link_libraries(test_rnnt_streaming PRIVATE nemo_speech_asr)
 
 add_executable(test_gguf_mmap_loader test_gguf_mmap_loader.cpp)
 target_link_libraries(test_gguf_mmap_loader PRIVATE nemo_speech_asr)
+# Synthetic-GGUF cases always run; NEMO_SPEECH_TEST_ASR_MODEL (if set) adds a full-model compare.
+add_test(NAME gguf_mmap_loader COMMAND test_gguf_mmap_loader $ENV{NEMO_SPEECH_TEST_ASR_MODEL})
+set_tests_properties(gguf_mmap_loader PROPERTIES SKIP_RETURN_CODE 77)
 
 # Multi-threaded crosstalk / deadlock stress test for the shared cache-aware
 # encoder Session driven by many per-stream SessionStates at once.

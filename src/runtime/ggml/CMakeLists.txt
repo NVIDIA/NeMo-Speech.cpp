@@ -13,7 +13,7 @@ file(GLOB RUNTIME_GGML_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 # Reuses llama.cpp's llama_mmap (not the full `llama` target, nor
 # llama-impl.cpp, whose format() clashes with logging.cpp's — see llama_log_shim.cpp).
 list(APPEND RUNTIME_GGML_SOURCES
-    ${CMAKE_SOURCE_DIR}/llama.cpp/src/llama-mmap.cpp
+    ${NEMO_SPEECH_LLAMA_CPP_DIR}/src/llama-mmap.cpp
 )
 
 add_library(nemo_speech_runtime_ggml STATIC ${RUNTIME_GGML_SOURCES})
@@ -32,8 +32,8 @@ target_include_directories(nemo_speech_runtime_ggml PRIVATE
 )
 
 target_include_directories(nemo_speech_runtime_ggml PRIVATE
-    ${CMAKE_SOURCE_DIR}/llama.cpp/src
-    ${CMAKE_SOURCE_DIR}/llama.cpp/include
+    ${NEMO_SPEECH_LLAMA_CPP_DIR}/src
+    ${NEMO_SPEECH_LLAMA_CPP_DIR}/include
 )
 
 target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
