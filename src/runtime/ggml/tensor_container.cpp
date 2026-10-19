@@ -59,11 +59,19 @@ alloc_tensor_subset(ggml_backend_buffer_type_t buft, const std::vector<ggml_tens
     return buf;
 }
 
+// The CPU buffer type reports a NULL device; resolve it to the CPU device as
+// llama.cpp does (llama-model.cpp), so CPU weights are eligible too.
+static ggml_backend_dev_t
+buft_device_or_cpu(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return dev ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+}
+
 // Eligible only for a device's default buft that supports
 // buffer_from_host_ptr (CPU/Metal); CUDA reports false and is unaffected.
 static bool
 buft_supports_mmap_zero_copy(ggml_backend_buffer_type_t buft) {
-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_dev_t dev = buft_device_or_cpu(buft);
     if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
         return false;
     }
@@ -327,7 +335,7 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
             first = std::min(first, off);
             last = std::max(last, off + ggml_nbytes(t));
         }
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_dev_t dev = buft_device_or_cpu(buft);
         void* base = mmap_loader_->mapped_base();
         const size_t max_tensor_size = ggml_get_max_tensor_size(bf_ctx.ctx);
         ggml_backend_buffer_t mmap_buf = ggml_backend_dev_buffer_from_host_ptr(
