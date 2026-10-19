@@ -291,7 +291,8 @@ Session::bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key) {
         // Left unbound for zero-copy (see
         // TensorContainer::allocate_tensors_on_backend_buffers); bind directly.
         ggml_backend_buffer_t buf = model_tensor_container->mmap_buffer_for(t.buft);
-        ggml_backend_tensor_alloc(buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key));
+        ggml_backend_tensor_alloc(
+            buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key, ggml_nbytes(t.tensor)));
     } else {
         const size_t mem_bytes = ggml_nbytes(t.tensor);
         const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);

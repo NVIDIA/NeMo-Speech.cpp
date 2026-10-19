@@ -79,9 +79,16 @@ GGUFLoader::GGUFLoader(const std::string& path) {
     m_tensor_buffer.resize((tensor_size_mb + 1) * 1024 * 1024);
 
     // Lazily-faulted mmap (prefetch=0): clean, evictable pages instead of a
-    // malloc'd copy. Falls back to the fread path above where unsupported.
+    // malloc'd copy. llama_mmap throws on failure (e.g. ENODEV); a null
+    // m_mapping selects the fread path.
     if (llama_mmap::SUPPORTED) {
-        m_mapping = std::make_unique<llama_mmap>(m_file.get(), /*prefetch=*/0, /*numa=*/false);
+        try {
+            m_mapping = std::make_shared<llama_mmap>(m_file.get(), /*prefetch=*/0, /*numa=*/false);
+        }
+        catch (const std::exception& e) {
+            GGMLF_LOG_WARN(
+                "mmap of %s failed (%s); falling back to buffered reads\n", path.c_str(), e.what());
+        }
     }
 }
 
@@ -108,11 +115,21 @@ GGUFLoader::get_tensor_offset(const std::string& tensor_name) const {
 }
 
 void*
-GGUFLoader::mapped_tensor_ptr(const std::string& tensor_name) const {
+GGUFLoader::mapped_tensor_ptr(const std::string& tensor_name, size_t size) const {
     if (!m_mapping) {
         throw std::logic_error("mapped_tensor_ptr() called without an active mmap mapping");
     }
-    return static_cast<char*>(m_mapping->addr()) + get_tensor_offset(tensor_name);
+    const uint64_t offset = get_tensor_offset(tensor_name);
+    // Same bound as get_tensor_file_data(); a truncated file must fail here, not fault later.
+    if (offset > m_mapping->size() || size > m_mapping->size() - offset) {
+        throw std::runtime_error("Tensor data out of range: " + tensor_name);
+    }
+    return static_cast<char*>(m_mapping->addr()) + offset;
+}
+
+std::shared_ptr<void>
+GGUFLoader::mapping_handle() const {
+    return m_mapping;
 }
 
 void*

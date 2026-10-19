@@ -347,6 +347,7 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
         }
         backend_buffers.emplace_back(mmap_buf);
         mmap_bufs_[buft] = mmap_buf;
+        mmap_keepalive_ = mmap_loader_->mapping_handle();
         // mmap_tensors are left with data == nullptr; Session::load_weight
         // binds each one via ggml_backend_tensor_alloc.
 

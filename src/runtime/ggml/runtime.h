@@ -101,12 +101,17 @@ class GGUFLoader {
     std::vector<int64_t> get_tensor_ne(const std::string& tensor_name) const;
     bool has_tensor(const std::string& tensor_name) const;
 
-    // True when the file is mmap'd; see mapped_tensor_ptr()/mapped_base().
+    // False when mmap is unsupported or failed; use get_tensor_file_data() then.
     bool is_mmapped() const;
+    // Absolute file offset (includes the GGUF data offset); the mapping starts
+    // at file offset 0, so mapped_base() + offset addresses the tensor.
     uint64_t get_tensor_offset(const std::string& tensor_name) const;
-    // Pointer into the mapping; valid only while this GGUFLoader lives.
-    void* mapped_tensor_ptr(const std::string& tensor_name) const;
+    // Pointer to `size` bytes of the tensor in the mapping. Throws logic_error
+    // without a mapping, runtime_error ("out of range") past the end of the file.
+    void* mapped_tensor_ptr(const std::string& tensor_name, size_t size) const;
     void* mapped_base() const;
+    // Null when not mapped. Hold this while keeping pointers into the mapping.
+    std::shared_ptr<void> mapping_handle() const;
 
     // Metadata accessors (return `def` if key missing).
     uint32_t get_u32(const std::string& key, uint32_t def = 0) const;
@@ -124,7 +129,7 @@ class GGUFLoader {
     std::unique_ptr<llama_file> m_file;
     // Out-of-line dtor sees the complete llama_mmap type; never released by
     // release_file_resources() — see loader.cpp for why.
-    std::unique_ptr<llama_mmap> m_mapping;
+    std::shared_ptr<llama_mmap> m_mapping;
     std::map<std::string, std::tuple<ggml_type, uint64_t>> m_tensor_infos;
     // Per-tensor on-disk dimensionality.
     std::map<std::string, int> m_tensor_n_dims;
@@ -319,9 +324,11 @@ class TensorContainer {
     // (the ggml_bf_context.ctx field) into these contexts.
     std::vector<ggml_context_ptr> owned_ctxs_;
     buft_ctx_map_t ctx_map;
+    // Outlives backend_buffers (declared first) so mmap-backed buffers stay valid.
+    std::shared_ptr<void> mmap_keepalive_;
     std::vector<ggml_backend_buffer_ptr> backend_buffers;
     std::map<std::string, ggml_bf_tensor> tensor_lookup;
-    // Non-owning; see set_mmap_loader(). Null unless opted in.
+    // Non-owning, used only while allocating; see set_mmap_loader(). Null unless opted in.
     GGUFLoader* mmap_loader_ = nullptr;
     // Non-owning views into backend_buffers, keyed by buft; see mmap_buffer_for().
     std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_t> mmap_bufs_;
