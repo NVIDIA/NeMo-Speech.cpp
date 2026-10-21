@@ -30,6 +30,9 @@ MagpieTokenizerSentenceLimits::Register(common::ParameterParser& p) {
 void
 MagpieTokenizerConfig::Register(common::ParameterParser& p) {
     p.Register("sentence-limit", sentence_limit);
+    p.Register(
+        "latin-as-english", &latin_as_english,
+        "Korean text: tokenize inline Latin-letter runs with the English IPA tokenizer");
 }
 
 namespace {

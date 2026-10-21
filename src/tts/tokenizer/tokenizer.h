@@ -35,6 +35,9 @@ struct MagpieTokenizerSentenceLimits {
 
 struct MagpieTokenizerConfig {
     MagpieTokenizerSentenceLimits sentence_limit;
+    // Korean (ByT5) text: encode inline Latin-letter runs with the English IPA tokenizer so the
+    // model reads them as English words instead of raw bytes it never saw in Korean context.
+    bool latin_as_english = false;
 
     void Register(common::ParameterParser& parser);
 };
