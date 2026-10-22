@@ -33,7 +33,10 @@ namespace {
 constexpr size_t kPayload = 640;
 constexpr int kFrames = 64;
 constexpr size_t kFrameSize = 2 + 2 + 4 + kPayload;  // header, 16-bit length, mask, payload
+// RFC 6455 requires the shortest length encoding; the 16-bit form starts here.
+constexpr size_t kMin16BitPayload = 126;
 
+// A masked binary frame with a 16-bit length: payload_len must be 126..65535.
 void
 append_frame(std::string& out, size_t payload_len) {
     const char mask[4] = {0x11, 0x22, 0x33, 0x44};
@@ -114,10 +117,11 @@ main() {
     std::thread listener([&] { server.listen_after_bind(); });
     server.wait_until_ready();
 
-    // Every phase of the frame period against the 4 KiB buffer.
+    // Every phase of the frame period against the 4 KiB buffer: kFrameSize
+    // consecutive lead payload lengths, all valid in the 16-bit length form.
     int failed = 0;
     bool upgraded = true;
-    for (size_t lead = 8; lead < 8 + kFrameSize; ++lead) {
+    for (size_t lead = kMin16BitPayload; lead < kMin16BitPayload + kFrameSize; ++lead) {
         burst_written.store(false);
         received.store(-1);
         const int fd = open_websocket(port);
@@ -126,7 +130,7 @@ main() {
             break;
         }
         std::string burst;
-        append_frame(burst, lead - 8);
+        append_frame(burst, lead);
         for (int f = 0; f < kFrames; ++f) append_frame(burst, kPayload);
         const bool written = write_all(fd, burst);
         burst_written.store(true);
