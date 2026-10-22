@@ -1110,6 +1110,10 @@ struct Server::Impl {
                 const auto kind = socket.read(message);
                 if (kind == httplib::ws::ReadResult::Fail)
                     break;
+                // Only after a WebSocket read timeout set on this socket; the
+                // connection is open and `message` still holds the last frame.
+                if (kind == httplib::ws::ReadResult::Timeout)
+                    continue;
                 try {
                     if (kind == httplib::ws::ReadResult::Binary) {
                         if (!append_audio(message))

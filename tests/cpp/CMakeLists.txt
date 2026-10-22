@@ -25,6 +25,13 @@ if(TARGET nemo_speech_http_server)
         ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_http_server_config.cpp)
     target_link_libraries(test_http_server_config PRIVATE nemo_speech_http_server)
     add_test(NAME http_server_config COMMAND test_http_server_config)
+    if(NOT WIN32)  # the raw test client uses POSIX sockets
+        find_package(Threads REQUIRED)
+        add_executable(test_websocket_frames
+            ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_websocket_frames.cpp)
+        target_link_libraries(test_websocket_frames PRIVATE httplib::httplib Threads::Threads)
+        add_test(NAME websocket_frames COMMAND test_websocket_frames)
+    endif()
 endif()
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
