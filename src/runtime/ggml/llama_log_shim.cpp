@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
+// Portions derived from parakeet.cpp:
+// Copyright (c) 2025 Jason Ni
+// Licensed under the MIT License. See THIRD_PARTY_NOTICES.md.
+//
 // llama-mmap.cpp (reused by GGUFLoader) logs via LLAMA_LOG_*; this supplies
 // the one symbol it needs without linking llama-impl.cpp (format() clash).
 #include <cstdarg>
