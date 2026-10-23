@@ -18,13 +18,43 @@
 | Application | Supported models |
 |---|---|
 | Speech recognition | [Nemotron 3.5 ASR Streaming 0.6B](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b), [Nemotron Speech Streaming 0.6B](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b), [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), and [Parakeet CTC 1.1B](https://huggingface.co/nvidia/parakeet-ctc-1.1b) |
-| Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2), standalone or combined with ASR |
+| Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) and [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), standalone or combined with ASR |
 | Text and speech translation | [Riva Translate 4B Instruct v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2), with composed ASR-to-NMT-to-TTS speech translation |
 | Speech synthesis | [MagpieTTS Multilingual 357M](https://huggingface.co/nvidia/magpie_tts_multilingual_357m) with [NeMo NanoCodec](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) |
 | Full-duplex voicechat | [Nemotron Labs VoiceChat](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B), including realtime audio, transcripts, and tool calling |
 | Speech processing | [Silero VAD](https://github.com/snakers4/silero-vad), punctuation and capitalization, endpointing, text normalization, and subtitles |
 
+## Performance
+
+NeMo-Speech.cpp is blazing fast and built for real-time streaming. Speech recognition
+transcribes audio in 160 ms chunks up to 67× faster than real time, and speech synthesis
+generates speech up to 60× faster than real time with its first audio in under 10 ms. Both stay
+faster than real time even on a CPU.
+
+Streaming speech recognition with Nemotron Speech Streaming 0.6B (Q8_0), 160 ms chunks:
+
+| Device | Latency per chunk | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|
+| GeForce RTX 4090 | **2.3 ms** | **67× real time** | **8.8×** |
+| CPU | **27 ms** | **6× real time** | **3.7×** |
+
+Streaming speech synthesis with MagpieTTS Multilingual (Q8_0), 186 ms audio chunks:
+
+| Device | Time to first audio | Inter-chunk latency | Throughput | Speedup over NeMo (FP32) |
+|---|:---:|:---:|:---:|:---:|
+| GeForce RTX 4090 | **9 ms** | **3 ms** | **60× real time** | **40×** |
+| CPU | **203 ms** | **64 ms** | **2.7× real time** | **9.7×** |
+
+See [BENCHMARK.md](BENCHMARK.md) for the methodology and more results.
+
 ## Installation
+
+> [!IMPORTANT]
+> **For the best performance, build natively from source.** A native build is compiled for
+> your machine. Tagged releases are cut periodically and can trail the `main` branch; for
+> prebuilt binaries of the latest `main`, pass `--channel nightly` (`-Channel nightly` on
+> Windows) to install the nightly prerelease, which is rebuilt daily. See
+> [Build from source](#build-from-source).
 
 Install the `nemo-speech` CLI for the detected platform and backend:
 
@@ -45,10 +75,12 @@ irm https://github.com/NVIDIA/NeMo-Speech.cpp/raw/main/scripts/install.ps1 | iex
 Open a new PowerShell window after installation so the updated user `PATH`
 takes effect.
 
-The installer prefers a verified native release and falls back to a source
-build when an artifact is unavailable. A source build requires Git, CMake 3.26
-or newer, Ninja, a C++17 compiler, SentencePiece development files, and the
-toolchain required by the selected backend, if any. See
+The installer downloads the prebuilt archive for the latest release, checks it
+against the SHA-256 checksum published with the release, and builds from source
+when no archive is available for your platform. **Pass `--source` (`-Source` on
+Windows) to always build from the `main` branch.** A source build requires Git,
+CMake 3.26 or newer, Ninja, a C++17 compiler, SentencePiece development files,
+and the toolchain required by the selected backend, if any. See
 [Installation](docs/install.md) for platform-specific prerequisites and
 options.
 
@@ -126,7 +158,7 @@ development files, and the toolchain required by the selected backend, if any.
 For a CUDA ASR and TTS server with the playground:
 
 ```bash
-git submodule update --init ggml llama.cpp third_party/cpp-httplib
+git submodule update --init llama.cpp third_party/cpp-httplib
 scripts/configure.sh cuda-server
 cmake --build --preset cuda-server
 ```

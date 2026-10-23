@@ -11,10 +11,10 @@
 //               live source, state (speaker cache/FIFO) threads across chunks;
 //               works for arbitrarily long audio.
 //   --offline   one stateless full-attention pass (best-effort quality trade,
-//               capped at ~6.6 minutes by the model's positional table).
+//               capped by the model's positional limit).
 //
 // Usage: ./diarize_file <sortformer.gguf> <audio.wav>
-//            [--gpu N] [--offline] [--rttm NAME] [--preset streaming|offline]
+//            [--gpu N] [--offline] [--rttm NAME] [--preset NAME]
 //
 // For word-level speaker tags on a transcript, see transcribe_file --diar
 // (the ASR ABI's diarization integration).
@@ -33,11 +33,11 @@ main(int argc, char** argv) {
         std::fprintf(
             stderr,
             "Usage: %s <sortformer.gguf> <audio.wav> [--gpu N] [--offline] [--rttm NAME]\n"
-            "          [--preset streaming|offline]\n"
+            "          [--preset streaming|offline|v3-streaming|v3-offline]\n"
             "  --gpu N     GPU device index (default 0; -1 = CPU)\n"
-            "  --offline   single stateless full-attention pass (<= ~6.6 min audio)\n"
+            "  --offline   single stateless full-attention pass for short audio\n"
             "  --rttm NAME print RTTM lines (for DER scoring) instead of readable segments\n"
-            "  --preset P  streaming geometry preset (default: streaming)\n"
+            "  --preset P  streaming geometry preset (default: model-specific)\n"
             "  Audio must be 16 kHz mono WAV (PCM16 or float32).\n",
             argv[0]);
         return 1;

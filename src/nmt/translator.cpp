@@ -29,24 +29,6 @@ ensure_backend() {
     std::call_once(once, [] { llama_backend_init(); });
 }
 
-// NMT-only entry points (test_nmt, the nemo_speech_nmt_* C ABI, direct lib use). The
-// skinny-q8 ggml kernel (see ggml-patches/0005) is an ASR-encoder optimization
-// whose in-place repack is unsafe for the decoder and whose padded single-token
-// decode is slower than the stock path; with no ASR in the process, disable it
-// entirely. The flag is read once, on the first skinny repack, so this runs in
-// the Translator ctor, before any decode. putenv (not setenv) keeps it portable
-// with no _WIN32 branch; the string must outlive the call, hence static. Defer
-// to the server (it sets one of these for the combined ASR+NMT case): act only
-// when neither is already set.
-void
-force_skinny_q8_safe_for_nmt() {
-    if (std::getenv("GGML_SKINNY_Q8") == nullptr &&
-        std::getenv("GGML_SKINNY_Q8_INPLACE") == nullptr) {
-        static char kv[] = "GGML_SKINNY_Q8=0";
-        putenv(kv);
-    }
-}
-
 std::string
 path_stem(const std::string& path) {
     const std::size_t slash = path.find_last_of("/\\");
@@ -169,7 +151,6 @@ struct Translator::Impl {
 };
 
 Translator::Translator(TranslatorConfig cfg) : impl_(std::make_unique<Impl>()) {
-    force_skinny_q8_safe_for_nmt();
     configure_llama_logging(cfg.verbose);
     ensure_backend();
     impl_->cfg = std::move(cfg);

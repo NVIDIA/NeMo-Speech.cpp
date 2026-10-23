@@ -27,9 +27,11 @@ class SileroVadModel;
 class Recognizer;
 
 struct BackendConfig {
-    int gpu = 0;  // -1 = CPU
+    int gpu = 0;      // -1 = CPU
+    int threads = 0;  // CPU backend threads; 0 = min(8, hardware threads)
     void Register(common::ParameterParser& p) {
         p.Register("gpu", &gpu, "GPU device index (-1 = CPU)", {"--gpu", "-g"});
+        p.Register("threads", &threads, "CPU backend threads (0 = min(8, hardware threads))");
     }
 };
 
@@ -85,6 +87,13 @@ class RecognitionStream {
     Result finish();
 
     const AsrRequestOptions& options() const { return opts_; }
+    // Interim results also carry word timings (when requested) and speaker tags.
+    void set_interim_words(bool on) { interim_words_ = on; }
+    // Retag buffered words from the diarizer's revised timeline.
+    // Speaker labels strictly before this audio time are immutable.
+    // Excludes provisional chunks and retrospective relabeling.
+    double stable_speaker_time() const;
+    void refresh_speaker_tags(Result& result) const;
 
    private:
     Result build_result_(const StreamingUpdate& u, bool is_final) const;
@@ -106,6 +115,9 @@ class RecognitionStream {
     // does not advance it processed no new window (audio exhausted), so next()
     // reports nullopt and a drain loop terminates. Monotonic per stream.
     float last_processed_sec_ = -1.0f;
+    bool interim_words_ = false;
+    // Late punctuation from steps that returned no Result; sent with the next.
+    std::string late_punctuation_;
 };
 
 class Recognizer {

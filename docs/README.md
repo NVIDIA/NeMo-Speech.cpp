@@ -50,9 +50,10 @@ Start with:
 ## Developer guide
 
 - [Overview](development/README.md) - implementation and performance internals.
-- [Diagnostics](development/diagnostics.md) - `check_backend_coverage`.
+- [Diagnostics](development/diagnostics.md) - build switches, runtime knobs, and
+  `check_backend_coverage`.
 - [ASR batching](development/asr-batching.md) - neural microbatching and
   streaming-state arenas.
-- [ggml patches](development/ggml-patches.md) - the project-specific ggml changes.
+- [llama.cpp and ggml patches](../patches/README.md) - the project-specific changes.
 - [cuBLAS shim](development/cublas-shim.md) - the in-tree drop-in cuBLAS
   replacement.

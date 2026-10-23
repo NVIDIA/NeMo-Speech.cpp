@@ -134,6 +134,6 @@ summaries.
   submissions rather than concurrent access to ggml's shared scheduler.
 - Disabling batching keeps the scalar path and avoids its queue-delay cost.
 
-For planar-Q8 kernel behavior, diagnostic environment switches, and patched
-versus stock ggml builds, see [ggml patches](ggml-patches.md). The complete
+For planar-Q8 kernel behavior and patched versus stock ggml builds, see
+[`patches/README.md`](../../patches/README.md) and the patch descriptions there. The complete
 runtime key reference is in [ASR configuration](../asr/configuration.md).

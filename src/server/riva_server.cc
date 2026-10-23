@@ -24,6 +24,7 @@
 #include "model_logging.h"
 #include "parameter_parser.h"
 #include "recognizer.h"
+#include "runtime.h"
 #if defined(NEMO_SPEECH_BUILD_TTS)
 #include "grpc_tts.h"
 #include "tts/magpietts/config.h"
@@ -121,20 +122,6 @@ struct RivaServerConfig {
     }
 };
 
-#if defined(NEMO_SPEECH_BUILD_TTS)
-void
-configure_cuda_graph_cache_defaults() {
-    if (std::getenv("GGML_CUDA_GRAPH_EVICT_AFTER_MS") != nullptr) {
-        return;
-    }
-    // putenv (not setenv) so there is no _WIN32 branch; the string must outlive
-    // the call, hence static.
-    static char kv[] = "GGML_CUDA_GRAPH_EVICT_AFTER_MS=0";
-    putenv(kv);
-    std::cerr << "[riva_server] defaulting GGML_CUDA_GRAPH_EVICT_AFTER_MS=0"
-              << " to keep CUDA graphs resident across TTS requests\n";
-}
-#endif
 
 bool
 asr_configured(const AsrServerConfig& cfg) {
@@ -347,27 +334,8 @@ main(int argc, char** argv) {
         return 1;
     }
 
-    // The skinny-q8 ggml kernel (see ggml-patches/0005) is an ASR-encoder
-    // optimization; its in-place repack is unsafe for the NMT decoder and its
-    // padded single-token decode is slower than the stock path. The flag is read
-    // once, on the first skinny repack, so set the right env process-wide before
-    // any service warms up:
-    //   * NMT alone: disable skinny (GGML_SKINNY_Q8=0). TTS is fp16 and does not
-    //     use skinny.
-    //   * NMT + ASR: keep skinny for the ASR encoder, force the safe non-in-place
-    //     repack (GGML_SKINNY_Q8_INPLACE=0); NMT then runs skinny.
-    if (enable_nmt) {
-        if (enable_asr) {
-            static char kv[] = "GGML_SKINNY_Q8_INPLACE=0";
-            putenv(kv);
-            std::cerr << "[riva_server] NMT+ASR: forcing GGML_SKINNY_Q8_INPLACE=0 "
-                         "(keep ASR skinny-q8, non-in-place)\n";
-        } else {
-            static char kv[] = "GGML_SKINNY_Q8=0";
-            putenv(kv);
-            std::cerr << "[riva_server] NMT without ASR: forcing GGML_SKINNY_Q8=0 "
-                         "(disable skinny-q8; faster decode)\n";
-        }
+    if (enable_nmt && enable_asr) {
+        ggml_runtime::keep_skinny_q8_weights_separate();
     }
 
     // Core capabilities outlive the protocol adapters.
@@ -405,7 +373,7 @@ main(int argc, char** argv) {
 
 #if defined(NEMO_SPEECH_BUILD_TTS)
     if (enable_tts) {
-        configure_cuda_graph_cache_defaults();
+        ggml_runtime::keep_cuda_graphs_resident();
         std::cerr << "[riva_server] loading MagpieTTS model: "
                   << cfg.tts.server.runtime.magpie_model << "\n";
         std::cerr << "[riva_server] loading NanoCodec model: " << cfg.tts.server.runtime.codec_model

@@ -39,9 +39,8 @@ ARG ENABLE_TESTS=OFF
 ARG ENABLE_NMT=OFF
 # Full-duplex VoiceChat via llama.cpp. Set ON to build realtime server support.
 ARG ENABLE_S2S=OFF
-# Apply the project ggml patches and build the ASR against them. Set OFF to
-# build the ASR against STANDARD upstream ggml (stock ops only, no patches):
-# skips apply-ggml-patches.sh and sets -DNEMO_SPEECH_GGML_PATCHED=OFF.
+# Build ggml and llama.cpp with patches/ applied (CMake applies them). Set OFF to
+# build against pristine upstream llama.cpp (stock ggml ops only).
 ARG ENABLE_GGML_PATCHES=ON
 ARG JOBS=
 # GPU arch(es) for ggml-cuda. Empty = ggml's portable default (sm_86/89/120/121
@@ -120,12 +119,9 @@ COPY README.md CONTRIBUTING.md /work/
 COPY docs /work/docs
 COPY config /work/config
 COPY models/index.json /work/models/index.json
-# Core submodules: ggml (every backend) and llama.cpp (NMT and VoiceChat;
-# copied unconditionally so the layer cache is stable).
-COPY ggml /work/ggml
+# llama.cpp provides ggml for every backend (and libllama for NMT and VoiceChat).
 COPY llama.cpp /work/llama.cpp
-COPY ggml-patches /work/ggml-patches
-COPY llama-patches /work/llama-patches
+COPY patches /work/patches
 COPY proto /work/proto
 COPY include /work/include
 COPY src /work/src
@@ -159,19 +155,6 @@ RUN if [ "${ENABLE_FLASHLIGHT}" = "ON" ]; then \
         PREFIX=/usr/local JOBS="${JOBS:-$(nproc)}" \
         bash /work/scripts/build_sentencepiece_static.sh \
         && rm -rf /work/.deps/sentencepiece-build; \
-    fi
-
-# Apply the project ggml patches (fused rel-pos attention, NVFP4 quantization,
-# norm fusion, dw-conv F16, skinny-q8, BF16 fusions, and CUDA correctness) onto the clean
-# vendored ggml. Idempotent: a working tree that already has them applied is
-# detected and skipped. Skipped entirely when ENABLE_GGML_PATCHES=OFF — the ASR
-# then builds against standard upstream ggml (see NEMO_SPEECH_GGML_PATCHED).
-RUN if [ "${ENABLE_GGML_PATCHES}" = "ON" ]; then bash /work/scripts/apply-ggml-patches.sh; fi
-
-# NMT and VoiceChat rely on the project's llama.cpp compatibility and
-# quantization patches. The patch script is idempotent for prepatched trees.
-RUN if [ "${ENABLE_NMT}" = "ON" ] || [ "${ENABLE_S2S}" = "ON" ]; then \
-        bash /work/scripts/apply-llama-patches.sh; \
     fi
 
 # NCCL disabled: single-GPU inference does not use multi-GPU collectives,
@@ -229,7 +212,7 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
     && install -Dm0644 /work/build/share/nemo-speech/model-index.json \
         /out/share/nemo-speech/model-index.json \
     && license_dir=/out/share/licenses/nemo-speech/third_party \
-    && install -Dm0644 /work/ggml/LICENSE "$license_dir/ggml/LICENSE" \
+    && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/ggml/LICENSE" \
     && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/llama.cpp/LICENSE" \
     && if [ "${ENABLE_GRPC}" = "ON" ]; then \
            install -Dm0644 /work/proto/riva-common/LICENSE \

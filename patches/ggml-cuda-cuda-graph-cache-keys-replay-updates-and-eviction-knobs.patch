@@ -1,0 +1,307 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: CUDA graph cache keys, replay updates and eviction knobs
+
+- Key cached graph executables by graph identity and structural shape, so
+  allocator reuse cannot select an executable for a different shape.
+- Refresh node parameters when a cached graph is replayed, so per-stream
+  state pointers that change every call keep the graph resident.
+- GGML_CUDA_GRAPH_EVICT_AFTER_MS, read when a backend is created, sets how
+  long an idle graph is kept (default 10 s; 0 keeps graphs resident).
+
+Upstream: the shape key is the follow-up requested in
+ggml-org/llama.cpp#28243 and the eviction knobs are a small candidate; replay
+updates are NeMo-specific.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f5f4465b5e0cade7888d67728b71d8d745eb1939..fbd855dd5ca483874abba3e17db15b77e1f15821 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -27,6 +27,7 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdio>
++#include <cstdlib>
+ #include <string>
+ #include <unordered_map>
+ #include <utility>
+@@ -1290,6 +1291,7 @@ struct ggml_cuda_graph {
+     size_t num_nodes = 0;
+     std::vector<cudaGraphNode_t> nodes;
+     bool disable_due_to_gpu_arch = false;
++    bool warmup_started = false;
+     bool warmup_complete = false;
+     uint64_t uid = 0;
+     int64_t last_used_time = 0;
+@@ -1308,6 +1310,23 @@ struct ggml_cuda_graph {
+ #endif
+ };
+ 
++struct ggml_cuda_graph_key {
++    const void * first_node_ptr = nullptr;
++    uint64_t     signature      = 0;
++
++    bool operator==(const ggml_cuda_graph_key & other) const {
++        return first_node_ptr == other.first_node_ptr && signature == other.signature;
++    }
++};
++
++struct ggml_cuda_graph_key_hash {
++    size_t operator()(const ggml_cuda_graph_key & key) const {
++        const size_t ptr_hash = std::hash<const void *>{}(key.first_node_ptr);
++        const size_t sig_hash = std::hash<uint64_t>{}(key.signature);
++        return ptr_hash ^ (sig_hash + 0x9e3779b97f4a7c15ULL + (ptr_hash << 6) + (ptr_hash >> 2));
++    }
++};
++
+ struct ggml_cuda_concurrent_event {
+     std::vector<cudaEvent_t> join_events;
+     cudaEvent_t              fork_event = nullptr;
+@@ -1472,20 +1491,34 @@ struct ggml_backend_cuda_context {
+     int curr_stream_no = 0;
+ 
+ #ifdef USE_CUDA_GRAPH
+-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
++    // The structural signature separates batch shapes and graph topologies even
++    // when a freed host tensor arena is recycled at the same first-node address.
++    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
+ 
+     int64_t last_graph_eviction_sweep = 0;
+ 
+-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
++    // Read when the backend is created, so an application can set it first.
++    // GGML_CUDA_GRAPH_EVICT_AFTER_MS=0 keeps captured graphs resident.
++    const int64_t graph_evict_after_us = graph_evict_after_us_from_env();
++
++    static int64_t graph_evict_after_us_from_env() {
++        const char * value = getenv("GGML_CUDA_GRAPH_EVICT_AFTER_MS");
++        if (value == nullptr || value[0] == '\0') {
++            return 10'000'000;
++        }
++        char * end = nullptr;
++        const long long ms = std::strtoll(value, &end, 10);
++        return end == value || *end != '\0' || ms < 0 ? 10'000'000 : (int64_t) ms * 1000;
++    }
++
++    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & graph_key) {
+         const int64_t time_now = ggml_time_us();
+ 
+-        // sweep every 5s, evicting cuda graphs unused for >=10s
+-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
++        // sweep every 5s, evicting cuda graphs unused for graph_evict_after_us
++        if (graph_evict_after_us > 0 && time_now - last_graph_eviction_sweep >= 5'000'000) {
+             last_graph_eviction_sweep = time_now;
+             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+-                if (time_now - it->second->last_used_time >= 10'000'000) {
++                if (time_now - it->second->last_used_time >= graph_evict_after_us) {
+                     it = cuda_graphs.erase(it);
+                 } else {
+                     ++it;
+@@ -1493,9 +1526,9 @@ struct ggml_backend_cuda_context {
+             }
+         }
+ 
+-        auto it = cuda_graphs.find(first_node_ptr);
++        auto it = cuda_graphs.find(graph_key);
+         if (it == cuda_graphs.end()) {
+-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
++            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
+         }
+         it->second->last_used_time = time_now;
+         return it->second.get();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1c0c25329d832ca97c327df4ab2329dddc2d5013..ee47bc09e20c299d8813080a48415a2e958d83d6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2606,19 +2606,92 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+     return use_cuda_graph;
+ }
+ 
+-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++static inline void ggml_cuda_graph_hash_mix(uint64_t & hash, uint64_t value) {
++    // Mix one machine word at a time. The original byte-at-a-time FNV loop
++    // serialized hundreds of thousands of dependent multiplies for large
++    // encoder graphs, and get_key runs in both graph_optimize and compute.
++    hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+ }
+ 
+-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
++static void ggml_cuda_graph_hash_tensor_descriptor(uint64_t & hash, const ggml_tensor * tensor) {
++    ggml_cuda_graph_hash_mix(hash, reinterpret_cast<uintptr_t>(tensor));
++    if (tensor == nullptr) {
++        return;
++    }
++    ggml_cuda_graph_hash_mix(hash, tensor->op);
++    ggml_cuda_graph_hash_mix(hash, tensor->type);
++    ggml_cuda_graph_hash_mix(hash, tensor->flags);
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        ggml_cuda_graph_hash_mix(hash, tensor->ne[d]);
++        ggml_cuda_graph_hash_mix(hash, tensor->nb[d]);
++    }
++    static_assert(sizeof(tensor->op_params) % sizeof(uint64_t) == 0);
++    for (size_t off = 0; off < sizeof(tensor->op_params); off += sizeof(uint64_t)) {
++        uint64_t word;
++        memcpy(&word, tensor->op_params + off, sizeof(word));
++        ggml_cuda_graph_hash_mix(hash, word);
++    }
++    ggml_cuda_graph_hash_mix(hash, reinterpret_cast<uintptr_t>(tensor->view_src));
++    ggml_cuda_graph_hash_mix(hash, tensor->view_offs);
++    for (int j = 0; j < GGML_MAX_SRC; ++j) {
++        const ggml_tensor * src = tensor->src[j];
++        ggml_cuda_graph_hash_mix(hash, reinterpret_cast<uintptr_t>(src));
++        if (src != nullptr) {
++            ggml_cuda_graph_hash_mix(hash, src->op);
++            ggml_cuda_graph_hash_mix(hash, src->type);
++            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++                ggml_cuda_graph_hash_mix(hash, src->ne[d]);
++                ggml_cuda_graph_hash_mix(hash, src->nb[d]);
++            }
++        }
++    }
++}
++
++static ggml_cuda_graph_key ggml_cuda_graph_get_key(const ggml_cgraph * cgraph) {
++    GGML_ASSERT(cgraph != nullptr && cgraph->n_nodes > 0);
++
++    // A first-node pointer alone is unsafe: Session's bounded shape cache can
++    // free a TensorContainer, after which the allocator may reuse that address
++    // for a different batch shape or graph topology. Node count plus the full
++    // endpoint descriptors discriminate stage, batch/time shape, strides, and
++    // observed topology-size changes without scanning thousands of internal
++    // nodes on every dispatch. Device data/buffer pointers remain updateable.
++    uint64_t signature = 14695981039346656037ULL;
++    ggml_cuda_graph_hash_mix(signature, cgraph->n_nodes);
++    ggml_cuda_graph_hash_mix(signature, cgraph->n_leafs);
++    ggml_cuda_graph_hash_tensor_descriptor(signature, cgraph->nodes[0]);
++    if (cgraph->n_nodes > 1) {
++        ggml_cuda_graph_hash_tensor_descriptor(signature, cgraph->nodes[cgraph->n_nodes - 1]);
++    }
++
++    return { cgraph->nodes[0], signature };
++}
++
++static const char * ggml_cuda_graph_tensor_name(const ggml_tensor * tensor) {
++    return tensor && tensor->name[0] ? tensor->name : "(unnamed)";
++}
++
++static void ggml_cuda_graph_log_event(
++        const char * func,
++        const char * event,
++        const ggml_cgraph * cgraph,
++        const ggml_cuda_graph_key & graph_key) {
++    const int n_nodes = cgraph ? cgraph->n_nodes : 0;
++    const ggml_tensor * first = n_nodes > 0 ? cgraph->nodes[0] : nullptr;
++    const ggml_tensor * last = n_nodes > 0 ? cgraph->nodes[n_nodes - 1] : nullptr;
++    GGML_LOG_DEBUG("%s: CUDA graph %s key=%p signature=%016" PRIx64 " uid=%" PRIu64
++            " nodes=%d first=%s last=%s\n",
++            func, event, graph_key.first_node_ptr, graph_key.signature, cgraph ? cgraph->uid : 0, n_nodes,
++            ggml_cuda_graph_tensor_name(first), ggml_cuda_graph_tensor_name(last));
++}
++
++static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const ggml_cuda_graph_key & graph_key) {
+     bool res = false;
+ 
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (cgraph->uid != 0 &&
+         cgraph->uid == graph->uid) {
+-        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
+         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
+         return false;
+     }
+@@ -2652,7 +2725,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+     return res;
+ }
+ 
+-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+ #if CUDART_VERSION >= 12000
+@@ -4321,7 +4394,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
+-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
++static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+@@ -4540,7 +4613,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
++static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (graph->graph == nullptr) {
+@@ -4563,7 +4636,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+-    const void * graph_key = nullptr;
++    ggml_cuda_graph_key graph_key = {};
+ 
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+@@ -4574,27 +4647,27 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     if (graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+-
+-            if (!graph->warmup_complete) {
+-                // Warmup: need at least 2 calls with no property change on the 2nd call
+-                if (!properties_changed) {
+-                    graph->warmup_complete = true;
+-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+-                    use_cuda_graph = true;
+-                    cuda_graph_update_required = true;
+-                }
+-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
++            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
++
++            if (!graph->warmup_started) {
++                // Execute one call directly so lazy kernel/library setup happens
++                // outside stream capture.  Cache/state addresses are expected to
++                // change between streaming calls, so stability is not a valid
++                // prerequisite for completing warmup.
++                graph->warmup_started = true;
++            } else if (!graph->warmup_complete) {
++                graph->warmup_complete = true;
++                ggml_cuda_graph_log_event(__func__, "warmup complete", cgraph, graph_key);
++                use_cuda_graph = true;
++                cuda_graph_update_required = true;
+             } else {
+-                // Post-warmup: normal CUDA graph operation
+-                if (properties_changed) {
+-                    // Properties changed - reset warmup, execute directly until stable again
+-                    graph->warmup_complete = false;
+-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+-                } else {
+-                    use_cuda_graph = true;
+-                    cuda_graph_update_required = graph->instance == nullptr;
+-                }
++                // CUDA graph topology is stable even when tensor/cache pointers
++                // rotate. Re-capture the current parameters and update the
++                // executable instead of invalidating it and falling back to
++                // repeated direct launches. cudaGraphExecUpdate() below safely
++                // re-instantiates if CUDA reports a topology incompatibility.
++                use_cuda_graph = true;
++                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+             }
+         }
+     }
+@@ -4733,7 +4806,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     }
+ 
+ #ifdef USE_CUDA_GRAPH
+-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
++    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
+     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ #else
+     const bool use_cuda_graph = false;

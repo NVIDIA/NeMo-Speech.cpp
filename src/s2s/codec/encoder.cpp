@@ -87,7 +87,7 @@ CodecEncodeModule::build_graph(gr::Session* s, gr::TensorBag in, gr::TensorConta
     auto ctx0 = tc->get_ctx_of_buffer_type(spec.buft);
     ggml_context* g = ctx0.ctx;
 
-    ggml_tensor* x = ggml_conv_1d(g, W(s, "enc.proj_in.weight"), spec.tensor, 1, 0, 1);
+    ggml_tensor* x = gr::conv_1d(g, W(s, "enc.proj_in.weight"), spec.tensor, 1, 0, 1);
     x = add_channel_bias(g, x, W_opt(s, "enc.proj_in.bias"));
 
     int block_idx = 0;
@@ -101,7 +101,7 @@ CodecEncodeModule::build_graph(gr::Session* s, gr::TensorBag in, gr::TensorConta
         const int rate = cfg_.rates[st];
         ggml_tensor* w = (st < n_stages - 1) ? W(s, fmt_name("enc.ds%d.weight", st))
                                              : W(s, "enc.bottleneck.weight");
-        x = ggml_conv_1d(g, w, x, rate, 0, 1);
+        x = gr::conv_1d(g, w, x, rate, 0, 1);
     }
     // x: (n_frames, L, B) -> latent (L, BT)
     ggml_tensor* r = ggml_cont(g, ggml_permute(g, x, 1, 0, 2, 3));

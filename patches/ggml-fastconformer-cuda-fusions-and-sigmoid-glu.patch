@@ -1,0 +1,882 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml: FastConformer CUDA fusions and sigmoid GLU
+
+- GGML_GLU_OP_SIGMOID (PyTorch nn.GLU) with CPU and CUDA implementations.
+- Macaron residual (SCALE + ADD), BatchNorm (+ transpose + SiLU) and
+  LayerNorm -> BF16/F16 cast epilogues, plus LayerNorm launch tuning.
+
+Used by the FastConformer encoder in CUDA builds with NEMO_SPEECH_GGML_PATCHED.
+
+Upstream: GGML_GLU_OP_SIGMOID is a candidate; the other fusions are
+NeMo-specific.
+
+Co-authored-by: anand-nv <105917641+anand-nv@users.noreply.github.com>
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 19ade01735e6c072fcb7752ef7955ac5d2afe19e..6197891dbb20ad7bfd322abe731cf6fed5162eb3 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -641,6 +641,7 @@ extern "C" {
+         GGML_GLU_OP_GEGLU_ERF,
+         GGML_GLU_OP_GEGLU_QUICK,
+         GGML_GLU_OP_SWIGLU_CLAMP,
++        GGML_GLU_OP_SIGMOID,
+ 
+         GGML_GLU_OP_COUNT,
+     };
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 4fb2e8b6f7236c95e66a0be167d531f154cfd4d1..01893e3bd07a2b98b110865a364216b56cd652d7 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2349,6 +2349,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                 case GGML_GLU_OP_SWIGLU_CLAMP:
++                case GGML_GLU_OP_SIGMOID:
+                     {
+                         n_tasks = n_threads;
+                     } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ba00a0a73ed8d3b42fc1e840d686918a05e9c327..b05475768dfe92655a33bf876895b2becbf30488 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -3030,6 +3030,149 @@ static void ggml_compute_forward_reglu(
+     }
+ }
+ 
++// ggml_compute_forward_sigmoid_glu
++
++static void ggml_compute_forward_sigmoid_glu_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    char * src0_d = (char *) src0->data;
++    char * src1_d = (char *) (src1 ? src1->data : src0->data);
++    const size_t src0_o = src0->nb[1];
++    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
++
++    GGML_ASSERT(ggml_is_contiguous_1(src0));
++    GGML_ASSERT(ggml_is_contiguous_1(dst));
++
++    if (src1) {
++        GGML_ASSERT(ggml_is_contiguous_1(src1));
++        GGML_ASSERT(src0->type == src1->type);
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
++    const int nr = ggml_nrows(src0);
++
++    GGML_ASSERT(dst->ne[0] == nc);
++    GGML_ASSERT(ggml_nrows(dst) == nr);
++
++    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
++
++    // rows per thread
++    const int dr = (nr + nth - 1)/nth;
++
++    // row range for this thread
++    const int ir0 = dr*ith;
++    const int ir1 = MIN(ir0 + dr, nr);
++
++    for (int i1 = ir0; i1 < ir1; i1++) {
++        float * src0_p = (float *) (src0_d + i1*src0_o);
++        float * src1_p = (float *) (src1_d + i1*src1_o);
++
++        if (!src1) {
++            src0_p += swapped ? nc : 0;
++            src1_p += swapped ? 0 : nc;
++        }
++
++        ggml_vec_sigmoid_glu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
++
++#ifndef NDEBUG
++        for (int k = 0; k < nc; k++) {
++            const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
++            GGML_UNUSED(x);
++            assert(!isnan(x));
++            assert(!isinf(x));
++        }
++#endif // NDEBUG
++    }
++}
++
++static void ggml_compute_forward_sigmoid_glu_f16(
++    const ggml_compute_params * params,
++    ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    char * src0_d = (char *) src0->data;
++    char * src1_d = (char *) (src1 ? src1->data : src0->data);
++    const size_t src0_o = src0->nb[1];
++    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
++
++    GGML_ASSERT(ggml_is_contiguous_1(src0));
++    GGML_ASSERT(ggml_is_contiguous_1(dst));
++
++    if (src1) {
++        GGML_ASSERT(ggml_is_contiguous_1(src1));
++        GGML_ASSERT(src0->type == src1->type);
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
++    const int nr = ggml_nrows(src0);
++
++    GGML_ASSERT(dst->ne[0] == nc);
++    GGML_ASSERT(ggml_nrows(dst) == nr);
++
++    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
++
++    // rows per thread
++    const int dr = (nr + nth - 1)/nth;
++
++    // row range for this thread
++    const int ir0 = dr*ith;
++    const int ir1 = MIN(ir0 + dr, nr);
++
++    for (int i1 = ir0; i1 < ir1; i1++) {
++        ggml_fp16_t * src0_p = (ggml_fp16_t *) (src0_d + i1*src0_o);
++        ggml_fp16_t * src1_p = (ggml_fp16_t *) (src1_d + i1*src1_o);
++
++        if (!src1) {
++            src0_p += swapped ? nc : 0;
++            src1_p += swapped ? 0 : nc;
++        }
++
++        ggml_vec_sigmoid_glu_f16(nc, (ggml_fp16_t *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
++
++#ifndef NDEBUG
++        for (int k = 0; k < nc; k++) {
++            const ggml_fp16_t x = ((ggml_fp16_t *) ((char *) dst->data + i1*( dst->nb[1])))[k];
++            const float v = GGML_FP16_TO_FP32(x);
++            GGML_UNUSED(v);
++            assert(!isnan(v));
++            assert(!isinf(v));
++        }
++#endif // NDEBUG
++    }
++}
++
++static void ggml_compute_forward_sigmoid_glu(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++
++    switch (src0->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_sigmoid_glu_f32(params, dst);
++            } break;
++        case GGML_TYPE_F16:
++            {
++                ggml_compute_forward_sigmoid_glu_f16(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_geglu
+ 
+ static void ggml_compute_forward_geglu_f32(
+@@ -10273,6 +10416,10 @@ void ggml_compute_forward_glu(
+             {
+                 ggml_compute_forward_swiglu_clamp(params, dst);
+             } break;
++        case GGML_GLU_OP_SIGMOID:
++            {
++                ggml_compute_forward_sigmoid_glu(params, dst);
++            } break;
+         default:
+             {
+                 GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 5de9cb5b7e0969bc10a99e40675ed35b0561637b..2a380b7d7345c79780c63ad708f1815f8ccf313c 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1411,6 +1411,19 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
+     }
+ }
+ 
++inline static void ggml_vec_sigmoid_glu_f32(const int n, float * y, const float * x, const float * g) {
++    for (int i = 0; i < n; ++i) {
++        y[i] = g[i] / (1.0f + expf(-x[i]));
++    }
++}
++
++inline static void ggml_vec_sigmoid_glu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
++    for (int i = 0; i < n; ++i) {
++        const float v = GGML_CPU_FP16_TO_FP32(x[i]);
++        y[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(g[i]) / (1.0f + expf(-v)));
++    }
++}
++
+ #ifdef GGML_GELU_FP16
+ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
+     uint16_t t;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4c0c0633dd66cc6f717d69cd9f74a1f5d0acc404..29bddaff6da1ee9f4f6aec73a89b4078641845ee 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2247,6 +2247,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                     ggml_cuda_op_swiglu_clamp(ctx, dst);
+                     break;
++                case GGML_GLU_OP_SIGMOID:
++                    ggml_cuda_op_sigmoid_glu(ctx, dst);
++                    break;
+                 default:
+                     return false;
+             }
+@@ -3623,6 +3626,111 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    const std::initializer_list<ggml_op> batch_norm_ops = {
++        GGML_OP_SUB, GGML_OP_ADD, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_MUL, GGML_OP_ADD
++    };
++    const bool batch_norm_ops_match =
++        i + (int) batch_norm_ops.size() <= cgraph->n_nodes &&
++        std::equal(
++            batch_norm_ops.begin(), batch_norm_ops.end(), cgraph->nodes + i,
++            [](ggml_op op, const ggml_tensor * tensor) { return op == tensor->op; });
++    const bool batch_norm_subgraph =
++        batch_norm_ops_match &&
++        ggml_can_fuse_subgraph(cgraph, i, batch_norm_ops, { i + 5 });
++    if (batch_norm_subgraph) {
++        ggml_tensor * sub      = cgraph->nodes[i];
++        ggml_tensor * var_add  = cgraph->nodes[i + 1];
++        ggml_tensor * sqrt     = cgraph->nodes[i + 2];
++        ggml_tensor * div      = cgraph->nodes[i + 3];
++        ggml_tensor * mul      = cgraph->nodes[i + 4];
++        ggml_tensor * out      = cgraph->nodes[i + 5];
++
++        const ggml_tensor * input = sub->src[0];
++        const ggml_tensor * mean  = sub->src[1];
++        const ggml_tensor * variance = nullptr;
++        const ggml_tensor * epsilon  = nullptr;
++        if (ggml_nelements(var_add->src[0]) == 1) {
++            epsilon = var_add->src[0];
++            variance = var_add->src[1];
++        } else if (ggml_nelements(var_add->src[1]) == 1) {
++            variance = var_add->src[0];
++            epsilon = var_add->src[1];
++        }
++
++        const ggml_tensor * weight =
++            mul->src[0] == div ? mul->src[1] :
++            mul->src[1] == div ? mul->src[0] : nullptr;
++        const ggml_tensor * bias =
++            out->src[0] == mul ? out->src[1] :
++            out->src[1] == mul ? out->src[0] : nullptr;
++
++        const int64_t channels = input->ne[1];
++        const bool graph_ok =
++            sqrt->src[0] == var_add &&
++            div->src[0] == sub && div->src[1] == sqrt;
++        const bool params_ok =
++            variance != nullptr && epsilon != nullptr && weight != nullptr && bias != nullptr &&
++            ggml_nelements(mean) == channels &&
++            ggml_nelements(variance) == channels &&
++            ggml_nelements(weight) == channels &&
++            ggml_nelements(bias) == channels;
++        const bool types_ok =
++            input->type == GGML_TYPE_F32 && mean->type == GGML_TYPE_F32 &&
++            variance != nullptr && variance->type == GGML_TYPE_F32 &&
++            epsilon != nullptr && epsilon->type == GGML_TYPE_F32 &&
++            weight != nullptr && weight->type == GGML_TYPE_F32 &&
++            bias != nullptr && bias->type == GGML_TYPE_F32 &&
++            sub->type == GGML_TYPE_F32 && var_add->type == GGML_TYPE_F32 &&
++            sqrt->type == GGML_TYPE_F32 && div->type == GGML_TYPE_F32 &&
++            mul->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32;
++        const bool layout_ok =
++            ggml_is_contiguous(input) && ggml_is_contiguous(mean) &&
++            variance != nullptr && ggml_is_contiguous(variance) &&
++            epsilon != nullptr && ggml_is_contiguous(epsilon) &&
++            weight != nullptr && ggml_is_contiguous(weight) &&
++            bias != nullptr && ggml_is_contiguous(bias) &&
++            ggml_is_contiguous(out) && ggml_are_same_shape(input, out);
++        const int out_node = i + 5;
++
++        const bool common_eligible =
++            graph_ok && params_ok && types_ok && layout_ok;
++        if (common_eligible &&
++            ggml_can_fuse_subgraph(
++                cgraph, i,
++                { GGML_OP_SUB, GGML_OP_ADD, GGML_OP_SQRT, GGML_OP_DIV, GGML_OP_MUL,
++                  GGML_OP_ADD, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_UNARY },
++                { i + 8 })) {
++            ggml_tensor * permute = cgraph->nodes[i + 6];
++            ggml_tensor * cont = cgraph->nodes[i + 7];
++            ggml_tensor * silu = cgraph->nodes[i + 8];
++            const bool transpose_ok =
++                permute->src[0] == out && cont->src[0] == permute && silu->src[0] == cont &&
++                ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
++                permute->type == GGML_TYPE_F32 && cont->type == GGML_TYPE_F32 &&
++                silu->type == GGML_TYPE_F32 &&
++                permute->ne[0] == input->ne[1] && permute->ne[1] == input->ne[0] &&
++                permute->ne[2] == input->ne[2] && permute->ne[3] == input->ne[3] &&
++                permute->nb[0] == out->nb[1] && permute->nb[1] == out->nb[0] &&
++                permute->nb[2] == out->nb[2] && permute->nb[3] == out->nb[3] &&
++                ggml_is_contiguous(cont) && ggml_is_contiguous(silu) &&
++                ggml_are_same_shape(cont, silu);
++            const int transpose_out_node = i + 8;
++            if (transpose_ok &&
++                ggml_cuda_check_fusion_memory_ranges(
++                    cgraph, i, 9, &transpose_out_node, 1)) {
++                ggml_cuda_op_batch_norm_silu_transpose_fused(
++                    *cuda_ctx, input, mean, variance, epsilon, weight, bias, silu);
++                return 8;
++            }
++        }
++        if (common_eligible &&
++            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, &out_node, 1)) {
++            ggml_cuda_op_batch_norm_fused(
++                *cuda_ctx, input, mean, variance, epsilon, weight, bias, out);
++            return 5;
++        }
++    }
++
+     //topk-moe
+     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+@@ -3756,6 +3864,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Macaron feed-forward residual: residual + scale * ff. Both tensors are
++    // contiguous F32 and have identical shapes, so materializing the scaled
++    // activation only creates an avoidable full-tensor round trip.
++    if (ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_ADD })) {
++        const ggml_tensor * scale_node = cgraph->nodes[i];
++        ggml_tensor * add_node = cgraph->nodes[i + 1];
++        const ggml_tensor * residual =
++            add_node->src[0] == scale_node ? add_node->src[1] :
++            add_node->src[1] == scale_node ? add_node->src[0] : nullptr;
++
++        const float bias = ggml_get_op_params_f32(scale_node, 1);
++        const bool eligible =
++            residual != nullptr && bias == 0.0f &&
++            scale_node->src[0]->type == GGML_TYPE_F32 &&
++            residual->type == GGML_TYPE_F32 && add_node->type == GGML_TYPE_F32 &&
++            ggml_are_same_shape(scale_node->src[0], residual) &&
++            ggml_are_same_shape(scale_node->src[0], add_node) &&
++            ggml_is_contiguous(scale_node->src[0]) &&
++            ggml_is_contiguous(residual) && ggml_is_contiguous(add_node);
++        if (eligible) {
++            ggml_cuda_op_scale_add(*cuda_ctx, scale_node, residual, add_node);
++            return 1;
++        }
++    }
++
+     // multi-(add or mul)
+     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+         int     n_fuse = 0;
+@@ -4231,21 +4364,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
+-    // A BF16 projection immediately following SiLU would otherwise launch an
+-    // F32 SiLU kernel and then a separate F32-to-BF16 input conversion. Emit
+-    // the same rounded BF16 activation directly in one pass.
++    // A 16-bit projection immediately following SiLU would otherwise launch an
++    // F32 SiLU kernel and then a separate input conversion.
+     if (ggml_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_CPY })) {
+         const ggml_tensor * silu_node = cgraph->nodes[i];
+         ggml_tensor * cast_node = cgraph->nodes[i + 1];
++        const bool cast_supported =
++            cast_node->type == GGML_TYPE_F16 ||
++            (cast_node->type == GGML_TYPE_BF16 && native_bf16);
+         const bool eligible =
+-            native_bf16 && ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
++            cast_supported && ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
+             cast_node->src[0] == silu_node &&
+             silu_node->src[0]->type == GGML_TYPE_F32 &&
+-            silu_node->type == GGML_TYPE_F32 && cast_node->type == GGML_TYPE_BF16 &&
++            silu_node->type == GGML_TYPE_F32 &&
+             ggml_are_same_shape(silu_node->src[0], cast_node) &&
+             ggml_is_contiguous(silu_node->src[0]) && ggml_is_contiguous(cast_node);
+         if (eligible) {
+-            ggml_cuda_op_silu_f32_to_bf16(*cuda_ctx, silu_node, cast_node);
++            ggml_cuda_op_silu_f32_to_16(*cuda_ctx, silu_node, cast_node);
+             return 1;
+         }
+     }
+@@ -4386,6 +4521,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
++    // LayerNorm affine followed by a 16-bit projection. Store the affine result
++    // directly in the projection's input precision instead of writing F32 and
++    // launching a second full-tensor conversion.
++    if (ggml_can_fuse(cgraph, i,
++            { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_CPY })) {
++        ggml_tensor * norm = cgraph->nodes[i];
++        ggml_tensor * mul  = cgraph->nodes[i + 1];
++        ggml_tensor * add  = cgraph->nodes[i + 2];
++        ggml_tensor * cast = cgraph->nodes[i + 3];
++        const ggml_tensor * gamma =
++            mul->src[0] == norm ? mul->src[1] : mul->src[0];
++        const ggml_tensor * beta =
++            add->src[0] == mul ? add->src[1] : add->src[0];
++        const bool cast_supported =
++            cast->type == GGML_TYPE_F16 ||
++            (cast->type == GGML_TYPE_BF16 && native_bf16);
++        const bool eligible =
++            cast_supported && cast->src[0] == add && norm->src[0]->type == GGML_TYPE_F32 &&
++            norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
++            add->type == GGML_TYPE_F32 &&
++            gamma->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 &&
++            ggml_nelements(gamma) == norm->ne[0] &&
++            ggml_nelements(beta) == norm->ne[0] &&
++            ggml_is_contiguous(gamma) && ggml_is_contiguous(beta) &&
++            ggml_is_contiguous(mul) && ggml_is_contiguous(add) &&
++            ggml_is_contiguous(cast) && ggml_are_same_shape(norm, cast);
++        if (eligible) {
++            ggml_cuda_op_norm_fused(*cuda_ctx, norm, mul, add, cast);
++            return 3;
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+@@ -5436,6 +5603,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                 case GGML_GLU_OP_SWIGLU_CLAMP:
++                case GGML_GLU_OP_SIGMOID:
+                     return ggml_is_contiguous_1(op->src[0]);
+                 default:
+                     return false;
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 8d2c036b6b414d8ba4d05b61382855b3da4a99b0..142650af5e8b4b7cd3c38235016bb4541c19fbcc 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -43,9 +44,9 @@ static __global__ void norm_f32(
+ // to ne0-length vectors broadcast over rows/channels/samples (the standard
+ // LayerNorm affine), enforced by ggml_cuda_can_fuse — this keeps indexing
+ // trivial instead of replicating rms_norm's general broadcast machinery.
+-template <int block_size, bool do_add>
++template <int block_size, bool do_add, typename T>
+ static __global__ void norm_mul_add_f32(
+-        const float * x, const float * mul, const float * add, float * dst, const int ncols,
++        const float * x, const float * mul, const float * add, T * dst, const int ncols,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+     const int nrows     = gridDim.x;
+     const int nchannels = gridDim.y;
+@@ -78,10 +79,65 @@ static __global__ void norm_mul_add_f32(
+         if constexpr (do_add) {
+             v += add[col];
+         }
+-        dst[col] = v;
++        dst[col] = (T) v;
+     }
+ }
+ 
++static __global__ void batch_norm_f32(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels) {
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= nelements) {
++        return;
++    }
++
++    const int64_t channel = (i / ntime) % nchannels;
++    const float centered = __fsub_rn(x[i], mean[channel]);
++    const float denominator = sqrtf(__fadd_rn(variance[channel], epsilon[0]));
++    const float normalized = __fdiv_rn(centered, denominator);
++    dst[i] = __fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]);
++}
++
++static __global__ void batch_norm_silu_transpose_f32(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels) {
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= nelements) {
++        return;
++    }
++
++    const int64_t channel = (i / ntime) % nchannels;
++    const int64_t time = i % ntime;
++    const int64_t sample = i / (ntime * nchannels);
++    const float centered = __fsub_rn(x[i], mean[channel]);
++    const float denominator = sqrtf(__fadd_rn(variance[channel], epsilon[0]));
++    const float normalized = __fdiv_rn(centered, denominator);
++    const float affine = __fadd_rn(__fmul_rn(normalized, weight[channel]), bias[channel]);
++    dst[channel + nchannels * (time + ntime * sample)] = ggml_cuda_op_silu_single(affine);
++}
++
++static void batch_norm_f32_cuda(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels, cudaStream_t stream) {
++    constexpr int block_size = 256;
++    const int64_t block_count = (nelements + block_size - 1) / block_size;
++    batch_norm_f32<<<block_count, block_size, 0, stream>>>(
++        x, mean, variance, epsilon, weight, bias, dst, nelements, ntime, nchannels);
++}
++
++static void batch_norm_silu_transpose_f32_cuda(
++        const float * x, const float * mean, const float * variance, const float * epsilon,
++        const float * weight, const float * bias, float * dst, int64_t nelements,
++        int64_t ntime, int64_t nchannels, cudaStream_t stream) {
++    constexpr int block_size = 256;
++    const int64_t block_count = (nelements + block_size - 1) / block_size;
++    batch_norm_silu_transpose_f32<<<block_count, block_size, 0, stream>>>(
++        x, mean, variance, epsilon, weight, bias, dst, nelements, ntime, nchannels);
++}
++
+ template <int block_size>
+ static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
+     // blockIdx.x: num_groups idx
+@@ -334,27 +390,50 @@ static void norm_f32_cuda(
+     }
+ }
+ 
+-static void norm_mul_add_f32_cuda(
+-        const float * x, const float * mul, const float * add, float * dst, const int ncols, const int nrows,
++template <typename T>
++static void norm_mul_add_cuda(
++        const float * x, const float * mul, const float * add, T * dst, const int ncols, const int nrows,
+         const int nchannels, const int nsamples, const int64_t stride_row, const int64_t stride_channel,
+         const int64_t stride_sample, const float eps, cudaStream_t stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+-    if (ncols < 1024) {
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (ncols == 768 && WARP_SIZE == 32) {
++        constexpr int block_size = 384;
++        if (add) {
++            norm_mul_add_f32<block_size, true, T>
++                <<<blocks_num, block_size, 12 * sizeof(float2), stream>>>(
++                    x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        } else {
++            norm_mul_add_f32<block_size, false, T>
++                <<<blocks_num, block_size, 12 * sizeof(float2), stream>>>(
++                    x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        }
++    } else if (ncols < 1024) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+         if (add) {
+-            norm_mul_add_f32<WARP_SIZE, true><<<blocks_num, block_dims, 0, stream>>>(
++            norm_mul_add_f32<WARP_SIZE, true, T><<<blocks_num, block_dims, 0, stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        } else {
++            norm_mul_add_f32<WARP_SIZE, false, T><<<blocks_num, block_dims, 0, stream>>>(
++                x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
++        }
++    } else if (ncols == 1024 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
++        // Four elements per thread balances reduction work and occupancy.
++        const dim3 block_dims(256, 1, 1);
++        if (add) {
++            norm_mul_add_f32<256, true, T><<<blocks_num, block_dims, 8 * sizeof(float2), stream>>>(
+                 x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         } else {
+-            norm_mul_add_f32<WARP_SIZE, false><<<blocks_num, block_dims, 0, stream>>>(
++            norm_mul_add_f32<256, false, T><<<blocks_num, block_dims, 8 * sizeof(float2), stream>>>(
+                 x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         }
+     } else {
+         const dim3 block_dims(1024, 1, 1);
+         if (add) {
+-            norm_mul_add_f32<1024, true><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
++            norm_mul_add_f32<1024, true, T><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
+                 x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         } else {
+-            norm_mul_add_f32<1024, false><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
++            norm_mul_add_f32<1024, false, T><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
+                 x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+         }
+     }
+@@ -531,7 +610,7 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ // or add_tensor), mirroring ggml_cuda_op_rms_norm_fused(_add). Eligibility
+ // (row-vector operands, F32, contiguity) is enforced in ggml_cuda_can_fuse.
+ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+-                             ggml_tensor * add_tensor) {
++                             ggml_tensor * add_tensor, ggml_tensor * cast_dst) {
+     const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
+     float eps = 0.0f;
+     memcpy(&eps, dst->op_params, sizeof(float));
+@@ -575,8 +654,68 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     const int64_t s02 = norm_src->nb[2] / ts0;
+     const int64_t s03 = norm_src->nb[3] / ts0;
+ 
+-    norm_mul_add_f32_cuda(
+-        src0_d, mul_d, add_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++    if (cast_dst != nullptr) {
++        GGML_ASSERT(cast_dst->type == GGML_TYPE_BF16 || cast_dst->type == GGML_TYPE_F16);
++        GGML_ASSERT(ggml_is_contiguous(cast_dst));
++        GGML_ASSERT(ggml_are_same_shape(dst, cast_dst));
++        if (cast_dst->type == GGML_TYPE_BF16) {
++            norm_mul_add_cuda(
++                src0_d, mul_d, add_d, (nv_bfloat16 *) cast_dst->data,
++                ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++        } else {
++            norm_mul_add_cuda(
++                src0_d, mul_d, add_d, (half *) cast_dst->data,
++                ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++        }
++    } else {
++        norm_mul_add_cuda(
++            src0_d, mul_d, add_d, dst_d,
++            ne00, ne01, ne02, ne03, s01, s02, s03, eps, ctx.stream());
++    }
++}
++
++void ggml_cuda_op_batch_norm_fused(ggml_backend_cuda_context & ctx,
++                                   const ggml_tensor *         input,
++                                   const ggml_tensor *         mean,
++                                   const ggml_tensor *         variance,
++                                   const ggml_tensor *         epsilon,
++                                   const ggml_tensor *         weight,
++                                   const ggml_tensor *         bias,
++                                   ggml_tensor *               dst) {
++    batch_norm_f32_cuda(
++        (const float *) input->data,
++        (const float *) mean->data,
++        (const float *) variance->data,
++        (const float *) epsilon->data,
++        (const float *) weight->data,
++        (const float *) bias->data,
++        (float *) dst->data,
++        ggml_nelements(input),
++        input->ne[0],
++        input->ne[1],
++        ctx.stream());
++}
++
++void ggml_cuda_op_batch_norm_silu_transpose_fused(ggml_backend_cuda_context & ctx,
++                                                  const ggml_tensor *         input,
++                                                  const ggml_tensor *         mean,
++                                                  const ggml_tensor *         variance,
++                                                  const ggml_tensor *         epsilon,
++                                                  const ggml_tensor *         weight,
++                                                  const ggml_tensor *         bias,
++                                                  ggml_tensor *               dst) {
++    batch_norm_silu_transpose_f32_cuda(
++        (const float *) input->data,
++        (const float *) mean->data,
++        (const float *) variance->data,
++        (const float *) epsilon->data,
++        (const float *) weight->data,
++        (const float *) bias->data,
++        (float *) dst->data,
++        ggml_nelements(input),
++        input->ne[0],
++        input->ne[1],
++        ctx.stream());
+ }
+ 
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 20ecaa2d9e7536c3f19d111ade42fa1f2497b38d..f580ae90bf032cfdddb13ba999265be80ca8bb0e 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -5,7 +5,25 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ // Fused LayerNorm + row-vector mul (gamma) + optional row-vector add (beta).
+ // add_tensor may be nullptr (norm+mul only).
+ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+-                             ggml_tensor * add_tensor);
++                             ggml_tensor * add_tensor, ggml_tensor * cast_dst = nullptr);
++
++void ggml_cuda_op_batch_norm_fused(ggml_backend_cuda_context & ctx,
++                                   const ggml_tensor *         input,
++                                   const ggml_tensor *         mean,
++                                   const ggml_tensor *         variance,
++                                   const ggml_tensor *         epsilon,
++                                   const ggml_tensor *         weight,
++                                   const ggml_tensor *         bias,
++                                   ggml_tensor *               dst);
++
++void ggml_cuda_op_batch_norm_silu_transpose_fused(ggml_backend_cuda_context & ctx,
++                                                  const ggml_tensor *         input,
++                                                  const ggml_tensor *         mean,
++                                                  const ggml_tensor *         variance,
++                                                  const ggml_tensor *         epsilon,
++                                                  const ggml_tensor *         weight,
++                                                  const ggml_tensor *         bias,
++                                                  ggml_tensor *               dst);
+ 
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+diff --git a/ggml/src/ggml-cuda/scale.cu b/ggml/src/ggml-cuda/scale.cu
+index 7b2e59a4383f2bb2c3c63f8f132193cbfb9d8122..d9f1af8c3b6ffba577fc24ac9a0f30253961ad7b 100644
+--- a/ggml/src/ggml-cuda/scale.cu
++++ b/ggml/src/ggml-cuda/scale.cu
+@@ -35,3 +35,39 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     scale_f32_cuda(src0_d, dst_d, scale, bias, ggml_nelements(src0), stream);
+ }
++
++static __global__ void scale_add_f32(
++        const float * __restrict__ x, const float * __restrict__ residual,
++        float * __restrict__ dst, const float scale, const int64_t nelements) {
++    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t stride = (int64_t) blockDim.x * gridDim.x;
++
++    for (int64_t i = tid; i < nelements; i += stride) {
++        dst[i] = residual[i] + scale * x[i];
++    }
++}
++
++void ggml_cuda_op_scale_add(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * scale_node,
++        const ggml_tensor * residual, ggml_tensor * dst) {
++    const ggml_tensor * x = scale_node->src[0];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(residual));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(ggml_are_same_shape(x, residual));
++    GGML_ASSERT(ggml_are_same_shape(x, dst));
++
++    const float scale = ggml_get_op_params_f32(scale_node, 0);
++    const float bias  = ggml_get_op_params_f32(scale_node, 1);
++    GGML_ASSERT(bias == 0.0f);
++
++    const int64_t nelements = ggml_nelements(x);
++    const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
++    scale_add_f32<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, ctx.stream()>>>(
++        (const float *) x->data, (const float *) residual->data,
++        (float *) dst->data, scale, nelements);
++}
+diff --git a/ggml/src/ggml-cuda/scale.cuh b/ggml/src/ggml-cuda/scale.cuh
+index 8ff75c8298b0207e81fff8736b39c0260d246ee1..16fe10ab7359f843b7946a2bdada339d4d540fe9 100644
+--- a/ggml/src/ggml-cuda/scale.cuh
++++ b/ggml/src/ggml-cuda/scale.cuh
+@@ -3,3 +3,7 @@
+ #define CUDA_SCALE_BLOCK_SIZE 256
+ 
+ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_op_scale_add(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * scale_node,
++    const ggml_tensor * residual, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 0b908345a1a5ba0424979d0dde4c0b94751de898..4ed4dc65e937d3bb8edba77f7fa25d652cf036e7 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -186,11 +186,20 @@ void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary<op_silu>(ctx, dst);
+ }
+ 
++static __global__ void silu_f32_to_f16(
++        const float * __restrict__ x, half * __restrict__ dst,
++        const int64_t nelements) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < nelements) {
++        dst[i] = __float2half(op_silu(x[i]));
++    }
++}
++
+ static __global__ void silu_f32_to_bf16(
+         const float * __restrict__ x, nv_bfloat16 * __restrict__ dst,
+         const int64_t nelements) {
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+     if (i < nelements) {
+         dst[i] = __float2bfloat16(op_silu(x[i]));
+     }
+@@ -200,21 +209,26 @@ static __global__ void silu_f32_to_bf16(
+ #endif
+ }
+ 
+-void ggml_cuda_op_silu_f32_to_bf16(
++void ggml_cuda_op_silu_f32_to_16(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * silu_node,
+         ggml_tensor * dst) {
+     const ggml_tensor * src = silu_node->src[0];
+     GGML_ASSERT(src->type == GGML_TYPE_F32);
+     GGML_ASSERT(silu_node->type == GGML_TYPE_F32);
+-    GGML_ASSERT(dst->type == GGML_TYPE_BF16);
++    GGML_ASSERT(dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_F16);
+     GGML_ASSERT(ggml_are_same_shape(src, dst));
+     GGML_ASSERT(ggml_is_contiguous(src));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
+     const int64_t nelements = ggml_nelements(src);
+     const int64_t num_blocks = (nelements + CUDA_SILU_BLOCK_SIZE - 1) / CUDA_SILU_BLOCK_SIZE;
+-    silu_f32_to_bf16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
+-        (const float *) src->data, (nv_bfloat16 *) dst->data, nelements);
++    if (dst->type == GGML_TYPE_BF16) {
++        silu_f32_to_bf16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
++            (const float *) src->data, (nv_bfloat16 *) dst->data, nelements);
++    } else {
++        silu_f32_to_f16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
++            (const float *) src->data, (half *) dst->data, nelements);
++    }
+ }
+ 
+ void ggml_cuda_op_tanh(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -380,6 +394,10 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
+ }
+ 
++void ggml_cuda_op_sigmoid_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_op_unary_gated<op_sigmoid>(ctx, dst);
++}
++
+ void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_op_unary_gated<op_gelu_erf>(ctx, dst);
+ }
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 5c39ccb2a05d57a82b70ffb445c0e7977e5f2f47..7b9148e42741d11a05fe452d0df55089d3a5b4f0 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -31,7 +31,7 @@ void ggml_cuda_op_gelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+-void ggml_cuda_op_silu_f32_to_bf16(
++void ggml_cuda_op_silu_f32_to_16(
+     ggml_backend_cuda_context & ctx, const ggml_tensor * silu_node, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+@@ -84,6 +84,8 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_sigmoid_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 81ecb230f6f88ff0f58292f6b4283e552f7ada39..3aaa06603030c43ee8dfe72a2170272327e3f708 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1259,9 +1259,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
+     "GEGLU_ERF",
+     "GEGLU_QUICK",
+     "SWIGLU_CLAMP",
++    "SIGMOID_GLU",
+ };
+ 
+-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
++static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
+ 
+ static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
+ static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");

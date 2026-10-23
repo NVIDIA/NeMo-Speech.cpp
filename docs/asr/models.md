@@ -146,22 +146,33 @@ package), or whisper.cpp's bundled checkpoint for the offline path.
 
 ### Sortformer speaker diarization
 
-Used for ASR speaker tags and standalone `nemo-speech diarize`. Sortformer v2
-supports up to four speakers, with stateful streaming for long recordings and
-full-attention inference for short recordings. Convert it with:
+Used for ASR speaker tags and standalone `nemo-speech diarize`. Both models
+stream long recordings and run full attention over short ones.
+
+| Model | Name in presets | Speakers | Output frame |
+|---|---|---|---|
+| [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) | V2 | 4 | 80 ms |
+| [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) | V3 | 8 | 10 ms |
 
 ```bash
 python3 convert_model.py nvidia/diar_streaming_sortformer_4spk-v2 \
     --outfile models/sortformer-v2-f32.gguf
+python3 convert_model.py nvidia/Nemotron-3-Diarization \
+    --outfile models/Nemotron-3-Diarization.q8_0.gguf --outtype q8_0
 # --outtype f32 is the default; f16 and q8_0 produce smaller artifacts.
 ```
 
-Enable with `--diar-model models/sortformer-v2-f32.gguf`; streaming geometry
-comes from `--diar-preset` (see [configuration](configuration.md)). Segment
-postprocessing defaults follow the checkpoint and may need tuning for your
-audio.
+Enable with `--diar-model MODEL.gguf`. Default streaming geometry, in 80 ms
+frames:
 
-Source: [nvidia/diar_streaming_sortformer_4spk-v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2).
+| Model | Chunk | Right context | FIFO | Speaker cache | Cache update period |
+|---|---|---|---|---|---|
+| V2 | 20 | 0 | 80 | 160 | 80 |
+| V3 | 13 | 1 | 80 | 264 | 40 |
+
+Override it with `--diar-preset` or the `asr.diar.*` keys (see
+[configuration](configuration.md)). Segment postprocessing defaults follow the
+checkpoint and may need tuning for your audio.
 
 ### PnC (punctuation + capitalization)
 

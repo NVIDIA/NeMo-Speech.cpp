@@ -4,7 +4,11 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
 reviews:
-  profile: assertive
+  profile: chill
+  # Generate the summary, and put it in the walkthrough comment instead of the PR
+  # description. (high_level_summary: false would disable it entirely.)
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
   auto_review:
     enabled: true
     auto_incremental_review: true
@@ -12,3 +16,23 @@ reviews:
     drafts: true
     base_branches:
       - ".*"
+  path_instructions:
+    - path: "**/*.{cu,cuh,cpp,c,h,hpp}"
+      instructions: |
+        Prioritize correctness, performance and portability:
+        - Correctness: races, uninitialized or stale state, edge cases (empty, masked,
+          boundary sizes), numerical stability, and fallback paths that differ from the fast
+          path.
+        - Performance: regressions on hot paths, redundant work, unnecessary allocations or
+          synchronization, and caches or reuse that do not actually take effect.
+        - Portability: assumptions tied to one GPU, architecture, backend or platform; hardware
+          limits must be queried or guarded, with a working fallback.
+    - path: "patches/**"
+      instructions: |
+        Patches to the pinned llama.cpp submodule. Apply the same correctness, performance and
+        portability checks; also check that op preconditions match what the kernels support
+        and that the patch series stays consistent.
+    - path: "{BENCHMARK.md,README.md,docs/**,app/bench*}"
+      instructions: |
+        Check that measurements are sound and that documented numbers, defaults and flags match
+        the code.

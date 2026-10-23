@@ -12,7 +12,7 @@ JOBS="${JOBS:-8}"
 JOBS="$(( JOBS < 4 ? JOBS : 4 ))"
 SOURCE="$WORK/source"
 BUILD="$WORK/build"
-COMMIT=17d7580d6407802f85855d2cc9190634e2c95624
+COMMIT=31646a467d2051eb904e0b45de3a73e91fe1c1e3
 
 if [ ! -d "$SOURCE/.git" ]; then
     git clone --filter=blob:none --no-checkout https://github.com/google/sentencepiece.git "$SOURCE"
@@ -32,7 +32,8 @@ install -m 0644 "$BUILD/src/libsentencepiece.a" "$PREFIX/lib/libsentencepiece.a"
 install -m 0644 "$SOURCE/src/sentencepiece_processor.h" "$PREFIX/include/sentencepiece_processor.h"
 
 LICENSE_DIR="$PREFIX/share/licenses/nemo-speech/third_party/sentencepiece"
-install -Dm0644 "$SOURCE/LICENSE" "$LICENSE_DIR/LICENSE"
-install -Dm0644 "$SOURCE/third_party/absl/LICENSE" "$LICENSE_DIR/absl-LICENSE"
-install -Dm0644 "$SOURCE/third_party/darts_clone/LICENSE" "$LICENSE_DIR/darts-clone-LICENSE"
-install -Dm0644 "$SOURCE/third_party/protobuf-lite/LICENSE" "$LICENSE_DIR/protobuf-lite-LICENSE"
+install -d "$LICENSE_DIR"
+install -m 0644 "$SOURCE/LICENSE" "$LICENSE_DIR/LICENSE"
+install -m 0644 "$SOURCE/third_party/absl/LICENSE" "$LICENSE_DIR/absl-LICENSE"
+install -m 0644 "$SOURCE/third_party/darts_clone/LICENSE" "$LICENSE_DIR/darts-clone-LICENSE"
+install -m 0644 "$SOURCE/third_party/protobuf-lite/LICENSE" "$LICENSE_DIR/protobuf-lite-LICENSE"

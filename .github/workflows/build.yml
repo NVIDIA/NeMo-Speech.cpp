@@ -4,6 +4,7 @@ name: Build and Test
 # model-free ctest suite, then a CLI smoke test with real models.
 #
 # Coverage per job:
+#   Patch series - patches/ applies to the pinned llama.cpp in exported form
 #   Linux CPU    - build, ctest, CPU inference
 #   macOS Metal  - Metal backend COMPILE AND LINK only; inference runs on CPU.
 #                  The hosted macOS VM's paravirtual GPU cannot run ggml Metal.
@@ -28,6 +29,25 @@ env:
   NEMO_SPEECH_MODEL_DIR: ${{ github.workspace }}/.ci-models
 
 jobs:
+  patch-series:
+    name: Patch series
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Check patches/
+        # The series must apply to the pinned llama.cpp and be exactly what
+        # scripts/llama-patches.sh export produces.
+        run: scripts/llama-patches.sh check
+
   linux-cpu:
     name: Linux CPU
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -40,8 +60,8 @@ jobs:
           persist-credentials: false
 
       - name: Initialize submodules
-        # llama.cpp is needed only for the vendored miniaudio header.
-        run: git submodule update --init --depth 1 ggml llama.cpp
+        # llama.cpp also provides ggml.
+        run: git submodule update --init --depth 1 llama.cpp
 
       - name: Install dependencies
         run: |
@@ -86,7 +106,7 @@ jobs:
           persist-credentials: false
 
       - name: Initialize submodules
-        run: git submodule update --init --depth 1 ggml llama.cpp
+        run: git submodule update --init --depth 1 llama.cpp
 
       - name: Install dependencies
         # Homebrew's sentencepiece header includes abseil, which the formula
@@ -94,8 +114,8 @@ jobs:
         run: brew install bash ninja sentencepiece abseil
 
       - name: Configure
-        # The runner's default shell is Apple's bash 3.2; configure.sh and
-        # apply-ggml-patches.sh need bash 4+, so run them under Homebrew bash.
+        # The runner's default shell is Apple's bash 3.2; configure.sh needs
+        # bash 4+, so run it under Homebrew bash.
         shell: /opt/homebrew/bin/bash -e {0}
         run: |
           scripts/configure.sh metal-speech \
@@ -148,7 +168,7 @@ jobs:
           persist-credentials: false
 
       - name: Initialize submodules
-        run: git submodule update --init --depth 1 ggml llama.cpp
+        run: git submodule update --init --depth 1 llama.cpp
 
       - name: Install Ninja
         shell: pwsh

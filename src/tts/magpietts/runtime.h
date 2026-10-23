@@ -32,8 +32,8 @@ struct MagpieRuntimeConfig {
     std::string magpie_model;
     std::string codec_model;
     int speaker = 0;
-    int threads = 4;
-    int codec_threads = 0;
+    int threads = 0;        // 0 = min(8, hardware threads)
+    int codec_threads = 0;  // 0 = threads
     int seed = -1;
     int steps = -1;
     int top_k = -1;

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <string>
+
 int command_transcribe(int argc, char** argv);
 int command_diarize(int argc, char** argv);
 int command_translate(int argc, char** argv);
@@ -22,3 +24,15 @@ void print_model_help(const char* program);
 void print_doctor_help(const char* program);
 void print_health_help(const char* program);
 void print_serve_help(const char* program);
+
+#if defined(NEMO_SPEECH_CLI_TTS)
+namespace nemo_speech::tts {
+struct MagpieTtsServerConfig;
+struct SynthesizerConfig;
+}  // namespace nemo_speech::tts
+
+// Resolve model references and apply a --device choice to a parsed TTS config.
+nemo_speech::tts::SynthesizerConfig make_synthesizer_config(
+    nemo_speech::tts::MagpieTtsServerConfig parsed, const std::string& device_name,
+    bool device_set);
+#endif

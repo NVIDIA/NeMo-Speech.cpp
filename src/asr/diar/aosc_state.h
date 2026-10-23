@@ -19,19 +19,27 @@
 
 namespace nemo_speech::asr {
 
-// Streaming geometry in 80 ms encoder frames. Prefer the named presets over
-// setting individual fields.
+// Streaming geometry in coarse encoder frames (80 ms for both v2 and v3).
+// V3's public predictions are upsampled to 10 ms; its AOSC state remains on
+// this coarse grid. Prefer the named presets over setting individual fields.
 struct DiarGeometry {
-    int spkcache_len = 160;           // speaker cache capacity
-    int fifo_len = 80;                // FIFO capacity
-    int chunk_len = 20;               // new frames consumed per step (1.6 s)
-    int spkcache_update_period = 80;  // FIFO pop on overflow (riva refresh_rate=0)
-    int chunk_left_context = 0;
-    int chunk_right_context = 0;
+    // -1 means unspecified, independently for each field. Resolve before use
+    // so explicit values (including V2 defaults and zero contexts) survive.
+    int spkcache_len = -1;
+    int fifo_len = -1;
+    int chunk_len = -1;
+    int spkcache_update_period = -1;
+    int chunk_left_context = -1;
+    int chunk_right_context = -1;
 
     // The "offline" preset still uses AOSC streaming with larger chunks and caches.
-    static DiarGeometry riva_streaming() { return {}; }
+    static DiarGeometry riva_streaming() { return {160, 80, 20, 80, 0, 0}; }
     static DiarGeometry riva_offline() { return {312, 100, 100, 100, 0, 0}; }
+    // Low-latency V3 streaming default: 1.04 s center chunk, no left context,
+    // 80 ms right context, speaker cache 264, FIFO 80, refresh 40 (80 ms grid).
+    static DiarGeometry v3_streaming() { return {264, 80, 13, 40, 0, 1}; }
+    static DiarGeometry v3_offline() { return {264, 0, 264, 188, 1, 1}; }
+    DiarGeometry resolved(bool is_v3) const;
     // Throws std::invalid_argument for unknown names.
     static DiarGeometry preset(const std::string& name);
 
@@ -45,11 +53,16 @@ struct DiarGeometry {
 // then its probability is folded into the strongest established channel.
 class ChannelBirthGate {
    public:
+    // Maximum retrospective relabeling window, on the V2 output frame grid.
+    static constexpr int revision_frames = 128;
     explicit ChannelBirthGate(int n_spk);
 
     void reset();
     void append(const std::vector<float>& raw, std::vector<float>& timeline);
     bool is_established(int speaker) const;
+    // Frontier before which no future birth can change a frame's top speaker:
+    // the first retained frame where an unborn channel is the raw winner.
+    int64_t settled_frames() const;
 
    private:
     bool observe(const float* probs);
@@ -67,7 +80,9 @@ class ChannelBirthGate {
 
 class AoscState {
    public:
-    AoscState(const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim);
+    AoscState(
+        const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim,
+        const std::vector<float>& learned_silence = {});
 
     // One streaming update after a model chunk.
     //   chunk_embs: (t3, emb_dim) pre-encode embeddings of the whole window
@@ -105,6 +120,7 @@ class AoscState {
     int fifo_frames_ = 0;
     std::vector<float> mean_sil_emb_;  // emb_dim
     int64_t n_sil_frames_ = 0;
+    bool use_learned_silence_ = false;
 };
 
 }  // namespace nemo_speech::asr

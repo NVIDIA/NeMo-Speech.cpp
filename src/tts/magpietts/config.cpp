@@ -135,7 +135,9 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
     p.Register("magpie-model", &c.magpie_model, "MagpieTTS GGUF token generator path");
     p.Register("codec-model", &c.codec_model, "NanoCodec decoder GGUF path");
     p.Register("speaker", &c.speaker, "Default baked speaker index");
-    p.Register("threads", &c.threads, "CPU threads for Magpie and codec", {"--threads"});
+    p.Register(
+        "threads", &c.threads, "CPU threads for Magpie and codec (0 = min(8, hardware threads))",
+        {"--threads"});
     p.Register("codec-threads", &c.codec_threads, "Codec CPU threads; 0 uses threads");
     p.Register("seed", &c.seed, "Default RNG seed; -1 uses current time");
     p.Register("steps", &c.steps, "Maximum decoder frames; -1 uses model default");

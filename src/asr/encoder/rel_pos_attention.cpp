@@ -110,8 +110,9 @@ RelPositionalEncoding::set_data(Session* session) {
     // Prefer GGUF-embedded PE (produced by convert_model.py). Fall back
     // to external pe.bin for legacy tdt-0.6b flow.
     if (session->gguf_loader != nullptr && session->gguf_loader->has_tensor(name + ".pe")) {
-        auto data = session->gguf_loader->get_tensor_file_data(name + ".pe", data_size);
-        ggml_backend_tensor_set(pe_tensor.tensor, data, 0, data_size);
+        // May be left unallocated for zero-copy mmap binding — see
+        // TensorContainer::allocate_tensors_on_backend_buffers.
+        session->bind_or_copy_tensor(pe_tensor, name + ".pe");
         return;
     }
     std::vector<char> buffer(data_size);
@@ -230,7 +231,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // the shared merge-heads reshape below.
     ggml_tensor* attn = nullptr;
     bool attn_heads_merged = false;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     // The fused CUDA op accepts both the streaming per-key mask and the
     // offline per-(key,query) band mask. This entire branch is compiled ONLY
     // with a patched ggml: ggml_fused_relpos_attn is a patch-only symbol, so a

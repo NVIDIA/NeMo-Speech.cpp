@@ -1,0 +1,62 @@
+{
+  "triggerOnUpdates": true,
+  "instructions": "NeMo-Speech.cpp is a C++17 speech runtime (ASR, diarization, TTS, translation, VoiceChat) built on ggml from a pinned llama.cpp submodule, with CPU, CUDA, Metal and Vulkan backends and portable release archives for Linux, macOS and Windows. patches/ holds the project's own changes to llama.cpp and ggml, including custom GPU kernels; review them like any other code.\n\nPrioritize findings in this order: correctness, performance, portability, maintainability. Report only problems the change introduces or makes reachable, each with the concrete input, backend or platform where it fails and what to do about it. Do not comment on formatting, naming or anything pre-commit already checks.",
+  "customContext": {
+    "rules": [
+      {
+        "scope": [
+          "src/**",
+          "app/**",
+          "server/**",
+          "include/**",
+          "patches/**",
+          "kernels/**",
+          "conversion/**",
+          "convert_model.py",
+          "scripts/**",
+          ".github/workflows/**"
+        ],
+        "rule": "Look for wrong results, crashes, memory errors, races, uninitialized or stale state, unhandled edge cases (empty input, boundary sizes, partial tiles or chunks), numerical instability, and fallback paths that behave differently from the fast path. Streaming results must not depend on chunk size."
+      },
+      {
+        "scope": [
+          "src/**",
+          "server/**",
+          "patches/**",
+          "kernels/**"
+        ],
+        "rule": "Look for regressions on hot paths: added host-device synchronization, per-chunk allocations, redundant work, extra copies between backends, ops that fall back to the CPU, and caches or reuse that never take effect."
+      },
+      {
+        "scope": [
+          "src/**",
+          "app/**",
+          "server/**",
+          "include/**",
+          "patches/**",
+          "kernels/**",
+          "scripts/**",
+          "docker/**",
+          "CMakeLists.txt",
+          "**/CMakeLists.txt"
+        ],
+        "rule": "Look for assumptions tied to one GPU architecture, backend, operating system or compiler. Hardware limits and features must be checked with a working fallback, and code must build with GCC, Clang, Apple Clang and MSVC. Release archives must stay self-contained and run on every supported target."
+      },
+      {
+        "scope": [
+          "src/**",
+          "app/**",
+          "server/**",
+          "include/**",
+          "patches/**",
+          "kernels/**",
+          "conversion/**",
+          "scripts/**",
+          "docs/**",
+          "README.md"
+        ],
+        "rule": "Look for duplicated logic that should reuse an existing helper, platform-specific branches scattered across call sites, dead or unreachable code, unexplained magic constants, and documentation that no longer matches the code."
+      }
+    ]
+  }
+}

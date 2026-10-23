@@ -239,6 +239,12 @@ echo "Prefix:   $prefix"
 [ "$dry_run" -eq 0 ] || exit 0
 
 install_identity="$release_version $os $arch $artifact_backend"
+# The nightly tag is rebuilt in place, so identify a nightly install by its archive digest.
+if [ "$release_version" = nightly ] && [ "$install_mode" != source ] && [ "$binary_candidate" -eq 1 ] &&
+   nightly_sha256=$(curl -fsSL --retry 3 "$checksum_url" 2>/dev/null | awk 'NR == 1 { print $1 }') &&
+   [ -n "$nightly_sha256" ]; then
+    install_identity="$install_identity sha256:$nightly_sha256"
+fi
 source_identity="$release_version $os $arch $backend source:$source_ref profile:speech-server"
 install_metadata=$prefix/.nemo-speech-install
 if [ "$install_mode" != source ] && [ "$binary_candidate" -eq 1 ] &&

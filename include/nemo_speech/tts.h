@@ -76,8 +76,8 @@ typedef struct nemo_speech_tts_model_config {
 typedef struct nemo_speech_tts_runtime_config {
     size_t size;
     int32_t speaker;
-    int32_t threads;
-    int32_t codec_threads;
+    int32_t threads;        // CPU threads; 0 = min(8, hardware threads)
+    int32_t codec_threads;  // 0 = threads
     int32_t seed;
     int32_t steps;
     int32_t top_k;

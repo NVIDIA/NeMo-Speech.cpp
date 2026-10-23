@@ -31,12 +31,12 @@ typedef struct nemo_speech_diar_model_config {
     size_t size;
     const char* model_path;  // Sortformer GGUF (required)
     int32_t gpu;             // GPU device index; -1 = CPU
-    // Streaming geometry preset: "streaming" (default, 1.6 s chunks) or
-    // "offline" (riva's long-form batch mode: 8 s chunks + bigger speaker
-    // caches - still the streaming state machine; the stateless full-attention
-    // path is nemo_speech_diar_offline_f32). NULL/"" = "streaming".
+    // Streaming geometry preset: "streaming"/"offline" for V2 or
+    // "v3-streaming"/"v3-offline" for V3. NULL/"" selects the model-specific
+    // low-latency default. Every preset uses the streaming state machine; the
+    // stateless full-attention path is nemo_speech_diar_offline_f32.
     const char* preset;
-    // Individual geometry overrides in 80 ms encoder frames, applied on top
+    // Individual geometry overrides in coarse 80 ms encoder frames, applied on top
     // of the preset (<= 0 = keep preset value; left context: < 0 keeps it, 0
     // is a valid explicit value). Validated at create: bad combinations fail
     // with INVALID_ARGUMENT rather than degrading.
@@ -75,7 +75,8 @@ NEMO_SPEECH_ASR_API nemo_speech_asr_status
 nemo_speech_diar_create(const nemo_speech_diar_model_config* cfg, nemo_speech_diar_model** out);
 NEMO_SPEECH_ASR_API void nemo_speech_diar_destroy(nemo_speech_diar_model* model);
 
-// Model capacity (Sortformer v2: 4) and output frame duration (0.08 s).
+// Model capacity and native output cadence (V2: 4 speakers/80 ms; supported
+// high-resolution V3: 8 speakers/10 ms).
 NEMO_SPEECH_ASR_API int32_t nemo_speech_diar_num_speakers(const nemo_speech_diar_model* model);
 NEMO_SPEECH_ASR_API double nemo_speech_diar_seconds_per_frame(const nemo_speech_diar_model* model);
 
@@ -103,7 +104,7 @@ NEMO_SPEECH_ASR_API void nemo_speech_diar_stream_close(nemo_speech_diar_stream* 
 // One full-attention pass over the whole file with no streaming state (NeMo
 // streaming_mode=False). `sample_rate` follows the push contract above
 // (8-96 kHz resampled, 0 = model rate). Bounded by the encoder's positional
-// table (~6.6 minutes at the model rate); longer audio fails with
+// limit (model-dependent); longer audio fails with
 // INVALID_ARGUMENT - use a stream. On success *out is a finished job handle
 // for the accessors below (release with nemo_speech_diar_stream_close).
 NEMO_SPEECH_ASR_API nemo_speech_asr_status nemo_speech_diar_offline_f32(
@@ -112,7 +113,8 @@ NEMO_SPEECH_ASR_API nemo_speech_asr_status nemo_speech_diar_offline_f32(
 
 // ---- Results (valid on a live stream at any point; complete after finish) --
 
-// Number of labeled 80 ms frames so far.
+// Number of labeled native-cadence frames so far. Query the duration with
+// nemo_speech_diar_seconds_per_frame().
 NEMO_SPEECH_ASR_API int64_t nemo_speech_diar_frame_count(const nemo_speech_diar_stream* stream);
 // First frame whose raw probabilities are still retained. 0 for offline jobs
 // and streams shorter than the compaction horizon (~20 min); long-lived

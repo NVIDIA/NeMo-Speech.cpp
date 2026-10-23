@@ -27,7 +27,7 @@ See [Build from source](../build.md) for other platforms and toolchains.
 ```bash
 git clone https://github.com/NVIDIA/NeMo-Speech.cpp.git
 cd NeMo-Speech.cpp
-git submodule update --init ggml llama.cpp third_party/cpp-httplib
+git submodule update --init llama.cpp third_party/cpp-httplib
 
 python3 -m venv .venv
 . .venv/bin/activate

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Validate a source checkout, apply the pinned ggml CUDA and llama.cpp patches
-# when needed, and configure one of the supported CMake presets.
+# Validate a source checkout and configure one of the supported CMake presets.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,9 +20,8 @@ Examples:
   scripts/configure.sh cpu-server
   scripts/configure.sh cuda-server -DNEMO_SPEECH_WITH_NORM=ON
 
-The script checks required submodules and optional feature assets, applies the
-pinned ggml patch series for CUDA and Metal presets and the llama.cpp batching
-patch series when required, and then runs cmake --preset PRESET.
+The script checks required submodules and optional feature assets, then runs
+cmake --preset PRESET. CMake applies patches/ to llama.cpp (and ggml) itself.
 EOF
     exit 0
 fi
@@ -50,12 +48,6 @@ esac
 
 cd "$ROOT"
 
-if [ ! -f ggml/CMakeLists.txt ]; then
-    echo "error: ggml submodule is not initialized" >&2
-    echo "       run: git submodule update --init ggml" >&2
-    exit 1
-fi
-
 cmake_bool_override() { # cmake_bool_override VARIABLE DEFAULT ARGS...
     local variable="$1" value="$2" arg definition key setting
     shift 2
@@ -76,23 +68,11 @@ cmake_bool_override() { # cmake_bool_override VARIABLE DEFAULT ARGS...
     printf '%s' "$value"
 }
 
-need_nmt=OFF
-need_asr=OFF
-need_s2s=OFF
 need_grpc=OFF
 need_http=OFF
 need_flashlight=OFF
 need_ja=OFF
 need_zh=OFF
-case "$PRESET" in
-    *-nmt|*-speech|*-server|cuda-full|developer) need_nmt=ON ;;
-esac
-case "$PRESET" in
-    *-asr|*-speech|*-server|cuda-full|developer) need_asr=ON ;;
-esac
-case "$PRESET" in
-    cuda-s2s) need_s2s=ON ;;
-esac
 case "$PRESET" in
     cuda-full|developer) need_grpc=ON ;;
 esac
@@ -105,12 +85,7 @@ if [ "$PRESET" = cuda-full ]; then
     need_zh=ON
 fi
 
-need_nmt="$(cmake_bool_override NEMO_SPEECH_BUILD_NMT "$need_nmt" "$@")"
-need_nmt="$(cmake_bool_override NEMO_SPEECH_WITH_NMT "$need_nmt" "$@")"
-need_asr="$(cmake_bool_override NEMO_SPEECH_BUILD_ASR "$need_asr" "$@")"
-need_s2s="$(cmake_bool_override NEMO_SPEECH_BUILD_S2S "$need_s2s" "$@")"
 need_grpc="$(cmake_bool_override NEMO_SPEECH_BUILD_GRPC "$need_grpc" "$@")"
-need_grpc="$(cmake_bool_override NEMO_SPEECH_WITH_GRPC "$need_grpc" "$@")"
 need_http="$(cmake_bool_override NEMO_SPEECH_BUILD_HTTP "$need_http" "$@")"
 need_flashlight="$(cmake_bool_override NEMO_SPEECH_WITH_FLASHLIGHT "$need_flashlight" "$@")"
 need_ja="$(cmake_bool_override NEMO_SPEECH_TTS_WITH_JA "$need_ja" "$@")"
@@ -138,11 +113,8 @@ require_submodule() { # require_submodule PATH SENTINEL
 if [ "$need_http" = ON ]; then
     require_submodule third_party/cpp-httplib httplib.h
 fi
-if [ "$need_nmt" = ON ] || [ "$need_s2s" = ON ]; then
-    require_submodule llama.cpp CMakeLists.txt
-elif [ "$need_asr" = ON ]; then
-    require_submodule llama.cpp vendor/miniaudio/miniaudio.h
-fi
+# llama.cpp also provides ggml, so every build needs it.
+require_submodule llama.cpp ggml/CMakeLists.txt
 if [ "$need_grpc" = ON ]; then
     require_submodule proto/riva-common LICENSE
 fi
@@ -164,16 +136,6 @@ if [ "${#missing[@]}" -ne 0 ]; then
     printf ' %q' "${missing[@]}" >&2
     printf '\n' >&2
     exit 1
-fi
-
-case "$PRESET" in
-    cuda-*|metal-*)
-        scripts/apply-ggml-patches.sh
-        ;;
-esac
-
-if [ "$need_nmt" = ON ] || [ "$need_s2s" = ON ]; then
-    scripts/apply-llama-patches.sh
 fi
 
 cmake --preset "$PRESET" "$@"

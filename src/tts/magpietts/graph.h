@@ -23,11 +23,14 @@ ggml_tensor* cross_attention(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     ggml_tensor* x, ggml_tensor* memory, ggml_tensor* attn_prior = nullptr,
     ggml_tensor** last_attn = nullptr);
+// softmax_bias (optional): additive [n_kv_override] bias fused into soft_max_ext (scale + bias +
+// softmax in one kernel); the attention then spans n_kv_override cached rows (padded text
+// capacity) and attn_prior is ignored (fold the log prior into the bias).
 ggml_tensor* cross_attention_cached(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x,
-    ggml_tensor* attn_prior = nullptr, ggml_tensor** last_attn = nullptr,
-    bool prior_is_log = false);
+    ggml_tensor* attn_prior = nullptr, ggml_tensor** last_attn = nullptr, bool prior_is_log = false,
+    ggml_tensor* softmax_bias = nullptr, int64_t n_kv_override = 0);
 ggml_tensor* transformer_forward(
     ggml_context* ctx, const magpietts_transformer& tr, ggml_tensor* x, ggml_tensor* pos,
     ggml_tensor* cond, ggml_tensor* attn_prior = nullptr,
@@ -43,7 +46,10 @@ bool compute_graph(
     const magpietts_model& model, ggml_context* ctx, ggml_cgraph* gf,
     const std::vector<std::pair<std::string, std::vector<int32_t>>>& i32_inputs,
     const std::vector<std::pair<std::string, std::vector<float>>>& f32_inputs, int threads,
-    ggml_gallocr_t* keep_allocr = nullptr);
+    ggml_gallocr_t* keep_allocr = nullptr, ggml_backend_t backend = nullptr);
+// keep_allocr: when it already holds an allocator that one is reused (its buffer grows on
+// demand) and handed back, so repeated graphs do not malloc/free per call. backend: overrides
+// model.backend for allocation and compute (a side stream for background work).
 std::vector<int32_t> positions(int n);
 std::vector<int32_t> positions_range(int start, int n);
 

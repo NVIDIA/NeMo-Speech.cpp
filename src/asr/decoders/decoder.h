@@ -140,6 +140,20 @@ sp_starts_new_word(const std::string& p) {
     return sp_is_word_boundary(p) && !sp_is_sentence_terminator(p);
 }
 
+inline bool
+sp_is_punctuation(const std::string& piece) {
+    const auto text = sp_piece_text(piece);
+    if (text.empty())
+        return false;
+    // Only detachable sentence punctuation: quotes, apostrophes, signs and
+    // brackets can be meaningful word content and must not be discarded.
+    if (text.size() <= 3 && text.find_first_not_of(".,!?;:") == std::string::npos)
+        return true;
+    return text == "\xE0\xA5\xA4" || text == "\xE0\xA5\xA5" || text == "\xE3\x80\x82" ||
+           text == "\xE3\x80\x81" || text == "\xEF\xBC\x81" || text == "\xEF\xBC\x9F" ||
+           text == "\xEF\xBC\x8C" || text == "\xD8\x8C" || text == "\xD8\x9F";
+}
+
 class Decoder {
    public:
     virtual ~Decoder() = default;
@@ -189,23 +203,25 @@ class Decoder {
     // hypothesis. Called once at end-of-stream.
     virtual void finalize() {}
 
-    // Global encoder frame of the most recent speech evidence this decoder
-    // observed (last non-blank argmax/emission), or -1 before any. Drives
-    // token-silence endpointing: trailing silence = frames since this.
+    // Global encoder frame of the most recent non-blank model emission,
+    // or -1 before any. By default this also supplies endpoint evidence.
     // Survives reset_utterance() (the silence timeline continues across
     // utterances so the endpointer can re-arm); cleared by reset().
     virtual int64_t last_emit_frame() const { return -1; }
 
-    // Hint: last_emit_frame() will be polled (the runner runs token-silence
+    // Endpoint evidence can exclude non-speech emissions such as punctuation.
+    virtual int64_t last_speech_frame() const { return last_emit_frame(); }
+
+    // Hint: the speech frame will be polled (the runner runs token-silence
     // endpointing on this head). Default no-op - heads that derive the frame as
     // part of their normal decode ignore it; FlashlightDecoder uses it to skip
     // an extra per-frame argmax it would otherwise run only to feed this signal.
     virtual void set_track_speech_frame(bool /*on*/) {}
 
-    // Hint: the next step() processes an end-of-utterance (is_last) chunk. RNNT
-    // greedy uses it to apply the end-of-utterance punctuation-logit floor (see
-    // RnntGreedyDecoder); other heads ignore it.
-    virtual void set_finalizing(bool /*on*/) {}
+    // Returns and clears sentence punctuation emitted after an endpoint but
+    // before the next word; it belongs to the already-published utterance.
+    // A mark still waiting for the next word is released only at end of stream.
+    virtual std::string take_late_punctuation(bool /*end_of_stream*/ = false) { return {}; }
 
     // Utterance confidence. Greedy CTC returns the mean emitted-token posterior;
     // heads without a usable posterior return 1.0.

@@ -50,8 +50,8 @@ class DiarizationStream {
 class Diarizer {
    public:
     static std::shared_ptr<Diarizer> load(
-        int gpu, const std::string& model_path,
-        DiarGeometry geometry = DiarGeometry::preset("streaming"), BatchingConfig batching = {});
+        int gpu, const std::string& model_path, DiarGeometry geometry = {},
+        BatchingConfig batching = {});
 
     Diarizer(std::shared_ptr<DiarModel> model, DiarGeometry geometry);
 

@@ -12,8 +12,8 @@
          find the toolset. MSVC is required: nvcc on Windows only supports cl.exe
          as the CUDA host compiler.
       3. Provisions required C++ dependencies.
-      4. For a CUDA build, applies the CUDA-only ggml patches.
-      5. Configures with CMake (Ninja) and builds.
+      4. Initializes the required submodules.
+      5. Configures with CMake (Ninja), which applies patches/ for CUDA and CPU builds, and builds.
 
 .PARAMETER Backend
     cuda | vulkan | cpu. CUDA and Vulkan are separate build trees (different ggml
@@ -77,6 +77,9 @@
 
 .PARAMETER Architecture
     Target architecture: auto (the host), x64, or arm64.
+.PARAMETER CMakeArgs
+    Extra arguments appended to the CMake configure command, for example
+    -CMakeArgs '-DGGML_NATIVE=OFF'.
 
 .EXAMPLE
     pwsh scripts\windows\build.ps1 -Backend cuda -Profile server
@@ -112,7 +115,8 @@ param(
     [ValidateSet('auto', 'msvc', 'clang-cl')]
     [string]$Compiler = 'auto',
     [int]$Jobs = 0,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [string[]]$CMakeArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -342,12 +346,8 @@ function Initialize-RequiredSubmodule {
     }
 }
 
-Initialize-RequiredSubmodule 'ggml' 'CMakeLists.txt'
-if ($BuildNmt) {
-    Initialize-RequiredSubmodule 'llama.cpp' 'CMakeLists.txt'
-} elseif ($BuildAsr) {
-    Initialize-RequiredSubmodule 'llama.cpp' 'vendor\miniaudio\miniaudio.h'
-}
+# llama.cpp also provides ggml, so every build needs it.
+Initialize-RequiredSubmodule 'llama.cpp' 'ggml\CMakeLists.txt'
 if ($BuildHttp) { Initialize-RequiredSubmodule 'third_party\cpp-httplib' 'httplib.h' }
 if ($BuildGrpc) { Initialize-RequiredSubmodule 'proto\riva-common' 'LICENSE' }
 if ($BuildFlashlight) {
@@ -375,29 +375,21 @@ if ($BuildTtsZh) {
     }
 }
 
-# --- 5. CUDA-only: apply the ggml patches ---------------------------------------
-if ($Backend -eq 'cuda') {
-    Write-Host "==> applying ggml patches (CUDA)"
-    & (Join-Path $PSScriptRoot 'apply-ggml-patches.ps1')
-}
-
-# --- 6. Configure + build -------------------------------------------------------
+# --- 5. Configure + build -------------------------------------------------------
 function ConvertTo-CMakeBool([bool]$Value) {
     if ($Value) { return 'ON' }
     return 'OFF'
 }
 
-$cmakeArgs = @(
+$configureArgs = @(
     '-S', $RepoRoot, '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Config",
     "-DNEMO_SPEECH_BUILD_ASR=$(ConvertTo-CMakeBool $BuildAsr)",
     "-DNEMO_SPEECH_BUILD_DIAR=$(ConvertTo-CMakeBool $BuildDiar)",
     "-DNEMO_SPEECH_BUILD_TTS=$(ConvertTo-CMakeBool $BuildTts)",
     "-DNEMO_SPEECH_BUILD_NMT=$(ConvertTo-CMakeBool $BuildNmt)",
-    "-DNEMO_SPEECH_WITH_NMT=$(ConvertTo-CMakeBool $BuildNmt)",
     "-DNEMO_SPEECH_BUILD_HTTP=$(ConvertTo-CMakeBool $BuildHttp)",
     "-DNEMO_SPEECH_HTTP_TLS=$(ConvertTo-CMakeBool $BuildHttpTls)",
     "-DNEMO_SPEECH_BUILD_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
-    "-DNEMO_SPEECH_WITH_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
     "-DNEMO_SPEECH_WITH_FLASHLIGHT=$(ConvertTo-CMakeBool $BuildFlashlight)",
     '-DNEMO_SPEECH_WITH_NORM=OFF',
     "-DNEMO_SPEECH_TTS_WITH_JA=$(ConvertTo-CMakeBool $BuildTtsJa)",
@@ -408,56 +400,56 @@ $cmakeArgs = @(
     "-DNEMO_SPEECH_BUILD_TOOLS=$(ConvertTo-CMakeBool $BuildTools)"
 )
 if ($VcpkgFeatures.Count -gt 0) {
-    $cmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
-    $cmakeArgs += "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet"
-    $cmakeArgs += "-DVCPKG_MANIFEST_FEATURES=$($VcpkgFeatures -join ';')"
-    $cmakeArgs += "-DVCPKG_INSTALLED_DIR=$(Join-Path $BuildDir 'vcpkg_installed')"
+    $configureArgs += "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
+    $configureArgs += "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet"
+    $configureArgs += "-DVCPKG_MANIFEST_FEATURES=$($VcpkgFeatures -join ';')"
+    $configureArgs += "-DVCPKG_INSTALLED_DIR=$(Join-Path $BuildDir 'vcpkg_installed')"
 }
 if ($Compiler -eq 'clang-cl') {
-    $cmakeArgs += '-DCMAKE_C_COMPILER=clang-cl'
-    $cmakeArgs += '-DCMAKE_CXX_COMPILER=clang-cl'
+    $configureArgs += '-DCMAKE_C_COMPILER=clang-cl'
+    $configureArgs += '-DCMAKE_CXX_COMPILER=clang-cl'
     if ($CrossCompiling) {
         $llvmTarget = if ($TargetArch -eq 'arm64') { 'arm64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
-        $cmakeArgs += "-DCMAKE_C_COMPILER_TARGET=$llvmTarget"
-        $cmakeArgs += "-DCMAKE_CXX_COMPILER_TARGET=$llvmTarget"
-        $cmakeArgs += '-DCMAKE_SYSTEM_NAME=Windows'
-        $cmakeArgs += "-DCMAKE_SYSTEM_PROCESSOR=$TargetArch"
+        $configureArgs += "-DCMAKE_C_COMPILER_TARGET=$llvmTarget"
+        $configureArgs += "-DCMAKE_CXX_COMPILER_TARGET=$llvmTarget"
+        $configureArgs += '-DCMAKE_SYSTEM_NAME=Windows'
+        $configureArgs += "-DCMAKE_SYSTEM_PROCESSOR=$TargetArch"
     }
     if ($Backend -eq 'cuda') {
         # nvcc only supports cl.exe as its host compiler on Windows; pin it
         # explicitly so it never inherits clang-cl.
-        $cmakeArgs += '-DCMAKE_CUDA_HOST_COMPILER=cl'
+        $configureArgs += '-DCMAKE_CUDA_HOST_COMPILER=cl'
     }
 }
 if ($TargetArch -eq 'arm64') {
     # Avoid an additional OpenMP runtime DLL in ARM64 packages.
-    $cmakeArgs += '-DGGML_OPENMP=OFF'
+    $configureArgs += '-DGGML_OPENMP=OFF'
 }
 switch ($Backend) {
     'cuda'   {
-        $cmakeArgs += '-DGGML_CUDA=ON'
-        $cmakeArgs += '-DGGML_VULKAN=OFF'
-        $cmakeArgs += "-DNEMO_SPEECH_CUBLAS_SHIM=$(ConvertTo-CMakeBool $CublasShim.IsPresent)"
-        $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch"
+        $configureArgs += '-DGGML_CUDA=ON'
+        $configureArgs += '-DGGML_VULKAN=OFF'
+        $configureArgs += "-DNEMO_SPEECH_CUBLAS_SHIM=$(ConvertTo-CMakeBool $CublasShim.IsPresent)"
+        $configureArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch"
     }
     'vulkan' {
-        $cmakeArgs += '-DGGML_CUDA=OFF'
-        $cmakeArgs += '-DGGML_VULKAN=ON'
-        $cmakeArgs += '-DNEMO_SPEECH_GGML_PATCHED=OFF'
+        $configureArgs += '-DGGML_CUDA=OFF'
+        $configureArgs += '-DGGML_VULKAN=ON'
+        $configureArgs += '-DNEMO_SPEECH_GGML_PATCHED=OFF'
         # ggml-vulkan hard-requires the SPIRV-Headers CMake package; the Vulkan
         # SDK ships its config, but not on CMake's default search path.
         $spirvDir = Join-Path $env:VULKAN_SDK 'Lib\cmake\SPIRV-Headers'
-        if (Test-Path $spirvDir) { $cmakeArgs += "-DSPIRV-Headers_DIR=$spirvDir" }
+        if (Test-Path $spirvDir) { $configureArgs += "-DSPIRV-Headers_DIR=$spirvDir" }
     }
     'cpu'    {
-        $cmakeArgs += '-DGGML_CUDA=OFF'
-        $cmakeArgs += '-DGGML_VULKAN=OFF'
-        $cmakeArgs += '-DNEMO_SPEECH_GGML_PATCHED=OFF'
+        $configureArgs += '-DGGML_CUDA=OFF'
+        $configureArgs += '-DGGML_VULKAN=OFF'
     }
 }
 
-Write-Host "==> cmake $($cmakeArgs -join ' ')"
-& cmake @cmakeArgs
+$configureArgs += $CMakeArgs
+Write-Host "==> cmake $($configureArgs -join ' ')"
+& cmake @configureArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed ($LASTEXITCODE)" }
 
 Write-Host "==> building"

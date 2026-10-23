@@ -1,0 +1,1305 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: skinny Q8_0 GEMM with planar weights
+
+Adds a Q8_0 x F32 GEMM for streaming activations wider than MMVQ's 8 columns
+with planar weight storage (GGML_TENSOR_FLAG_Q8_PLANAR), deterministic
+K-split, and bias/SiLU epilogues on MMVQ for narrow (<= 2 column)
+projections. Dispatch is limited to encoder.* Q8_0 weights and depends only on
+the call's column count (N <= 8: MMVQ, planar MMVQ after a repack; wider:
+this kernel), never on whether an earlier call repacked the weight, so outputs
+do not depend on previously served requests. Weights are repacked in place on
+first use; GGML_SKINNY_Q8_INPLACE=0 keeps a separate copy instead, which is
+needed when llama.cpp's multi-stream scheduler shares the process. Cache
+entries are dropped when their weight buffer is freed or cleared.
+GGML_SKINNY_Q8=0 disables the kernel for block (not planar) Q8_0 weights.
+
+Upstream: not planned (NeMo-specific encoder shapes). The MMVQ
+broadcast-bias/SiLU epilogue is a candidate on its own.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index fd31b70ca3a05c4814c62a0be599ec0a56766e8e..19ade01735e6c072fcb7752ef7955ac5d2afe19e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -667,6 +667,10 @@ extern "C" {
+         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
++        // Model weight uses Q8_0 bytes serialized as one tensor-wide int8
++        // plane followed by one FP16 scale plane. CUDA-only storage hint;
++        // logical type, element count, and allocation size remain Q8_0.
++        GGML_TENSOR_FLAG_Q8_PLANAR = 32,
+     };
+ 
+     enum ggml_tri_type {
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e78ae4facb9d2fffdfe0e3352d68baf7dc4a847..25893da48941518b5e0a8cfa20c1538fd2a5d305 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1578,6 +1578,7 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * gate_bias = nullptr;
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
++    bool silu = false;
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+ };
+@@ -1587,6 +1588,12 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * gate_bias = nullptr;
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
++    // A Linear bias has shape [M, 1, 1, 1] and is broadcast across the
++    // destination columns/channels. Keep this explicit because the legacy
++    // fusion path also accepts a full-shape elementwise bias.
++    bool x_bias_broadcast = false;
++    bool gate_bias_broadcast = false;
++    bool silu = false;
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+ };
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6730a6e28ef9ab02c74cf4e164ff2e8ac5cfb0bf..32b96b5e7fdb48a02ad255dfab688520d86ea884 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -17,6 +17,7 @@
+ #include "ggml-cuda/conv2d.cuh"
+ #include "ggml-cuda/conv2d-dw.cuh"
+ #include "ggml-cuda/conv2d-transpose.cuh"
++#include "ggml-cuda/skinny-q8.cuh"
+ #include "ggml-cuda/convert.cuh"
+ #include "ggml-cuda/count-equal.cuh"
+ #include "ggml-cuda/cpy.cuh"
+@@ -741,6 +742,8 @@ struct ggml_backend_cuda_buffer_context {
+ 
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
++    ggml_cuda_set_device(ctx->device);
++    ggml_cuda_skinny_q8_forget(ctx->dev_ptr, buffer->size);
+     delete ctx;
+ }
+ 
+@@ -849,6 +852,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    ggml_cuda_skinny_q8_forget(ctx->dev_ptr, buffer->size);
+ }
+ 
+ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+@@ -1801,16 +1805,20 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+ 
++    const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
+     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
++                             dst->type == GGML_TYPE_F32 && total_n <= MMVQ_MAX_BATCH_SIZE;
+ 
+     // fusion is not universally faster on Pascal
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    // MMVQ's narrow epilogue supports the two-frame streaming chunk used by
++    // NeMo-Speech.cpp. Outer request-batch columns are included in
++    // total_n above so [K,2,B] stays on skinny-Q8 when B makes it wider than
++    // MMVQ_MAX_BATCH_SIZE.
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > 2) {
+         return false;
+     }
+ 
+@@ -1842,6 +1850,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+ 
++    if (ggml_cuda_skinny_q8_supported(src0, src1, dst)) {
++        // streaming-encoder specialization: Q8_0 weights x activations wider
++        // than MMVQ's range; beats mul_mat_q's LLM-batch tiling at skinny N
++        ggml_cuda_mul_mat_skinny_q8(ctx, src0, src1, dst);
++        return;
++    }
+     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+@@ -4121,6 +4135,64 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // Q8 narrow projection + SiLU. NeMo-Speech.cpp's Conformer FF1
++    // layers are bias-free, so this is their actual hot graph sequence.
++    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY })) {
++        ggml_tensor * mm_node   = cgraph->nodes[i];
++        ggml_tensor * silu_node = cgraph->nodes[i + 1];
++        if (ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
++            silu_node->src[0] == mm_node && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++            ggml_cuda_mm_fusion_args_host fusion_data{};
++            fusion_data.silu = true;
++            ggml_cuda_mul_mat_vec_q(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr, silu_node, &fusion_data);
++            return 1;
++        }
++    }
++
++    // Q8 narrow projection + broadcast Linear bias + SiLU. This is the hot
++    // Conformer FF1 sequence at the two-frame streaming chunk size. Folding
++    // both epilogues avoids two launches and two full output round trips.
++    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY })) {
++        ggml_tensor * mm_node   = cgraph->nodes[i];
++        ggml_tensor * bias_node = cgraph->nodes[i + 1];
++        ggml_tensor * silu_node = cgraph->nodes[i + 2];
++        const ggml_tensor * bias = bias_node->src[0] == mm_node ? bias_node->src[1] :
++                                   bias_node->src[1] == mm_node ? bias_node->src[0] :
++                                                                  nullptr;
++        if (ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
++            silu_node->src[0] == bias_node && bias != nullptr &&
++            bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
++            ggml_nelements(bias) == mm_node->ne[0] &&
++            ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++            ggml_cuda_mm_fusion_args_host fusion_data{};
++            fusion_data.x_bias = bias;
++            fusion_data.silu   = true;
++            ggml_cuda_mul_mat_vec_q(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr, silu_node, &fusion_data);
++            return 2;
++        }
++    }
++
++    // skinny-q8 GEMM + row-vector bias: the upstream MUL_MAT+ADD fusion below
++    // requires a same-shape add, so the classic broadcast Linear bias
++    // ([M] over [M,N]) never qualifies — fold it into the skinny GEMM's
++    // epilogue instead.
++    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
++        ggml_tensor *       mm_node   = cgraph->nodes[i];
++        ggml_tensor *       bias_node = cgraph->nodes[i + 1];
++        const ggml_tensor * bias      = bias_node->src[0] == mm_node ? bias_node->src[1] :
++                                        bias_node->src[1] == mm_node ? bias_node->src[0] :
++                                                                       nullptr;
++        if (bias != nullptr && bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias) &&
++            ggml_nelements(bias) == mm_node->ne[0] && ggml_is_contiguous(bias_node) &&
++            ggml_cuda_skinny_q8_supported(mm_node->src[0], mm_node->src[1], mm_node)) {
++            ggml_cuda_mul_mat_skinny_q8_bias(
++                *cuda_ctx, mm_node->src[0], mm_node->src[1], bias, bias_node);
++            return 1;
++        }
++    }
++
+     // mul_mat + add
+     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+@@ -4156,14 +4228,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             continue;
+         }
+ 
+-        if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
++        const bool same_shape_bias = bias_op != GGML_OP_ADD ||
++                                     ggml_are_same_shape(bias_node->src[0], bias_node->src[1]);
++        const bool broadcast_q_bias =
++                                      bias_op == GGML_OP_ADD &&
++                                      bias_tensor->type == GGML_TYPE_F32 &&
++                                      ggml_is_contiguous(bias_tensor) &&
++                                      ggml_nelements(bias_tensor) == mm_node->ne[0];
++        if (!same_shape_bias && !broadcast_q_bias) {
+             continue;
+         }
+ 
+         ggml_cuda_mm_fusion_args_host fusion_data{};
+         fusion_data.x_bias = bias_tensor;
+ 
+-        if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
++        if (same_shape_bias && ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+             fused_mul_mat_vec = true;
+             fused_node_count  = 2;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a85155360a7ba48014bf8a450fc3a35bafd2aa1d..8deb33650513227e81eea584c6fb1b744550e76b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,5 +1,6 @@
+ #include "mmvq.cuh"
+ #include "quantize.cuh"
++#include "skinny-q8.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+ 
+@@ -596,7 +597,17 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     return 1;
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
++template <int vdr>
++static __device__ __forceinline__ float vec_dot_q8_0_q8_1_planar(
++        const void * __restrict__ vx, const block_q8_1 * __restrict__ y,
++        int block_idx, int iqs, size_t scale_plane_offset) {
++    const int * v = (const int *) vx + (size_t) block_idx * (QK8_0 / 4) + iqs;
++    const int * u = (const int *) y->qs + iqs;
++    const half * d = (const half *) ((const char *) vx + scale_plane_offset);
++    return vec_dot_q8_0_q8_1_impl<float, vdr>(v, u, d[block_idx], __low2half(y->ds));
++}
++
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool q8_planar = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -624,6 +635,10 @@ static __global__ void mul_mat_vec_q(
+     const     int row0 = rows_per_cuda_block*blockIdx.x;
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
++    // Serialized planar weights are restricted to contiguous 2-D matrices.
++    // stride_col_dst is therefore the source row count, and one int8 byte is
++    // stored per logical weight before the FP16 scale plane.
++    const size_t q8_scale_plane_offset = (size_t) ncols_x * stride_col_dst;
+ 
+     const uint32_t channel_dst = blockIdx.y;
+ 
+@@ -644,6 +659,7 @@ static __global__ void mul_mat_vec_q(
+     bool use_gate_bias = false;
+     bool use_scale = false;
+     bool use_gate_scale = false;
++    bool use_silu = false;
+     [[maybe_unused]] const void * vgate = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
+@@ -656,6 +672,7 @@ static __global__ void mul_mat_vec_q(
+         use_gate      = fusion.gate      != nullptr;
+         use_bias      = fusion.x_bias    != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
++        use_silu      = fusion.silu;
+         vgate         = fusion.gate;
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
+@@ -681,17 +698,19 @@ static __global__ void mul_mat_vec_q(
+         if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+             (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+             if (use_bias) {
+-                x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
++                x_bias = x_bias + (fusion.x_bias_broadcast ? row0 :
++                    sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0);
+ #pragma unroll
+                 for (int j = 0; j < ncols_dst; ++j) {
+-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
++                    x_biases[j] = x_bias[(fusion.x_bias_broadcast ? 0 : j * stride_col_dst) + threadIdx.x];
+                 }
+             }
+             if (use_gate_bias) {
+-                gate_bias = gate_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
++                gate_bias = gate_bias + (fusion.gate_bias_broadcast ? row0 :
++                    sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0);
+ #pragma unroll
+                 for (int j = 0; j < ncols_dst; ++j) {
+-                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
++                    gate_biases[j] = gate_bias[(fusion.gate_bias_broadcast ? 0 : j * stride_col_dst) + threadIdx.x];
+                 }
+             }
+             if constexpr (type == GGML_TYPE_NVFP4) {
+@@ -742,12 +761,26 @@ static __global__ void mul_mat_vec_q(
+         for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                tmp[j][i] += vec_dot_q_cuda(
+-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                if constexpr (q8_planar) {
++                    static_assert(type == GGML_TYPE_Q8_0, "planar MMVQ is Q8_0-only");
++                    tmp[j][i] += vec_dot_q8_0_q8_1_planar<vdr>(
++                        vx, &y[j*stride_col_y + kby],
++                        kbx_offset + i*stride_row_x + kbx, kqs, q8_scale_plane_offset);
++                } else {
++                    tmp[j][i] += vec_dot_q_cuda(
++                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                }
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+-                        tmp_gate[j][i] += vec_dot_q_cuda(
+-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                        if constexpr (q8_planar) {
++                            tmp_gate[j][i] += vec_dot_q8_0_q8_1_planar<vdr>(
++                                vgate, &y[j*stride_col_y + kby],
++                                kbx_offset + i*stride_row_x + kbx, kqs, q8_scale_plane_offset);
++                        } else {
++                            tmp_gate[j][i] += vec_dot_q_cuda(
++                                vgate, &y[j*stride_col_y + kby],
++                                kbx_offset + i*stride_row_x + kbx, kqs);
++                        }
+                     }
+                 }
+             }
+@@ -831,13 +864,16 @@ static __global__ void mul_mat_vec_q(
+                         }
+                     }
+                 }
++                if (use_silu) {
++                    result = ggml_cuda_op_silu_single(result);
++                }
+                 dst[j*stride_col_dst + i] = result;
+             }
+         }
+     }
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_silu, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+     }
+     if constexpr (type != GGML_TYPE_NVFP4) {
+         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+@@ -1007,7 +1043,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+     return {block_nums, block_dims};
+ }
+ 
+-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
++template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool q8_planar = false>
+ static void mul_mat_vec_q_switch_fusion(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -1018,11 +1054,11 @@ static void mul_mat_vec_q_switch_fusion(
+         const uint32_t ids_stride, cudaStream_t stream) {
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+-    if constexpr (c_ncols_dst == 1) {
++                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.silu;
++    if constexpr (c_ncols_dst <= 2) {
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
++            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, q8_planar>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -1030,10 +1066,10 @@ static void mul_mat_vec_q_switch_fusion(
+         }
+     }
+ 
+-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
++    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=2");
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
++    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, q8_planar>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -1072,7 +1108,7 @@ static void mul_mat_vec_q_moe_launch(
+     }
+ }
+ 
+-template <ggml_type type>
++template <ggml_type type, bool q8_planar = false>
+ static void mul_mat_vec_q_switch_ncols_dst(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const int ncols_x, const int nrows_x, const int ncols_dst,
+@@ -1084,6 +1120,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+ 
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
++    static_assert(!q8_planar || type == GGML_TYPE_Q8_0, "planar MMVQ is Q8_0-only");
+ 
+     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+@@ -1163,6 +1200,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+     };
+ 
+     if (has_ids && ncols_dst > 1) {
++        GGML_ASSERT(!q8_planar && "planar Q8 does not support MUL_MAT_ID");
+         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+         mul_mat_vec_q_moe_launch<type>(
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+@@ -1189,7 +1227,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+ 
+                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
++                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, q8_planar>(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+@@ -1207,7 +1245,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 2: {
+             constexpr int c_ncols_dst = 2;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1215,7 +1253,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 3: {
+             constexpr int c_ncols_dst = 3;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1223,7 +1261,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 4: {
+             constexpr int c_ncols_dst = 4;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1231,7 +1269,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 5: {
+             constexpr int c_ncols_dst = 5;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1239,7 +1277,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 6: {
+             constexpr int c_ncols_dst = 6;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1247,7 +1285,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 7: {
+             constexpr int c_ncols_dst = 7;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1255,7 +1293,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         case 8: {
+             constexpr int c_ncols_dst = 8;
+             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++            mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q8_planar>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  dims.first, dims.second, 0, ids_stride, stream);
+@@ -1272,7 +1310,8 @@ static void mul_mat_vec_q_switch_type(
+         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
+         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const int ids_stride, cudaStream_t stream) {
++        const int ids_stride, const bool q8_planar, cudaStream_t stream) {
++    GGML_ASSERT(!q8_planar || type_x == GGML_TYPE_Q8_0);
+     switch (type_x) {
+         case GGML_TYPE_Q1_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
+@@ -1311,10 +1350,17 @@ static void mul_mat_vec_q_switch_type(
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
+         case GGML_TYPE_Q8_0:
+-            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
+-                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+-                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            if (q8_planar) {
++                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0, true>
++                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            } else {
++                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
++                    (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            }
+             break;
+         case GGML_TYPE_MXFP4:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
+@@ -1449,7 +1495,7 @@ void ggml_cuda_mul_mat_vec_q(
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] <= 2);
+         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
+         // non-negligible for some models such as gpt-oss-20b
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
+@@ -1459,6 +1505,7 @@ void ggml_cuda_mul_mat_vec_q(
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
+             fusion_local.x_bias = fusion->x_bias->data;
++            fusion_local.x_bias_broadcast = ggml_nelements(fusion->x_bias) == dst->ne[0];
+         }
+         if (fusion->gate) {
+             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+@@ -1469,6 +1516,7 @@ void ggml_cuda_mul_mat_vec_q(
+             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
+             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+             fusion_local.gate_bias = fusion->gate_bias->data;
++            fusion_local.gate_bias_broadcast = ggml_nelements(fusion->gate_bias) == dst->ne[0];
+         }
+         if (fusion->x_scale) {
+             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+@@ -1484,6 +1532,7 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+         fusion_local.glu_op = fusion->glu_op;
+         fusion_local.glu_limit = fusion->glu_limit;
++        fusion_local.silu = fusion->silu;
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+@@ -1527,12 +1576,19 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t stride_channel_y   = ids ? s11  : s12;
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
++    const bool q8_planar = (src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0 ||
++                           ggml_cuda_skinny_q8_repacked_in_place(src0);
++    if (q8_planar) {
++        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && ids == nullptr);
++        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0));
++    }
+ 
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
++        ne03,              ne3,           s03, s13,              s3,               ids_stride,
++        q8_planar, stream);
+ }
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1559,9 +1615,12 @@ void ggml_cuda_op_mul_mat_vec_q(
+     const int stride_col_y = src1_padded_row_size / QK8_1;
+ 
+     ggml_cuda_mm_fusion_args_device fusion_local{};
++    GGML_ASSERT((src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) == 0 &&
++                !ggml_cuda_skinny_q8_repacked_in_place(src0) &&
++                "planar Q8 does not support split-buffer MMVQ");
+     mul_mat_vec_q_switch_type(
+         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
+-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
++        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, false, stream);
+ 
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
+diff --git a/ggml/src/ggml-cuda/skinny-q8.cu b/ggml/src/ggml-cuda/skinny-q8.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..a39355ea5cb3640b6244c73a246bd46876d98fdb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/skinny-q8.cu
+@@ -0,0 +1,676 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++// Skinny-N Q8_0 GEMM for streaming ASR encoders (nemo-speech).
++//
++// This kernel is specialized for 9 <= N <= 64, where the activation tile fits
++// on chip and weight reads dominate memory traffic.
++//
++// It uses int8 tensor cores and a cp.async pipeline:
++//  * mma.sync.m16n8k32.s8 — one MMA spans exactly one q8 block of k, so the
++//    per-block scales (weight d x activation d) apply directly to the s32
++//    MMA result, accumulated in fp32.
++//  * Block tile = 32 rows x 64 cols: 8 warps as 2 row-halves x 4 col-quarters
++//    (each warp: 16x16 = 2 MMAs per k-block). All N tiles are launched in
++//    grid.z so a large outer batch fills the GPU instead of issuing a serial
++//    stream of sub-SM grids.
++//  * A 2-buffer pipeline stages W (32x128B), A (64x128B), and their scales per
++//    128-k step. The next buffer is issued before the current buffer computes,
++//    keeping one cp.async group in flight without paying for a third buffer.
++//  * Weights use aligned planes qs[M][K] + d[M][K/32]. Models can serialize
++//    those planes directly; standard block_q8_0 weights are repacked once on
++//    first use and cached. Activations are quantized to a zero-padded
++//    64-column int8 buffer so staging needs no bounds checks.
++//
++// Bit-accuracy: same q8 activation round-trip as mul_mat_q, but a different
++// summation order — results are not bit-identical to mmq. Dispatch must
++// therefore depend only on the call's shape, never on process history: a
++// weight takes MMVQ for N <= 8 and this kernel for every wider call, from its
++// first call on, whether or not an earlier call already repacked it. Each
++// output column's sum is independent of N (tiles only add columns), so
++// singleton and batched calls wider than 8 columns compute the same bits.
++
++#include "skinny-q8.cuh"
++#include "mmvq.cuh"  // MMVQ_MAX_BATCH_SIZE: the N range mmvq already covers
++
++#include <algorithm>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++
++#define SKQ8_WARPS 8
++#define SKQ8_ROWS 32    // rows per block (2 warp row-halves x 16); M % 32 == 0
++#define SKQ8_NPAD 64    // max padded cols (4 warp col-quarters x 2 n-tiles x 8)
++#define SKQ8_KSTEP 128  // k bytes staged per pipeline stage; K % KSTEP == 0
++#define SKQ8_KTB (SKQ8_KSTEP / 32)  // q8 blocks per stage
++#define SKQ8_STAGES 2
++// Shared-memory strides (bytes). KSTEP + 16 keeps the 16B cp.async stores
++// aligned while breaking the power-of-two bank pattern on fragment loads.
++#define SKQ8_SW (SKQ8_KSTEP + 16)
++#define SKQ8_SA (SKQ8_KSTEP + 16)
++// Per-stage layout: W tile | A tile | W scales (half) | A scales (float).
++// The A tile + A scales are sized for NPAD but only ncols (= n-tiles actually
++// used, host-padded to 8) are staged/consumed.
++#define SKQ8_STAGE_W (SKQ8_ROWS * SKQ8_SW)
++#define SKQ8_STAGE_A (SKQ8_NPAD * SKQ8_SA)
++#define SKQ8_STAGE_DW (SKQ8_ROWS * SKQ8_KTB * 2)
++#define SKQ8_STAGE_DA (SKQ8_NPAD * SKQ8_KTB * 4)
++#define SKQ8_STAGE_BYTES (SKQ8_STAGE_W + SKQ8_STAGE_A + SKQ8_STAGE_DW + SKQ8_STAGE_DA)
++
++// ---------------------------------------------------------------------------
++// Repack block_q8_0[M][K/32] -> qs plane int8[M][K] + d plane half[M][K/32].
++static __global__ void skq8_repack(
++    const void * __restrict__ src, int8_t * __restrict__ qs, half * __restrict__ d,
++    const int64_t M, const int64_t KB) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= M * KB) {
++        return;
++    }
++    const block_q8_0 * b = (const block_q8_0 *) src + i;
++    d[i] = b->d;
++    int8_t * out = qs + i * 32;
++#pragma unroll
++    for (int j = 0; j < 32; j++) {
++        out[j] = b->qs[j];
++    }
++}
++
++
++// ---------------------------------------------------------------------------
++// Quantize F32 activations [K, N] (col-contiguous) into a zero-padded
++// SKQ8_NPAD-column buffer: int8[NPAD][K] + d float[NPAD][K/32].
++static __global__ void skq8_quantize(
++    const float * __restrict__ X, int8_t * __restrict__ Aq, float * __restrict__ Ad,
++    const int K, const int N) {
++    // One WARP per (col, q8-block): lane j owns element j, so the 32-float
++    // read is one coalesced 128B transaction and the int8 store one 32B
++    // transaction (a thread-per-block version did 32 scalar strided loads and
++    // cost 5x the GEMM quantize budget).
++    const int KB   = K / 32;
++    const int wid  = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
++    const int lane = threadIdx.x % 32;
++    const int ncols = (N + 7) / 8 * 8;  // active column tiles only
++    if (wid >= ncols * KB) {
++        return;
++    }
++    const int n = wid / KB, kb = wid % KB;
++    int8_t *  q = Aq + (size_t) n * K + kb * 32;
++    if (n >= N) {
++        // Pad columns: only the scale must be zeroed — the GEMM multiplies the
++        // integer MMA result by da, and int math on stale qs bytes is finite,
++        // so da == 0 makes the contribution exactly 0.
++        if (lane == 0) {
++            Ad[(size_t) n * KB + kb] = 0.0f;
++        }
++        return;
++    }
++    const float x    = X[(size_t) n * K + kb * 32 + lane];
++    float       amax = fabsf(x);
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
++    }
++    const float dv = amax / 127.0f;
++    const float id = dv > 0.0f ? 1.0f / dv : 0.0f;
++    q[lane]        = (int8_t) roundf(x * id);
++    if (lane == 0) {
++        Ad[(size_t) n * KB + kb] = dv;
++    }
++}
++
++// ---------------------------------------------------------------------------
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++static __device__ __forceinline__ void skq8_cp16(void * dst, const void * src) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(src));
++}
++static __device__ __forceinline__ void skq8_cp8(void * dst, const void * src) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(s), "l"(src));
++}
++static __device__ __forceinline__ void skq8_cp4(void * dst, const void * src) {
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(s), "l"(src));
++}
++static __device__ __forceinline__ void skq8_commit() {
++    asm volatile("cp.async.commit_group;");
++}
++template <int n> static __device__ __forceinline__ void skq8_wait() {
++    asm volatile("cp.async.wait_group %0;" ::"n"(n));
++}
++static __device__ __forceinline__ void skq8_mma(
++    int & d0, int & d1, int & d2, int & d3, int a0, int a1, int a2, int a3, int b0, int b1) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
++        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
++        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++#endif
++
++// C[M,N] (F32, col stride M) = Wq8 x A. Small-M GEMMs split K over
++// blockIdx.y (gridDim.y k-ranges, scales already folded per range); each
++// split writes a private plane for deterministic reduction afterward.
++static __global__ __launch_bounds__(SKQ8_WARPS * 32, 5) void skq8_gemm(
++    const int8_t * __restrict__ Wq, const half * __restrict__ Wd, const int8_t * __restrict__ Aq,
++    const float * __restrict__ Ad, const float * __restrict__ bias, float * __restrict__ C,
++    const int M, const int N_total, const int K, const int ncols_total /* N padded to 8 */) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    const int KB   = K / 32;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int gid  = lane >> 2;  // mma group id (0..7)
++    const int tid4 = lane & 3;   // mma thread-in-group (0..3)
++
++    const int k_len = K / gridDim.y;       // multiple of SKQ8_KSTEP (host-enforced)
++    const int k0    = blockIdx.y * k_len;
++
++    // grid.z carries independent 64-column output tiles. Keeping them in one
++    // launch is essential on high-SM-count GPUs: a typical encoder projection
++    // has only 128 row/K-split CTAs and can underfill the device. The old host
++    // loop repeated that underfilled launch per tile and serialized the
++    // entire outer batch. Pointer rebasing keeps all inner indexing unchanged,
++    // including the per-q8-block FP32 accumulation order.
++    const int cbase = (int) blockIdx.z * SKQ8_NPAD;
++    const int ncols = min(SKQ8_NPAD, ncols_total - cbase);
++    const int N     = min(SKQ8_NPAD, N_total - cbase);
++    Aq += (size_t) cbase * K;
++    Ad += (size_t) cbase * KB;
++    C += (size_t) cbase * M;
++
++    const int row_blk = blockIdx.x * SKQ8_ROWS;
++    const int mhalf   = warp / 4;        // which 16-row half
++    const int nt0     = (warp % 4) * 2;  // first of this warp's two 8-col n-tiles
++
++    extern __shared__ char smem[];
++    char * stage[SKQ8_STAGES];
++#pragma unroll
++    for (int s = 0; s < SKQ8_STAGES; s++) {
++        stage[s] = smem + (size_t) s * SKQ8_STAGE_BYTES;
++    }
++
++    const int nsteps = k_len / SKQ8_KSTEP;
++
++    // Stage `ks` of this block's k-range into buffer ks % STAGES.
++    auto issue = [&](int ks) {
++        char * buf  = stage[ks % SKQ8_STAGES];
++        char * s_w  = buf;
++        char * s_a  = buf + SKQ8_STAGE_W;
++        char * s_dw = s_a + SKQ8_STAGE_A;
++        char * s_da = s_dw + SKQ8_STAGE_DW;
++        const int kbyte = k0 + ks * SKQ8_KSTEP;   // k offset in elements (== bytes for s8)
++        const int kbb   = kbyte / 32;             // k offset in q8 blocks
++        constexpr int vw = SKQ8_KSTEP / 16;       // 16B vectors per row per stage
++        // W tile: ROWS x vw x 16B
++        for (int it = threadIdx.x; it < SKQ8_ROWS * vw; it += blockDim.x) {
++            const int r = it / vw, v = it % vw;
++            skq8_cp16(
++                s_w + r * SKQ8_SW + v * 16, Wq + (size_t) (row_blk + r) * K + kbyte + v * 16);
++        }
++        // A tile: ncols x vw x 16B (only the active column tiles)
++        for (int it = threadIdx.x; it < ncols * vw; it += blockDim.x) {
++            const int c = it / vw, v = it % vw;
++            skq8_cp16(s_a + c * SKQ8_SA + v * 16, Aq + (size_t) c * K + kbyte + v * 16);
++        }
++        // scales: dw ROWS x KTB half (KTB*2 bytes/row), da ncols x KTB float
++        // (KTB*4 bytes/col); copy width follows KTB.
++        if (threadIdx.x < SKQ8_ROWS) {
++            if (SKQ8_KTB * 2 == 16) {
++                skq8_cp16(
++                    s_dw + threadIdx.x * (SKQ8_KTB * 2),
++                    Wd + (size_t) (row_blk + threadIdx.x) * KB + kbb);
++            } else if (SKQ8_KTB * 2 == 8) {
++                skq8_cp8(
++                    s_dw + threadIdx.x * (SKQ8_KTB * 2),
++                    Wd + (size_t) (row_blk + threadIdx.x) * KB + kbb);
++            } else {
++                skq8_cp4(
++                    s_dw + threadIdx.x * (SKQ8_KTB * 2),
++                    Wd + (size_t) (row_blk + threadIdx.x) * KB + kbb);
++            }
++        }
++        constexpr int da_vec = SKQ8_KTB * 4 / 16;  // 16B vectors per col
++        if constexpr (da_vec > 0) {
++            for (int it = threadIdx.x; it < ncols * da_vec; it += blockDim.x) {
++                const int c = it / da_vec, h = it % da_vec;
++                skq8_cp16(
++                    s_da + c * (SKQ8_KTB * 4) + h * 16, Ad + (size_t) c * KB + kbb + h * 4);
++            }
++        } else if (threadIdx.x < ncols) {
++            skq8_cp8(
++                s_da + threadIdx.x * (SKQ8_KTB * 4),
++                Ad + (size_t) threadIdx.x * KB + kbb);
++        }
++        skq8_commit();
++    };
++
++    float facc[2][4] = { { 0.0f } };
++
++    issue(0);
++
++    for (int ks = 0; ks < nsteps; ks++) {
++        // The next stage is issued after the current buffer is ready and before
++        // its MMA loop. This preserves compute/copy overlap with two buffers;
++        // the trailing barrier makes reusing the just-consumed buffer safe.
++        skq8_wait<0>();
++        __syncthreads();
++
++        if (ks + 1 < nsteps) {
++            issue(ks + 1);
++        }
++
++        const char * buf  = stage[ks % SKQ8_STAGES];
++        const char * s_w  = buf;
++        const char * s_a  = buf + SKQ8_STAGE_W;
++        const half * s_dw = (const half *) (buf + SKQ8_STAGE_W + SKQ8_STAGE_A);
++        const float * s_da =
++            (const float *) (buf + SKQ8_STAGE_W + SKQ8_STAGE_A + SKQ8_STAGE_DW);
++
++#pragma unroll
++        for (int kb = 0; kb < SKQ8_KSTEP / 32; kb++) {
++            // W fragment for this warp's 16 rows (rows mhalf*16 + gid, +8).
++            const char * wbase = s_w + (mhalf * 16 + gid) * SKQ8_SW + kb * 32 + tid4 * 4;
++            const int    a0    = *(const int *) (wbase);
++            const int    a1    = *(const int *) (wbase + 8 * SKQ8_SW);
++            const int    a2    = *(const int *) (wbase + 16);
++            const int    a3    = *(const int *) (wbase + 8 * SKQ8_SW + 16);
++            const float  dw0   = __half2float(s_dw[(mhalf * 16 + gid) * SKQ8_KTB + kb]);
++            const float  dw1   = __half2float(s_dw[(mhalf * 16 + gid + 8) * SKQ8_KTB + kb]);
++#pragma unroll
++            for (int t = 0; t < 2; t++) {
++                const int nt = nt0 + t;
++                if (nt * 8 >= ncols) {
++                    continue;  // dead column tile (N padded to ncols < NPAD)
++                }
++                const char * bbase = s_a + (nt * 8 + gid) * SKQ8_SA + kb * 32 + tid4 * 4;
++                const int    b0    = *(const int *) (bbase);
++                const int    b1    = *(const int *) (bbase + 16);
++                int          d0 = 0, d1 = 0, d2 = 0, d3 = 0;
++                skq8_mma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
++                const int   c0  = nt * 8 + tid4 * 2;
++                const float da0 = s_da[c0 * SKQ8_KTB + kb];
++                const float da1 = s_da[(c0 + 1) * SKQ8_KTB + kb];
++                facc[t][0] += dw0 * da0 * (float) d0;
++                facc[t][1] += dw0 * da1 * (float) d1;
++                facc[t][2] += dw1 * da0 * (float) d2;
++                facc[t][3] += dw1 * da1 * (float) d3;
++            }
++        }
++        __syncthreads();
++    }
++
++    // Write back: C rows mhalf*16 + gid (+8), cols nt*8 + tid4*2 (+1).
++    // With a K-split grid, each split writes a private output plane. A
++    // follow-up kernel reduces those planes in a fixed order, avoiding the
++    // run-to-run numerical drift caused by unordered FP32 atomic additions.
++    const int   row0 = row_blk + mhalf * 16 + gid;
++    const float b0   = (bias != nullptr && blockIdx.y == 0) ? bias[row0] : 0.0f;
++    const float b1   = (bias != nullptr && blockIdx.y == 0) ? bias[row0 + 8] : 0.0f;
++#pragma unroll
++    for (int t = 0; t < 2; t++) {
++        facc[t][0] += b0;
++        facc[t][1] += b0;
++        facc[t][2] += b1;
++        facc[t][3] += b1;
++    }
++#pragma unroll
++    for (int t = 0; t < 2; t++) {
++        const int c0 = (nt0 + t) * 8 + tid4 * 2;
++        if (gridDim.y > 1) {
++            // Plane stride covers the full logical output. `N` is only this
++            // grid.z tile's width (<= SKQ8_NPAD), so using it here aliases the
++            // next tile whenever N_total > SKQ8_NPAD.
++            const size_t split_base = (size_t) blockIdx.y * M * N_total;
++            if (c0 < N) {
++                C[split_base + row0 + (size_t) c0 * M]     = facc[t][0];
++                C[split_base + row0 + 8 + (size_t) c0 * M] = facc[t][2];
++            }
++            if (c0 + 1 < N) {
++                C[split_base + row0 + (size_t) (c0 + 1) * M]     = facc[t][1];
++                C[split_base + row0 + 8 + (size_t) (c0 + 1) * M] = facc[t][3];
++            }
++        } else {
++            if (c0 < N) {
++                C[row0 + (size_t) c0 * M]     = facc[t][0];
++                C[row0 + 8 + (size_t) c0 * M] = facc[t][2];
++            }
++            if (c0 + 1 < N) {
++                C[row0 + (size_t) (c0 + 1) * M]     = facc[t][1];
++                C[row0 + 8 + (size_t) (c0 + 1) * M] = facc[t][3];
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Wq, Wd, Aq, Ad, bias, C, M, N_total, K, ncols_total);
++    NO_DEVICE_CODE;
++#endif
++}
++
++static __global__ void skq8_reduce_splitk(
++    const float * __restrict__ partials, float * __restrict__ dst,
++    const int64_t count, const int ksplit) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= count) {
++        return;
++    }
++    float sum = partials[i];
++    for (int split = 1; split < ksplit; ++split) {
++        sum += partials[(int64_t) split * count + i];
++    }
++    dst[i] = sum;
++}
++
++static __global__ void skq8_add_bias_f32(
++    float * __restrict__ dst, const float * __restrict__ bias, const int m, const int64_t count) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= count) {
++        return;
++    }
++    dst[i] += bias[i % m];
++}
++
++// Repacked-weight cache. Keyed by the weight tensor's device pointer; entries
++// are dropped when the device buffer holding the weight is freed or cleared, so
++// new weights at the same address are repacked again. Repacking happens on
++// first (eager/warmup) use, before any CUDA-graph capture.
++namespace {
++struct skq8_planes {
++    int8_t * qs;
++    half *   d;
++};
++std::unordered_map<const void *, skq8_planes> g_skq8_cache;
++std::mutex                                    g_skq8_mutex;
++}  // namespace
++
++static const ggml_tensor * skq8_root(const ggml_tensor * t) {
++    while (t->view_src != nullptr) {
++        t = t->view_src;
++    }
++    return t;
++}
++
++// This specialization targets encoder matrices, whose ne[1] is a time or token
++// dimension: the FastConformer encoders and the MagpieTTS text encoder, which
++// shares the "encoder." prefix. Keeping the domain explicit also prevents a
++// decoder's request batch (which commonly occupies ne[1]) from being mistaken
++// for a skinny time dimension.
++static bool skq8_encoder_weight(const ggml_tensor * root) {
++    return strncmp(root->name, "encoder.", 8) == 0;
++}
++
++bool ggml_cuda_skinny_q8_repacked_in_place(const ggml_tensor * src0) {
++    // Only encoder weights are ever repacked, so every other Q8_0 weight skips
++    // the lock on MMVQ's per-call check.
++    if (src0->type != GGML_TYPE_Q8_0 || !skq8_encoder_weight(skq8_root(src0))) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_skq8_mutex);
++    const auto it = g_skq8_cache.find(src0->data);
++    return it != g_skq8_cache.end() && (const void *) it->second.qs == src0->data;
++}
++
++void ggml_cuda_skinny_q8_forget(const void * base, size_t size) {
++    const uintptr_t begin = (uintptr_t) base;
++    std::lock_guard<std::mutex> lock(g_skq8_mutex);
++    for (auto it = g_skq8_cache.begin(); it != g_skq8_cache.end();) {
++        // Compare as integers: the cache holds pointers into unrelated allocations.
++        const uintptr_t key = (uintptr_t) it->first;
++        if (key < begin || key - begin >= size) {
++            ++it;
++            continue;
++        }
++        const skq8_planes & planes = it->second;
++        // In-place and planar weights alias the tensor; only a separate
++        // (GGML_SKINNY_Q8_INPLACE=0) repack owns its planes.
++        if ((const void *) planes.qs != it->first) {
++            CUDA_CHECK(cudaFree(planes.qs));
++            CUDA_CHECK(cudaFree(planes.d));
++        }
++        it = g_skq8_cache.erase(it);
++    }
++}
++
++bool ggml_cuda_skinny_q8_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    // GGML_SKINNY_Q8=0 disables the kernel for block Q8_0 weights. Planar weights
++    // cannot be read by any other kernel, so they ignore it.
++    static const bool disabled = []() {
++        const char * e = getenv("GGML_SKINNY_Q8");
++        return e != nullptr && e[0] == '0';
++    }();
++    // Resolve views before checking the persistent model-weight marker. A
++    // serialized planar tensor is accepted only through its full allocation,
++    // since a normal ggml byte-offset view cannot describe two separate
++    // tensor-wide planes.
++    const ggml_tensor * root = skq8_root(src0);
++    const bool planar_q8 = (root->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0;
++    if (disabled && !planar_q8) {
++        return false;
++    }
++    if (!skq8_encoder_weight(root)) {
++        return false;
++    }
++    if (!planar_q8 && strstr(root->name, ".linear_qkv.weight") != nullptr) {
++        return false;
++    }
++    // Tensor-wide planes cannot be addressed through a stock block-row view.
++    // Current encoder graphs use the full fused QKV tensor, never a weight
++    // view; reject defensively if that changes.
++    if (planar_q8 && src0 != root) {
++        return false;
++    }
++
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    const bool skinny_q8_available = ampere_mma_available(cc);
++    if (!planar_q8 && !skinny_q8_available) {
++        return false;
++    }
++    // The repack cache is keyed by src0->data and assumes the bytes are
++    // immutable from the outside: only accept long-lived weight buffers, never
++    // transient compute-pool tensors (whose addresses get reused).
++    if (src0->buffer == nullptr ||
++        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        return false;
++    }
++
++    // Weight-side (per-tensor, call-invariant) conditions.
++    const bool tensor_ok = src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) &&
++                           src0->ne[2] == 1 && src0->ne[3] == 1 &&
++                           src0->ne[0] % SKQ8_KSTEP == 0 && src0->ne[1] % SKQ8_ROWS == 0;
++    // Call-side conditions.
++    // A dense batched RHS [K,N,B...] is byte-identical to [K,N*B...].  Treat
++    // all outer columns as one logical N so a weight repacked by a scalar
++    // graph remains usable by a later true-batch graph.
++    const int64_t total_n = ggml_nelements(src1) / src1->ne[0];
++    const bool call_ok = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++                         ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++                         src1->ne[0] == src0->ne[0] &&
++                         ggml_nelements(dst) == src0->ne[1] * total_n;
++
++    if (planar_q8) {
++        // N<=8 is handled by planar MMVQ. Wider calls must stay on this path
++        // because stock MMQ cannot interpret tensor-wide planes; skq8_gemm
++        // tiles arbitrary N in 64-column chunks.
++        GGML_ASSERT(tensor_ok && call_ok && "planar Q8 weight used in unsupported mul_mat shape");
++        GGML_ASSERT((skinny_q8_available || total_n <= MMVQ_MAX_BATCH_SIZE) &&
++                    "wide planar Q8 requires an SM80+ CUDA kernel; use block Q8 on older GPUs");
++        return skinny_q8_available && total_n > MMVQ_MAX_BATCH_SIZE;
++    }
++
++    const bool repacked = [&]() {
++        std::lock_guard<std::mutex> lock(g_skq8_mutex);
++        return g_skq8_cache.find(src0->data) != g_skq8_cache.end();
++    }();
++    if (repacked) {
++        // The weight was converted IN PLACE to the plane layout — the
++        // block_q8_0 bytes no longer exist, so every mul_mat on this tensor
++        // must come through here (skq8_run serves N <= MMVQ_MAX_BATCH_SIZE
++        // with planar MMVQ and tiles wider N). Falling back to mmq/mmvq would
++        // silently read garbage: abort loudly instead if a call shape we
++        // cannot serve ever appears.
++        GGML_ASSERT(call_ok && "skinny-q8: repacked weight used in an unsupported mul_mat shape");
++        return true;
++    }
++    // Same rule as serialized planar weights above, applied from the first
++    // call: the kernel depends only on the call's column count, never on
++    // whether an earlier call already repacked the weight. N <= 8 stays on
++    // MMVQ (planar MMVQ after a repack computes the same bits); every wider
++    // call runs skq8, which repacks on first use. An N cap here would send
++    // wide calls to mmq before the first repack and to skq8 after it, making
++    // outputs depend on which requests the process served earlier.
++    return tensor_ok && call_ok && total_n > MMVQ_MAX_BATCH_SIZE;
++}
++
++static void skq8_run(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst) {
++    const int64_t M  = src0->ne[1];
++    const int64_t K  = src0->ne[0];
++    const int64_t N  = ggml_nelements(src1) / src1->ne[0];
++    const int64_t KB = K / 32;
++
++    cudaStream_t stream = ctx.stream();
++    // Only a repacked weight reaches here with N <= MMVQ_MAX_BATCH_SIZE (see
++    // ggml_cuda_skinny_q8_supported); it keeps the MMVQ math it had before.
++    const bool mmvq_cols = N <= MMVQ_MAX_BATCH_SIZE;
++
++    // Repacked weight planes (create on first use). Default: IN PLACE. The plane
++    // layout (qs M*K + d M*KB*2) is byte-for-byte the same total size as
++    // block_q8_0 (M*KB*34), so it repacks through a transient pool staging buffer
++    // and copies back over the original allocation: zero extra weight memory (the
++    // cudaMalloc'd duplicate cost ~1.07 GB on parakeet-xxl). After this the
++    // tensor's block_q8_0 layout is GONE; the dispatch in
++    // ggml_cuda_skinny_q8_supported() therefore claims every mul_mat on a
++    // repacked tensor.
++    //
++    // GGML_SKINNY_Q8_INPLACE=0 forces the separate-buffer (cudaMalloc) layout.
++    // The in-place D2D memcpy is a stream-ordering hazard under multi-stream
++    // graph-split scheduling (llama.cpp's NMT decoder): it corrupts the GEMM even
++    // though the repacked bytes are correct. Callers that share the process with
++    // such a scheduler set GGML_SKINNY_Q8_INPLACE=0 (the NMT pipeline does this
++    // when enabled). The streaming-ASR encoder runtime has no such hazard.
++    skq8_planes planes = {};
++    {
++        std::lock_guard<std::mutex> lock(g_skq8_mutex);
++        auto                        it = g_skq8_cache.find(src0->data);
++        if (it != g_skq8_cache.end()) {
++            planes = it->second;
++        } else {
++            const size_t qs_bytes = (size_t) M * K;
++            const size_t d_bytes  = (size_t) M * KB * sizeof(half);
++            GGML_ASSERT(qs_bytes + d_bytes == ggml_nbytes(src0));
++            if ((src0->flags & GGML_TENSOR_FLAG_Q8_PLANAR) != 0) {
++                planes.qs = (int8_t *) src0->data;
++                planes.d  = (half *) ((char *) src0->data + qs_bytes);
++                g_skq8_cache.emplace(src0->data, planes);
++            } else {
++                static const bool inplace = []() {
++                    const char * e = getenv("GGML_SKINNY_Q8_INPLACE");
++                    return e == nullptr || e[0] != '0';
++                }();
++                const int64_t total  = M * KB;
++                const int     blocks = (int) ((total + 255) / 256);
++                if (inplace) {
++                    ggml_cuda_pool_alloc<int8_t> staging(ctx.pool(), qs_bytes + d_bytes);
++                    skq8_repack<<<blocks, 256, 0, stream>>>(
++                        src0->data, staging.get(), (half *) (staging.get() + qs_bytes), M, KB);
++                    CUDA_CHECK(cudaMemcpyAsync(
++                        src0->data, staging.get(), qs_bytes + d_bytes, cudaMemcpyDeviceToDevice,
++                        stream));
++                    planes.qs = (int8_t *) src0->data;
++                    planes.d  = (half *) ((char *) src0->data + qs_bytes);
++                    // staging returns to the pool at scope exit; the copy is
++                    // stream-ordered before any later reuse on this stream.
++                } else {
++                    CUDA_CHECK(cudaMalloc(&planes.qs, qs_bytes));
++                    CUDA_CHECK(cudaMalloc(&planes.d, d_bytes));
++                    skq8_repack<<<blocks, 256, 0, stream>>>(
++                        src0->data, planes.qs, planes.d, M, KB);
++                }
++                g_skq8_cache.emplace(src0->data, planes);
++            }
++        }
++    }
++
++    if (mmvq_cols) {
++        // Serve MMVQ's column range with MMVQ, as before the repack. In-place
++        // (and serialized planar) planes alias the tensor bytes, so read them
++        // through planar MMVQ, which computes the same bits as block MMVQ; a
++        // separate (GGML_SKINNY_Q8_INPLACE=0) repack left the block bytes intact.
++        GGML_ASSERT(src1->type == GGML_TYPE_F32);
++        ggml_tensor weight = *src0;
++        if ((const void *) planes.qs == src0->data) {
++            weight.flags |= GGML_TENSOR_FLAG_Q8_PLANAR;
++        }
++        ggml_cuda_mul_mat_vec_q(ctx, &weight, src1, nullptr, dst);
++        if (bias != nullptr) {
++            // separate add, like the unfused mul_mat + add graph
++            const int64_t count = M * N;
++            skq8_add_bias_f32<<<(count + 255) / 256, 256, 0, stream>>>(
++                (float *) dst->data, (const float *) bias->data, (int) M, count);
++        }
++        return;
++    }
++
++
++    // Quantize activations into the zero-padded buffer (all columns, once —
++    // ntot may exceed NPAD; the GEMM below tiles over 64-col chunks).
++    const int ntot = (int) ((N + SKQ8_NPAD - 1) / SKQ8_NPAD * SKQ8_NPAD);
++    ggml_cuda_pool_alloc<int8_t> aq_alloc(ctx.pool(), (size_t) ntot * K);
++    ggml_cuda_pool_alloc<float>  ad_alloc(ctx.pool(), (size_t) ntot * KB);
++    {
++        const int64_t warps  = (int64_t) ntot * KB;  // one warp per (col, q8 block)
++        const int     blocks = (int) ((warps * 32 + 255) / 256);
++        skq8_quantize<<<blocks, 256, 0, stream>>>(
++            (const float *) src1->data, aq_alloc.get(), ad_alloc.get(), (int) K, (int) N);
++    }
++
++    // Split K for small-M shapes until there is enough block-level parallelism.
++    // Each split writes a private plane and a deterministic reduction combines
++    // the planes afterward; unordered atomics can amplify into visible
++    // B=1-versus-batched drift across a deep encoder.
++    // 1-step splits are allowed: no pipeline, but block-level K-parallelism.
++    // N > NPAD is mapped into grid.z. Weights are still read once per 64-column
++    // tile, but all tiles are visible to the scheduler in a single launch.
++    {
++        const int row_blocks = (int) (M / SKQ8_ROWS);
++        int       ksplit     = 1;
++        while (ksplit < 4 && row_blocks * ksplit < 128 &&
++               K % ((int64_t) SKQ8_KSTEP * ksplit * 2) == 0) {
++            ksplit *= 2;
++        }
++        const size_t smem = (size_t) SKQ8_STAGES * SKQ8_STAGE_BYTES;
++        static std::once_flag attr_set_flag;
++        std::call_once(attr_set_flag, [&]() {
++            CUDA_CHECK(cudaFuncSetAttribute(
++                skq8_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++        });
++        const int  ntiles = (ntot + SKQ8_NPAD - 1) / SKQ8_NPAD;
++        const dim3 grid(row_blocks, ksplit, ntiles);
++        const float * bias_data = bias != nullptr ? (const float *) bias->data : nullptr;
++        if (ksplit > 1) {
++            const int64_t count = M * N;
++            ggml_cuda_pool_alloc<float> partials(ctx.pool(), (size_t) ksplit * count);
++            skq8_gemm<<<grid, SKQ8_WARPS * 32, smem, stream>>>(
++                planes.qs, planes.d, aq_alloc.get(), ad_alloc.get(), bias_data, partials.get(),
++                (int) M, (int) N, (int) K, ntot);
++            skq8_reduce_splitk<<<(count + 255) / 256, 256, 0, stream>>>(
++                partials.get(), (float *) dst->data, count, ksplit);
++        } else {
++            skq8_gemm<<<grid, SKQ8_WARPS * 32, smem, stream>>>(
++                planes.qs, planes.d, aq_alloc.get(), ad_alloc.get(), bias_data,
++                (float *) dst->data, (int) M, (int) N, (int) K, ntot);
++        }
++    }
++}
++
++void ggml_cuda_mul_mat_skinny_q8(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    ggml_tensor * dst) {
++    skq8_run(ctx, src0, src1, nullptr, dst);
++}
++
++void ggml_cuda_mul_mat_skinny_q8_bias(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst) {
++    skq8_run(ctx, src0, src1, bias, dst);
++}
+diff --git a/ggml/src/ggml-cuda/skinny-q8.cuh b/ggml/src/ggml-cuda/skinny-q8.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..1847c2b1391a58f78937c1ef6f4edfccd1dea8d3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/skinny-q8.cuh
+@@ -0,0 +1,27 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++#include "common.cuh"
++
++// Skinny-N Q8_0 x F32 GEMM specialized for streaming encoders (claims every
++// call wider than MMVQ's 8 columns on an eligible weight).
++// See skinny-q8.cu for the design notes.
++
++// Drop cached planes for weights in a device allocation being freed or cleared.
++void ggml_cuda_skinny_q8_forget(const void * base, size_t size);
++
++// True when the Q8_0 weight src0 was repacked to the planar layout in place, so its
++// bytes are no longer block_q8_0 even though the tensor is not flagged planar.
++bool ggml_cuda_skinny_q8_repacked_in_place(const ggml_tensor * src0);
++
++bool ggml_cuda_skinny_q8_supported(
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++
++void ggml_cuda_mul_mat_skinny_q8(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    ggml_tensor * dst);
++
++// Fused variant: adds a row-vector bias ([M], F32) in the GEMM epilogue and
++// writes the result to `dst` (the bias-add node's buffer).
++void ggml_cuda_mul_mat_skinny_q8_bias(
++    ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++    const ggml_tensor * bias, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index f2a6f2009c9ac907b6002667a49dcb6c2e75be56..ce3ddbc5f8b2e58385e8017af6d5be4d66d601e1 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -240,7 +240,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
+     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
+ }
+ 
+-#define VDR_Q8_0_Q8_1_MMVQ 2
++#define VDR_Q8_0_Q8_1_MMVQ 4
+ #define VDR_Q8_0_Q8_1_MMQ 8
+ 
+ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(

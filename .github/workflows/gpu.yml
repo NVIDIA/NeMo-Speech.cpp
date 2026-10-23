@@ -74,10 +74,10 @@ jobs:
           echo "NEMO_SPEECH_MODEL_DIR=$GITHUB_WORKSPACE/.ci-models" >> "$GITHUB_ENV"
 
       - name: Initialize submodules
-        run: git submodule update --init --depth 1 ggml llama.cpp
+        run: git submodule update --init --depth 1 llama.cpp
 
       - name: Configure
-        # configure.sh applies the ggml patch series for cuda-* presets.
+        # CMake applies patches/ for cuda-* presets.
         # sm_89 is the L4.
         run: |
           scripts/configure.sh cuda-speech \
@@ -118,7 +118,7 @@ jobs:
           persist-credentials: false
 
       - name: Initialize submodules
-        run: git submodule update --init --depth 1 ggml llama.cpp
+        run: git submodule update --init --depth 1 llama.cpp
 
       - name: Install build prerequisites
         # The ephemeral VM ships the NVIDIA driver (with the Vulkan ICD) but not

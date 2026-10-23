@@ -23,6 +23,8 @@ from safetensors.torch import save_file
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from conversion.diarization import is_high_resolution_v3
+from conversion.diarization import remap as remap_diarization
 from conversion.registry import (
     ConversionRequest,
     _convert_nmt,
@@ -141,6 +143,9 @@ class ConverterContractTest(unittest.TestCase):
         self.assertEqual(_normalized_outtype("asr", "auto"), "q8_0")
         self.assertEqual(_normalized_outtype("diarization", "auto"), "f32")
         self.assertEqual(_normalized_outtype("tts", "fp16"), "f16")
+        self.assertEqual(_normalized_outtype("tts", "q8_0"), "q8_0")
+        self.assertEqual(_normalized_outtype("tts", "auto"), "q8_0")
+        self.assertEqual(_normalized_outtype("codec", "auto"), "f16")
         self.assertEqual(_normalized_outtype("s2s", "auto"), "q4_k_m")
         self.assertEqual(_normalized_outtype("s2s", "q4"), "q4_k_m")
         self.assertEqual(_normalized_outtype("s2s", "nvfp4"), "nvfp4")
@@ -358,9 +363,9 @@ class ConverterContractTest(unittest.TestCase):
             llama_cpp.mkdir()
             (llama_cpp / "CMakeLists.txt").touch()
             (llama_cpp / "convert_hf_to_gguf.py").touch()
-            patch_script = root / "scripts" / "apply-llama-patches.sh"
-            patch_script.parent.mkdir()
-            patch_script.touch()
+            materialize = root / "cmake" / "llama_cpp.cmake"
+            materialize.parent.mkdir()
+            materialize.touch()
             built = default_quantizer_path(llama_cpp)
 
             def fake_run(command, **_kwargs):
@@ -385,7 +390,11 @@ class ConverterContractTest(unittest.TestCase):
 
             self.assertEqual(actual, built)
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(commands[0], ["bash", str(patch_script)])
+            self.assertEqual(commands[0][-2:], ["-P", str(materialize)])
+            self.assertIn(f"-DDEST_DIR={root / '.deps' / 'llama.cpp-patched'}", commands[0])
+            self.assertEqual(
+                commands[1][commands[1].index("-S") + 1], str(root / ".deps" / "llama.cpp-patched")
+            )
             self.assertIn("-DLLAMA_BUILD_TOOLS=ON", commands[1])
             self.assertEqual(commands[2][-3:], ["--target", "llama-quantize", "--parallel"])
 
@@ -394,6 +403,33 @@ class ConverterContractTest(unittest.TestCase):
             llama_cpp = Path(temporary) / "llama.cpp"
             with self.assertRaisesRegex(FileNotFoundError, "automatic build is disabled"):
                 ensure_quantizer(llama_cpp, auto_build=False)
+
+    def test_sortformer_v2_v3_contract_detection_and_remapping(self) -> None:
+        v2 = {
+            "encoder": {
+                "self_attention_model": "rel_pos",
+                "subsampling": "dw_striding",
+            }
+        }
+        v3 = {
+            "high_resolution": True,
+            "encoder": {
+                "self_attention_model": "rope",
+                "subsampling": "feature_stacking",
+            },
+        }
+        self.assertFalse(is_high_resolution_v3(v2))
+        self.assertTrue(is_high_resolution_v3(v3))
+        self.assertFalse(is_high_resolution_v3({**v3, "high_resolution": False}))
+        self.assertEqual(
+            remap_diarization("sortformer_modules.subpixel_upsample.weight"),
+            "subpixel_upsample.weight",
+        )
+        self.assertEqual(
+            remap_diarization("sortformer_modules.learnable_sil_emb"),
+            "learnable_sil_emb",
+        )
+        self.assertIsNone(remap_diarization("sortformer_modules.hidden_to_spks.weight"))
 
     def test_archive_traversal_and_links_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

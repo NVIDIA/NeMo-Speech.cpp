@@ -1,0 +1,40 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: enable NVFP4 in llama-quantize
+
+Maps LLAMA_FTYPE_MOSTLY_NVFP4 to GGML_TYPE_NVFP4 and exposes it in
+llama-quantize for the S2S nvfp4 conversion profile.
+
+Upstream: candidate (needs PPL/KLD data).
+
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 34ff25db57e661ceceabc1579983ff908dbbb3ed..9bbb61b366b98970e88a8199e090c86050c18afe 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -398,6 +398,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
+             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
+             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
+             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
++            case GGML_TYPE_NVFP4:   return_type = GGML_TYPE_Q8_0;   break;
+             default:
+                 if (qk_k <= 32) {
+                     // the target is already a 32-block type, so there is no smaller block to demote to
+@@ -858,6 +859,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+ 
+         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
++        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
+ 
+         // K-quants
+         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
+diff --git a/tools/quantize/quantize.cpp b/tools/quantize/quantize.cpp
+index 38950036cd820e41f49fe28714a03ea261ce9df3..daa0a819b60afafe3ba1a2b313fec1303b6e460f 100644
+--- a/tools/quantize/quantize.cpp
++++ b/tools/quantize/quantize.cpp
+@@ -37,6 +37,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
+     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
+     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
+     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
++    { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,    " NVIDIA FP4 quantization",          },
+     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
+     { "Q5_1",     LLAMA_FTYPE_MOSTLY_Q5_1,     " 5.65G, +0.1062 ppl @ Llama-3-8B",  },
+     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },

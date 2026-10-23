@@ -21,7 +21,7 @@ examples, tests, and tools. Individual features can be selected explicitly
 ```bash
 nemo-speech serve \
   --asr-model models/asr.q8_0.gguf \
-  --tts-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+  --tts-model models/magpie-tts/magpie.gguf \
   --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
   --tokenizer-dir models/magpie-tts/extracted
 # HTTP API and playground: http://127.0.0.1:8080/

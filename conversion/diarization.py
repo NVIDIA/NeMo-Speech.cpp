@@ -17,6 +17,11 @@ Target model: nvidia/diar_streaming_sortformer_4spk-v2 (SortformerEncLabelModel)
   * `preprocessor.featurizer.fb` — the trained mel filterbank; emitted
                        verbatim as `preprocessor.fb` (no librosa rebuild).
 
+The converter also supports the high-resolution Sortformer v3 checkpoints:
+  * 8x FeatureStacking -> 31-layer pre-LN RoPE Transformer (d512, 8 heads)
+  * encoder projection 512->192 and 8x subpixel Conv1d upsampling
+  * the same sigmoid speaker head, with a learned silence embedding for AOSC
+
 Usage:
     python3 convert_model.py <src.nemo|hf-repo-id> --outfile <out.gguf> \
         [--outtype f32|f16|bf16|q8_0|...]
@@ -52,6 +57,7 @@ WEIGHT_TYPES["f32"] = (GGMLQuantizationType.F32, GGMLQuantizationType.F32, 0)  #
 
 KEY_ARCH = "general.architecture"
 KEY_NAME = "general.name"
+KEY_VERSION = f"{ARCH}.version"
 
 # NEST encoder — same key layout as asr.encoder.* so config parsing stays
 # uniform between the ASR and diarizer loaders.
@@ -69,6 +75,13 @@ KEY_ENC_PE_MAX_LEN = f"{ARCH}.encoder.pos_emb_max_len"
 KEY_ENC_CONV_NORM = f"{ARCH}.encoder.conv_norm"
 KEY_ENC_CONV_CONTEXT = f"{ARCH}.encoder.conv_context"
 KEY_ENC_ATT_CONTEXT_STYLE = f"{ARCH}.encoder.att_context_style"
+KEY_ENC_TYPE = f"{ARCH}.encoder.type"
+KEY_ENC_SUBSAMPLE_TYPE = f"{ARCH}.encoder.subsampling_type"
+KEY_ENC_QKV_BIAS = f"{ARCH}.encoder.qkv_bias"
+KEY_ENC_QK_NORM = f"{ARCH}.encoder.qk_norm"
+KEY_ENC_PRE_BLOCK_NORM = f"{ARCH}.encoder.pre_block_norm"
+KEY_ENC_ROPE_BASE = f"{ARCH}.encoder.rope_base"
+KEY_ENC_ROTARY_FRACTION = f"{ARCH}.encoder.rotary_fraction"
 
 # Transformer head
 KEY_TF_N_LAYERS = f"{ARCH}.transformer.n_layers"
@@ -78,6 +91,10 @@ KEY_TF_N_HEADS = f"{ARCH}.transformer.n_heads"
 KEY_TF_PRE_LN = f"{ARCH}.transformer.pre_ln"
 
 KEY_NUM_SPEAKERS = f"{ARCH}.num_speakers"
+KEY_HIGH_RESOLUTION = f"{ARCH}.high_resolution"
+KEY_OUTPUT_SUBSAMPLE = f"{ARCH}.output_subsampling_factor"
+KEY_UPSAMPLE_FACTOR = f"{ARCH}.upsample_factor"
+KEY_LEARNABLE_SILENCE = f"{ARCH}.learnable_silence"
 
 # Preprocessor (FE)
 KEY_FE_SAMPLE_RATE = f"{ARCH}.preprocessor.sample_rate"
@@ -143,6 +160,10 @@ def remap(name: str) -> Optional[str]:
         return None
     if name.startswith("sortformer_modules.encoder_proj."):
         return name.replace("sortformer_modules.", "", 1)
+    if name.startswith("sortformer_modules.subpixel_upsample."):
+        return name.replace("sortformer_modules.", "", 1)
+    if name == "sortformer_modules.learnable_sil_emb":
+        return "learnable_sil_emb"
     if name.startswith("sortformer_modules."):
         # first_hidden_to_hidden / single_hidden_to_spks
         return name.replace("sortformer_modules.", "head.", 1)
@@ -152,6 +173,16 @@ def remap(name: str) -> Optional[str]:
         return name
     print(f"[convert] WARNING: unrecognized tensor skipped: {name}", file=sys.stderr)
     return None
+
+
+def is_high_resolution_v3(config: dict) -> bool:
+    """Return whether a Sortformer config uses the supported V3 contract."""
+    encoder = config.get("encoder", {}) or {}
+    return (
+        str(encoder.get("self_attention_model", "rel_pos")) == "rope"
+        and str(encoder.get("subsampling", "")) == "feature_stacking"
+        and bool(config.get("high_resolution", False))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +195,9 @@ _LINEAR_WEIGHT_PATTERNS = [
     re.compile(r"^encoder\.pre_encode\.out\.weight$"),
     re.compile(r"^encoder\.layers\.\d+\.conv\.pointwise_conv[12]\.weight$"),
     re.compile(r"^encoder_proj\.weight$"),
+    re.compile(r"^encoder\.pre_encode\.proj\.weight$"),
+    re.compile(r"^encoder\.layers\.\d+\.attn\.(w_qkv|out_proj)\.weight$"),
+    re.compile(r"^encoder\.layers\.\d+\.ffn\.net\.(0|3)\.weight$"),
     re.compile(
         r"^transformer\.layers\.\d+\."
         r"(first_sub_layer\.(query_net|key_net|value_net|out_projection)"
@@ -172,7 +206,8 @@ _LINEAR_WEIGHT_PATTERNS = [
     # head.* weights are tiny (192x192 / 4x192): always F32, not listed here.
 ]
 _CONV_WEIGHT_PATTERN = re.compile(
-    r"^(encoder\.layers\.\d+\.conv\.depthwise_conv" r"|encoder\.pre_encode\.conv\.\d+)\.weight$"
+    r"^(encoder\.layers\.\d+\.conv\.depthwise_conv"
+    r"|encoder\.pre_encode\.conv\.\d+|subpixel_upsample)\.weight$"
 )
 _POINTWISE_PATTERN = re.compile(r"^encoder\.layers\.\d+\.conv\.pointwise_conv[12]\.weight$")
 
@@ -180,6 +215,8 @@ _POINTWISE_PATTERN = re.compile(r"^encoder\.layers\.\d+\.conv\.pointwise_conv[12
 def _pick_dtype(
     name: str, shape: tuple, linear_qtype: GGMLQuantizationType, default_qtype: GGMLQuantizationType
 ) -> tuple[GGMLQuantizationType, Optional[str]]:
+    if name == "learnable_sil_emb":
+        return GGMLQuantizationType.F32, None
     if any(p.match(name) for p in _LINEAR_WEIGHT_PATTERNS):
         inner = int(shape[-1]) if len(shape) >= 1 else 1
         if linear_qtype in K_QUANTS and inner % QK_K != 0:
@@ -226,36 +263,54 @@ def convert(nemo_path: Path, out_path: Path, weight_type: str) -> None:
 
         enc_cfg = cfg["encoder"]
         pp_cfg = cfg["preprocessor"]
-        tf_cfg = cfg["transformer_encoder"]
         sm_cfg = cfg.get("sortformer_modules", {}) or {}
+
+        self_attention = str(enc_cfg.get("self_attention_model", "rel_pos"))
+        is_v3 = is_high_resolution_v3(cfg)
+        version = "v3" if is_v3 else "v2"
+        tf_cfg = None if is_v3 else cfg.get("transformer_encoder")
+        if not is_v3 and tf_cfg is None:
+            raise RuntimeError("Sortformer v2 checkpoint is missing transformer_encoder config")
 
         d_model = int(enc_cfg["d_model"])
         n_layers = int(enc_cfg["n_layers"])
-        d_ff = d_model * int(enc_cfg.get("ff_expansion_factor", 4))
+        ff_expansion = float(enc_cfg.get("ff_expansion", enc_cfg.get("ff_expansion_factor", 4)))
+        d_ff = int(d_model * ff_expansion)
         pe_max_len = int(enc_cfg.get("pos_emb_max_len", 5000))
         feat_in = int(enc_cfg["feat_in"])
         num_speakers = int(cfg.get("max_num_of_spks", sm_cfg.get("num_spks", 4)))
 
-        if str(enc_cfg.get("self_attention_model", "rel_pos")) != "rel_pos":
-            raise RuntimeError("only rel_pos NEST encoders are supported")
+        if is_v3:
+            if not bool(sm_cfg.get("use_learnable_sil_emb", False)):
+                raise RuntimeError("Sortformer v3 requires use_learnable_sil_emb=true")
+            if int(cfg.get("output_subsampling_factor", 1)) != 1:
+                raise RuntimeError(
+                    "Sortformer v3 conversion currently requires native 10 ms output"
+                )
+            if bool(enc_cfg.get("qk_norm", False)):
+                raise RuntimeError("Sortformer v3 qk_norm checkpoints are not supported")
+            if str(enc_cfg.get("attn_mode", "full")) != "full":
+                raise RuntimeError("Sortformer v3 currently requires full attention")
+        elif self_attention != "rel_pos":
+            raise RuntimeError("unsupported Sortformer encoder (expected v2 rel_pos or v3 rope)")
 
         print(
             f"[convert] encoder d_model={d_model} n_layers={n_layers} "
             f"n_heads={enc_cfg['n_heads']} d_ff={d_ff} feat_in={feat_in}; "
-            f"transformer n_layers={tf_cfg['num_layers']} hidden={tf_cfg['hidden_size']}; "
-            f"num_speakers={num_speakers}"
+            f"variant={version}; num_speakers={num_speakers}"
         )
 
         gw = GGUFWriter(str(out_path), arch=ARCH)
         gw.add_architecture()
         gw.add_string(KEY_NAME, cfg.get("name", out_path.stem))
+        gw.add_string(KEY_VERSION, version)
         gw.add_uint32("general.file_type", file_type_value)
 
         gw.add_uint32(KEY_ENC_D_MODEL, d_model)
         gw.add_uint32(KEY_ENC_N_LAYERS, n_layers)
         gw.add_uint32(KEY_ENC_N_HEADS, int(enc_cfg["n_heads"]))
         gw.add_uint32(KEY_ENC_D_FF, d_ff)
-        gw.add_uint32(KEY_ENC_CONV_KERNEL, int(enc_cfg["conv_kernel_size"]))
+        gw.add_uint32(KEY_ENC_CONV_KERNEL, int(enc_cfg.get("conv_kernel_size", 0)))
         gw.add_uint32(KEY_ENC_SUBSAMPLE, int(enc_cfg.get("subsampling_factor", 8)))
         gw.add_uint32(
             KEY_ENC_SUBSAMPLE_CONV_CHANNELS, int(enc_cfg.get("subsampling_conv_channels", 256))
@@ -267,16 +322,47 @@ def convert(nemo_path: Path, out_path: Path, weight_type: str) -> None:
         gw.add_string(KEY_ENC_CONV_NORM, str(enc_cfg.get("conv_norm_type", "batch_norm")))
         gw.add_string(KEY_ENC_CONV_CONTEXT, "symmetric")
         gw.add_string(KEY_ENC_ATT_CONTEXT_STYLE, str(enc_cfg.get("att_context_style", "regular")))
+        gw.add_string(KEY_ENC_TYPE, "transformer_rope" if is_v3 else "fastconformer")
+        gw.add_string(
+            KEY_ENC_SUBSAMPLE_TYPE,
+            str(enc_cfg.get("subsampling", "dw_striding")),
+        )
+        gw.add_bool(KEY_ENC_QKV_BIAS, bool(enc_cfg.get("qkv_bias", not is_v3)))
+        gw.add_bool(KEY_ENC_QK_NORM, bool(enc_cfg.get("qk_norm", False)))
+        gw.add_bool(KEY_ENC_PRE_BLOCK_NORM, bool(enc_cfg.get("pre_block_norm", is_v3)))
+        gw.add_float32(KEY_ENC_ROPE_BASE, float(enc_cfg.get("rope_base", 10000.0)))
+        gw.add_float32(KEY_ENC_ROTARY_FRACTION, float(enc_cfg.get("rotary_fraction", 1.0)))
 
-        gw.add_uint32(KEY_TF_N_LAYERS, int(tf_cfg["num_layers"]))
-        gw.add_uint32(KEY_TF_HIDDEN, int(tf_cfg["hidden_size"]))
-        gw.add_uint32(KEY_TF_INNER, int(tf_cfg["inner_size"]))
-        gw.add_uint32(KEY_TF_N_HEADS, int(tf_cfg["num_attention_heads"]))
-        gw.add_bool(KEY_TF_PRE_LN, bool(tf_cfg.get("pre_ln", False)))
-        if str(tf_cfg.get("hidden_act", "relu")) != "relu":
-            raise RuntimeError("only relu transformer FF activation is supported")
+        if is_v3:
+            tf_hidden = int(
+                sm_cfg.get("tf_d_model", cfg.get("model_defaults", {}).get("tf_d_model", 192))
+            )
+            gw.add_uint32(KEY_TF_N_LAYERS, 0)
+            gw.add_uint32(KEY_TF_HIDDEN, tf_hidden)
+            gw.add_uint32(KEY_TF_INNER, 0)
+            gw.add_uint32(KEY_TF_N_HEADS, 0)
+            gw.add_bool(KEY_TF_PRE_LN, True)
+        else:
+            assert tf_cfg is not None
+            gw.add_uint32(KEY_TF_N_LAYERS, int(tf_cfg["num_layers"]))
+            gw.add_uint32(KEY_TF_HIDDEN, int(tf_cfg["hidden_size"]))
+            gw.add_uint32(KEY_TF_INNER, int(tf_cfg["inner_size"]))
+            gw.add_uint32(KEY_TF_N_HEADS, int(tf_cfg["num_attention_heads"]))
+            gw.add_bool(KEY_TF_PRE_LN, bool(tf_cfg.get("pre_ln", False)))
+            if str(tf_cfg.get("hidden_act", "relu")) != "relu":
+                raise RuntimeError("only relu transformer FF activation is supported")
 
         gw.add_uint32(KEY_NUM_SPEAKERS, num_speakers)
+        gw.add_bool(KEY_HIGH_RESOLUTION, bool(cfg.get("high_resolution", False)))
+        gw.add_uint32(
+            KEY_OUTPUT_SUBSAMPLE,
+            int(cfg.get("output_subsampling_factor", 1 if is_v3 else 8)),
+        )
+        gw.add_uint32(
+            KEY_UPSAMPLE_FACTOR,
+            int(enc_cfg.get("subsampling_factor", 8)) if is_v3 else 1,
+        )
+        gw.add_bool(KEY_LEARNABLE_SILENCE, bool(sm_cfg.get("use_learnable_sil_emb", False)))
 
         gw.add_uint32(KEY_FE_SAMPLE_RATE, int(pp_cfg.get("sample_rate", 16000)))
         gw.add_float32(KEY_FE_WINDOW_SIZE, float(pp_cfg.get("window_size", 0.025)))
@@ -306,9 +392,10 @@ def convert(nemo_path: Path, out_path: Path, weight_type: str) -> None:
         gw.add_uint32(KEY_ST_CHUNK_LC, int(sm_cfg.get("chunk_left_context", 1)))
         gw.add_uint32(KEY_ST_CHUNK_RC, int(sm_cfg.get("chunk_right_context", 1)))
 
-        # ---- Analytical rel-pos PE table ----
-        pe = build_pe(d_model, pe_max_len)
-        gw.add_tensor("encoder.pos_enc.pe", pe, raw_dtype=GGMLQuantizationType.F32)
+        # ---- Analytical rel-pos PE table (v2 only; v3 RoPE is generated in-graph) ----
+        if not is_v3:
+            pe = build_pe(d_model, pe_max_len)
+            gw.add_tensor("encoder.pos_enc.pe", pe, raw_dtype=GGMLQuantizationType.F32)
 
         # ---- Trained mel filterbank, verbatim from the checkpoint ----
         fb = sd["preprocessor.featurizer.fb"].detach().cpu().float().numpy()

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "magpietts.h"
@@ -78,8 +79,8 @@ validate_config(const MagpieRuntimeConfig& config) {
     if (config.codec_model.empty()) {
         throw std::invalid_argument("NanoCodec model path is required");
     }
-    if (config.threads <= 0) {
-        throw std::invalid_argument("threads must be positive");
+    if (config.threads < 0) {
+        throw std::invalid_argument("threads must be non-negative");
     }
     if (config.codec_threads < 0) {
         throw std::invalid_argument("codec_threads must be non-negative");
@@ -169,8 +170,14 @@ class MagpieTtsRuntime::Impl {
         params.warmup_tokens = tokens;
         params.warmup_token_chunks = token_chunks;
         params.speaker = options.speaker >= 0 ? options.speaker : config_.speaker;
-        params.threads = config_.threads;
-        params.codec_threads = config_.codec_threads > 0 ? config_.codec_threads : config_.threads;
+        if (config_.threads > 0) {
+            params.threads = config_.threads;
+        } else {
+            // More busy-waiting CPU workers than hardware threads slows the graphs down.
+            const unsigned hw = std::thread::hardware_concurrency();
+            params.threads = hw > 0 ? std::min(8, static_cast<int>(hw)) : 8;
+        }
+        params.codec_threads = config_.codec_threads > 0 ? config_.codec_threads : params.threads;
         params.seed = options.seed >= 0 ? options.seed : config_.seed;
         params.steps = options.steps > 0 ? options.steps : config_.steps;
         params.top_k = options.top_k > 0 ? options.top_k : config_.top_k;

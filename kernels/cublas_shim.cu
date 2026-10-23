@@ -36,7 +36,7 @@
 enum { OP_N = 0, OP_T = 1 };
 enum { R_32F = 0, R_16F = 2, R_16BF = 14 };
 enum { COMPUTE_16F = 64, COMPUTE_32F = 68 };
-enum { STATUS_SUCCESS = 0 };
+enum { STATUS_SUCCESS = 0, STATUS_INVALID_VALUE = 7, STATUS_EXECUTION_FAILED = 13 };
 
 // cudaDataType is already defined by library_types.h (via cuda_runtime.h).
 typedef void* cublasHandle_t;
@@ -1077,7 +1077,7 @@ k_hgemm_tn_smalln_warp(
 // large subsampling-conv GEMMs (k-reuse bound) but LOSES ~2.5x on the small
 // streaming GEMMs (which need parallelism, not reuse) — so launch() picks per
 // shape: tiled iff the aggregate batched output is large enough to fill the
-// GPU (see EDGE_SHIM_TILE_MIN).
+// GPU (see use_tiled).
 #define EDGE_TM 64
 #define EDGE_TN 64
 #define EDGE_TK 16
@@ -1167,26 +1167,13 @@ k_strided_tiled(
 inline bool
 use_tiled(int m, int n, int batch) {
     // Crossover between the naive (parallelism-bound, small outputs) and the
-    // tiled (k-reuse-bound, large batched outputs). Overridable for tuning.
-    static const size_t min_mn = [] {
-        const char* e = getenv("EDGE_SHIM_TILE_MIN");
-        return e ? (size_t)atoll(e) : (size_t)64 * 1024;
-    }();
-    return (size_t)m * (size_t)n * (size_t)batch >= min_mn;
-}
-inline size_t
-wmma_min_mn() {
-    static const size_t min_mn = [] {
-        const char* e = getenv("EDGE_SHIM_WMMA_MIN_MN");
-        return e ? (size_t)atoll(e) : (size_t)1;
-    }();
-    return min_mn;
+    // tiled (k-reuse-bound, large batched outputs).
+    return (size_t)m * (size_t)n * (size_t)batch >= (size_t)64 * 1024;
 }
 inline bool
 use_wmma_tn(int m, int n, int opA, int opB, int ta, int tb, int tc) {
     return opA == OP_T && opB == OP_N && ta == R_16F && tb == R_16F &&
-           (tc == R_16F || tc == R_32F || tc == R_16BF) && n > 1 &&
-           (size_t)m * (size_t)n >= wmma_min_mn();
+           (tc == R_16F || tc == R_32F || tc == R_16BF) && n > 1 && m > 0;
 }
 inline bool
 use_hgemv_tn(int n, int opA, int opB, int ta, int tb, int tc) {
@@ -1375,6 +1362,58 @@ launch(
         m, n, k, opA, opB, A, lda, sa, ta, B, ldb, sb, tb, C, ldc, sc, tc, alpha, beta, esz(ta),
         esz(tb), esz(tc), bb);
 }
+
+// The batch index is carried in grid.z, which CUDA limits to 65535; larger
+// batches are issued as several launches.
+constexpr int kMaxGridZ = 65535;
+
+inline const void*
+offset(const void* p, long long elements, int dt) {
+    return (const char*)p + elements * (long long)esz(dt);
+}
+
+inline void
+launch_strided(
+    int m, int n, int k, int opA, int opB, const void* A, int lda, long long sa, int ta,
+    const void* B, int ldb, long long sb, int tb, void* C, int ldc, long long sc, int tc,
+    float alpha, float beta, int batch, cudaStream_t s, ShimHandle* sh) {
+    for (int b0 = 0, count = 0; b0 < batch; b0 += count) {
+        count = std::min(batch - b0, kMaxGridZ);
+        launch(
+            m, n, k, opA, opB, offset(A, b0 * sa, ta), lda, sa, ta, offset(B, b0 * sb, tb), ldb, sb,
+            tb, (void*)offset(C, b0 * sc, tc), ldc, sc, tc, alpha, beta, count, s, sh);
+    }
+}
+
+inline void
+launch_ptrs(
+    int m, int n, int k, int opA, int opB, const void* const* A, int lda, int ta,
+    const void* const* B, int ldb, int tb, void* const* C, int ldc, int tc, float alpha, float beta,
+    int batch, cudaStream_t s) {
+    for (int b0 = 0, count = 0; b0 < batch; b0 += count) {
+        count = std::min(batch - b0, kMaxGridZ);
+        dim3 blk(16, 16, 1), grd((m + 15) / 16, (n + 15) / 16, count);
+        k_ptrs<<<grd, blk, 0, s>>>(
+            m, n, k, opA, opB, A + b0, lda, ta, B + b0, ldb, tb, C + b0, ldc, tc, alpha, beta,
+            count);
+    }
+}
+
+// cuBLAS rejects negative sizes and completes empty problems without work.
+// Returns false, with the status to report, when there is nothing to launch.
+inline bool
+gemm_has_work(int m, int n, int k, int batch, cublasStatus_t* status) {
+    *status = m < 0 || n < 0 || k < 0 || batch < 0 ? STATUS_INVALID_VALUE : STATUS_SUCCESS;
+    return *status == STATUS_SUCCESS && m > 0 && n > 0 && batch > 0;
+}
+
+// Report a failed kernel launch instead of claiming success. The shim links the
+// CUDA runtime statically, so this error state is its own: it never holds or
+// clears an error pending in the caller's runtime.
+inline cublasStatus_t
+launch_status() {
+    return cudaGetLastError() == cudaSuccess ? STATUS_SUCCESS : STATUS_EXECUTION_FAILED;
+}
 }  // namespace
 
 extern "C" {
@@ -1427,6 +1466,12 @@ NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSetMathMode(cublasHandle_t, cublasMath_t) {
     return STATUS_SUCCESS;
 }
+// The shim allocates its own split-K workspaces, so a caller-provided
+// workspace is accepted and left unused.
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
+cublasSetWorkspace_v2(cublasHandle_t, void*, size_t) {
+    return STATUS_SUCCESS;
+}
 NEMO_SPEECH_CUBLAS_EXPORT const char*
 cublasGetStatusString(cublasStatus_t) {
     return "EDGE_SHIM_OK";
@@ -1438,12 +1483,16 @@ cublasGemmEx(
     const void* alpha, const void* A, cudaDataType ta, int lda, const void* B, cudaDataType tb,
     int ldb, const void* beta, void* C, cudaDataType tc, int ldc, cublasComputeType_t ct,
     cublasGemmAlgo_t) {
+    cublasStatus_t status;
+    if (!gemm_has_work(m, n, k, 1, &status)) {
+        return status;
+    }
     ShimHandle* sh = (ShimHandle*)h;
     const cudaStream_t stream = stream_for_handle(sh);
     launch(
         m, n, k, opA, opB, A, lda, 0, ta, B, ldb, 0, tb, C, ldc, 0, tc, host_scalar(alpha, ct),
         host_scalar(beta, ct), 1, stream, sh);
-    return STATUS_SUCCESS;
+    return launch_status();
 }
 NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasGemmStridedBatchedEx(
@@ -1451,12 +1500,16 @@ cublasGemmStridedBatchedEx(
     const void* alpha, const void* A, cudaDataType ta, int lda, long long sa, const void* B,
     cudaDataType tb, int ldb, long long sb, const void* beta, void* C, cudaDataType tc, int ldc,
     long long sc, int batch, cublasComputeType_t ct, cublasGemmAlgo_t) {
+    cublasStatus_t status;
+    if (!gemm_has_work(m, n, k, batch, &status)) {
+        return status;
+    }
     ShimHandle* sh = (ShimHandle*)h;
     const cudaStream_t stream = stream_for_handle(sh);
-    launch(
+    launch_strided(
         m, n, k, opA, opB, A, lda, sa, ta, B, ldb, sb, tb, C, ldc, sc, tc, host_scalar(alpha, ct),
         host_scalar(beta, ct), batch, stream, sh);
-    return STATUS_SUCCESS;
+    return launch_status();
 }
 NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasGemmBatchedEx(
@@ -1464,37 +1517,64 @@ cublasGemmBatchedEx(
     const void* alpha, const void* const Aarray[], cudaDataType ta, int lda,
     const void* const Barray[], cudaDataType tb, int ldb, const void* beta, void* const Carray[],
     cudaDataType tc, int ldc, int batch, cublasComputeType_t ct, cublasGemmAlgo_t) {
+    cublasStatus_t status;
+    if (!gemm_has_work(m, n, k, batch, &status)) {
+        return status;
+    }
     ShimHandle* sh = (ShimHandle*)h;
     const cudaStream_t stream = stream_for_handle(sh);
-    dim3 blk(16, 16, 1), grd((m + 15) / 16, (n + 15) / 16, batch);
-    k_ptrs<<<grd, blk, 0, stream>>>(
+    launch_ptrs(
         m, n, k, opA, opB, Aarray, lda, ta, Barray, ldb, tb, Carray, ldc, tc,
-        host_scalar(alpha, ct), host_scalar(beta, ct), batch);
-    return STATUS_SUCCESS;
+        host_scalar(alpha, ct), host_scalar(beta, ct), batch, stream);
+    return launch_status();
 }
 NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSgemm_v2(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const float* alpha, const float* A, int lda, const float* B, int ldb, const float* beta,
     float* C, int ldc) {
+    cublasStatus_t status;
+    if (!gemm_has_work(m, n, k, 1, &status)) {
+        return status;
+    }
     ShimHandle* sh = (ShimHandle*)h;
     const cudaStream_t stream = stream_for_handle(sh);
     launch(
         m, n, k, opA, opB, A, lda, 0, R_32F, B, ldb, 0, R_32F, C, ldc, 0, R_32F, *alpha, *beta, 1,
         stream, sh);
-    return STATUS_SUCCESS;
+    return launch_status();
 }
 NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasSgemmStridedBatched(
     cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
     const float* alpha, const float* A, int lda, long long sa, const float* B, int ldb,
     long long sb, const float* beta, float* C, int ldc, long long sc, int batch) {
+    cublasStatus_t status;
+    if (!gemm_has_work(m, n, k, batch, &status)) {
+        return status;
+    }
     ShimHandle* sh = (ShimHandle*)h;
     const cudaStream_t stream = stream_for_handle(sh);
-    launch(
+    launch_strided(
         m, n, k, opA, opB, A, lda, sa, R_32F, B, ldb, sb, R_32F, C, ldc, sc, R_32F, *alpha, *beta,
         batch, stream, sh);
-    return STATUS_SUCCESS;
+    return launch_status();
+}
+NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
+cublasSgemmBatched(
+    cublasHandle_t h, cublasOperation_t opA, cublasOperation_t opB, int m, int n, int k,
+    const float* alpha, const float* const Aarray[], int lda, const float* const Barray[], int ldb,
+    const float* beta, float* const Carray[], int ldc, int batch) {
+    cublasStatus_t status;
+    if (!gemm_has_work(m, n, k, batch, &status)) {
+        return status;
+    }
+    ShimHandle* sh = (ShimHandle*)h;
+    const cudaStream_t stream = stream_for_handle(sh);
+    launch_ptrs(
+        m, n, k, opA, opB, (const void* const*)Aarray, lda, R_32F, (const void* const*)Barray, ldb,
+        R_32F, (void* const*)Carray, ldc, R_32F, *alpha, *beta, batch, stream);
+    return launch_status();
 }
 NEMO_SPEECH_CUBLAS_EXPORT cublasStatus_t
 cublasStrsmBatched(

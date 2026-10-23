@@ -10,6 +10,12 @@
 # link time. NOT installed — internal implementation detail.
 file(GLOB RUNTIME_GGML_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
+# Reuses llama.cpp's llama_mmap (not the full `llama` target, nor
+# llama-impl.cpp, whose format() clashes with logging.cpp's — see llama_log_shim.cpp).
+list(APPEND RUNTIME_GGML_SOURCES
+    ${NEMO_SPEECH_LLAMA_CPP_DIR}/src/llama-mmap.cpp
+)
+
 add_library(nemo_speech_runtime_ggml STATIC ${RUNTIME_GGML_SOURCES})
 
 set_target_properties(nemo_speech_runtime_ggml PROPERTIES
@@ -20,23 +26,22 @@ set_target_properties(nemo_speech_runtime_ggml PROPERTIES
 
 target_include_directories(nemo_speech_runtime_ggml PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/ggml/include
-    ${CMAKE_SOURCE_DIR}/ggml/src
 )
 target_include_directories(nemo_speech_runtime_ggml PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common
 )
 
+target_include_directories(nemo_speech_runtime_ggml PRIVATE
+    ${NEMO_SPEECH_LLAMA_CPP_DIR}/src
+    ${NEMO_SPEECH_LLAMA_CPP_DIR}/include
+)
+
 target_link_libraries(nemo_speech_runtime_ggml PUBLIC ${GGML_DEPENDENCIES})
 
+# Consumers use the patched operations only when patches/ was applied; runtime.h
+# derives NEMO_SPEECH_CUDA_FAST_PATHS from this and GGML_USE_CUDA.
 if(NEMO_SPEECH_GGML_PATCHED)
-    target_compile_definitions(nemo_speech_runtime_ggml PRIVATE NEMO_SPEECH_GGML_PATCHED=1)
-endif()
-
-# CUDA-only direct depthwise-conv kernel (see CMakeLists.txt option). When off,
-# nn.cpp uses the portable ggml_conv_1d_dw lowering (F16-safe on all backends).
-if(NEMO_SPEECH_DIRECT_DW_CONV)
-    target_compile_definitions(nemo_speech_runtime_ggml PRIVATE NEMO_SPEECH_DIRECT_DW_CONV=1)
+    target_compile_definitions(nemo_speech_runtime_ggml PUBLIC NEMO_SPEECH_GGML_PATCHED=1)
 endif()
 
 # ggml-cuda links CUDA::cuda_driver PRIVATE, so the stub libcuda.so on the

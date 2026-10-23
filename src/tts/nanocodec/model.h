@@ -46,6 +46,8 @@ class NanoCodecModel {
     bool load(const std::string& path, bool force_cpu = false, bool verbose = false);
     void reset();
     bool loaded() const;
+    // Whether the decoder runs on an accelerator backend (not the CPU).
+    bool onAccelerator() const;
 
     const NanoCodecHParams& hparams() const;
     int sampleRate() const;
@@ -121,5 +123,8 @@ class NanoCodecDecoder {
    private:
     const NanoCodecModel* model_;
 };
+
+// True when every sample is finite (no NaN or infinity).
+bool is_finite_audio(const std::vector<float>& audio);
 
 }  // namespace nemo_speech::tts::nanocodec

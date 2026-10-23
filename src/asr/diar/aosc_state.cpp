@@ -17,15 +17,16 @@ constexpr float kPosInf = std::numeric_limits<float>::infinity();
 // NeMo's placeholder for disabled top-k picks (sortformer_modules.max_index).
 constexpr int64_t kMaxIndex = 99999;
 
+// V2 channel-birth thresholds on the 80 ms output grid: a channel is
+// established after 4 clean handoff frames or 8 fading handoff frames.
 constexpr float kBirthSpeech = 0.30f;
-constexpr float kBirthClean = 0.95f;
-constexpr float kEstablishedQuiet = 0.02f;
-constexpr float kBirthFading = 0.90f;
-constexpr float kEstablishedFading = 0.15f;
+constexpr float kBirthClean = 0.50f;
+constexpr float kEstablishedQuiet = 0.10f;
+constexpr float kBirthFading = 0.65f;
+constexpr float kEstablishedFading = 0.30f;
 constexpr int kBirthCleanFrames = 4;
-constexpr int kBirthFadingFrames = 20;
+constexpr int kBirthFadingFrames = 8;
 constexpr int kBirthEpisodeGapFrames = 25;
-constexpr int kBirthRevisionFrames = 128;
 
 // Indices of the k largest values in column `spk` of `scores` (n x n_spk).
 // Ties break toward the lower frame index (deterministic; torch's order for
@@ -117,7 +118,7 @@ ChannelBirthGate::relabel(float* probs) const {
 void
 ChannelBirthGate::push_raw(const float* probs) {
     raw_ring_.insert(raw_ring_.end(), probs, probs + n_spk_);
-    const size_t cap = static_cast<size_t>(kBirthRevisionFrames) * n_spk_;
+    const size_t cap = static_cast<size_t>(revision_frames) * n_spk_;
     if (raw_ring_.size() > cap)
         raw_ring_.erase(raw_ring_.begin(), raw_ring_.begin() + n_spk_);
 }
@@ -151,14 +152,48 @@ ChannelBirthGate::is_established(int speaker) const {
     return speaker >= 0 && speaker < n_spk_ && established_[speaker];
 }
 
+int64_t
+ChannelBirthGate::settled_frames() const {
+    const int64_t ring_frames = static_cast<int64_t>(raw_ring_.size()) / n_spk_;
+    for (int64_t i = 0; i < ring_frames; i++) {
+        const float* probs = raw_ring_.data() + static_cast<size_t>(i) * n_spk_;
+        int winner = 0;
+        for (int s = 1; s < n_spk_; s++)
+            if (probs[s] > probs[winner])
+                winner = s;
+        if (!established_[winner] && probs[winner] > 0.0f)
+            return frame_ - ring_frames + i;
+    }
+    return frame_;
+}
+
+DiarGeometry
+DiarGeometry::resolved(bool is_v3) const {
+    DiarGeometry result = *this;
+    const auto defaults = is_v3 ? v3_streaming() : riva_streaming();
+    for (auto field :
+         {&DiarGeometry::spkcache_len, &DiarGeometry::fifo_len, &DiarGeometry::chunk_len,
+          &DiarGeometry::spkcache_update_period, &DiarGeometry::chunk_left_context,
+          &DiarGeometry::chunk_right_context}) {
+        if (result.*field == -1)
+            result.*field = defaults.*field;
+    }
+    return result;
+}
+
 DiarGeometry
 DiarGeometry::preset(const std::string& name) {
     if (name == "streaming")
         return riva_streaming();
     if (name == "offline")
         return riva_offline();
+    if (name == "v3-streaming")
+        return v3_streaming();
+    if (name == "v3-offline")
+        return v3_offline();
     throw std::invalid_argument(
-        "unknown diarizer geometry preset '" + name + "' (expected streaming | offline)");
+        "unknown diarizer geometry preset '" + name +
+        "' (expected streaming | offline | v3-streaming | v3-offline)");
 }
 
 void
@@ -184,13 +219,18 @@ DiarGeometry::validate(int n_spk, int sil_frames_per_spk, int pos_emb_max_len) c
     if (total > pos_emb_max_len)
         fail(
             "total sequence length " + std::to_string(total) +
-            " exceeds the encoder rel-pos table (" + std::to_string(pos_emb_max_len) + ")");
+            " exceeds the encoder position limit (" + std::to_string(pos_emb_max_len) + ")");
 }
 
 AoscState::AoscState(
-    const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim)
+    const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim,
+    const std::vector<float>& learned_silence)
     : geo_(geo), sc_(scoring), n_spk_(n_spk), emb_dim_(emb_dim) {
-    mean_sil_emb_.assign(emb_dim_, 0.f);
+    if (!learned_silence.empty() && static_cast<int>(learned_silence.size()) != emb_dim_) {
+        throw std::invalid_argument("AoscState: learned silence embedding has wrong dimension");
+    }
+    use_learned_silence_ = !learned_silence.empty();
+    mean_sil_emb_ = use_learned_silence_ ? learned_silence : std::vector<float>(emb_dim_, 0.f);
 }
 
 // NeMo `_get_silence_profile`: running mean embedding over frames whose
@@ -257,7 +297,8 @@ AoscState::update(const float* chunk_embs, int t3, const float* preds, int lc, i
 
         const float* pop_embs = fifo_.data();
         const float* pop_preds = fifo_preds_full.data();
-        accumulate_silence(pop_embs, pop_preds, pop);
+        if (!use_learned_silence_)
+            accumulate_silence(pop_embs, pop_preds, pop);
 
         spkcache_.insert(spkcache_.end(), pop_embs, pop_embs + static_cast<size_t>(pop) * emb_dim_);
         if (spkcache_preds_valid()) {

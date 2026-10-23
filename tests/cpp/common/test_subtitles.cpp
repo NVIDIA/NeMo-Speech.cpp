@@ -141,6 +141,19 @@ test_fallback_text() {
     require(cues[0].text == "Fallback transcript.", "fallback text");
 }
 
+void
+test_speaker_turns() {
+    const std::vector<Word> words{{"Hello", 0, 200, 0.0f, 1},  {"there", 200, 400, 0.0f, 1},
+                                  {".", 400, 450, 0.0f, 2},    {"How", 700, 900, 0.0f, 2},
+                                  {"are", 900, 1050, 0.0f, 2}, {"you?", 1050, 1300, 0.0f, 2}};
+    const auto turns = nemo_speech::subtitle::make_speaker_turns(words);
+    require(turns.size() == 2, "speaker changes produce separate turns");
+    require(turns[0].speaker == 1 && turns[0].text == "Hello there.", "first speaker turn");
+    require(turns[0].start_ms == 0 && turns[0].end_ms == 450, "first speaker turn timing");
+    require(turns[1].speaker == 2 && turns[1].text == "How are you?", "second speaker turn");
+    require(turns[1].start_ms == 700 && turns[1].end_ms == 1300, "second speaker turn timing");
+}
+
 }  // namespace
 
 int
@@ -154,6 +167,7 @@ main() {
     test_two_lines_and_utf8_character_count();
     test_duration_and_length_split_are_ordered();
     test_fallback_text();
+    test_speaker_turns();
     std::cout << "subtitle tests passed\n";
     return 0;
 }

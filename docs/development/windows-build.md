@@ -49,9 +49,8 @@ defaults.
 ## Get the sources
 
 ```powershell
-git submodule update --init ggml                            # required (all backends)
+git submodule update --init llama.cpp                       # required (also provides ggml)
 git submodule update --init proto/riva-common               # gRPC server
-git submodule update --init llama.cpp                       # ASR live capture or NMT
 git submodule update --init third_party/flashlight-text third_party/kenlm # only for LM-fused CTC decoding
 git submodule update --init third_party/open_jtalk          # optional TTS JA tokenizer (-TtsJa)
 git submodule update --init --recursive third_party/cppjieba  # optional TTS ZH tokenizer (-TtsZh)
@@ -111,9 +110,7 @@ If you prefer to drive CMake yourself, run from an **x64 Native Tools** prompt
 (or after `vcvars64.bat`), with CMake/Ninja/CUDA/Vulkan on `PATH`:
 
 ```powershell
-# CUDA: apply the CUDA-only ggml patches first
-powershell -ExecutionPolicy Bypass -File scripts\windows\apply-ggml-patches.ps1
-
+# CUDA: CMake applies patches/ itself (git must be on PATH).
 cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native `
     -DNEMO_SPEECH_BUILD_GRPC=ON `
@@ -121,7 +118,7 @@ cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build-cuda --parallel
 
-# Vulkan: stock ggml (the project's ggml patches are CUDA-only). ggml-vulkan requires the
+# Vulkan: stock ggml (the patches are applied for CUDA and CPU builds). ggml-vulkan requires the
 # SPIRV-Headers CMake package; the Vulkan SDK ships it under Lib\cmake.
 cmake -S . -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DGGML_VULKAN=ON -DNEMO_SPEECH_GGML_PATCHED=OFF `
@@ -136,24 +133,12 @@ cmake --build build-vulkan --parallel
 
 - **The cuBLAS shim is optional.** Pass `-CublasShim` to the build driver for an
   app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt.
-- **ggml patches are CUDA-only.** A Vulkan/CPU build uses stock ggml; pass
-  `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the encoder uses the portable op path).
+- **CUDA and CPU builds apply the patches.** A Vulkan build uses stock ggml;
+  pass `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the build driver does this).
 - Dependent DLLs must be next to the executable or on `PATH`. Ninja places them
   together in `build-<backend>\bin`.
 - Flashlight builds install the replaceable `kenlm.dll` alongside the runtime
   libraries.
-
-### Reset a partially patched ggml checkout
-
-If `apply-ggml-patches` reports that a patch does not apply cleanly, reset the
-submodule and re-apply it:
-
-```powershell
-git -C ggml reset -q
-git -C ggml checkout -- .
-git -C ggml clean -fd src        # removes patch-created files
-powershell -ExecutionPolicy Bypass -File scripts\windows\apply-ggml-patches.ps1
-```
 
 ### Backend status
 

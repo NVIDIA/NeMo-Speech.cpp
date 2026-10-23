@@ -17,7 +17,7 @@ or with flags for HTTP:
 
 ```bash
 nemo-speech serve \
-    --tts.magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --tts.magpie-model models/magpie-tts/magpie.gguf \
     --tts.codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
     --tts.tokenizer-model-dir models/magpie-tts/extracted \
     --host 127.0.0.1 --port 8080 \
@@ -89,7 +89,7 @@ Pass the grammar directory to the CLI or server:
 
 ```bash
 nemo-speech synthesize "I have 2 apples." \
-    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --magpie-model models/magpie-tts/magpie.gguf \
     --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
     --tokenizer-dir models/magpie-tts/extracted \
     --tn-model-dir models/tn_configs \
@@ -100,7 +100,7 @@ The equivalent YAML setting is:
 
 ```yaml
 tts:
-  magpie-model: /models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf
+  magpie-model: /models/magpie-tts/magpie.gguf
   codec-model: /models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf
   tokenizer-model-dir: /models/magpie-tts/extracted
   tn-model-dir: /models/tn_configs
@@ -122,7 +122,7 @@ Use the unified CLI for synthesis without a server:
 
 ```bash
 nemo-speech synthesize "Hello from Magpie." \
-    --magpie-model models/magpie-tts/magpie_tts_multilingual_357m.v2602.f16.gguf \
+    --magpie-model models/magpie-tts/magpie.gguf \
     --codec-model models/nano-codec/nemo_nano_codec_22khz_1.89kbps_21.5fps.decoder.f16.gguf \
     --tokenizer-dir models/magpie-tts/extracted \
     --speaker 0 --output magpie.wav

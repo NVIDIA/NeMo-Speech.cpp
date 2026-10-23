@@ -121,6 +121,7 @@ Diarizer::Diarizer(std::shared_ptr<DiarModel> model, DiarGeometry geometry)
     : model_(std::move(model)), geometry_(std::move(geometry)) {
     if (!model_)
         throw std::invalid_argument("diarization model must not be null");
+    geometry_ = model_->resolved_geometry(geometry_);
     geometry_.validate(
         model_->cfg().num_speakers, model_->cfg().scoring.sil_frames_per_spk,
         model_->cfg().encoder.pos_emb_max_len);
@@ -152,8 +153,7 @@ Diarizer::diarize(
         int64_t frames = 0;
         const auto probabilities = model_->diarize_offline(audio_samples, audio_size, &frames);
         const auto& config = model_->cfg();
-        const double seconds_per_frame =
-            config.encoder.subsampling_factor * static_cast<double>(config.window_stride);
+        const double seconds_per_frame = config.seconds_per_output_frame();
         result.segments = diar_segments_from_probs(
             probabilities.data(), frames, config.num_speakers, seconds_per_frame, segmentation);
         result.frame_probabilities = probabilities;
@@ -191,8 +191,7 @@ Diarizer::num_speakers() const {
 
 double
 Diarizer::seconds_per_frame() const {
-    const auto& config = model_->cfg();
-    return config.encoder.subsampling_factor * static_cast<double>(config.window_stride);
+    return model_->cfg().seconds_per_output_frame();
 }
 
 BatchMetrics

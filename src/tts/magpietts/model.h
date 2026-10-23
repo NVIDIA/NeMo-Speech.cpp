@@ -194,6 +194,10 @@ struct magpietts_transformer {
 struct magpietts_decoder_attention {
     const std::vector<float>* prior = nullptr;
     std::vector<float>* alignment_scores = nullptr;
+    // Persistent CUDA path: enqueue the alignment readback but do not wait for it; the caller
+    // fetches it with MagpieDecoder::completeAlignment after enqueuing the sampler, so the
+    // sampler kernels follow the decoder kernel on the GPU without a host round trip.
+    bool defer_alignment = false;
 };
 
 class MagpieAttentionPriorState {
@@ -417,7 +421,8 @@ const char* magpietts_uma_mode_name(magpietts_uma_mode mode);
 bool parse_uma_mode(const std::string& value, magpietts_uma_mode& mode);
 
 bool magpietts_backend_is_cuda(ggml_backend_t backend);
-// ggml_fused_attn_cached comes from ggml-patches/0014 and has a CUDA kernel only.
+// ggml_fused_attn_cached comes from the "fused attention op" patch in patches/ and has a CUDA
+// kernel only.
 bool magpietts_fused_cached_attention_available(ggml_backend_t backend);
 
 std::vector<int32_t> parse_token_list(const std::string& text);

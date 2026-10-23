@@ -57,7 +57,8 @@ MagpieEncoder::eval(
 
 bool
 MagpieEncoder::evalDevice(
-    const std::vector<int32_t>& tokens, int threads, magpietts_backend_tensor& out) const {
+    const std::vector<int32_t>& tokens, int threads, magpietts_backend_tensor& out,
+    ggml_backend_t backend, ggml_gallocr_t* keep_allocr) const {
     const ggml_nvtx::range nvtx_range("magpietts_encoder_eval_device");
     const int n = (int)tokens.size();
     if (n <= 0 || n > model_.hparams.n_ctx) {
@@ -85,18 +86,21 @@ MagpieEncoder::evalDevice(
     ggml_set_output(x);
     ggml_build_forward_expand(gf, x);
 
-    ggml_gallocr_t allocr = nullptr;
+    ggml_gallocr_t local_allocr = nullptr;
+    ggml_gallocr_t* allocr = keep_allocr ? keep_allocr : &local_allocr;
     const bool ok = compute_graph(
         model_, ctx, gf,
         {{"magpietts_encoder_tokens", tokens}, {"magpietts_encoder_positions", positions(n)}}, {},
-        threads, &allocr);
+        threads, allocr, backend);
     if (!ok) {
         ggml_free(ctx);
         return false;
     }
 
     ggml_backend_tensor_copy(x, out.tensor);
-    ggml_gallocr_free(allocr);
+    if (!keep_allocr) {
+        ggml_gallocr_free(local_allocr);
+    }
     ggml_free(ctx);
     return true;
 }

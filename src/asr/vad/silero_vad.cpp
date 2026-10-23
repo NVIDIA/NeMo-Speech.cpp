@@ -101,7 +101,8 @@ class SileroVadModule : public ggml_runtime::Module {
         const int stft_hop = cfg_.stft_filter_length / 2;  // = 128
         ggml_tensor* padded =
             ggml_pad_reflect_1d(g, frame.tensor, cfg_.context_size, cfg_.context_size);
-        ggml_tensor* stft = ggml_conv_1d(g, basis, padded, stft_hop, /*padding=*/0, /*d0=*/1);
+        ggml_tensor* stft =
+            ggml_runtime::conv_1d(g, basis, padded, stft_hop, /*padding=*/0, /*d0=*/1);
 
         const int w = static_cast<int>(stft->ne[0]);  // STFT frames (=4)
         const int cutoff = cfg_.stft_n_basis / 2;     // n_freqs (=129)
@@ -123,7 +124,7 @@ class SileroVadModule : public ggml_runtime::Module {
         for (int i = 0; i < cfg_.n_encoder_layers; i++) {
             ggml_tensor* wt = mtc->get_tensor_by_name(enc_w(i)).tensor;
             ggml_tensor* b = mtc->get_tensor_by_name(enc_b(i)).tensor;
-            cur = ggml_conv_1d(g, wt, cur, cfg_.enc_strides[i], /*padding=*/1, /*d0=*/1);
+            cur = ggml_runtime::conv_1d(g, wt, cur, cfg_.enc_strides[i], /*padding=*/1, /*d0=*/1);
             cur = ggml_add(g, cur, ggml_reshape_3d(g, b, 1, cfg_.enc_out_channels[i], 1));
             cur = ggml_relu(g, cur);
         }

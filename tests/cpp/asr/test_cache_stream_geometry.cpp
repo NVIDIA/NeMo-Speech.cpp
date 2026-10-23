@@ -180,17 +180,34 @@ check_model(const std::string& path, int gpu, int right) {
         require(decode(size, 1279, true) == expected, "odd packet EOF differs");
         require(decode(size, 1600, true) == expected, "100ms packet EOF differs");
     }
-    // A hard EOU starts a fresh encoder context but keeps the absolute frame
-    // clock. The next chunk must nevertheless use startup geometry again.
-    runner.reset();
-    runner.feed_audio(audio.data(), first_samples);
-    runner.force_eou();
-    require(runner.step().is_final, "forced EOU did not fire");
-    require(runner.cache_filled_frames() == 0, "forced EOU did not reset cache");
-    const int before = runner.chunks_processed();
-    runner.feed_audio(audio.data(), first_samples);
-    runner.step();
-    require(runner.chunks_processed() == before + 1, "post-EOU did not use first chunk");
+    // EOU publishes text without ending the acoustic stream. Preserve the
+    // first chunk's cache and require steady-state geometry after the event.
+    // Use identical FE packet shapes for the EOU and no-EOU controls: otherwise
+    // Metal FFT rounding differences would test packetization, not the boundary.
+    auto after_boundary = [&](bool force) {
+        runner.reset();
+        runner.feed_audio(audio.data(), first_samples - 1);
+        runner.step();
+        runner.feed_audio(audio.data() + first_samples - 1, 1);
+        if (force)
+            runner.force_eou();
+        require(runner.step().is_final == force, "unexpected forced EOU result");
+        require(runner.cache_filled_frames() == right + 1, "EOU changed encoder cache");
+        const int before = runner.chunks_processed();
+        require(before == 1, "EOU synthesized extra chunks");
+        runner.feed_audio(audio.data() + first_samples, stride_samples - 1);
+        runner.step();
+        require(runner.chunks_processed() == before, "post-EOU reused first-chunk geometry");
+        runner.feed_audio(audio.data() + first_samples + stride_samples - 1, 1);
+        runner.step();
+        require(runner.chunks_processed() == before + 1, "post-EOU steady chunk was not processed");
+        std::vector<float> output;
+        int count = 0, dim = 0;
+        runner.take_encoder_frames(output, count, dim);
+        return output;
+    };
+    const auto no_eou = after_boundary(false);
+    same_encoder(no_eou, after_boundary(true));
     std::fprintf(stdout, "[PASS] R=%d first/history encoder, reset, EOF and EOU\n", right);
 }
 

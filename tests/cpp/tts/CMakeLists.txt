@@ -12,19 +12,47 @@ add_executable(test_magpietts_frame_stacking test_magpietts_frame_stacking.cpp)
 target_link_libraries(test_magpietts_frame_stacking PRIVATE nemo_speech_tts_magpietts)
 add_test(NAME magpietts_frame_stacking COMMAND test_magpietts_frame_stacking)
 
+add_executable(test_nanocodec_decode_guard test_nanocodec_decode_guard.cpp)
+target_link_libraries(test_nanocodec_decode_guard PRIVATE nemo_speech_tts_nanocodec)
+add_test(NAME nanocodec_decode_guard COMMAND test_nanocodec_decode_guard)
+
+# Needs a real graph and a real allocator, so it links ggml directly rather than
+# testing the kernel in isolation -- the bug it guards is invisible to a
+# kernel-level test. The fusion and its guard only exist in the patched ggml, so
+# against a stock submodule this would pass without exercising anything. Skips
+# itself (exit 77) without a GPU backend.
+if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
+    add_executable(test_nanocodec_half_snake_fusion test_nanocodec_half_snake_fusion.cpp)
+    # Links ggml directly, so runtime_ggml's PUBLIC CUDA::cuda_driver stub doesn't
+    # reach it; add it so libggml-cuda's NEEDED libcuda.so.1 resolves without a driver.
+    target_link_libraries(test_nanocodec_half_snake_fusion PRIVATE ggml CUDA::cuda_driver)
+    add_test(
+        NAME nanocodec_half_snake_fusion
+        COMMAND test_nanocodec_half_snake_fusion)
+    set_tests_properties(nanocodec_half_snake_fusion PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
+
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_magpietts_cached_attention test_magpietts_cached_attention.cpp)
     target_link_libraries(test_magpietts_cached_attention PRIVATE nemo_speech_tts_magpietts)
     add_test(NAME magpietts_cached_attention COMMAND test_magpietts_cached_attention)
 endif()
 
-add_executable(test_magpietts_asr test_magpietts_asr.cpp)
-target_link_libraries(test_magpietts_asr PRIVATE
-    tests_cpp_wer
-    nemo_speech_tts_magpietts
-    nemo_speech_tts_tokenizer
-    nemo_speech_asr
-)
+# Synthesizes with MagpieTTS and transcribes the result, so it needs both
+# pipelines. With NEMO_SPEECH_BUILD_ASR=OFF the nemo_speech_asr link name
+# resolves to nothing -- CMake takes an unknown target for a raw library and
+# says so only at link time -- so recognizer.h never reaches the include path
+# and the whole directory fails to compile.
+if(TARGET nemo_speech_asr)
+    add_executable(test_magpietts_asr test_magpietts_asr.cpp)
+    target_link_libraries(test_magpietts_asr PRIVATE
+        tests_cpp_wer
+        nemo_speech_tts_magpietts
+        nemo_speech_tts_tokenizer
+        nemo_speech_asr
+    )
+endif()
 
 # C ABI tests. tts_c_smoke is compiled as C (proves include/nemo_speech/tts.h
 # is valid C) and links the unified TTS library; tts_c_dlopen loads it at runtime.

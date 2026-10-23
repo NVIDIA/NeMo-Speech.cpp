@@ -71,17 +71,21 @@ produce an error with a conversion command.
 ### Transcribe a microphone live
 
 ```bash
-nemo-speech transcribe --live \
-  --backend auto \
-  --endpointing
+nemo-speech transcribe --live --backend auto
+nemo-speech transcribe --live --diarize --diar-model ./models/Nemotron-3-Diarization.q8_0.gguf
 ```
 
-The command captures the system's default microphone and prints interim
-transcripts to stderr while you speak. With `--endpointing`, trailing silence
-also finalizes utterances without ending the capture. Press Ctrl-C once to
+The command captures the system's default microphone and shows a live preview
+on stderr. Endpointing is on by default for `--live`, so trailing silence
+finalizes utterances without ending capture; `--endpointing=false` disables it.
+Press Ctrl-C once to
 stop; the stream is flushed and the complete final transcript is written to
 stdout. Use `--output transcript.txt` to write it to a file, or select `json`,
 `srt`, or `vtt` with `--format`.
+
+With `--diarize`, the preview shows speaker turns. Speaker labels can change
+until the diarizer confirms them, which can take up to 10 s with V2. Set
+`NO_COLOR=1` to disable colors.
 
 Live capture is compiled directly into the CLI through miniaudio and uses the
 native host audio API: CoreAudio on macOS, WASAPI on Windows, and ALSA or
@@ -153,8 +157,8 @@ For ASR plus speaker labels without the other stages:
 nemo-speech transcribe meeting.wav --diarize --json
 ```
 
-Sortformer v2 supports up to four speakers. Diarization enables
-word timestamps automatically and places a 1-based `speaker` value on each
+V2 supports up to four speakers and V3 up to eight. Diarization enables word
+timestamps automatically and places a 1-based `speaker` value on each
 word in JSON output.
 
 ## Diarize audio
@@ -170,13 +174,13 @@ nemo-speech diarize recordings/ \
 
 Directory inputs load one shared model and dynamically batch compatible steps.
 Relative paths are preserved. A stateful streaming pass is the default and is
-appropriate for long recordings. `--preset offline` selects larger streaming
-chunks and caches; it does not enable full attention. Use `--offline` for one
-full-attention pass over a short recording. The indexed model's positional
-table limits that path to about 6.6 minutes, so use the default streaming pass
-for longer audio.
+appropriate for long recordings. `--preset offline` (V2) or `--preset v3-offline`
+(V3) selects larger streaming chunks and caches; it does not enable full
+attention. Use `--offline` for one full-attention pass over a short recording.
+The model's positional table limits that path to about 6.6 minutes, so use the
+default streaming pass for longer audio.
 
-Sortformer v2 supports up to four speakers. Segmentation thresholds
+V2 supports up to four speakers and V3 up to eight. Segmentation thresholds
 are dataset-dependent; use `--onset`, `--offset`, `--pad-onset`, `--pad-offset`,
 `--min-duration-on`, and `--min-duration-off` when applying a checkpoint's
 published postprocessing configuration.
@@ -234,11 +238,41 @@ configuration file](server.md#engine-and-listener-configuration).
 
 ## Benchmark
 
-Benchmark end-to-end ASR concurrency with one shared recognizer:
+`nemo-speech bench <task>` loads one engine, warms it up, and runs every input
+`--repetitions` times at each `--concurrency` level. The tasks compiled into
+the build are listed by `nemo-speech help bench`; a task missing from the build
+fails with `unsupported_feature`.
 
 ```bash
-nemo-speech bench asr recordings/ \
-  --model asr.q8_0.gguf \
-  --concurrency 1,2,4 \
-  --json
+# ASR over a WAV file or directory
+nemo-speech bench asr recordings/ --model asr.q8_0.gguf --concurrency 1,2,4 --json
+
+# TTS over --text, a .txt file or directory (one utterance per file), or
+# --text-file (one utterance per line)
+nemo-speech bench tts --text-file test_files/tts/ljs_audio_text_test_filelist_small.txt \
+  --magpie-model magpie.q8_0.gguf --codec-model codec.gguf --tokenizer-dir tokenizer/ \
+  --per-stream 20 --json
+
+# Diarization over a WAV file or directory
+nemo-speech bench diarize meetings/ --model sortformer.gguf
+
+# Translation over a text file, one input per line (NMT builds)
+nemo-speech bench translate lines.txt --model nmt.gguf --from en --to de
 ```
+
+All tasks share `-n/--repetitions` (or `--per-stream N` requests per
+concurrent stream), `--warmup`, `-c/--concurrency`,
+`--device`, `--config`, the task's `--asr.*`/`--tts.*`/`--diar.*`/`--nmt.*`
+overrides, and `--json`. The report contains `command`, `task`, the model,
+`load_ms`, `warmup_ms`, and one `runs` entry per concurrency level with
+`concurrency`, `items`, `wall_seconds`, `items_per_second`, client-side
+`latency_ms` (`mean`/`p50`/`p90`/`p95`/`p99`/`min`/`max`), per-item `metrics`, task
+throughput such as `rtfx`, and an output-mismatch count against the first
+result observed for each input (`transcript_mismatches`,
+`audio_length_mismatches`, `segment_mismatches`, `translation_mismatches`).
+
+`bench tts` reports time to first audio (TTFA) and inter-chunk latency (ICL),
+measured at the client (`first_audio_ms`, `chunk_gap_ms`), and throughput RTFx,
+plus a per-input breakdown. It fixes `--seed`
+to 1 so repeated runs generate identical audio. The MagpieTTS runtime serializes
+requests, so TTS concurrency above 1 measures queueing.

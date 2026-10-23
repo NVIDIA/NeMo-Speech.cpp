@@ -3,12 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """CLI smoke test with real models: ASR, diarization, and a TTS round trip.
 
+With grammar directories, it also checks text normalization: TN must turn digits
+into words before synthesis, and ITN must turn them back in the transcript.
+
 Models are pulled by the CLI from the indexed Hugging Face repos into
 NEMO_SPEECH_MODEL_DIR, so a warm cache makes this cheap. Text comparisons use a
 similarity ratio rather than exact match so backend numerics cannot flake it.
 """
 import argparse
 import difflib
+import itertools
 import json
 import pathlib
 import re
@@ -23,6 +27,9 @@ JFK_TEXT = (
     "ask what you can do for your country"
 )
 TTS_TEXT = "The quick brown fox jumps over the lazy dog."
+NORM_TEXT = "I paid 25 dollars for 3 tickets."
+NORM_SPOKEN = "i paid twenty five dollars for three tickets"
+FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "test_files" / "diar"
 
 
 def normalize(text: str) -> str:
@@ -57,21 +64,102 @@ def read_wav_stats(path: pathlib.Path) -> tuple[float, int, int]:
     return seconds, len(set(samples)), max(abs(s) for s in samples)
 
 
+def speaker_frames(segments, step=0.01):
+    frames = {}
+    for speaker, start, end in segments:
+        frames.setdefault(speaker, set()).update(range(round(start / step), round(end / step)))
+    return frames
+
+
+def diarization_errors(reference, hypothesis) -> tuple[float, float]:
+    """Frame-level DER and speaker confusion (no collar) under the best speaker mapping."""
+    ref, hyp = speaker_frames(reference), speaker_frames(hypothesis)
+    frames = set().union(*ref.values(), *hyp.values())
+    ref_count = {f: sum(f in s for s in ref.values()) for f in frames}
+    hyp_count = {f: sum(f in s for s in hyp.values()) for f in frames}
+    ref_ids, hyp_ids = list(ref), list(hyp) + [None] * max(0, len(ref) - len(hyp))
+    best = max(
+        (
+            sum(len(ref[r] & hyp[h]) for r, h in zip(ref_ids, perm) if h is not None)
+            for perm in itertools.permutations(hyp_ids, len(ref_ids))
+        ),
+        default=0,
+    )
+    total = sum(ref_count.values())
+    miss = sum(max(ref_count[f] - hyp_count[f], 0) for f in frames)
+    false_alarm = sum(max(hyp_count[f] - ref_count[f], 0) for f in frames)
+    confusion = sum(min(ref_count[f], hyp_count[f]) for f in frames) - best
+    return (miss + false_alarm + confusion) / total, confusion / total
+
+
+FILLERS = {"mm", "hmm", "mm-hmm", "mhm", "uh", "um", "uh-huh"}
+
+
+def meeting_words(text: str) -> list[str]:
+    # AMI spells letters as "D_N_L_G_"; fillers are not scored.
+    text = re.sub(r"[^a-z0-9'_ -]+", " ", text.lower().replace("_", ""))
+    return [w for w in text.split() if w not in FILLERS]
+
+
+def edit_distance(a: list[str], b: list[str]) -> int:
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, y in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (x != y))
+    return row[-1]
+
+
+def cp_wer(reference: dict[str, list[str]], hypothesis: dict[str, list[str]]) -> float:
+    """Concatenated minimum-permutation WER over speaker assignments."""
+    ref_ids = list(reference)
+    hyp_ids = list(hypothesis) + [None] * max(0, len(reference) - len(hypothesis))
+    best = None
+    for perm in itertools.permutations(hyp_ids, len(ref_ids)):
+        errors = sum(
+            edit_distance(reference[r], hypothesis.get(h, [])) for r, h in zip(ref_ids, perm)
+        )
+        # Hypothesis speakers left unassigned are pure insertions.
+        errors += sum(len(hypothesis[h]) for h in hypothesis if h not in perm)
+        best = errors if best is None else min(best, errors)
+    return best / sum(len(words) for words in reference.values())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--backend", default="cpu")
     parser.add_argument("--audio", required=True)
     parser.add_argument("--skip-tts", action="store_true")
+    parser.add_argument("--itn-model-dir", help="ITN grammar directory")
+    parser.add_argument("--tn-model-dir", help="TN grammar directory")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="nemo-speech-smoke-") as temporary:
         work = pathlib.Path(temporary)
 
+        if args.itn_model_dir or args.tn_model_dir:
+            features = json.loads(run(args.binary, "doctor", "--json"))["features"]
+            check(features.get("text_normalization") is True, "build includes text normalization")
+
         text = run(args.binary, "transcribe", args.audio, "--backend", args.backend)
         ratio = similarity(text, JFK_TEXT)
         print(f"asr transcript: {text.strip()!r} (similarity {ratio:.2f})")
         check(ratio >= 0.9, "ASR offline transcript matches the reference")
+
+        if args.itn_model_dir:
+            text = run(
+                args.binary,
+                "transcribe",
+                args.audio,
+                "--backend",
+                args.backend,
+                "--itn-model-dir",
+                args.itn_model_dir,
+            )
+            ratio = similarity(text, JFK_TEXT)
+            print(f"asr transcript with itn: {text.strip()!r} (similarity {ratio:.2f})")
+            check(ratio >= 0.9, "ASR transcript with ITN matches the reference")
 
         streamed = run(
             args.binary,
@@ -96,6 +184,50 @@ def main() -> None:
         check(len(segments) >= 1 and speech >= 8.0, "diarization covers the utterance")
         check(len(speakers) == 1, "single-speaker audio yields one speaker")
 
+        meeting = FIXTURES / "ami_en2002d_2132.wav"
+        diar = json.loads(
+            run(args.binary, "diarize", str(meeting), "--backend", args.backend, "--format", "json")
+        )
+        hypothesis = [(s["speaker"], s["start"], s["end"]) for s in diar.get("segments", [])]
+        reference = []
+        for line in meeting.with_suffix(".rttm").read_text().splitlines():
+            fields = line.split()
+            start = float(fields[3])
+            reference.append((fields[7], start, start + float(fields[4])))
+        der, confusion = diarization_errors(reference, hypothesis)
+        speakers = {s for s, _, _ in hypothesis}
+        print(
+            f"meeting diarization: {len(speakers)} speakers, DER {der:.1%}, confusion {confusion:.1%}"
+        )
+        check(len(speakers) == 3, "meeting yields its three main speakers")
+        check(confusion < 0.06 and der < 0.32, "meeting diarization matches the reference")
+
+        transcript = json.loads(
+            run(
+                args.binary,
+                "transcribe",
+                str(meeting),
+                "--diarize",
+                "--backend",
+                args.backend,
+                "--format",
+                "json",
+            )
+        )
+        hypothesis_words = {}
+        for word in transcript.get("words", []):
+            hypothesis_words.setdefault(word.get("speaker", 0), []).extend(
+                meeting_words(word["word"])
+            )
+        reference_words = {}
+        for segment in json.loads(meeting.with_suffix(".json").read_text()):
+            reference_words.setdefault(segment["speaker"], []).extend(
+                meeting_words(segment["words"])
+            )
+        score = cp_wer(reference_words, hypothesis_words)
+        print(f"meeting transcription: {len(hypothesis_words)} speakers, cpWER {score:.1%}")
+        check(score < 0.30, "diarized meeting transcript matches the reference")
+
         if args.skip_tts:
             return
 
@@ -111,6 +243,36 @@ def main() -> None:
         ratio = similarity(round_trip, TTS_TEXT)
         print(f"tts round trip: {round_trip.strip()!r} (similarity {ratio:.2f})")
         check(ratio >= 0.8, "TTS output transcribes back to the input text")
+
+        if args.tn_model_dir:
+            wav = work / "tn.wav"
+            run(
+                args.binary,
+                "synthesize",
+                NORM_TEXT,
+                "--backend",
+                args.backend,
+                "--tn-model-dir",
+                args.tn_model_dir,
+                "--output",
+                str(wav),
+            )
+            spoken = run(args.binary, "transcribe", str(wav), "--backend", args.backend)
+            ratio = similarity(spoken, NORM_SPOKEN)
+            print(f"tn round trip: {spoken.strip()!r} (similarity {ratio:.2f})")
+            check(ratio >= 0.8, "TN spells out numbers before synthesis")
+            if args.itn_model_dir:
+                written = run(
+                    args.binary,
+                    "transcribe",
+                    str(wav),
+                    "--backend",
+                    args.backend,
+                    "--itn-model-dir",
+                    args.itn_model_dir,
+                )
+                print(f"itn round trip: {written.strip()!r}")
+                check("$25" in written, "ITN writes spoken numbers in written form")
 
 
 if __name__ == "__main__":

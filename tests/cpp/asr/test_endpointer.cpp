@@ -12,12 +12,15 @@
 //      default; pass --vad-model to also exercise the VAD-driven path.
 //
 // Usage: ./test_endpointer [<model.gguf> <audio.wav> [--gpu N] [--vad-model F]
-//                           [--chunk-ms N] [--gap-ms N] [--eou-ms N]]
+//                           [--chunk-ms N] [--gap-ms N] [--eou-ms N]
+//                           [--right-ctx N] [--punctuation] [--realtime]]
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "fe.h"
@@ -114,9 +117,9 @@ static int
 test_integration(int argc, char** argv) {
     const std::string model_path = argv[1];
     const std::string audio_path = argv[2];
-    int gpu = 0, chunk_ms = 160, gap_ms = 1500, eou_ms = 800;
+    int gpu = 0, chunk_ms = 160, gap_ms = 1500, eou_ms = 800, right_ctx = 1;
     std::string vad_model;
-    bool no_masking = false;
+    bool no_masking = false, realtime = false, punctuation = false;
     for (int i = 3; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--gpu" && i + 1 < argc)
@@ -125,12 +128,18 @@ test_integration(int argc, char** argv) {
             vad_model = argv[++i];
         else if (a == "--no-masking")
             no_masking = true;  // VAD loaded for endpointing only (decoupling test)
+        else if (a == "--realtime")
+            realtime = true;
+        else if (a == "--punctuation")
+            punctuation = true;
         else if (a == "--chunk-ms" && i + 1 < argc)
             chunk_ms = std::atoi(argv[++i]);
         else if (a == "--gap-ms" && i + 1 < argc)
             gap_ms = std::atoi(argv[++i]);
         else if (a == "--eou-ms" && i + 1 < argc)
             eou_ms = std::atoi(argv[++i]);
+        else if (a == "--right-ctx" && i + 1 < argc)
+            right_ctx = std::atoi(argv[++i]);
     }
 
     ggml_runtime::Params p;
@@ -164,7 +173,7 @@ test_integration(int argc, char** argv) {
     cfg.vad.model_path = vad_model;
     cfg.vad.masker.mask_enable = !no_masking;
     cfg.endpointing = ep;
-    cfg.streaming.rnnt_right_context = 1;  // R=1 for RNNT; the CTC runner ignores it
+    cfg.streaming.rnnt_right_context = right_ctx;  // the CTC runner ignores it
 
     std::unique_ptr<AsrRunner> runner;
     if (model->head_kind() == HeadKind::Rnnt) {
@@ -174,9 +183,36 @@ test_integration(int argc, char** argv) {
     }
     AsrRequestOptions request_options;
     request_options.enable_word_time_offsets = true;
+    request_options.enable_automatic_punctuation = punctuation;
     runner->set_request_options(request_options);
 
     const size_t chunk_samples = static_cast<size_t>(chunk_ms) * sr / 1000;
+    const auto pace = [&](auto start, size_t end_sample) {
+        if (realtime)
+            std::this_thread::sleep_until(
+                start +
+                std::chrono::microseconds(static_cast<int64_t>(end_sample * 1000000ULL / sr)));
+    };
+
+    if (model->head_kind() == HeadKind::Rnnt) {
+        CacheStreamRunner silent(static_cast<RnntModel*>(model.get()), cfg);
+        silent.set_request_options(request_options);
+        std::vector<float> silence(static_cast<size_t>(3) * sr, 0.0f);
+        const auto began = std::chrono::steady_clock::now();
+        bool clean = true;
+        for (size_t off = 0; off < silence.size(); off += chunk_samples) {
+            const size_t n = std::min(chunk_samples, silence.size() - off);
+            pace(began, off + n);
+            silent.feed_audio(silence.data() + off, n);
+            auto update = silent.step();
+            clean = clean && !update.is_final && update.transcript_so_far.empty() &&
+                    update.words.empty();
+        }
+        auto tail = silent.finalize();
+        check(
+            clean && tail.transcript_so_far.empty() && tail.words.empty(),
+            "integration: silence-only stream produces no punctuation, words or false endpoints");
+    }
 
     // force_eou (riva runtime_config["force_eou"]) with endpointing disabled:
     // force fires regardless of `enable`, and no natural EOU can race the
@@ -187,7 +223,7 @@ test_integration(int argc, char** argv) {
         ep_off.enable = false;
         RecognizerConfig pcfg;
         pcfg.endpointing = ep_off;
-        pcfg.streaming.rnnt_right_context = 1;  // R=1 for RNNT; the CTC runner ignores it
+        pcfg.streaming.rnnt_right_context = right_ctx;
         std::unique_ptr<AsrRunner> probe;
         if (model->head_kind() == HeadKind::Rnnt) {
             probe = std::make_unique<CacheStreamRunner>(static_cast<RnntModel*>(model.get()), pcfg);
@@ -196,8 +232,10 @@ test_integration(int argc, char** argv) {
                 std::make_unique<BufferedStreamRunner>(static_cast<CtcModel*>(model.get()), pcfg);
         }
         const size_t head = std::min(audio.size(), static_cast<size_t>(4) * sr);
+        const auto start = std::chrono::steady_clock::now();
         for (size_t off = 0; off < head; off += chunk_samples) {
             const size_t n = std::min(chunk_samples, head - off);
+            pace(start, off + n);
             probe->feed_audio(audio.data() + off, n);
             probe->step();
         }
@@ -217,8 +255,10 @@ test_integration(int argc, char** argv) {
         if (!update.words.empty())
             first_word_frames.push_back(update.words.front().start_frame);
     };
+    const auto start = std::chrono::steady_clock::now();
     for (size_t off = 0; off < audio.size(); off += chunk_samples) {
         const size_t n = std::min(chunk_samples, audio.size() - off);
+        pace(start, off + n);
         runner->feed_audio(audio.data() + off, n);
         // Drain finals like the service does: an EOU breaks the runner's chunk
         // loop, so re-step until the update is non-final.
@@ -256,6 +296,75 @@ test_integration(int argc, char** argv) {
         first_word_frames.size() >= 2 &&
             std::is_sorted(first_word_frames.begin(), first_word_frames.end()),
         "integration: word timestamps remain absolute across endpoint resets");
+
+    if (model->head_kind() == HeadKind::Rnnt) {
+        // Publishing an automatic EOU must not change acoustic/predictor state
+        // or inject EOS padding into a continuing stream. Compare emitted token
+        // IDs rather than formatted words, which may split at final boundaries.
+        // Publication may suppress late punctuation, but the model must still
+        // consume it and retain identical raw decoder-state statistics.
+        const auto decode_tokens = [&](bool endpointing, bool forced = false) {
+            RecognizerConfig control = cfg;
+            control.endpointing.enable = endpointing;
+            CacheStreamRunner stream(static_cast<RnntModel*>(model.get()), control);
+            stream.set_request_options(request_options);
+            std::vector<int> tokens;
+            int endpoints = 0;
+            bool forced_sent = false;
+            const auto began = std::chrono::steady_clock::now();
+            for (size_t off = 0; off < audio.size(); off += chunk_samples) {
+                const size_t n = std::min(chunk_samples, audio.size() - off);
+                pace(began, off + n);
+                stream.feed_audio(audio.data() + off, n);
+                if (forced && !forced_sent &&
+                    off + n >= one.size() + static_cast<size_t>(gap_ms) * sr / 2000) {
+                    stream.force_eou();
+                    forced_sent = true;
+                }
+                for (;;) {
+                    auto update = stream.step();
+                    tokens.insert(
+                        tokens.end(), update.new_token_ids.begin(), update.new_token_ids.end());
+                    if (!update.is_final)
+                        break;
+                    ++endpoints;
+                }
+            }
+            auto tail = stream.finalize();
+            tokens.insert(tokens.end(), tail.new_token_ids.begin(), tail.new_token_ids.end());
+            check(
+                endpointing || forced ? endpoints > 0 : endpoints == 0,
+                "integration: continuity control actually exercises the requested EOU policy");
+            const auto& vocab = model->vocab();
+            tokens.erase(
+                std::remove_if(
+                    tokens.begin(), tokens.end(),
+                    [&](int id) {
+                        return id >= 0 && id < static_cast<int>(vocab.size()) &&
+                               sp_is_punctuation(vocab[id]);
+                    }),
+                tokens.end());
+            return std::make_pair(tokens, stream.rnnt_decode_stats());
+        };
+        const auto uninterrupted = decode_tokens(false);
+        const auto segmented = decode_tokens(true);
+        check(!uninterrupted.first.empty(), "integration: continuity control decodes speech");
+        check(
+            uninterrupted.first == segmented.first,
+            "integration: automatic EOU preserves the complete RNNT content-token sequence");
+        check(
+            uninterrupted.second.emitted_tokens == segmented.second.emitted_tokens &&
+                uninterrupted.second.encoder_frames == segmented.second.encoder_frames &&
+                uninterrupted.second.predictor_calls == segmented.second.predictor_calls,
+            "integration: automatic EOU preserves raw model emission and predictor counts");
+        const auto forced = decode_tokens(false, true);
+        check(
+            uninterrupted.first == forced.first &&
+                uninterrupted.second.emitted_tokens == forced.second.emitted_tokens &&
+                uninterrupted.second.encoder_frames == forced.second.encoder_frames &&
+                uninterrupted.second.predictor_calls == forced.second.predictor_calls,
+            "integration: forced EOU preserves content, acoustic context and predictor state");
+    }
     return 0;
 }
 

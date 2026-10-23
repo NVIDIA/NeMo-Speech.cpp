@@ -13,6 +13,12 @@ add_executable(test_cache_stream_geometry test_cache_stream_geometry.cpp)
 target_link_libraries(test_cache_stream_geometry PRIVATE nemo_speech_asr)
 add_test(NAME cache_stream_geometry COMMAND test_cache_stream_geometry)
 
+add_executable(test_gguf_mmap_loader test_gguf_mmap_loader.cpp)
+target_link_libraries(test_gguf_mmap_loader PRIVATE nemo_speech_asr)
+# Synthetic-GGUF cases always run; NEMO_SPEECH_TEST_ASR_MODEL (if set) adds a full-model compare.
+add_test(NAME gguf_mmap_loader COMMAND test_gguf_mmap_loader $ENV{NEMO_SPEECH_TEST_ASR_MODEL})
+set_tests_properties(gguf_mmap_loader PROPERTIES SKIP_RETURN_CODE 77)
+
 # Multi-threaded crosstalk / deadlock stress test for the shared cache-aware
 # encoder Session driven by many per-stream SessionStates at once.
 find_package(Threads REQUIRED)
@@ -26,9 +32,11 @@ target_link_libraries(test_vad PRIVATE nemo_speech_asr)
 
 add_executable(test_endpointer test_endpointer.cpp)
 target_link_libraries(test_endpointer PRIVATE nemo_speech_asr)
+add_test(NAME endpointer_policy COMMAND test_endpointer)
 
 add_executable(test_postproc test_postproc.cpp)
 target_link_libraries(test_postproc PRIVATE nemo_speech_asr Threads::Threads)
+add_test(NAME asr_postprocessing COMMAND test_postproc)
 
 add_executable(test_audio_resampler test_audio_resampler.cpp)
 target_link_libraries(test_audio_resampler PRIVATE nemo_speech_common)
@@ -38,6 +46,7 @@ target_link_libraries(test_audio_decoder PRIVATE nemo_speech_common)
 
 add_executable(test_decoders test_decoders.cpp)
 target_link_libraries(test_decoders PRIVATE nemo_speech_asr)
+add_test(NAME decoders COMMAND test_decoders)
 
 # Do not link sentencepiece directly; it is provided by nemo_speech_asr.
 add_executable(test_oov_boost test_oov_boost.cpp)
@@ -56,8 +65,19 @@ add_executable(test_diar_state test_diar_state.cpp)
 target_link_libraries(test_diar_state PRIVATE nemo_speech_asr)
 add_test(NAME diar_state COMMAND test_diar_state)
 
+add_executable(test_mel_features test_mel_features.cpp)
+target_link_libraries(test_mel_features PRIVATE nemo_speech_asr)
+add_test(NAME mel_features COMMAND test_mel_features)
+
 add_executable(test_diar_recognizer test_diar_recognizer.cpp)
 target_link_libraries(test_diar_recognizer PRIVATE nemo_speech_asr)
+
+# The presenter is CLI code; compile it in directly so tests need no CLI target.
+add_executable(test_live_transcript test_live_transcript.cpp
+    ${CMAKE_SOURCE_DIR}/app/live_transcript.cpp)
+target_include_directories(test_live_transcript PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(test_live_transcript PRIVATE nemo_speech_asr)
+add_test(NAME live_transcript COMMAND test_live_transcript)
 
 add_executable(test_batching test_batching.cpp)
 target_link_libraries(test_batching PRIVATE nemo_speech_asr Threads::Threads)
@@ -76,3 +96,12 @@ endif()
 
 add_executable(asr_c_dlopen ${CMAKE_SOURCE_DIR}/tests/c/asr_c_dlopen.c)
 target_link_libraries(asr_c_dlopen PRIVATE ${CMAKE_DL_LIBS})
+
+# Skinny-Q8 dispatch (the skinny-Q8 ggml patch) must give the same bits before and after a weight is
+# repacked. The kernel exists only in the patched CUDA ggml. Skips itself (exit 77) without a GPU.
+if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
+    add_executable(test_skinny_q8_dispatch test_skinny_q8_dispatch.cpp)
+    target_link_libraries(test_skinny_q8_dispatch PRIVATE ggml)
+    add_test(NAME skinny_q8_dispatch COMMAND test_skinny_q8_dispatch)
+    set_tests_properties(skinny_q8_dispatch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()

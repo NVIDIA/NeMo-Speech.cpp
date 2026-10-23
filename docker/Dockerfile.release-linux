@@ -1,0 +1,249 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Portable x86_64 and aarch64 CPU/Vulkan/CUDA release archives.
+#
+# Build an installer-compatible archive into release-artifacts/ from the
+# repository root (.github/workflows/release.yml runs the same commands):
+#   docker build --platform=linux/amd64 -f docker/Dockerfile.release-linux \
+#       --build-arg BACKEND=vulkan --target artifact \
+#       --output type=local,dest=release-artifacts .
+#   docker build --platform=linux/amd64 -f docker/Dockerfile.release-linux \
+#       --target cuda-artifact \
+#       --output type=local,dest=release-artifacts .
+
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+FROM ubuntu:24.04 AS vulkan-tools
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        glslc \
+        libvulkan-dev \
+        spirv-headers \
+    && rm -rf /var/lib/apt/lists/* \
+    && set -eux; \
+       mkdir -p /opt/vulkan-tools/bin /opt/vulkan-tools/lib; \
+       cp -L "$(command -v glslc)" /opt/vulkan-tools/bin/glslc; \
+       ldd "$(command -v glslc)" \
+           | awk '$1 ~ /^\// { print $1 } $2 == "=>" && $3 ~ /^\// { print $3 }' \
+           | sort -u \
+           | while read -r dependency; do \
+                 cp -L "$dependency" "/opt/vulkan-tools/lib/$(basename "$dependency")"; \
+             done; \
+       loader="$(ldd "$(command -v glslc)" \
+           | awk '$1 ~ /ld-linux/ { print $1 } $2 == "=>" && $3 ~ /ld-linux/ { print $3 }' \
+           | head -n 1)"; \
+       test -n "$loader"; \
+       cp -L "$loader" /opt/vulkan-tools/lib/ld-linux.so
+
+FROM ${CUDA_IMAGE} AS cuda-tools
+
+RUN set -eux; \
+    cuda_home="$(readlink -f /usr/local/cuda)"; \
+    mkdir -p /opt/cuda; \
+    cp -a "$cuda_home"/. /opt/cuda/; \
+    cuda_license="$(find /usr/share/doc -maxdepth 2 -type f \
+        -path '*/cuda-cudart-*/copyright' -print | sort | head -n 1)"; \
+    test -n "$cuda_license"; \
+    cp "$cuda_license" /opt/cuda-cudart-copyright
+
+FROM ubuntu:20.04 AS portable-base
+
+ARG TARGETARCH
+ARG CMAKE_VERSION=3.31.6
+ARG CMAKE_SHA256_AMD64=5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf
+ARG CMAKE_SHA256_ARM64=b4cc788d63112b2749b40627e719eb5d3b8ed8f00c36d77189f4019cfe64bc9e
+ARG JOBS=4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CMAKE_BUILD_PARALLEL_LEVEL=${JOBS} \
+    PATH=/opt/cmake/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Use the target architecture's native toolchain on the portable baseline.
+RUN test "$(dpkg --print-architecture)" = "${TARGETARCH}" \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        binutils \
+        ca-certificates \
+        curl \
+        g++-9 \
+        gcc-9 \
+        git \
+        libvulkan-dev \
+        ninja-build \
+        pkg-config \
+        python3 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-9 100 \
+    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-9 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-9 100 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) \
+            cmake_arch=x86_64; \
+            cmake_sha256="${CMAKE_SHA256_AMD64}" \
+            ;; \
+        arm64) \
+            cmake_arch=aarch64; \
+            cmake_sha256="${CMAKE_SHA256_ARM64}" \
+            ;; \
+        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 2 ;; \
+    esac; \
+    curl -fsSL \
+        "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${cmake_arch}.tar.gz" \
+        -o /tmp/cmake.tar.gz; \
+    echo "${cmake_sha256}  /tmp/cmake.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/cmake; \
+    tar -xzf /tmp/cmake.tar.gz --strip-components=1 -C /opt/cmake; \
+    rm /tmp/cmake.tar.gz; \
+    cmake --version; \
+    ninja --version
+
+FROM portable-base AS sentencepiece-dependency
+
+WORKDIR /work
+COPY scripts/build_sentencepiece_static.sh /work/scripts/build_sentencepiece_static.sh
+
+# SentencePiece is a core ASR dependency. Build the repository's pinned static
+# revision once per target architecture and share it across every release
+# backend instead of relying on a package from the portable base image.
+RUN scripts/build_sentencepiece_static.sh
+
+FROM portable-base AS itn-dependency
+
+RUN apt-get update && apt-get install -y --no-install-recommends make perl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY scripts/build_itn_deps.sh /work/scripts/build_itn_deps.sh
+COPY src/common/text_normalization/compat /work/src/common/text_normalization/compat
+
+# Text normalization (ITN/TN): OpenFST, Sparrowhawk, protobuf, and RE2 as
+# static archives, linked privately into libnemo_speech_text_normalization.
+RUN STATIC=1 scripts/build_itn_deps.sh
+
+FROM portable-base AS builder
+
+ARG BACKEND
+ARG ARTIFACT_BACKEND
+# Archive version; defaults to VERSION ("nightly" for the nightly channel).
+ARG RELEASE_VERSION=
+
+# Ubuntu 20.04 supplies the release ABI baseline. Current Vulkan headers and
+# glslc are build-only inputs copied from the newer tool stage.
+COPY --from=vulkan-tools /opt/vulkan-tools /opt/vulkan-tools
+COPY --from=vulkan-tools /usr/include/vulkan /usr/include/vulkan
+COPY --from=vulkan-tools /usr/include/vk_video /usr/include/vk_video
+COPY --from=vulkan-tools /usr/include/spirv /usr/include/spirv
+COPY --from=vulkan-tools /usr/share/cmake/SPIRV-Headers /usr/share/cmake/SPIRV-Headers
+
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec /opt/vulkan-tools/lib/ld-linux.so --library-path /opt/vulkan-tools/lib /opt/vulkan-tools/bin/glslc "$@"' \
+        > /usr/local/bin/glslc \
+    && chmod 0755 /usr/local/bin/glslc \
+    && glslc --version
+
+WORKDIR /work
+COPY . /work
+COPY --from=sentencepiece-dependency /work/.deps/sentencepiece /work/.deps/sentencepiece
+COPY --from=itn-dependency /work/.deps/itn /work/.deps/itn
+
+# Build metadata for the reported version (nightly.<sha> for nightly builds).
+ARG VERSION_METADATA=
+RUN case "${BACKEND}" in cpu|vulkan) ;; \
+        *) echo "BACKEND must be cpu or vulkan" >&2; exit 2 ;; \
+    esac \
+    && scripts/configure.sh "${BACKEND}-server" \
+        -DGGML_NATIVE=OFF \
+        -DNEMO_SPEECH_BUILD_GRPC=OFF \
+        -DNEMO_SPEECH_WITH_GRPC=OFF \
+        -DNEMO_SPEECH_WITH_NORM=ON \
+        "-DNEMO_SPEECH_VERSION_METADATA=${VERSION_METADATA}" \
+        -DCMAKE_INSTALL_PREFIX=/opt/nemo-speech \
+        "-DCMAKE_CXX_STANDARD_LIBRARIES:STRING=-lstdc++fs -lanl" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags" \
+        "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--disable-new-dtags" \
+    && cmake --build --preset "${BACKEND}-server" \
+    && cmake --install "build/${BACKEND}-server" --prefix /opt/nemo-speech \
+    && artifact_backend="${ARTIFACT_BACKEND:-${BACKEND}}" \
+    && scripts/release/package-linux.sh \
+        --install-prefix /opt/nemo-speech \
+        --backend "${BACKEND}" \
+        --artifact-backend "${artifact_backend}" \
+        --output-dir /release \
+        --max-glibc 2.31 \
+        ${RELEASE_VERSION:+--version "$RELEASE_VERSION"}
+
+FROM scratch AS artifact
+COPY --from=builder /release/ /
+
+FROM portable-base AS cuda-builder
+
+ARG TARGETARCH
+ARG CUDA_ARCH=
+ARG ARTIFACT_BACKEND=cuda
+ARG RELEASE_VERSION=
+
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/opt/cmake/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+COPY --from=cuda-tools /opt/cuda /usr/local/cuda
+COPY --from=cuda-tools /opt/cuda-cudart-copyright /opt/cuda-cudart-copyright
+
+RUN set -eux; \
+    nvcc --version; \
+    cuda_version="$(nvcc --version \
+        | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1-\2/p' \
+        | head -n 1)"; \
+    test -n "$cuda_version"; \
+    install -Dm0644 /opt/cuda-cudart-copyright \
+        "/usr/share/doc/cuda-cudart-${cuda_version}/copyright"
+
+WORKDIR /work
+COPY . /work
+COPY --from=sentencepiece-dependency /work/.deps/sentencepiece /work/.deps/sentencepiece
+COPY --from=itn-dependency /work/.deps/itn /work/.deps/itn
+
+# Build metadata for the reported version (nightly.<sha> for nightly builds).
+ARG VERSION_METADATA=
+# The default architectures match the default CUDA 12.8 image; CUDA 13 builds
+# (sm_110, sm_121) pass CUDA_ARCH.
+RUN set -eux; \
+    cuda_arch="${CUDA_ARCH}"; \
+    if [ -z "$cuda_arch" ]; then \
+        case "${TARGETARCH}" in \
+            amd64) cuda_arch='75-real;80-virtual;86-real;89-real;120a-real' ;; \
+            arm64) cuda_arch='87-real;87-virtual' ;; \
+            *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 2 ;; \
+        esac; \
+    fi; \
+    scripts/configure.sh cuda-server \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CUDA_NCCL=OFF \
+        -DNEMO_SPEECH_CUBLAS_SHIM=ON \
+        -DNEMO_SPEECH_BUILD_GRPC=OFF \
+        -DNEMO_SPEECH_WITH_GRPC=OFF \
+        -DNEMO_SPEECH_WITH_NORM=ON \
+        "-DNEMO_SPEECH_VERSION_METADATA=${VERSION_METADATA}" \
+        -DCMAKE_INSTALL_PREFIX=/opt/nemo-speech \
+        "-DCMAKE_CXX_STANDARD_LIBRARIES:STRING=-lstdc++fs -lanl" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags" \
+        "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--disable-new-dtags" \
+        "-DCMAKE_CUDA_ARCHITECTURES=${cuda_arch}"; \
+    cmake --build --preset cuda-server; \
+    cmake --install build/cuda-server --prefix /opt/nemo-speech; \
+    scripts/release/package-linux.sh \
+        --install-prefix /opt/nemo-speech \
+        --backend cuda \
+        --artifact-backend "${ARTIFACT_BACKEND}" \
+        --output-dir /release \
+        --max-glibc 2.31 \
+        ${RELEASE_VERSION:+--version "$RELEASE_VERSION"}
+
+FROM scratch AS cuda-artifact
+COPY --from=cuda-builder /release/ /

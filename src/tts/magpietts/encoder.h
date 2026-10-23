@@ -12,8 +12,11 @@ class MagpieEncoder {
     MagpieEncoder(magpietts_model&&) = delete;
 
     bool eval(const std::vector<int32_t>& tokens, int threads, std::vector<float>& out) const;
+    // backend/keep_allocr: optional side backend (own stream) and reusable graph allocator for
+    // background evaluation (longform chunk prefetch).
     bool evalDevice(
-        const std::vector<int32_t>& tokens, int threads, magpietts_backend_tensor& out) const;
+        const std::vector<int32_t>& tokens, int threads, magpietts_backend_tensor& out,
+        ggml_backend_t backend = nullptr, ggml_gallocr_t* keep_allocr = nullptr) const;
 
    private:
     const magpietts_model& model_;
