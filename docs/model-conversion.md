@@ -61,3 +61,13 @@ option list.
 
 The converters do not import `nemo_toolkit`, and source checkpoints are not
 modified.
+
+### Cache-aware RNNT Q8 precision
+
+Cache-aware RNNT Q8_0 exports keep the Conformer pointwise convolution weights
+in F16. Quantizing these kernels to Q8 can cause speech to be decoded as long
+blank runs; attention, feed-forward and decoder matrix quantization is unchanged.
+Existing GGUFs are not repaired by updating the runtime: regenerate them from
+the original `.nemo` checkpoint with `--outtype q8_0`. Converting already-quantized
+weights to F16 cannot recover the original values. Other model/head types and
+requested weight types keep their previous conversion policy.

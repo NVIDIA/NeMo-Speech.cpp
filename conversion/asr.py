@@ -69,7 +69,8 @@ _LINEAR_WEIGHT_PATTERNS = [
     re.compile(r"^joint\.enc\.weight$"),
     re.compile(r"^joint\.pred\.weight$"),
     re.compile(r"^joint\.joint_net\.2\.weight$"),
-    # ConformerConv pointwise convs are 1×1 — mathematically Linear. We squeeze
+    # ConformerConv pointwise convs are 1×1 — mathematically Linear. Cache-aware
+    # RNNT Q8 exports retain F16 here; see _pick_dtype. We squeeze
     # the k=1 dim in reshape_for_emission so the Q8_0/k-quant kernels see a
     # 2D (out, in) tensor; the runtime detects 2D stored shape and dispatches
     # the matmul through ggml_mul_mat (see Conv1D::build_graph).
@@ -132,11 +133,18 @@ def _q8_0_to_tensor_planar(packed: np.ndarray, n_per_row: int) -> np.ndarray:
 
 
 def _pick_dtype(
-    name: str, shape: tuple, linear_qtype: GGMLQuantizationType, default_qtype: GGMLQuantizationType
+    name: str,
+    shape: tuple,
+    linear_qtype: GGMLQuantizationType,
+    default_qtype: GGMLQuantizationType,
+    *,
+    cache_aware_rnnt: bool = False,
 ) -> tuple[GGMLQuantizationType, Optional[str]]:
     """Return (chosen GGMLQuantizationType, fallback reason or None).
 
     Dispatch by tensor class:
+      * Cache-aware RNNT Q8 pointwise convs → F16; quantizing these kernels
+                                  can cause long non-speech/blank runs in speech.
       * Linear weights         → user-selected `--weight-type` (linear_qtype).
       * Conv weights, embed    → F16 (regardless of --weight-type) — saves
                                   ~50% disk vs F32 with no runtime cost.
@@ -144,6 +152,12 @@ def _pick_dtype(
                                   pos_bias, pe table, etc. The runtime keeps
                                   these in F32 in memory.
     """
+    if (
+        cache_aware_rnnt
+        and linear_qtype == GGMLQuantizationType.Q8_0
+        and _POINTWISE_PATTERN.fullmatch(name)
+    ):
+        return GGMLQuantizationType.F16, "cache-aware RNNT pointwise precision"
     if _is_linear_weight(name):
         inner = int(shape[-1]) if len(shape) >= 1 else 1
         if linear_qtype in _K_QUANTS and inner % _QK_K != 0:
@@ -677,7 +691,11 @@ def convert(
             arr = reshape_for_emission(dst_name, arr)
 
             chosen_qtype, fallback_reason = _pick_dtype(
-                dst_name, arr.shape, linear_qtype, default_qtype
+                dst_name,
+                arr.shape,
+                linear_qtype,
+                default_qtype,
+                cache_aware_rnnt=cache_supported and head_type == "rnnt",
             )
             if fallback_reason is not None:
                 print(f"[convert] kept fp16 ({fallback_reason}): {dst_name}")

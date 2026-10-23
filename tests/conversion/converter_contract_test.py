@@ -11,18 +11,22 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import torch
 import yaml
-from gguf import GGMLQuantizationType
+from gguf import GGMLQuantizationType, GGUFReader
 from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from conversion.asr import _pick_dtype
+from conversion.asr import convert as convert_asr
+from conversion.asr import reshape_for_emission
 from conversion.diarization import is_high_resolution_v3
 from conversion.diarization import remap as remap_diarization
 from conversion.registry import (
@@ -52,6 +56,93 @@ from conversion.source import extract_archive
 
 
 class ConverterContractTest(unittest.TestCase):
+    def test_streaming_rnnt_q8_preserves_pointwise_precision(self) -> None:
+        for layer in (0, 23):
+            for conv in (1, 2):
+                name = f"encoder.layers.{layer}.conv.pointwise_conv{conv}.weight"
+                shape = reshape_for_emission(name, np.zeros((64, 32, 1))).shape
+                self.assertEqual(shape, (64, 32))
+                dtype, reason = _pick_dtype(
+                    name,
+                    shape,
+                    GGMLQuantizationType.Q8_0,
+                    GGMLQuantizationType.F32,
+                    cache_aware_rnnt=True,
+                )
+                self.assertEqual(dtype, GGMLQuantizationType.F16)
+                self.assertEqual(reason, "cache-aware RNNT pointwise precision")
+                # Offline/CTC and other export precisions retain their policy.
+                dtype, _ = _pick_dtype(
+                    name, shape, GGMLQuantizationType.Q8_0, GGMLQuantizationType.F32
+                )
+                self.assertEqual(dtype, GGMLQuantizationType.Q8_0)
+                for requested in (GGMLQuantizationType.F16, GGMLQuantizationType.BF16):
+                    dtype, _ = _pick_dtype(
+                        name,
+                        shape,
+                        requested,
+                        GGMLQuantizationType.F32,
+                        cache_aware_rnnt=True,
+                    )
+                    self.assertEqual(dtype, requested)
+
+    def test_streaming_rnnt_precision_change_is_limited_to_pointwise(self) -> None:
+        expected = {
+            "encoder.layers.0.self_attn.linear_q.weight": GGMLQuantizationType.Q8_0,
+            "encoder.layers.0.feed_forward1.linear1.weight": GGMLQuantizationType.Q8_0,
+            "decoder.prediction.dec_rnn.lstm.ih_l0.weight": GGMLQuantizationType.Q8_0,
+            "encoder.layers.0.conv.depthwise_conv.weight": GGMLQuantizationType.F16,
+            "encoder.pre_encode.conv.0.weight": GGMLQuantizationType.F16,
+            "encoder.layers.0.conv.pointwise_conv1.bias": GGMLQuantizationType.F32,
+        }
+        for name, want in expected.items():
+            dtype, reason = _pick_dtype(
+                name,
+                (64, 32),
+                GGMLQuantizationType.Q8_0,
+                GGMLQuantizationType.F32,
+                cache_aware_rnnt=True,
+            )
+            self.assertEqual(dtype, want, name)
+            self.assertIsNone(reason)
+
+    def test_streaming_rnnt_export_keeps_original_pointwise_values(self) -> None:
+        name = "encoder.layers.0.conv.pointwise_conv1.weight"
+        linear = "encoder.layers.0.feed_forward1.linear1.weight"
+        values = torch.arange(32 * 32, dtype=torch.float32).reshape(32, 32, 1) / 337
+        config = {
+            "encoder": {
+                "d_model": 32,
+                "n_layers": 1,
+                "n_heads": 4,
+                "conv_kernel_size": 3,
+                "feat_in": 128,
+                "pos_emb_max_len": 32,
+                "att_context_size": [[70, 3]],
+                "att_context_style": "chunked_limited",
+            },
+            "decoder": {"vocab_size": 32},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            torch.save({name: values, linear: values.squeeze(-1)}, root / "model_weights.ckpt")
+            for streaming in (True, False):
+                config["encoder"]["att_context_style"] = (
+                    "chunked_limited" if streaming else "regular"
+                )
+                (root / "model_config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+                output = root / f"model-{streaming}.gguf"
+                with redirect_stdout(io.StringIO()):
+                    convert_asr(root, output, "rnnt", "q8_0")
+                tensors = {tensor.name: tensor for tensor in GGUFReader(output).tensors}
+                self.assertEqual(tensors[linear].tensor_type, GGMLQuantizationType.Q8_0)
+                want = GGMLQuantizationType.F16 if streaming else GGMLQuantizationType.Q8_0
+                self.assertEqual(tensors[name].tensor_type, want)
+                if streaming:
+                    np.testing.assert_array_equal(
+                        tensors[name].data, values.squeeze(-1).half().numpy()
+                    )
+
     def _checkpoint(self, root: Path, name: str, config: dict) -> Path:
         checkpoint = root / f"{name}.nemo"
         payload = yaml.safe_dump(config).encode("utf-8")
