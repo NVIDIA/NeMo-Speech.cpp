@@ -11,7 +11,7 @@ target_link_libraries(test_rnnt_streaming PRIVATE nemo_speech_asr)
 
 add_executable(test_cache_stream_geometry test_cache_stream_geometry.cpp)
 target_link_libraries(test_cache_stream_geometry PRIVATE nemo_speech_asr)
-add_test(NAME cache_stream_geometry COMMAND test_cache_stream_geometry)
+add_test(NAME cache_stream_geometry COMMAND test_cache_stream_geometry $ENV{NEMO_SPEECH_TEST_ASR_MODEL})
 
 add_executable(test_gguf_mmap_loader test_gguf_mmap_loader.cpp)
 target_link_libraries(test_gguf_mmap_loader PRIVATE nemo_speech_asr)
