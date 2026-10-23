@@ -221,6 +221,8 @@ main(int argc, char** argv) try {
         else if (argc != 2)
             throw std::runtime_error("Usage: test_cache_stream_geometry [MODEL.gguf [--gpu N]]");
         for (int right : {0, 3, 6, 13}) check_model(argv[1], gpu, right);
+    } else {
+        std::fprintf(stdout, "[SKIP] model checks: no cache-aware RNNT model supplied\n");
     }
     std::fprintf(stdout, "[PASS] cache-aware chunk geometry\n");
     return 0;
