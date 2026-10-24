@@ -33,12 +33,20 @@ SOURCE_SUFFIXES = {
     ".ps1",
     ".cmake",
 }
-DERIVED_PREFIX = "src/runtime/ggml/"
 DERIVED_FILES = {
     "src/asr/encoder/fastconformer.cpp",
     "src/asr/encoder/fastconformer.h",
     "src/asr/encoder/rel_pos_attention.cpp",
     "src/asr/encoder/rel_pos_attention.h",
+    "src/runtime/ggml/CMakeLists.txt",
+    "src/runtime/ggml/backend.cpp",
+    "src/runtime/ggml/loader.cpp",
+    "src/runtime/ggml/logging.cpp",
+    "src/runtime/ggml/nn.cpp",
+    "src/runtime/ggml/nn.h",
+    "src/runtime/ggml/runtime.h",
+    "src/runtime/ggml/session.cpp",
+    "src/runtime/ggml/tensor_container.cpp",
 }
 
 
@@ -101,7 +109,7 @@ def expected_header(path: Path) -> str:
         lines = [f"{prefix} {COPYRIGHT}", f"{prefix} {LICENSE}"]
 
     path_string = path.as_posix()
-    if path_string.startswith(DERIVED_PREFIX) or path_string in DERIVED_FILES:
+    if path_string in DERIVED_FILES:
         if prefix == "/*":
             lines.extend(
                 [
@@ -128,7 +136,7 @@ def has_header(path: Path, text: str) -> bool:
     if COPYRIGHT not in first_lines or LICENSE not in first_lines:
         return False
     path_string = path.as_posix()
-    if path_string.startswith(DERIVED_PREFIX) or path_string in DERIVED_FILES:
+    if path_string in DERIVED_FILES:
         return (
             "Copyright (c) 2025 Jason Ni" in first_lines
             and "Licensed under the MIT License" in first_lines
