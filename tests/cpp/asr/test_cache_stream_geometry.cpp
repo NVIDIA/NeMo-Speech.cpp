@@ -30,7 +30,26 @@ check_shapes() {
         require(
             cfg.subsample_time_length(steady) - cfg.cache_drop_extra == 1 + right,
             "steady chunk must drop only the overlap");
+        require(cfg.cache_decoded_mel_frames(0) == 0, "empty stream has a nonzero decode clock");
+        require(cfg.cache_decoded_mel_frames(1) == 1, "first encoder frame must end at mel zero");
+        for (int chunks : {1, 2, 100}) {
+            const int64_t emitted = static_cast<int64_t>(chunks) * (1 + right);
+            const int64_t consumed = first + static_cast<int64_t>(chunks - 1) * 8 * (1 + right);
+            require(cfg.cache_decoded_mel_frames(emitted) == consumed, "VAD decode clock is ahead");
+        }
     }
+
+    // R13: 14 emitted frames cover 105 real mel frames, not 112. At a 10ms
+    // hop, the old clock would fire an 800ms endpoint after only 730ms silence.
+    const auto cfg = make_cache_aware_config(EncoderConfig{}, 13);
+    VadEndpointer endpoint(VadEndpointerCfg{true, true, 800.0f});
+    require(!endpoint.poll(320.0, 320.0), "speech must not immediately endpoint");
+    require(
+        !endpoint.poll(cfg.cache_decoded_mel_frames(14) * 10.0, 320.0),
+        "VAD endpoint fired on the old 70ms-ahead clock");
+    require(
+        endpoint.poll(cfg.cache_decoded_mel_frames(15) * 10.0, 320.0),
+        "VAD endpoint did not fire after decoded silence reached the threshold");
 }
 
 static void

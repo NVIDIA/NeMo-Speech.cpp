@@ -1062,9 +1062,10 @@ CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
     double now_ms = 0.0, last_speech_ms = 0.0;
     if (vad_ && endpointer_->config().vad_based) {
         // VAD-driven: scan the Silero speech bits over the newly decoded mel
-        // frames (enc frame f covers mel frames [f*sub, (f+1)*sub)).
+        // frames. Causal encoder frame f ends at mel f*sub (inclusive), so
+        // the shorter first chunk shifts the exclusive frontier by sub-1.
         const double mel_ms = 1000.0 * hop / sample_rate;
-        const int64_t decoded_mel = total_frames_emitted_ * enc_cfg_.subsampling_factor;
+        const int64_t decoded_mel = enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_);
         scan_vad_speech(*vad_, decoded_mel, vad_scan_frame_, vad_speech_seen_frame_);
         now_ms = static_cast<double>(decoded_mel) * mel_ms;
         last_speech_ms = (vad_speech_seen_frame_ < 0)
@@ -1116,7 +1117,7 @@ CacheStreamRunner::trim_buffers() {
         // masker's neighbourhood scans never cross the trimmed base.
         const int64_t margin =
             std::max<int64_t>(256, vad_masker_ ? 2 * vad_masker_->max_scan() : 0);
-        const int64_t decoded_mel = total_frames_emitted_ * enc_cfg_.subsampling_factor;
+        const int64_t decoded_mel = enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_);
         const int64_t g = decoded_mel - margin;
         if (g > 0)
             vad_->discard_timeline_before(g);

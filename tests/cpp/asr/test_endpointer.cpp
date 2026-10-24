@@ -10,6 +10,8 @@
 //      utterance] clip, stream it through the runner with endpointing enabled,
 //      and assert >= 2 finals with the right split. Token-silence mode by
 //      default; pass --vad-model to also exercise the VAD-driven path.
+//      Cache-aware RNNT also checks each VAD endpoint against an independent
+//      first/steady mel-coverage timeline, before and after reset.
 //
 // Usage: ./test_endpointer [<model.gguf> <audio.wav> [--gpu N] [--vad-model F]
 //                           [--chunk-ms N] [--gap-ms N] [--eou-ms N]
@@ -113,6 +115,67 @@ test_policy() {
 // ---------------------------------------------------------------------------
 // 2. Integration: stream a 2-utterance clip, count finals.
 // ---------------------------------------------------------------------------
+static void
+test_cache_vad_clock(
+    RnntModel* model, const RecognizerConfig& cfg, const std::vector<float>& audio) {
+    CacheStreamRunner stream(model, cfg);
+    stream.set_prompt_index(model->prompt_index_for_lang("auto"));
+    SileroVad reference(model->backend_manager(), cfg.vad.model_path);
+    const auto enc =
+        make_cache_aware_config(model->encoder_config(), cfg.streaming.rnnt_right_context);
+    const int hop = model->fe().hop_length();
+    const int sub = enc.subsampling_factor;
+    const int first = 1 + sub * enc.cache_right_ctx;
+    const int stride = sub * (1 + enc.cache_right_ctx);
+    const double mel_ms = 1000.0 * hop / model->fe_config().sample_rate;
+    // At most one encoder chunk becomes ready per feed, including R0. The
+    // independent VAD sees the same packets, including not-yet-decoded audio.
+    const size_t packet = static_cast<size_t>(sub) * hop;
+    reference.set_binarizer(cfg.vad.masker.onset, cfg.vad.masker.offset, hop);
+    for (int pass = 0; pass < 2; ++pass) {
+        stream.reset();
+        reference.reset();
+        VadEndpointer expected(cfg.endpointing);
+        int64_t scan = 0, speech = -1;
+        int endpoints = 0;
+        bool matched = true;
+        for (size_t off = 0; off < audio.size(); off += packet) {
+            const size_t count = std::min(packet, audio.size() - off);
+            reference.observe_audio(audio.data() + off, count);
+            const int before = stream.chunks_processed();
+            stream.feed_audio(audio.data() + off, count);
+            const auto update = stream.step();
+            const int chunks = stream.chunks_processed();
+            if (chunks - before > 1) {
+                matched = false;
+                break;
+            }
+            // Derive coverage from real first/steady chunk lengths, not the
+            // production encoder-frame-to-mel helper being tested.
+            const int64_t decoded = chunks ? first + static_cast<int64_t>(chunks - 1) * stride : 0;
+            const int64_t end = std::min(decoded, reference.committed_frames());
+            for (; scan < end; ++scan)
+                if (reference.frame_speech(scan))
+                    speech = scan;
+            const bool final = expected.poll(decoded * mel_ms, (speech + 1) * mel_ms);
+            endpoints += final ? 1 : 0;
+            if (update.is_final != final) {
+                std::fprintf(
+                    stderr,
+                    "VAD clock mismatch: pass=%d R=%d chunks=%d decoded_mel=%lld speech=%lld "
+                    "expected_final=%d actual_final=%d\n",
+                    pass, enc.cache_right_ctx, chunks, static_cast<long long>(decoded),
+                    static_cast<long long>(speech), final, update.is_final);
+                matched = false;
+                break;
+            }
+        }
+        check(matched, "integration: VAD finals match real decoded-mel coverage, including reset");
+        check(
+            speech >= 0 && endpoints > 0, "integration: VAD clock control sees speech and an EOU");
+    }
+}
+
 static int
 test_integration(int argc, char** argv) {
     const std::string model_path = argv[1];
@@ -148,6 +211,10 @@ test_integration(int argc, char** argv) {
     p.pe_bin_path = const_cast<char*>("");
     ggml_runtime::BackendManager bm(p);
     auto model = AsrModel::load(bm, model_path);
+    // Match production language detection for prompt-conditioned RNNT models.
+    const int prompt = model->head_kind() == HeadKind::Rnnt
+                           ? static_cast<RnntModel*>(model.get())->prompt_index_for_lang("auto")
+                           : -1;
 
     std::vector<float> one;
     int sr = 0;
@@ -175,12 +242,16 @@ test_integration(int argc, char** argv) {
     cfg.endpointing = ep;
     cfg.streaming.rnnt_right_context = right_ctx;  // the CTC runner ignores it
 
+    if (model->head_kind() == HeadKind::Rnnt && !vad_model.empty())
+        test_cache_vad_clock(static_cast<RnntModel*>(model.get()), cfg, audio);
+
     std::unique_ptr<AsrRunner> runner;
     if (model->head_kind() == HeadKind::Rnnt) {
         runner = std::make_unique<CacheStreamRunner>(static_cast<RnntModel*>(model.get()), cfg);
     } else {
         runner = std::make_unique<BufferedStreamRunner>(static_cast<CtcModel*>(model.get()), cfg);
     }
+    runner->set_prompt_index(prompt);
     AsrRequestOptions request_options;
     request_options.enable_word_time_offsets = true;
     request_options.enable_automatic_punctuation = punctuation;
@@ -196,6 +267,7 @@ test_integration(int argc, char** argv) {
 
     if (model->head_kind() == HeadKind::Rnnt) {
         CacheStreamRunner silent(static_cast<RnntModel*>(model.get()), cfg);
+        silent.set_prompt_index(prompt);
         silent.set_request_options(request_options);
         std::vector<float> silence(static_cast<size_t>(3) * sr, 0.0f);
         const auto began = std::chrono::steady_clock::now();
@@ -231,6 +303,7 @@ test_integration(int argc, char** argv) {
             probe =
                 std::make_unique<BufferedStreamRunner>(static_cast<CtcModel*>(model.get()), pcfg);
         }
+        probe->set_prompt_index(prompt);
         const size_t head = std::min(audio.size(), static_cast<size_t>(4) * sr);
         const auto start = std::chrono::steady_clock::now();
         for (size_t off = 0; off < head; off += chunk_samples) {
@@ -307,6 +380,7 @@ test_integration(int argc, char** argv) {
             RecognizerConfig control = cfg;
             control.endpointing.enable = endpointing;
             CacheStreamRunner stream(static_cast<RnntModel*>(model.get()), control);
+            stream.set_prompt_index(prompt);
             stream.set_request_options(request_options);
             std::vector<int> tokens;
             int endpoints = 0;
