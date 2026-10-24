@@ -34,6 +34,15 @@ Intel Core i7-11700K, 8 threads for both engines, on a 100-utterance subset of t
 | NeMo-Speech.cpp (Q8_0) | 160 ms | **27.0** · 28.9 | **5.6×** | 3.00% |
 | NeMo (FP32) | 160 ms | 103.5 · 112.5 | 1.5× | 3.14% |
 
+### Jetson Orin Nano Developer Kit Super
+
+Full test-clean (2,620 utterances). NeMo-Speech.cpp only; the PyTorch NeMo engine was not run on this board.
+
+| Engine | Chunk | Compute per chunk (ms)<br>avg · p99 | Throughput (RTFX) | WER |
+|---|:---:|:---:|:---:|:---:|
+| NeMo-Speech.cpp (Q8_0) | 1.12 s | **26.4** · 35.3 | **30.5×** | 2.43% |
+| NeMo-Speech.cpp (Q8_0) | 160 ms | **17.3** · 20.0 | **8.7×** | 2.52% |
+
 ## Speech synthesis (MagpieTTS)
 
 MagpieTTS Multilingual 357M v2607, streaming.
@@ -85,6 +94,22 @@ By input length:
 | Medium (55 words) | **199.2** · 233.1 | **2.60×** | 663.3 · 666.5 | 0.27× |
 | Long (258 words) | **216.4** · 229.9 | **2.61×** | 686.5 · 697.9 | 0.27× |
 
+### Jetson Orin Nano Developer Kit Super
+
+NeMo-Speech.cpp only.
+
+| Engine | Time to first audio (ms)<br>avg · p99 | Inter-chunk latency (ms)<br>avg · p99 | Throughput (RTFX) |
+|---|:---:|:---:|:---:|
+| NeMo-Speech.cpp (Q8_0) | **96.1** · 121.0 | **29.5** · 42.4 | **5.82×** |
+
+By input length:
+
+| Input | Time to first audio (ms)<br>avg · p99 | Throughput (RTFX) |
+|---|:---:|:---:|
+| Short (8 words) | **87.6** · 95.5 | **5.57×** |
+| Medium (55 words) | **93.1** · 99.2 | **5.21×** |
+| Long (258 words) | **105.2** · 110.0 | **5.34×** |
+
 ## Devices
 
 ### GeForce RTX 4090
@@ -114,6 +139,17 @@ Intel Core i7-11700K, the RTX 4090 host's CPU, with the same build and software,
 | Build | Release, `-DCMAKE_CUDA_ARCHITECTURES=121` |
 | NeMo | NeMo 3.1, PyTorch 2.11 (CUDA 13.0), TF32 matmuls |
 
+### Jetson Orin Nano Developer Kit Super
+
+| | |
+|---|---|
+| System | Jetson Orin Nano Developer Kit Super (8 GB): Orin GPU (8 SMs, 1,024 CUDA cores, sm_87), 6-core Arm Cortex-A78AE, 8 GB unified memory, 25 W power mode, GPU clock 1,020 MHz |
+| Software | Ubuntu 24.04, JetPack 7.2 (L4T R39.2.0), NVIDIA driver 595.00 (open kernel modules), CUDA 13.2 |
+| Build | Release, `-DCMAKE_CUDA_ARCHITECTURES=87 -DGGML_CUDA_NO_VMM=ON`, commit e680fc3 |
+| NeMo | Not run on this board |
+
+`GGML_CUDA_NO_VMM=ON` works around the ggml VMM pool reservation failure on integrated Jetson GPUs (#77). The fused CUDA decoder and local-transformer paths need more SMs than the Orin has, so MagpieTTS runs on the ggml round graphs here. Average of three runs for every row.
+
 ## Methodology
 
 Precision is shown per engine. NeMo-Speech.cpp runs Q8_0 GGUF weights; NeMo runs
@@ -127,7 +163,7 @@ FP32, which was faster than BF16 here.
 | Chunks | 1.12 s (`--asr.streaming.rnnt_right_context 13`), 160 ms (`1`) |
 | Metrics | Compute per chunk is the time to process one chunk; NeMo's excludes feature extraction, which its streaming example runs per utterance. Throughput is audio duration over wall time; NeMo's likewise excludes feature extraction. WER uses the Whisper English normalizer. |
 | CPU subset | Every 26th utterance of test-clean (100 utterances, 40 speakers, 13.3 min) |
-| Trials | RTX 4090 and CPU: NeMo-Speech.cpp average of three, NeMo one |
+| Trials | RTX 4090, CPU and Jetson: NeMo-Speech.cpp average of three, NeMo one |
 
 ```bash
 OUT_DIR=datasets scripts/asr/prepare_librispeech.sh test-clean
