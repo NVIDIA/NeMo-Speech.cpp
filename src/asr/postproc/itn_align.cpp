@@ -67,6 +67,12 @@ average_confidence(const std::vector<WordTiming>& timings, const std::vector<int
     return sum / static_cast<float>(indices.size());
 }
 
+bool
+have_audio_positions(const std::vector<WordTiming>& timings, const std::vector<int>& indices) {
+    return std::all_of(
+        indices.begin(), indices.end(), [&](int i) { return timings[i].has_audio_position; });
+}
+
 std::vector<std::string>
 split_ws(const std::string& s) {
     std::vector<std::string> out;
@@ -141,7 +147,8 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
     if (tokens.empty())
         return;
 
-    std::vector<WordTiming> result;
+    std::vector<std::pair<size_t, WordTiming>> result;
+    size_t output_order = 0;
     int cursor = 0;
     const int n = static_cast<int>(timings.size());
 
@@ -164,6 +171,8 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
             continue;  // no written words, or no spoken span matched (skip, like riva)
 
         const auto& outs = it->second;
+        const size_t output_base = output_order;
+        output_order += outs.size();
         std::vector<bool> spoken_used(spoken.size(), false);
         std::vector<bool> output_used(outs.size(), false);
 
@@ -173,7 +182,7 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
                     continue;
                 WordTiming exact = timings[spoken[si]];
                 exact.word = outs[oi];
-                result.push_back(std::move(exact));
+                result.emplace_back(output_base + oi, std::move(exact));
                 spoken_used[si] = true;
                 output_used[oi] = true;
                 break;
@@ -192,10 +201,13 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
             continue;
 
         if (remaining_output.size() == 1 && starts_with_digit(outs[remaining_output.front()])) {
-            result.push_back(
-                {outs[remaining_output.front()], timings[remaining_spoken.front()].start_frame,
-                 timings[remaining_spoken.back()].end_frame,
-                 average_confidence(timings, remaining_spoken)});
+            result.emplace_back(
+                output_base + remaining_output.front(),
+                WordTiming{
+                    outs[remaining_output.front()], timings[remaining_spoken.front()].start_frame,
+                    timings[remaining_spoken.back()].end_frame,
+                    average_confidence(timings, remaining_spoken),
+                    have_audio_positions(timings, remaining_spoken)});
             continue;
         }
 
@@ -207,13 +219,15 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
             const int64_t span = end - start;
             const float confidence = average_confidence(timings, remaining_spoken);
             for (size_t i = 0; i < remaining_output.size(); ++i) {
-                result.push_back(
-                    {outs[remaining_output[i]],
-                     start + span * static_cast<int64_t>(i) /
-                                 static_cast<int64_t>(remaining_output.size()),
-                     start + span * static_cast<int64_t>(i + 1) /
-                                 static_cast<int64_t>(remaining_output.size()),
-                     confidence});
+                result.emplace_back(
+                    output_base + remaining_output[i],
+                    WordTiming{
+                        outs[remaining_output[i]],
+                        start + span * static_cast<int64_t>(i) /
+                                    static_cast<int64_t>(remaining_output.size()),
+                        start + span * static_cast<int64_t>(i + 1) /
+                                    static_cast<int64_t>(remaining_output.size()),
+                        confidence, have_audio_positions(timings, remaining_spoken)});
             }
             continue;
         }
@@ -225,18 +239,26 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
             const size_t take = base + (i < extra ? 1 : 0);
             std::vector<int> slice(
                 remaining_spoken.begin() + offset, remaining_spoken.begin() + offset + take);
-            result.push_back(
-                {outs[remaining_output[i]], timings[slice.front()].start_frame,
-                 timings[slice.back()].end_frame, average_confidence(timings, slice)});
+            result.emplace_back(
+                output_base + remaining_output[i],
+                WordTiming{
+                    outs[remaining_output[i]], timings[slice.front()].start_frame,
+                    timings[slice.back()].end_frame, average_confidence(timings, slice),
+                    have_audio_positions(timings, slice)});
             offset += take;
         }
     }
 
     if (!result.empty()) {
-        std::sort(result.begin(), result.end(), [](const WordTiming& a, const WordTiming& b) {
-            return a.start_frame < b.start_frame;
+        // EOS backfill can give distinct words identical frame positions.
+        // Keep the written order for ties, not the order in which matches were found.
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+            if (a.second.start_frame != b.second.start_frame)
+                return a.second.start_frame < b.second.start_frame;
+            return a.first < b.first;
         });
-        timings = std::move(result);
+        timings.clear();
+        for (auto& entry : result) timings.push_back(std::move(entry.second));
     }
 }
 

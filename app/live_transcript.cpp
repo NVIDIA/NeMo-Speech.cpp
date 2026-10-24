@@ -12,6 +12,8 @@ namespace {
 
 double
 speaker_ready_time(const asr::Word& word) {
+    if (!word.has_audio_position)
+        return 0.0;  // No speaker window can make a padding-only position valid.
     return std::max(word.end_time / 1000.0, word.start_time / 1000.0 + 0.160);
 }
 

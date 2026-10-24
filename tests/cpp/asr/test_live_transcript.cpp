@@ -516,6 +516,16 @@ test_delayed_punctuation_in_revision_buffer() {
 
 int
 main() {
+    {
+        nemo_speech::cli::LiveDiarizationBuffer buffer;
+        auto late = word("Late", 560, 640, 0);
+        late.has_audio_position = false;
+        buffer.push(final_result(alternative("Late", {late}), 0.64f));
+        const auto ready = buffer.update(0.01, [](Result&) {});
+        check(
+            ready.size() == 1 && ready[0].alternatives[0].words[0].speaker_tag == 0,
+            "padding-only text does not wait for a nonexistent speaker window");
+    }
     test_canonical_single_speaker_text();
     test_silence_final_settles_without_more_speech();
     test_punctuation_stays_with_previous_speaker();

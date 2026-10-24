@@ -45,6 +45,26 @@ read_wav_f32(const char* path, size_t* n_out) {
     return out;
 }
 
+static int
+check_times(const nemo_speech_asr_result* result, size_t real_samples) {
+    const double duration_ms = real_samples / 16.0;
+    const float progress = nemo_speech_asr_result_audio_processed(result);
+    if (progress < 0 || progress > real_samples / 16000.0 + 1e-5) {
+        fprintf(stderr, "C API progress exceeds the real input\n");
+        return 0;
+    }
+    const size_t count = nemo_speech_asr_result_word_count(result, 0);
+    for (size_t i = 0; i < count; ++i) {
+        const int32_t start = nemo_speech_asr_result_word_start_time(result, 0, i);
+        const int32_t end = nemo_speech_asr_result_word_end_time(result, 0, i);
+        if (start < 0 || end < start || end > duration_ms) {
+            fprintf(stderr, "C API word timestamp exceeds the real input\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int
 main(int argc, char** argv) {
     printf("nemo_speech_asr_version: %s\n", nemo_speech_asr_version());
@@ -107,6 +127,7 @@ main(int argc, char** argv) {
     }
     printf("offline: %s\n", nemo_speech_asr_result_transcript(r, 0));
     printf("offline words: %zu\n", nemo_speech_asr_result_word_count(r, 0));
+    int timing_ok = check_times(r, n);
     nemo_speech_asr_result_destroy(r);
 
     /* ---- streaming (160 ms chunks) ---- */
@@ -140,6 +161,7 @@ main(int argc, char** argv) {
         nemo_speech_asr_stream_push_f32(st, audio + pos, cn, 16000);
         nemo_speech_asr_result* sr = NULL;
         while (nemo_speech_asr_stream_next(st, &sr) == NEMO_SPEECH_ASR_OK && sr) {
+            timing_ok &= check_times(sr, pos + cn);
             if (nemo_speech_asr_result_is_final(sr)) {
                 strncat(
                     streamed, nemo_speech_asr_result_transcript(sr, 0),
@@ -152,6 +174,7 @@ main(int argc, char** argv) {
     nemo_speech_asr_stream_finish(st);
     nemo_speech_asr_result* sr = NULL;
     while (nemo_speech_asr_stream_next(st, &sr) == NEMO_SPEECH_ASR_OK && sr) {
+        timing_ok &= check_times(sr, n);
         if (nemo_speech_asr_result_is_final(sr)) {
             strncat(
                 streamed, nemo_speech_asr_result_transcript(sr, 0),
@@ -165,6 +188,6 @@ main(int argc, char** argv) {
 
     free(audio);
     nemo_speech_asr_destroy(rec);
-    printf("[C ABI smoke OK]\n");
-    return 0;
+    printf(timing_ok ? "[C ABI smoke OK]\n" : "[C ABI timing FAILED]\n");
+    return timing_ok ? 0 : 1;
 }

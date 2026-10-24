@@ -94,10 +94,16 @@ check_model(const std::string& path, int gpu, int right) {
     CacheStreamRunner runner(model, cfg);
     runner.set_prompt_index(prompt);
     runner.feed_audio(audio.data(), first_samples - 1);
-    runner.step();
+    require(
+        runner.step().audio_processed_sec == 0.0f,
+        "received lookahead must not count as decoded progress");
     require(runner.chunks_processed() == 0, "first chunk ran before its last stable mel frame");
     runner.feed_audio(audio.data() + first_samples - 1, 1);
-    runner.step();
+    const auto first_update = runner.step();
+    require(
+        std::fabs(first_update.audio_processed_sec - first_mel * hop / float(fe.sample_rate)) <
+            1e-5f,
+        "first decoded progress must use the causal mel frontier");
     require(
         runner.chunks_processed() == 1, "first chunk incorrectly waits for steady-state length");
 
@@ -187,6 +193,9 @@ check_model(const std::string& path, int gpu, int right) {
             }
         }
         const auto final = runner.finalize();
+        require(
+            std::fabs(final.audio_processed_sec - size / float(fe.sample_rate)) < 1e-5f,
+            "EOS padding must not inflate final audio duration");
         ids.insert(ids.end(), final.new_token_ids.begin(), final.new_token_ids.end());
         require(final.is_final, "EOF not final");
         require(runner.finalize().new_token_ids.empty(), "EOF duplicated tokens");
