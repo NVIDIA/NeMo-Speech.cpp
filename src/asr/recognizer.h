@@ -19,6 +19,7 @@
 #include "runner.h"
 #include "runtime.h"
 #include "types.h"
+#include "word_time.h"
 
 namespace nemo_speech::asr {
 
@@ -97,6 +98,7 @@ class RecognitionStream {
 
    private:
     Result build_result_(const StreamingUpdate& u, bool is_final) const;
+    BoundedWordTime word_time_(const WordTiming& word) const;
     // Extends diarization to cover all words in a final result.
     void flush_diar_deficit_(const StreamingUpdate& u);
 
@@ -106,9 +108,11 @@ class RecognitionStream {
     std::unique_ptr<DiarStream> diar_;
     AsrRequestOptions opts_;
     int input_sample_rate_ = 0;
+    uint64_t input_samples_received_ = 0;  // Original rate; never counts padding.
     std::unique_ptr<audio::AudioResampler> resampler_;
     std::vector<float> resampled_audio_;
     bool resampler_flushed_ = false;
+    bool input_finished_ = false;
     bool coordinate_ingress_ = true;
     int pending_cohort_target_ = 0;
     // High-water mark of audio_processed_sec returned by next(). A step that

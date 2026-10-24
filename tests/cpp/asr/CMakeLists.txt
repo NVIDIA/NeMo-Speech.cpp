@@ -40,6 +40,16 @@ add_executable(test_postproc test_postproc.cpp)
 target_link_libraries(test_postproc PRIVATE nemo_speech_asr Threads::Threads)
 add_test(NAME asr_postprocessing COMMAND test_postproc)
 
+add_executable(test_result_timing test_result_timing.cpp)
+target_link_libraries(test_result_timing PRIVATE nemo_speech_asr)
+set(result_timing_args)
+if(DEFINED ENV{NEMO_SPEECH_TEST_CACHE_AWARE_RNNT_MODEL} AND
+   NOT "$ENV{NEMO_SPEECH_TEST_CACHE_AWARE_RNNT_MODEL}" STREQUAL "")
+    list(APPEND result_timing_args "$ENV{NEMO_SPEECH_TEST_CACHE_AWARE_RNNT_MODEL}"
+        "${CMAKE_SOURCE_DIR}/test_files/asr/wav/test/jfk.wav")
+endif()
+add_test(NAME result_timing COMMAND test_result_timing ${result_timing_args})
+
 add_executable(test_audio_resampler test_audio_resampler.cpp)
 target_link_libraries(test_audio_resampler PRIVATE nemo_speech_common)
 

@@ -154,6 +154,36 @@ test_speaker_turns() {
     require(turns[1].start_ms == 700 && turns[1].end_ms == 1300, "second speaker turn timing");
 }
 
+void
+test_real_audio_bounds() {
+    const std::vector<Word> padding{{"And", 560, 640}, {"so", 560, 640}};
+    const auto fallback = nemo_speech::subtitle::make_cues(padding, "And so", 640);
+    require(
+        fallback.size() == 1 && fallback[0].start_ms == 560 && fallback[0].end_ms == 640,
+        "backfilled EOF words retain their bounded interval");
+    require(fallback[0].text == "And so", "padding-only text is not dropped");
+    const auto markers =
+        nemo_speech::subtitle::make_cues({{"And", 640, 640}, {"so", 640, 640}}, "", 640);
+    require(
+        markers.size() == 1 && markers[0].text == "And so" && markers[0].end_ms == 640,
+        "zero-width endpoint markers preserve text");
+    const auto partial = nemo_speech::subtitle::make_cues(
+        {{"Hello", 0, 300}, {"world.", 300, 640}, {"Late", 560, 640}}, "", 640);
+    std::string text;
+    for (const auto& cue : partial) {
+        require(
+            cue.start_ms >= 0 && cue.start_ms < cue.end_ms && cue.end_ms <= 640,
+            "subtitle display extensions cannot exceed the audio");
+        text += cue.text;
+    }
+    require(
+        text.find("Hello") != std::string::npos && text.find("Late") != std::string::npos,
+        "mixed timed and late words are retained");
+    require(
+        nemo_speech::subtitle::make_cues({}, "text", 0).empty(),
+        "empty audio cannot have a positive-duration cue");
+}
+
 }  // namespace
 
 int
@@ -168,6 +198,7 @@ main() {
     test_duration_and_length_split_are_ordered();
     test_fallback_text();
     test_speaker_turns();
+    test_real_audio_bounds();
     std::cout << "subtitle tests passed\n";
     return 0;
 }

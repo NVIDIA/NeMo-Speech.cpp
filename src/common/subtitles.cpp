@@ -168,10 +168,12 @@ make_speaker_turns(const std::vector<Word>& words) {
 
 std::vector<Cue>
 make_cues(const std::vector<Word>& words, const std::string& fallback_text, int audio_ms) {
+    if (audio_ms <= 0)
+        return {};
     if (words.empty()) {
         if (fallback_text.empty())
             return {};
-        return {{0, std::max(1, audio_ms), fallback_text}};
+        return {{0, audio_ms, fallback_text}};
     }
 
     std::vector<Group> groups;
@@ -217,8 +219,9 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
     cues.reserve(groups.size());
     for (size_t i = 0; i < groups.size(); ++i) {
         auto cue = groups[i].cue;
+        cue.start_ms = std::clamp(cue.start_ms, 0, audio_ms - 1);
         const int available_end =
-            i + 1 < groups.size() ? groups[i + 1].cue.start_ms : std::max(cue.end_ms, audio_ms);
+            i + 1 < groups.size() ? std::min(audio_ms, groups[i + 1].cue.start_ms) : audio_ms;
         const int words_in_cue = static_cast<int>(groups[i].end - groups[i].begin);
         const int readable_ms = std::max(
             kMinimumCueDurationMs, (words_in_cue * 60000 + kWordsPerMinute - 1) / kWordsPerMinute);
@@ -227,7 +230,7 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
             std::max(cue.end_ms, desired_end),
             std::min(available_end, cue.start_ms + kMaximumCueDurationMs));
         if (cue.end_ms <= cue.start_ms)
-            cue.end_ms = cue.start_ms + 1;
+            cue.end_ms = std::min(audio_ms, cue.start_ms + 1);
         cues.push_back(std::move(cue));
     }
     return cues;

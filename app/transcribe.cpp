@@ -48,6 +48,7 @@ struct Transcript {
     std::string target_language;
     float confidence = 0.0f;
     float audio_seconds = 0.0f;
+    int32_t audio_extent_ms = -1;
     std::vector<std::string> languages;
     std::vector<nemo_speech::subtitle::Word> words;
 };
@@ -285,6 +286,7 @@ append_result(Transcript& transcript, const asr::Result& result) {
     }
     transcript.confidence = alternative.confidence;
     transcript.audio_seconds = std::max(transcript.audio_seconds, result.audio_processed);
+    transcript.audio_extent_ms = std::max(transcript.audio_extent_ms, result.audio_extent_ms);
     for (const auto& language : alternative.language_codes)
         if (std::find(transcript.languages.begin(), transcript.languages.end(), language) ==
             transcript.languages.end())
@@ -304,6 +306,7 @@ transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::pa
     const asr::AsrRequestOptions request = make_request_options(options);
 
     Transcript transcript;
+    transcript.audio_extent_ms = asr::real_audio_extent_ms(audio.samples.size(), audio.sample_rate);
     if (!options.stream) {
         append_result(
             transcript, recognizer.recognize(
@@ -506,6 +509,8 @@ transcribe_live(asr::Recognizer& recognizer, const Options& options) {
     emit_turns(presenter.finish(), final_audio_processed);
     transcript.audio_seconds = std::max(
         transcript.audio_seconds, captured_samples / static_cast<float>(microphone.sample_rate()));
+    transcript.audio_extent_ms =
+        asr::real_audio_extent_ms(captured_samples, microphone.sample_rate());
     terminal.stopped(transcript.audio_seconds);
     return transcript;
 }
@@ -563,7 +568,8 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
         if (vtt)
             output << "WEBVTT\n\n";
         const auto cues = nemo_speech::subtitle::make_cues(
-            t.words, t.text, static_cast<int>(t.audio_seconds * 1000));
+            t.words, t.text,
+            t.audio_extent_ms >= 0 ? t.audio_extent_ms : static_cast<int>(t.audio_seconds * 1000));
         for (size_t i = 0; i < cues.size(); ++i) {
             if (!vtt)
                 output << i + 1 << '\n';
