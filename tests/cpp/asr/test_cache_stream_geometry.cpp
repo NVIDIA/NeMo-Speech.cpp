@@ -94,16 +94,10 @@ check_model(const std::string& path, int gpu, int right) {
     CacheStreamRunner runner(model, cfg);
     runner.set_prompt_index(prompt);
     runner.feed_audio(audio.data(), first_samples - 1);
-    require(
-        runner.step().audio_processed_sec == 0.0f,
-        "received lookahead must not count as decoded progress");
+    runner.step();
     require(runner.chunks_processed() == 0, "first chunk ran before its last stable mel frame");
     runner.feed_audio(audio.data() + first_samples - 1, 1);
-    const auto first_update = runner.step();
-    require(
-        std::fabs(first_update.audio_processed_sec - first_mel * hop / float(fe.sample_rate)) <
-            1e-5f,
-        "first decoded progress must use the causal mel frontier");
+    runner.step();
     require(
         runner.chunks_processed() == 1, "first chunk incorrectly waits for steady-state length");
 
@@ -161,6 +155,13 @@ check_model(const std::string& path, int gpu, int right) {
         runner.take_encoder_frames(actual, actual_t, dim);
         require(actual_t == expected_t, "wrong runner encoder frame count");
         require(runner.chunks_processed() == step + 1, "wrong chunk consumption");
+        const auto emitted = static_cast<int64_t>(runner.rnnt_decode_stats().encoder_frames);
+        require(
+            emitted == static_cast<int64_t>(step + 1) * (right + 1),
+            "first/steady transition changed the absolute decoder frame offset");
+        require(
+            enc.cache_decoded_mel_frames(emitted) == consumed + fresh,
+            "decoded frontier differs from independently assembled real Mel coverage");
         same_encoder(actual, expected);
         if (step == 0)
             first_output = actual;
@@ -168,6 +169,9 @@ check_model(const std::string& path, int gpu, int right) {
         cached = std::min(enc.cache_left_ctx, cached + expected_t);
     }
     runner.reset();
+    require(
+        runner.rnnt_decode_stats().encoder_frames == 0,
+        "new stream retained the previous decoder frame clock");
     // Preserve FE packet shapes as well: Metal FFT rounding can differ across
     // packet shapes independently of the encoder's chunk geometry.
     runner.feed_audio(audio.data(), first_samples - 1);
@@ -193,9 +197,6 @@ check_model(const std::string& path, int gpu, int right) {
             }
         }
         const auto final = runner.finalize();
-        require(
-            std::fabs(final.audio_processed_sec - size / float(fe.sample_rate)) < 1e-5f,
-            "EOS padding must not inflate final audio duration");
         ids.insert(ids.end(), final.new_token_ids.begin(), final.new_token_ids.end());
         require(final.is_final, "EOF not final");
         require(runner.finalize().new_token_ids.empty(), "EOF duplicated tokens");
@@ -223,12 +224,18 @@ check_model(const std::string& path, int gpu, int right) {
         require(runner.cache_filled_frames() == right + 1, "EOU changed encoder cache");
         const int before = runner.chunks_processed();
         require(before == 1, "EOU synthesized extra chunks");
+        require(
+            runner.rnnt_decode_stats().encoder_frames == static_cast<uint64_t>(right + 1),
+            "EOU reset the absolute decoder clock after the first chunk");
         runner.feed_audio(audio.data() + first_samples, stride_samples - 1);
         runner.step();
         require(runner.chunks_processed() == before, "post-EOU reused first-chunk geometry");
         runner.feed_audio(audio.data() + first_samples + stride_samples - 1, 1);
         runner.step();
         require(runner.chunks_processed() == before + 1, "post-EOU steady chunk was not processed");
+        require(
+            runner.rnnt_decode_stats().encoder_frames == static_cast<uint64_t>(2 * (right + 1)),
+            "post-EOU decoder clock did not retain the first chunk offset");
         std::vector<float> output;
         int count = 0, dim = 0;
         runner.take_encoder_frames(output, count, dim);

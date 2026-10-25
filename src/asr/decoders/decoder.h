@@ -103,9 +103,6 @@ struct WordTiming {
     int64_t start_frame = 0;
     int64_t end_frame = 0;
     float confidence = 1.0f;
-    // Internal provenance: false when an EOS-only emission was moved onto
-    // real audio. Its bounded display interval must not imply speaker evidence.
-    bool has_audio_position = true;
 };
 
 // One N-best hypothesis. Times use the same encoder-frame clock as WordTiming.

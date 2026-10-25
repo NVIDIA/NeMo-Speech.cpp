@@ -34,8 +34,6 @@ bool attaches_to_previous(const std::string& text);
 
 std::vector<SpeakerTurn> make_speaker_turns(const std::vector<Word>& words);
 
-// Input word intervals are already bounded by the recognizer. Reading-time
-// extensions must stay inside audio_ms too; zero-duration audio yields no cues.
 std::vector<Cue> make_cues(
     const std::vector<Word>& words, const std::string& fallback_text, int audio_ms);
 

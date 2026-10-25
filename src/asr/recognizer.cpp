@@ -355,8 +355,6 @@ RecognitionStream::~RecognitionStream() {
 
 void
 RecognitionStream::push(const float* samples, size_t n, int sample_rate) {
-    if (input_finished_)
-        throw std::invalid_argument("cannot push audio after finish");
     if (n == 0)
         return;
     if (samples == nullptr)
@@ -373,7 +371,6 @@ RecognitionStream::push(const float* samples, size_t n, int sample_rate) {
     } else if (rate != input_sample_rate_) {
         throw std::invalid_argument("input sample rate cannot change within a stream");
     }
-    input_samples_received_ += n;
     if (coordinate_ingress_)
         pending_cohort_target_ = recognizer_->arrive_streaming_ingress();
     // The diarizer consumes the same model-rate audio the runner does, so it
@@ -404,12 +401,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     r.is_final = is_final;
     r.stability = is_final ? 1.0f : 0.0f;
     r.channel_tag = 1;
-    r.audio_extent_ms = real_audio_extent_ms(input_samples_received_, input_sample_rate_);
-    const double received_sec =
-        input_sample_rate_ > 0 ? static_cast<double>(input_samples_received_) / input_sample_rate_
-                               : 0.0;
-    r.audio_processed = static_cast<float>(
-        input_finished_ ? received_sec : std::min<double>(u.audio_processed_sec, received_sec));
+    r.audio_processed = u.audio_processed_sec;
 
     if (!is_final && !interim_words_) {
         // Interim results contain only the raw top hypothesis.
@@ -423,6 +415,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     // Detected languages are per-stream (shared by every alternative).
     const auto langs = runner_->detected_languages();
     const bool want_off = opts_.needs_word_timings();
+    const double ms = recognizer_->ms_per_enc_frame();
     const std::string lang0 = langs.empty() ? std::string() : langs.front();
     std::string postproc_language = opts_.language_code;
     std::string normalized_requested = postproc_language;
@@ -454,10 +447,8 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
                     continue;
                 Word ww;
                 ww.word = w.word;
-                const auto time = word_time_(w);
-                ww.start_time = time.start_ms;
-                ww.end_time = time.end_ms;
-                ww.has_audio_position = time.has_audio_position;
+                ww.start_time = static_cast<int32_t>(w.start_frame * ms + 0.5);
+                ww.end_time = static_cast<int32_t>(w.end_frame * ms + 0.5);
                 ww.confidence = w.confidence;
                 ww.language_code = lang0;
                 alt.words.push_back(std::move(ww));
@@ -488,13 +479,11 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
             for (const auto& w : words) {
                 Word ww;
                 ww.word = w.word;
-                const auto time = word_time_(w);
-                ww.start_time = time.start_ms;
-                ww.end_time = time.end_ms;
-                ww.has_audio_position = time.has_audio_position;
+                ww.start_time = static_cast<int32_t>(w.start_frame * ms + 0.5);
+                ww.end_time = static_cast<int32_t>(w.end_frame * ms + 0.5);
                 ww.confidence = w.confidence;
                 ww.language_code = lang0;
-                if (tag_speakers && diar_ && ww.has_audio_position) {
+                if (tag_speakers && diar_) {
                     // Transducer punctuation can extend a word timestamp into
                     // the next turn. Anchor attribution to the word onset and
                     // average two diar frames to reject single-frame noise.
@@ -520,25 +509,11 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     return r;
 }
 
-BoundedWordTime
-RecognitionStream::word_time_(const WordTiming& word) const {
-    auto time = bound_word_time(
-        word.start_frame, word.end_frame, recognizer_->ms_per_enc_frame(), input_samples_received_,
-        input_sample_rate_);
-    time.has_audio_position = time.has_audio_position && word.has_audio_position;
-    return time;
-}
-
 void
 RecognitionStream::flush_diar_deficit_(const StreamingUpdate& u) {
     if (!diar_ || u.words.empty())
         return;
-    double end_sec = 0.0;
-    for (const auto& word : u.words) {
-        const auto time = word_time_(word);
-        if (time.has_audio_position)
-            end_sec = std::max(end_sec, time.end_ms / 1000.0);
-    }
+    const double end_sec = u.words.back().end_frame * recognizer_->ms_per_enc_frame() / 1000.0;
     const auto target = static_cast<int64_t>(std::ceil(end_sec / diar_->seconds_per_frame()));
     if (target > diar_->n_frames()) {
         const int64_t before = diar_->n_frames();
@@ -563,16 +538,13 @@ RecognitionStream::next() {
         last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
         auto result = build_result_(u, /*is_final=*/true);
         if (diar_ && !u.words.empty()) {
-            // Retain the last observed word's attribution window; a nominal
-            // padding-only position must not evict real speech history.
-            for (auto it = u.words.rbegin(); it != u.words.rend(); ++it) {
-                const auto time = word_time_(*it);
-                if (time.has_audio_position) {
-                    diar_->hold_frames_from(static_cast<int64_t>(
-                        (time.start_ms / 1000.0) / diar_->seconds_per_frame()));
-                    break;
-                }
-            }
+            // This final's words are tagged and later words start at or after
+            // its last one. Not audio_processed_sec: the cache runner sets it
+            // to all pushed audio, which can hold utterances not decoded yet.
+            const double last_start_sec =
+                u.words.back().start_frame * recognizer_->ms_per_enc_frame() / 1000.0;
+            diar_->hold_frames_from(
+                static_cast<int64_t>(last_start_sec / diar_->seconds_per_frame()));
         }
         result.late_punctuation = std::exchange(late_punctuation_, {});
         return result;
@@ -596,7 +568,6 @@ RecognitionStream::next() {
 
 Result
 RecognitionStream::finish() {
-    input_finished_ = true;
     const ScopedBatchCohort cohort_scope(
         pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     pending_cohort_target_ = 0;
@@ -628,10 +599,6 @@ RecognitionStream::refresh_speaker_tags(Result& result) const {
     if (!diar_ || result.alternatives.empty())
         return;
     for (auto& word : result.alternatives.front().words) {
-        if (!word.has_audio_position) {
-            word.speaker_tag = 0;
-            continue;
-        }
         const int speaker =
             diar_->speaker_for_word_time(word.start_time / 1000.0, word.end_time / 1000.0);
         word.speaker_tag = speaker >= 0 ? speaker + 1 : 0;

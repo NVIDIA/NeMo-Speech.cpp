@@ -16,7 +16,6 @@
 
 #include "greedy_ctc_decoder.h"
 #include "recognizer.h"
-#include "word_time.h"
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
 #include "flashlight_decoder.h"
 #endif
@@ -973,22 +972,6 @@ CacheStreamRunner::process_one_chunk() {
     }
 }
 
-int64_t
-CacheStreamRunner::decoded_mel_frames() const {
-    return std::min(
-        total_mel_frames_produced_, enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_));
-}
-
-void
-CacheStreamRunner::bound_word_timings(StreamingUpdate& update) const {
-    const int64_t frames = total_mel_frames_produced_ > 0
-                               ? (total_mel_frames_produced_ - 1) / enc_cfg_.subsampling_factor + 1
-                               : 0;
-    for (auto& word : update.words) bound_word_frames(word, frames);
-    for (auto& alternative : update.extra_alternatives)
-        for (auto& word : alternative.words) bound_word_frames(word, frames);
-}
-
 StreamingUpdate
 CacheStreamRunner::step() {
     StreamingUpdate update;
@@ -1048,12 +1031,8 @@ CacheStreamRunner::step() {
     // per-utterance buffers are already cleared.
     if (!update.is_final)
         update.transcript_so_far = transcript_;
-    // Received audio can include lookahead or whole later utterances. Report
-    // only real decoded coverage, consistently with BufferedStreamRunner.
-    const size_t decoded_samples =
-        std::min(audio_end, static_cast<size_t>(decoded_mel_frames()) * model_->fe().hop_length());
     update.audio_processed_sec =
-        static_cast<float>(decoded_samples) / static_cast<float>(model_->fe_config().sample_rate);
+        static_cast<float>(audio_end) / static_cast<float>(model_->fe_config().sample_rate);
     // A pending force_eou() must fire even on a chunk-less step.
     if (!update.is_final)
         poll_endpoint(update, /*after_chunk=*/false);
@@ -1061,7 +1040,6 @@ CacheStreamRunner::step() {
         update.words = head_->word_timings();
     if (head_)
         update.late_punctuation = head_->take_late_punctuation();
-    bound_word_timings(update);
     trim_buffers();
     return update;
 }
@@ -1087,7 +1065,7 @@ CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
         // frames. Causal encoder frame f ends at mel f*sub (inclusive), so
         // the shorter first chunk shifts the exclusive frontier by sub-1.
         const double mel_ms = 1000.0 * hop / sample_rate;
-        const int64_t decoded_mel = decoded_mel_frames();
+        const int64_t decoded_mel = enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_);
         scan_vad_speech(*vad_, decoded_mel, vad_scan_frame_, vad_speech_seen_frame_);
         now_ms = static_cast<double>(decoded_mel) * mel_ms;
         last_speech_ms = (vad_speech_seen_frame_ < 0)
@@ -1139,7 +1117,7 @@ CacheStreamRunner::trim_buffers() {
         // masker's neighbourhood scans never cross the trimmed base.
         const int64_t margin =
             std::max<int64_t>(256, vad_masker_ ? 2 * vad_masker_->max_scan() : 0);
-        const int64_t decoded_mel = decoded_mel_frames();
+        const int64_t decoded_mel = enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_);
         const int64_t g = decoded_mel - margin;
         if (g > 0)
             vad_->discard_timeline_before(g);
@@ -1155,7 +1133,6 @@ CacheStreamRunner::finalize() {
             static_cast<float>(audio_base_ + audio_buf_.size()) /
                 static_cast<float>(model_->fe_config().sample_rate),
             opts_.max_alternatives);
-        bound_word_timings(update);
         return update;
     }
     finalizing_ = true;
@@ -1218,7 +1195,6 @@ CacheStreamRunner::finalize() {
         opts_.max_alternatives);
     if (head_)
         update.late_punctuation += head_->take_late_punctuation(/*end_of_stream=*/true);
-    bound_word_timings(update);
     return update;
 }
 

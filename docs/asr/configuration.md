@@ -222,37 +222,6 @@ together. For Riva-compatible gRPC clients,
 a `runtime_config["force_eou"] = "true"` message finalizes the current utterance
 once the audio received so far is decoded.
 
-## Time coordinates and word timestamps
-
-`audio_processed` is the real decoded progress in seconds, not the amount of
-audio already queued by the caller. Lookahead and synthetic EOS padding do not
-advance it beyond real decoded audio. At end-of-stream it reports the complete
-input duration, including when the input was resampled. Publishing an utterance
-does not restart the absolute stream clock. Input cannot be appended after
-`finish()`.
-
-Word timestamps are approximate decoder-frame positions, not forced alignment.
-They keep the model's nominal frame grid; the causal first-chunk correction for
-the decoded frontier must not be subtracted from every word. The cache-aware
-runner bounds result copies to the real encoder-frame range before ITN or
-diarization; it does not change decoding state or discard tail tokens. The
-shared result builder additionally bounds milliseconds to original-rate input
-samples, since the last encoder interval can straddle EOF. Subtitle exporters use
-the same sample-derived integer-millisecond extent instead of independently
-rounding the floating-point progress field.
-
-EOS padding may be needed to emit a real trailing word. If its nominal position
-is entirely outside the real encoder range, its text is retained on the last
-real encoder interval. Such backfilled words remain internally marked through
-ITN, receive no speaker attribution, and do not wait for future speaker evidence.
-This is an approximate display interval, **not** recovered phonetic alignment.
-Partly overlapping spans retain their original onset. ITN can split an integer
-frame interval into zero-width spans; these remain valid rather than being
-artificially extended. Integer-millisecond rounding never extends past the input.
-
-Subtitle reading-time extensions also remain within the recording. A
-zero-duration recording produces no positive-duration subtitle cue.
-
 ## Postprocessing: profanity, ITN, PnC
 
 Postprocessing runs on the final transcript in this order: **profanity → ITN →

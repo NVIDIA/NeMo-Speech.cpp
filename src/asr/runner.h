@@ -61,8 +61,7 @@ struct StreamingUpdate {
     bool is_final = false;
     // Mean token posterior for greedy CTC; 1.0 when the decoder has no posterior.
     float confidence = 1.0f;
-    // Real decoded progress, excluding lookahead and synthetic EOS padding.
-    // finalize() reports the complete real input duration.
+    // Seconds of audio processed.
     float audio_processed_sec = 0.0f;
     // Punctuation for the previous final (Decoder::take_late_punctuation);
     // not part of this update's text.
@@ -281,8 +280,6 @@ class CacheStreamRunner final : public AsrRunner {
 
    private:
     int next_chunk_mel_frames() const;
-    int64_t decoded_mel_frames() const;
-    void bound_word_timings(StreamingUpdate& update) const;
     void process_one_chunk();
     void upload_attn_mask();
     void zero_caches();

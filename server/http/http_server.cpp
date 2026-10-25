@@ -280,10 +280,7 @@ transcript_response(
         return alternative.transcript + "\n";
     if (format == "srt" || format == "vtt") {
         const bool vtt = format == "vtt";
-        const int audio_ms =
-            result.audio_extent_ms >= 0
-                ? result.audio_extent_ms
-                : std::max(0, static_cast<int>(std::round(result.audio_processed * 1000)));
+        int audio_ms = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
         std::vector<subtitle::Word> words;
         words.reserve(alternative.words.size());
         for (const auto& word : alternative.words)

@@ -50,9 +50,6 @@ struct Word {  // proto: WordInfo
     // proto WordInfo.speaker_tag: 1-based speaker id, set only when
     // diarization was requested (0 = untagged).
     int32_t speaker_tag = 0;
-    // Internal attribution guard. EOS-only emissions can have a bounded
-    // display interval without evidence for assigning a speaker at that time.
-    bool has_audio_position = true;
 };
 
 struct Alternative {         // proto: SpeechRecognitionAlternative
@@ -67,12 +64,8 @@ struct Result {  // proto: Streaming/SpeechRecognitionResult
     std::vector<Alternative> alternatives;
     bool is_final = true;
     float stability = 0.0f;
-    int32_t channel_tag = 1;  // mono channel
-    // Decoded progress in seconds; the complete input duration at EOF.
-    float audio_processed = 0.0f;  // proto audio_processed
-    // Internal, sample-derived input extent for display bounds. Unlike decoded
-    // progress it can include queued audio. -1 means unavailable to a producer.
-    int32_t audio_extent_ms = -1;
+    int32_t channel_tag = 1;       // mono channel
+    float audio_processed = 0.0f;  // seconds (proto audio_processed)
     // Streaming only: sentence punctuation emitted after the previous final's
     // endpoint. Append it to that final; it is not part of this result's text.
     std::string late_punctuation;
