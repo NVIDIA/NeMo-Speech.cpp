@@ -218,7 +218,7 @@ index 6cdbef17e3452e76107bb8a528f0be65e82f8109..41709f3894fb958c1b16ee86b0cff77c
 +// Dense [n_kv, n_tokens] mask of a metadata-only mask node into out.
 +void ggml_cuda_build_dense_kq_mask(const ggml_tensor * meta, half * out, cudaStream_t stream);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7506524feb9f333c9633be9d78df88202701ae77..83f430f1ca777b53d8bafed8e24477259f96d473 100644
+index 939f431064e13a18e4e006c240cdfdc324909c96..caf89cd9b71e368be343c41cf5d87ee77cb88ac7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -8,6 +8,7 @@

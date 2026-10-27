@@ -14,10 +14,10 @@ llama_decode.
 Upstream: not planned (batched serving path).
 
 diff --git a/include/llama.h b/include/llama.h
-index 64cafd06be99a8db3f6354325cb3c4bc7ca4aa12..529dd1c15b0683f5324b5a23a3528dac9d055db5 100644
+index 5e8167a427ecc1fc26c2f4ade2fc187fe5ea95bd..066db99858d6d91bd6d66bb1316a67d6f07c5288 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -1022,7 +1022,8 @@ extern "C" {
+@@ -1023,7 +1023,8 @@ extern "C" {
              struct llama_context * ctx,
                struct llama_batch   batch);
  
@@ -28,10 +28,10 @@ index 64cafd06be99a8db3f6354325cb3c4bc7ca4aa12..529dd1c15b0683f5324b5a23a3528dac
      // the token ids (batch order; NULL keeps the prepared ones) and computes. 0 on success.
      LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch batch);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b84156be01 100644
+index 2d033a689da20c5b83667c85cdca3e3a2fe9623c..7d0f9919d465f6fdcf70da0536bc401d299d0b94 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1789,9 +1789,63 @@ void llama_context::note_raw_logits() {
+@@ -1800,6 +1800,59 @@ void llama_context::note_raw_logits() {
      }
  }
  
@@ -88,6 +88,11 @@ index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b8
 +    }
 +}
 +
+ // A prepared decode that fails after the memory took its ubatch (apply): remove the ubatch's positions, as decode()
+ // does for a failed ubatch, so later batches at those positions are accepted and no cell claims an unwritten row.
+ static void rollback_ubatch(llama_memory_i * memory, const llama_ubatch & ubatch) {
+@@ -1819,7 +1872,8 @@ static void rollback_ubatch(llama_memory_i * memory, const llama_ubatch & ubatch
+ 
  int llama_context::decode_prepare(const llama_batch & batch_inp) {
      GGML_ASSERT(!pend.active && "llama_decode_prepare: a prepared decode is pending");
 -    GGML_ASSERT(memory && batch_inp.token && !batch_inp.embd && !batch_inp.embd_input && batch_inp.logits);
@@ -96,7 +101,7 @@ index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b8
      GGML_ASSERT(!cparams.embeddings && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
      if (batch_inp.n_tokens == 0) {
          return -1;
-@@ -1825,6 +1879,11 @@ int llama_context::decode_prepare(const llama_batch & batch_inp) {
+@@ -1853,6 +1907,11 @@ int llama_context::decode_prepare(const llama_batch & batch_inp) {
      } else {
          for (uint32_t i = 0; i < ubatch.n_tokens; i++) n_outputs_new += (int32_t) (ubatch.output[i] != 0);
      }
@@ -108,7 +113,7 @@ index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b8
      // the previous decode's outputs stay readable until launch: n_outputs is only borrowed for the graph build
      const int32_t n_outputs_keep = n_outputs;
      n_outputs = n_outputs_new;
-@@ -1856,9 +1915,6 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+@@ -1886,9 +1945,6 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
          pend = {};
          return -2;
      }
@@ -118,7 +123,7 @@ index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b8
      nextn_device_rows  = pend.n_tokens_all;
      nextn_host_current = false;
      n_outputs = pend.n_outputs;
-@@ -1874,6 +1930,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+@@ -1905,6 +1961,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
          ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
      }
      extract_layer_inputs(res, 0, ubatch.n_tokens);
@@ -126,7 +131,7 @@ index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b8
      if (!sampling.samplers.empty()) {
          copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,       0, sched.get());
          copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
-@@ -1884,10 +1941,11 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+@@ -1915,10 +1972,11 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
      if (n_outputs > 0) {
          auto & out_ids = balloc->get_out_ids();
          GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
@@ -139,7 +144,7 @@ index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b8
          }
          GGML_ASSERT(sorted_output && "llama_decode_launch: outputs must be in batch order");
      }
-@@ -2207,56 +2265,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2238,56 +2296,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
  

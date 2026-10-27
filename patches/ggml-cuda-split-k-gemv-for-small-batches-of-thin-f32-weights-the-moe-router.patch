@@ -119,7 +119,7 @@ index 0000000000000000000000000000000000000000..1ddca5296b2ee84e4162b0cbe0790346
 +void ggml_cuda_thin_f32_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
 +                             ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 83f430f1ca777b53d8bafed8e24477259f96d473..ec34785affefd64cd9bc4e48248b4ab204a4bef5 100644
+index caf89cd9b71e368be343c41cf5d87ee77cb88ac7..d19dae543b4bf717545003701dae2f94716fbbdd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -9,6 +9,7 @@

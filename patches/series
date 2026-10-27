@@ -38,3 +38,4 @@ ggml-cuda-split-k-gemv-for-small-batches-of-thin-f32-weights-the-moe-router.patc
 ggml-dflash_conv-op-for-the-dflash2-drafter-s-dynamic-grouped-convolution.patch
 ggml-cuda-top-k-for-small-k-over-long-rows-without-cub.patch
 llama-dflash2-drafting-in-the-batched-serving-path.patch
+llama-mtp-verify-steps-flagged-by-the-caller.patch

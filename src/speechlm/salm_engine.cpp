@@ -1965,7 +1965,21 @@ struct SalmEngine::Impl {
         if (n > static_cast<size_t>(cfg.n_batch))
             throw std::runtime_error("salm: verify batch exceeds n_batch");
         tok_batch.n_tokens = static_cast<int32_t>(n);
+#if SALM_FAST_PATH
+        // the one MTP verify decode: its rows stay uncommitted until the next verify accepts them;
+        // every other decode (prefill) commits its rows
+        llama_set_mtp_verify(ctx, true);
+        try {
+            decode(tok_batch);
+        }
+        catch (...) {
+            llama_set_mtp_verify(ctx, false);
+            throw;
+        }
+        llama_set_mtp_verify(ctx, false);
+#else
         decode(tok_batch);
+#endif
         std::vector<Slot*> slot_of(cfg.max_sequences, nullptr);
         for (Slot* s : active) slot_of[s->seq_id] = s;
         spec_process(slot_of);

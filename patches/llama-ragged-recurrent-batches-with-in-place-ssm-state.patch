@@ -13,8 +13,7 @@ llama_serving_params.batched (Nemotron-H MoE, unified KV cache):
   commits only the accepted tokens.
 - The KV length is padded to kv_bucket so decode graphs are reused, and the
   masks reserved at init cover at most kv_reserve_cells cells.
-- LLAMA_MAX_SEQ 4096, O(1) seq_pos_min/max, and batch-allocator fast paths for
-  many sequences.
+- O(1) seq_pos_min/max and batch-allocator fast paths for many sequences.
 
 Upstream: not planned in this form (Nemotron-H only).
 
@@ -155,19 +154,6 @@ index a3d1889d4a041be695a91b72a2a7f3badcb46fca..c1d953cf8a9cfb46f20ad5a5919a531b
  
      // a helper method for creating a well-defined ubatch of tokens
      // TODO: support embeddings if needed in the future
-diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 0c77170209bf370930ca901e05190615c7170184..cdbb8f4ee219b5be2b9396375c1d213afe431154 100644
---- a/src/llama-cparams.h
-+++ b/src/llama-cparams.h
-@@ -5,7 +5,7 @@
- #include <cstdint>
- #include <vector>
- 
--#define LLAMA_MAX_SEQ 256
-+#define LLAMA_MAX_SEQ 4096
- 
- struct llama_cparams {
-     uint32_t n_ctx;           // context size used during inference
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 07ca49ad09d11c42e8669869a5feedec9e6e3989..8805a29c83d370b0207ab9ae3ec1e75cc2e6b738 100644
 --- a/src/llama-graph.cpp

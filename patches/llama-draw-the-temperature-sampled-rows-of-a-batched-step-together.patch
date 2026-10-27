@@ -6,8 +6,7 @@ chain its own sampler graph: a scale, softmax, cumulative sum and threshold
 over the whole vocabulary per row. The rows of all such sequences are now
 gathered once and drawn together, each scaled by its own inverse temperature
 and compared with its own uniform draw, which the dist sampler fills from its
-generator in the same order as before. A step with fewer than 16 sampled rows
-runs the same per-row kernels, so its draws are unchanged.
+generator in the same order as before.
 
 Attaching or detaching a sampler no longer re-reserves the scheduler in
 batched serving (worst-case prefill and decode graphs on the next decode):
@@ -17,10 +16,10 @@ demand.
 Upstream: not planned (batched serving path).
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 15306644fd2b55c51e119cd12cfa0cdbcf14d202..57f82c914edd8a8005fe1320a594f7272924b9f0 100644
+index eaaf80fea4ac64597b5122d60a919b351926f3b9..2d033a689da20c5b83667c85cdca3e3a2fe9623c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1336,6 +1336,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -1347,6 +1347,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
          sampler->iface->backend_apply &&
          llama_sampler_chain_n(sampler) > 0;
  
@@ -32,7 +31,7 @@ index 15306644fd2b55c51e119cd12cfa0cdbcf14d202..57f82c914edd8a8005fe1320a594f727
      if (sampler && can_offload) {
          auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
  
-@@ -1343,7 +1348,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -1354,7 +1359,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
  
          sampling.samplers[seq_id] = sampler;
  
@@ -41,7 +40,7 @@ index 15306644fd2b55c51e119cd12cfa0cdbcf14d202..57f82c914edd8a8005fe1320a594f727
  
          return true;
      }
-@@ -1362,7 +1367,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -1373,7 +1378,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
  
      sampling.samplers.erase(seq_id);
  

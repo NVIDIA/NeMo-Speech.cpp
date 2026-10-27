@@ -13,10 +13,10 @@ size drops.
 Upstream: not planned (batched serving path).
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdbcf14d202 100644
+index 81f077dc2a2dd5962847915d4fa25ba8a453b061..eaaf80fea4ac64597b5122d60a919b351926f3b9 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1014,6 +1014,7 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
+@@ -1025,6 +1025,7 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
  void llama_context::set_embeddings_nextn_device(bool value) {
      GGML_ASSERT(!value || (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked));
      use_nextn_device = value;
@@ -24,7 +24,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
  }
  
  ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backend) {
-@@ -1024,6 +1025,10 @@ ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backen
+@@ -1035,6 +1036,10 @@ ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backen
  
  void llama_context::download_embeddings_nextn() {
      if (use_nextn_device && nextn_device && !nextn_host_current) {
@@ -35,7 +35,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
          ggml_backend_tensor_get_async(nextn_device_backend, nextn_device, embd_nextn.data,
                  0, size_t(nextn_device_rows)*nextn_device->nb[1]);
          ggml_backend_synchronize(nextn_device_backend);
-@@ -1761,6 +1766,24 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1772,6 +1777,24 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
@@ -57,10 +57,10 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
 +    }
 +}
 +
- int llama_context::decode_prepare(const llama_batch & batch_inp) {
-     GGML_ASSERT(!pend.active && "llama_decode_prepare: a prepared decode is pending");
-     GGML_ASSERT(memory && batch_inp.token && !batch_inp.embd && !batch_inp.embd_input && batch_inp.logits);
-@@ -1775,6 +1798,7 @@ int llama_context::decode_prepare(const llama_batch & batch_inp) {
+ // A prepared decode that fails after the memory took its ubatch (apply): remove the ubatch's positions, as decode()
+ // does for a failed ubatch, so later batches at those positions are accepted and no cell claims an unwritten row.
+ static void rollback_ubatch(llama_memory_i * memory, const llama_ubatch & ubatch) {
+@@ -1803,6 +1826,7 @@ int llama_context::decode_prepare(const llama_batch & batch_inp) {
      const uint32_t n_tokens_all  = balloc->get_n_tokens();
      const uint32_t n_outputs_all = balloc->get_n_outputs();
      GGML_ASSERT(n_tokens_all <= cparams.n_ubatch && "llama_decode_prepare: single-ubatch batches only");
@@ -68,7 +68,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
      if (t_compute_start_us == 0) {
          t_compute_start_us = ggml_time_us();
      }
-@@ -2016,6 +2040,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2047,6 +2071,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
          break;
      }
  
@@ -77,7 +77,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
      // reserve output buffer
      if (output_reserve(n_outputs_all) < n_outputs_all) {
          LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
-@@ -2183,14 +2209,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2214,14 +2240,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
              const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
              const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
  
@@ -95,7 +95,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
                  if (use_nextn_device) {
                      GGML_ASSERT(!masked);
                      if (!nextn_device) {
-@@ -2315,9 +2341,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2345,9 +2371,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
      const auto n_embd     = hparams.n_embd;
      const auto n_embd_out = hparams.n_embd_out();
  
@@ -109,7 +109,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
  
      // TODO: hacky enc-dec support
      if (model.arch == LLM_ARCH_T5) {
-@@ -2345,11 +2373,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2375,11 +2403,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
          }
      }
  
@@ -127,7 +127,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
      }
  
      if (output_ids.empty()) {
-@@ -2364,7 +2394,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2394,7 +2424,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
  
      // alloc only when more than the current capacity is required
      // TODO: also consider shrinking the buffer
@@ -138,7 +138,7 @@ index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdb
          if (buf_output) {
  #ifndef NDEBUG
              // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
-@@ -2421,16 +2453,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2451,16 +2483,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
      }
  
      if (has_sampling) {

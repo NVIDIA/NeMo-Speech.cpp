@@ -1,0 +1,186 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: MTP verify steps flagged by the caller
+
+Batched serving with mtp_replay took every ubatch whose sequences all had at
+most mtp_replay rows for an MTP verify step. A prefill that small (a short
+prompt after a copied prefix with many drafts per step, or the last rows of a
+long prefill split across passes) was then handled as a verify step: its rows
+stayed uncommitted, or a sequence on a new cell aborted the process. The caller
+now flags verify decodes with llama_set_mtp_verify(); the recurrent memory and
+the Mamba2 graph follow the flag, and graph reuse compares it.
+
+Upstream: not planned (batched serving path).
+
+diff --git a/include/llama.h b/include/llama.h
+index 066db99858d6d91bd6d66bb1316a67d6f07c5288..8dd80e0187a02fff196b1c6826031d195024ee5a 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1030,6 +1030,11 @@ extern "C" {
+     LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch batch);
+     LLAMA_API int32_t llama_decode_launch(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
+ 
++    // Batched serving with mtp_replay: whether the following decodes are MTP verify steps (each sequence's last accepted
++    // token and its drafts, at most mtp_replay rows; they stay uncommitted until the next verify step accepts them).
++    // Every other decode (prefill) commits its rows. Off by default.
++    LLAMA_API void llama_set_mtp_verify(struct llama_context * ctx, bool verify);
++
+     // Set the number of threads used for decoding
+     // n_threads is the number of threads used for generation (single token)
+     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 77e3d00cab0df305aa2f4319f280ff4a8c41e9c3..123ad58cae665e9db2f5e7208be2a6c13a6492e5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,8 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-recurrent.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-ext.h"
+@@ -2915,6 +2917,7 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.mtp_verify  =*/ mtp_verify,
+     };
+ }
+ 
+@@ -4336,6 +4339,21 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
+     return ctx->get_cparams().serving;
+ }
+ 
++void llama_context::set_mtp_verify(bool verify) {
++    mtp_verify = verify;
++    llama_memory_recurrent * recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
++    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
++        recr = hybrid->get_mem_recr();
++    }
++    if (recr) {
++        recr->mtp_verify = verify;
++    }
++}
++
++void llama_set_mtp_verify(llama_context * ctx, bool verify) {
++    ctx->set_mtp_verify(verify);
++}
++
+ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
+     ctx->set_input_wait_event(ev);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 53efc6741ec2f1069b0dccf60200620b817be388..08bd2d82964ea55c55217340c5ebe714b7dfd498 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -93,6 +93,9 @@ struct llama_context {
+     // one-shot: the next graph's GPU stream waits for this event before its inputs / kernels (cross-context ordering)
+     ggml_backend_event_t input_wait_event = nullptr;
+     void set_input_wait_event(ggml_backend_event_t ev) { input_wait_event = ev; }
++    // llama_set_mtp_verify: the following decodes are MTP verify steps (recurrent memory and graph)
++    bool mtp_verify = false;
++    void set_mtp_verify(bool verify);
+ 
+     void set_mtp_chain(ggml_tensor * tok, int64_t tok_in, int64_t tok_out, ggml_tensor * h_in, ggml_tensor * h_out) {
+         cparams.mtp_tok = tok; cparams.mtp_tok_in = tok_in; cparams.mtp_tok_out = tok_out;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 161d49bc99982c9e3bd5e5cceca0c1be5160bf73..2ce141c19fa79b96d594124d964c69dbf706292a 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -893,6 +893,9 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    // MTP verify step (llama_set_mtp_verify): a different recurrent graph for the same ubatch shape
++    bool mtp_verify = false;
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -928,6 +931,10 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        if (mtp_verify != other.mtp_verify) {
++            return false;
++        }
++
+         if (n_outputs != other.n_outputs) {
+             return false;
+         }
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 4781095b76fe32cbcfa8fff1d73bfb692eb1cc18..ca33e7d99d8a892754a82d9ab38ee4e88a81da33 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -627,8 +627,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+         const int32_t zero_cell = (int32_t) size - 1;
+         int32_t lo = zero_cell, hi = -1;
+         const int maxt = mtp_maxt;
+-        bool verify = maxt > 0;
+-        for (uint32_t s = 0; s < n_seqs && verify; ++s) verify = (int) ubatch.seq_length(s) <= maxt;
++        const bool verify = maxt > 0 && mtp_verify;  // flagged by the caller (llama_set_mtp_verify)
++        for (uint32_t s = 0; s < n_seqs && verify; ++s) {
++            GGML_ASSERT((int) ubatch.seq_length(s) <= maxt && "an MTP verify ubatch holds at most mtp_replay rows per sequence");
++        }
+         for (uint32_t s = 0; s < n_seqs; ++s) {
+             const uint32_t i = ubatch.seq_start(s);
+             const llama_seq_id seq_id = ubatch.seq_id[i][0];
+@@ -1454,6 +1456,10 @@ int llama_memory_recurrent_context::get_mtp_maxt() const {
+     return mem->mtp_maxt;
+ }
+ 
++bool llama_memory_recurrent_context::get_mtp_verify() const {
++    return mem->mtp_maxt > 0 && mem->mtp_verify;
++}
++
+ uint32_t llama_memory_recurrent_context::get_ssm_replay() const {
+     return mem->ssm_replay;
+ }
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index e186796e17d42fee2794ede1f4b823f45c2aaf16..7d365c36baf2543dedb78e82e5ae16cf53f4d67e 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -78,11 +78,12 @@ public:
+     uint32_t n_rs_seq = 0;
+ 
+     // Batched serving (llama_serving_params.batched, Nemotron-H): sequences keep their recurrent cell for life (pinned),
+-    // with ReplaySSM rows after each state (ssm_replay); speculative verify ubatches (every sequence <= mtp_maxt
+-    // tokens) append to the replay cache uncommitted and the next ubatch commits the accepted rows, so rejected MTP
+-    // drafts roll back without state snapshots.
++    // with ReplaySSM rows after each state (ssm_replay); MTP verify ubatches (the caller flags them, mtp_verify; at most
++    // mtp_maxt tokens per sequence) append to the replay cache uncommitted and the next verify ubatch commits the
++    // accepted rows, so rejected MTP drafts roll back without state snapshots.
+     bool     pinned       = false;
+     int      mtp_maxt     = 0;
++    bool     mtp_verify   = false;  // llama_set_mtp_verify
+     uint32_t ssm_replay   = 0;
+     uint32_t n_embd_s_row = 0;  // state row width: hparams.n_embd_s(ssm_replay)
+ 
+@@ -194,6 +195,7 @@ public:
+ 
+     bool     is_pinned()      const;
+     int      get_mtp_maxt()   const;
++    bool     get_mtp_verify() const;
+     uint32_t get_ssm_replay() const;
+     uint32_t get_n_embd_s()   const;  // state row width (ReplaySSM rows included)
+ 
+diff --git a/src/models/mamba-base.cpp b/src/models/mamba-base.cpp
+index 99d7d74eb99789ff9f134a09fee005b35ed9c0ac..4d5706ca9bf80bbc18b7c66197565596b0a99cfc 100644
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -185,11 +185,10 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+         ggml_tensor * read_ids  = ggml_view_1d(ctx0, inp->own_ids, n_seqs, 0);
+         ggml_tensor * write_ids = ggml_view_1d(ctx0, inp->own_ids, n_seqs, n_seqs*ggml_element_size(inp->own_ids));
+         ggml_tensor * conv_rows = ggml_reshape_2d(ctx0, conv_cache, hparams.n_embd_r(), conv_cache->ne[1]);
+-        // MTP verify (mtp_replay): ubatches whose sequences all have <= maxt tokens are speculative verify (or decode)
+-        // steps: conv and ReplaySSM append uncommitted rows and commit the previous step's accepted ones (own_ids[2n..3n))
++        // MTP verify steps (llama_set_mtp_verify, mtp_replay): conv and ReplaySSM append uncommitted rows and commit
++        // the previous step's accepted ones (own_ids[2n..3n))
+         const int mtp_maxt = mctx_cur->get_mtp_maxt();
+-        bool verify = mtp_maxt > 0;
+-        for (int64_t s = 0; verify && s < n_seqs; ++s) verify = (int) ubatch.seq_length(s) <= mtp_maxt;
++        const bool verify = mctx_cur->get_mtp_verify();
+         // decode ubatches (one token per sequence) update the pinned conv state rows inside the conv kernel (no gather of
+         // the old window, no scatter of the new one)
+         const bool conv_ip = !verify && (int64_t) ubatch.n_tokens == n_seqs;

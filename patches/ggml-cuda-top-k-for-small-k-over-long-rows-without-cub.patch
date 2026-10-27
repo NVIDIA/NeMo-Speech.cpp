@@ -11,7 +11,7 @@ paths.
 Upstream: candidate (needs test-backend-ops top-k cases with long rows).
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e89e664e7fc2e53b71f73cc63ea65a7a12c8f993..b0bac6d9e6287bacdf67da6653cf3dae7d4e4edf 100644
+index a27136420f89154576e5f341f6a1e8b7dbc83816..9491496f07dc1f50971455a929852836b9e15011 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -6270,7 +6270,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
@@ -24,10 +24,10 @@ index e89e664e7fc2e53b71f73cc63ea65a7a12c8f993..b0bac6d9e6287bacdf67da6653cf3dae
          case GGML_OP_ARGSORT:
  #ifndef GGML_CUDA_USE_CUB
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index c7a0c831788df8547ffd86c8a68e6d53aff61130..f61a41a0eaedbe313741cbcbffcacbac5c8dbaee 100644
+index c7a0c831788df8547ffd86c8a68e6d53aff61130..475fc1c9ac09c57d7b449c31c3e8e473b62261e2 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
-@@ -210,6 +210,107 @@ static void top_k_radix_cuda(
+@@ -210,6 +210,110 @@ static void top_k_radix_cuda(
  
  #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
  
@@ -128,14 +128,17 @@ index c7a0c831788df8547ffd86c8a68e6d53aff61130..f61a41a0eaedbe313741cbcbffcacbac
 +}
 +
 +bool ggml_cuda_top_k_small_rows_supported(const ggml_tensor * op) {
++    const ggml_tensor * src = op->src[0];
 +    const int64_t k = op->ne[0];
-+    return op->src[0]->ne[0] >= 1024 && op->src[0]->ne[0] % 4 == 0 && (k == 8 || k == 16 || k == 32);
++    // the launch's preconditions: row r at src + r*ncols, read with 16-byte loads
++    return src->type == GGML_TYPE_F32 && src->ne[0] >= 1024 && src->ne[0] % 4 == 0 && (k == 8 || k == 16 || k == 32) &&
++           ggml_is_contiguous(src) && src->view_offs % 16 == 0;
 +}
 +
  void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0   = dst->src[0];
      const float *       src0_d = (const float *) src0->data;
-@@ -225,6 +326,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -225,6 +329,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t    nrows = ggml_nrows(src0);
      const int64_t    k     = dst->ne[0];
      ggml_cuda_pool & pool  = ctx.pool();

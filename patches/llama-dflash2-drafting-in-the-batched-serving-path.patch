@@ -176,10 +176,10 @@ index b197dbb794a4945cb2542e4fb9c8cf9afb49ae7d..a6019897344f0426e82e3a158130b848
  
          // build one batch holding every drafting sequence's noise block into a single decode)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f058b0010d3651e55c4167cfcb9f05b84156be01..93631c1097fbeedc6b89c39c7261759a1b88a07f 100644
+index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a8c41e9c3 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1017,6 +1017,63 @@ void llama_context::set_embeddings_nextn_device(bool value) {
+@@ -1028,6 +1028,63 @@ void llama_context::set_embeddings_nextn_device(bool value) {
      if (cparams.serving.batched) output_reserve(cparams.n_outputs_max);
  }
  
@@ -243,7 +243,7 @@ index f058b0010d3651e55c4167cfcb9f05b84156be01..93631c1097fbeedc6b89c39c7261759a
  ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backend) {
      GGML_ASSERT(use_nextn_device && nextn_device);
      *backend = nextn_device_backend;
-@@ -1955,6 +2012,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+@@ -1986,6 +2043,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
  
  int llama_context::decode(const llama_batch & batch_inp) {
      GGML_ASSERT(!pend.active && "llama_decode: a prepared decode is pending (llama_decode_launch first)");
@@ -251,7 +251,7 @@ index f058b0010d3651e55c4167cfcb9f05b84156be01..93631c1097fbeedc6b89c39c7261759a
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
      GGML_ASSERT(batch_inp.token || batch_inp.embd);
-@@ -2267,6 +2325,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2298,6 +2356,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_nextn(ubatch, t_h_nextn, n_outputs, n_outputs_prev, n_tokens_prev);
  
@@ -268,7 +268,7 @@ index f058b0010d3651e55c4167cfcb9f05b84156be01..93631c1097fbeedc6b89c39c7261759a
          if (has_samplers) {
              const auto stride = n_vocab;
  
-@@ -4242,6 +4310,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
+@@ -4272,6 +4340,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
      ctx->set_input_wait_event(ev);
  }
  
@@ -324,7 +324,7 @@ index aeb8f5cf9a7bf976835385d44c120e2adc4645ec..53efc6741ec2f1069b0dccf60200620b
      uint32_t nextn_device_rows = 0;
      ggml_context_ptr ctx_nextn_device;
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index d1599fd379ca2e6e20e99e518bdfe897d6a64ed3..95c59c3512206aa60231289af60ca67c59dc8637 100644
+index 7fc5c029d40ca4c74bf4cd44751b1a0c814f9007..80a108c4e2b92877f0a1db594fb3bc2d92d34b82 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -44,6 +44,11 @@ struct llama_cparams {

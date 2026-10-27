@@ -15,7 +15,7 @@ context's backends through the registry (llama_serving_params.cuda_serving).
 Upstream: not planned (NeMo serving path).
 
 diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
-index fbbfaf56abd8938910ea71a649baf02de7aed087..9b5ba0dd7e04ac5ae84f05056f04b4ace9befb6c 100644
+index fbbfaf56abd8938910ea71a649baf02de7aed087..9cc0b9d2058dc91a91b1e14c6a35b67461afc03e 100644
 --- a/ggml/include/ggml-cuda.h
 +++ b/ggml/include/ggml-cuda.h
 @@ -35,6 +35,18 @@ GGML_BACKEND_API void ggml_backend_cuda_set_stream_priority(ggml_backend_t backe
@@ -31,7 +31,7 @@ index fbbfaf56abd8938910ea71a649baf02de7aed087..9b5ba0dd7e04ac5ae84f05056f04b4ac
 +};
 +GGML_BACKEND_API void ggml_backend_cuda_set_serving(ggml_backend_t backend, const struct ggml_backend_cuda_serving * serving);
 +// Whether the serving kernels can run on this backend's GPU: NVIDIA, compute capability 8.0 or newer (they use Ampere
-+// tensor cores and asynchronous copies).
++// tensor cores and asynchronous copies). Also reachable through the registry as "ggml_backend_cuda_serving_supported".
 +GGML_BACKEND_API bool ggml_backend_cuda_serving_supported(ggml_backend_t backend);
 +
  // Returns the backend-owned native CUDA/HIP graph template for a stable GGML graph after its
@@ -54,7 +54,7 @@ index a8bbc07b63d7057a54c7a01a7470e8f8a447b904..b7bcc820beb85dcb695398eaa2eac0e9
      // The structural signature separates batch shapes and graph topologies even
      // when a freed host tensor arena is recycled at the same first-node address.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 538da52595bdd669aa9a601240e9b3bd4ee40e89..7506524feb9f333c9633be9d78df88202701ae77 100644
+index 538da52595bdd669aa9a601240e9b3bd4ee40e89..939f431064e13a18e4e006c240cdfdc324909c96 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -5543,6 +5543,23 @@ void ggml_backend_cuda_set_graphs_enabled(ggml_backend_t backend, bool enabled)
@@ -81,12 +81,15 @@ index 538da52595bdd669aa9a601240e9b3bd4ee40e89..7506524feb9f333c9633be9d78df8820
  void * ggml_backend_cuda_get_graph_template(
      ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
      if (!ggml_backend_is_cuda(backend) || cgraph == nullptr) {
-@@ -6475,6 +6492,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -6475,6 +6492,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
 +    if (strcmp(name, "ggml_backend_cuda_set_serving") == 0) {
 +        return (void *)ggml_backend_cuda_set_serving;
++    }
++    if (strcmp(name, "ggml_backend_cuda_serving_supported") == 0) {
++        return (void *)ggml_backend_cuda_serving_supported;
 +    }
      return nullptr;
  }

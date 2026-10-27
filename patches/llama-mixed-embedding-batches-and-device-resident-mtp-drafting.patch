@@ -614,7 +614,7 @@ index c968750e2d80e490f60ad365828552ad0c644c2f..d891b28495e0404d7dc7b6e5d3c79553
  // print statistics about the speculative decoding
  void common_speculative_print_stats(const common_speculative * spec);
 diff --git a/include/llama.h b/include/llama.h
-index 869abcf35a28ef4d53e9d44b44ce6a0b1b97cd54..6f79582f090da11be735386ef56d34d7a18fd22c 100644
+index 4d3f9349a12dee00462dc8575139c04b5e19c75c..93215ebf12fd71b31f85db1635b51554d4e10841 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -269,6 +269,10 @@ extern "C" {
@@ -787,10 +787,10 @@ index c1d953cf8a9cfb46f20ad5a5919a531b062d08db..7d41dd43f806f982763c770602d429c0
  
      // sanitize and auto-gen missing data in the input batch
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf01197a6be 100644
+index 2cf84f88a4b1695f74607959eae49b295906248d..63a0558dc7a83ffde0e3b53509201b4f298737f2 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1011,13 +1011,35 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
+@@ -1022,13 +1022,35 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
      return it->second.data();
  }
  
@@ -826,7 +826,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
      output_reorder();
  
      try {
-@@ -1413,7 +1435,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1424,7 +1446,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
      const auto gparams = graph_params(res, ubatch, mctx, gtype);
  
@@ -835,7 +835,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
          //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
  
          // with pipeline parallelism, the previous graph_compute_async may still be running
-@@ -1789,6 +1811,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1800,6 +1822,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
          }
      }
  
@@ -843,7 +843,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
      if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
          LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
          return -1;
-@@ -1889,6 +1912,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1900,6 +1923,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
      int64_t n_outputs_prev = 0;
      int64_t n_tokens_prev  = 0;
@@ -852,7 +852,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
  
      do {
          const auto & ubatch = mctx->get_ubatch();
-@@ -2049,7 +2074,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2060,7 +2085,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
                  float * embd_nextn_out = embd_nextn.data + offset*n_embd;
  
                  GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
@@ -893,7 +893,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
              }
          }
  
-@@ -2341,7 +2398,7 @@ void llama_context::output_reorder() {
+@@ -2351,7 +2408,7 @@ void llama_context::output_reorder() {
              }
          }
  
@@ -902,7 +902,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
              for (uint64_t k = 0; k < n_embd_out; k++) {
                  std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
              }
-@@ -2615,6 +2672,14 @@ ggml_status llama_context::graph_compute(
+@@ -2625,6 +2682,14 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
@@ -917,7 +917,7 @@ index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf0
      auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-@@ -4006,6 +4071,23 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
+@@ -4016,6 +4081,23 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
      return ctx->get_cparams().serving;
  }
  
@@ -978,7 +978,7 @@ index 77ef92fc6ab294698e1fabf6864064989dcd779f..ec0249a7f8d5ab9334028f3fd29a3c9f
      // host buffers for output layer input embeddings, per layer
      // populated when cparams.output_layer_inp[il] is true
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index cdbb8f4ee219b5be2b9396375c1d213afe431154..d1599fd379ca2e6e20e99e518bdfe897d6a64ed3 100644
+index 0c77170209bf370930ca901e05190615c7170184..7fc5c029d40ca4c74bf4cd44751b1a0c814f9007 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -35,6 +35,15 @@ struct llama_cparams {

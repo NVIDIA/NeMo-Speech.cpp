@@ -10,7 +10,7 @@ asr:
     path: salm.gguf
     name: salm                     # the model id reported by /v1/models
   salm:
-    max_sequences: 768             # requests decoded at the same time
+    max_sequences: 64              # requests decoded at the same time
   batching:
     max_queue_depth: 2048          # requests waiting for a free slot
 ```
@@ -41,8 +41,8 @@ example:
 |---|---|---|---|---|
 | 24 GB | 4 | 8192 | 29 minutes (`max_context: 32768`) | IQ4_NL model; `mtp_draft: 0`, `n_batch: 1024`, `encoder_max_batch: 4` |
 | 32 GB | 16 | 8192 | one hour | none (the defaults) |
-| 80 GB or more | 768 | 2048 | one hour | `n_batch: 16384`, `encoder_max_batch: 128`: many requests at once |
-| 128 GB, unified | 256 | 2048 | one hour | `n_batch: 8192`, `encoder_max_batch: 64`, `mtp_draft: 3` |
+| 80 GB or more | 240 | 2048 | one hour | `n_batch: 16384`, `encoder_max_batch: 128`: many requests at once |
+| 128 GB, unified | 240 | 2048 | one hour | `n_batch: 8192`, `encoder_max_batch: 64`, `mtp_draft: 3` |
 
 The requests decoding at the same time share a pool of `n_ctx_per_sequence x max_sequences` tokens, which must hold
 the longest request: 12.5 tokens per second of audio plus up to 6 per second of transcript. The batched path grows

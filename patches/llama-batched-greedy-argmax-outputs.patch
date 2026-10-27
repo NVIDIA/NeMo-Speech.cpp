@@ -11,10 +11,10 @@ the sampled ids of many rows after one synchronization.
 Upstream: candidate.
 
 diff --git a/include/llama.h b/include/llama.h
-index 267ec9a801cd0bcc3882ce65d5d6c26390444ebd..869abcf35a28ef4d53e9d44b44ce6a0b1b97cd54 100644
+index cb44212bbbec65af3f64402da3893bbdabf1bbd1..4d3f9349a12dee00462dc8575139c04b5e19c75c 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -1101,6 +1101,10 @@ extern "C" {
+@@ -1102,6 +1102,10 @@ extern "C" {
      // Returns LLAMA_TOKEN_NULL if no token was sampled.
      LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
  
@@ -26,10 +26,10 @@ index 267ec9a801cd0bcc3882ce65d5d6c26390444ebd..869abcf35a28ef4d53e9d44b44ce6a0b
      // The index matches llama_get_sampled_token_ith().
      // Returns NULL if no probabilities were generated.
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index a04f134773005d05e24445cc4ca0bb8747c7ea09..e1535dbd9b9989716a9625871d82b0b160b863c3 100644
+index f94865905a0a1be3b1a332d88b64eed66d6517bc..2cf84f88a4b1695f74607959eae49b295906248d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1240,6 +1240,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+@@ -1251,6 +1251,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
  
      cparams.embeddings_nextn        = value;
      cparams.embeddings_nextn_masked = masked;
@@ -37,7 +37,7 @@ index a04f134773005d05e24445cc4ca0bb8747c7ea09..e1535dbd9b9989716a9625871d82b0b1
  }
  
  void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
-@@ -1677,6 +1678,22 @@ static void copy_tensor_async_rows(
+@@ -1688,6 +1689,22 @@ static void copy_tensor_async_rows(
              continue;
          }
  
@@ -60,19 +60,18 @@ index a04f134773005d05e24445cc4ca0bb8747c7ea09..e1535dbd9b9989716a9625871d82b0b1
          const uint32_t row = row_offset + i;
          const size_t n_elements = ggml_nelements(tensor);
          GGML_ASSERT(ggml_is_contiguous(tensor) && "sampling tensor must be contiguous for async copy");
-@@ -2114,7 +2131,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+@@ -2125,7 +2142,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
      const auto & hparams = model.hparams;
      const auto & vocab   = model.vocab;
  
 -    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
-+    int64_t n_outputs_max = std::max<int64_t>(n_outputs, cparams.serving.batched ? cparams.n_outputs_max : n_seq_max());
-+    // Grow straight to the configured maximum: with several outputs per sequence (MTP verify) every growth step would
-+    // re-pin a multi-GB host buffer (cudaMallocHost) in the middle of serving.
-+    if (n_outputs_max > n_seq_max() && (int64_t) cparams.n_outputs_max > n_outputs_max) n_outputs_max = cparams.n_outputs_max;
++    // Batched serving reserves the configured maximum at once: with several outputs per sequence (MTP verify) every
++    // growth step would re-pin a multi-GB host buffer (cudaMallocHost) in the middle of serving.
++    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, cparams.serving.batched ? cparams.n_outputs_max : n_seq_max());
  
      const auto n_batch    = cparams.n_batch;
      const auto n_vocab    = vocab.n_tokens();
-@@ -4030,6 +4050,14 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
+@@ -4041,6 +4060,14 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
      return ctx->get_sampled_token_ith(i);
  }
  

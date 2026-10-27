@@ -13,10 +13,10 @@ llama_get_serving_params() returns a context's parameters.
 Upstream: not planned (NeMo serving path).
 
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b0d98726a4c4627ce415f0cac9395ad996..267ec9a801cd0bcc3882ce65d5d6c26390444ebd 100644
+index 31bbf8b0d98726a4c4627ce415f0cac9395ad996..cb44212bbbec65af3f64402da3893bbdabf1bbd1 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -355,6 +355,23 @@ extern "C" {
+@@ -355,6 +355,24 @@ extern "C" {
          struct llama_sampler * sampler;
      };
  
@@ -25,7 +25,8 @@ index 31bbf8b0d98726a4c4627ce415f0cac9395ad996..267ec9a801cd0bcc3882ce65d5d6c263
 +    struct llama_serving_params {
 +        // Ragged batches (sequences of different lengths in one ubatch); in-place F16 recurrent state with one pinned
 +        // cell per sequence, ReplaySSM rows for one-token decode and chunked SSD for long segments; KQ masks built on the
-+        // device from per-sequence cell lists (flash attention, unified KV); batched greedy argmax outputs.
++        // device from per-sequence cell lists (flash attention, unified KV); batched greedy argmax outputs. CUDA devices
++        // need compute capability 8.0 or newer (context creation fails otherwise).
 +        bool     batched;
 +        // Tokens per MTP verify step (drafts + 1, at most the 16 ReplaySSM cache rows; needs batched); 0 = no MTP verify steps.
 +        int32_t  mtp_replay;
@@ -40,7 +41,7 @@ index 31bbf8b0d98726a4c4627ce415f0cac9395ad996..267ec9a801cd0bcc3882ce65d5d6c263
      // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
      //       https://github.com/ggml-org/llama.cpp/pull/7544
      struct llama_context_params {
-@@ -417,6 +434,8 @@ extern "C" {
+@@ -417,6 +435,8 @@ extern "C" {
          // a source/target/parent context
          // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
          struct llama_context * ctx_other;
@@ -50,7 +51,7 @@ index 31bbf8b0d98726a4c4627ce415f0cac9395ad996..267ec9a801cd0bcc3882ce65d5d6c263
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb13b10ab5f46b453e48cbf4b047154c684..a04f134773005d05e24445cc4ca0bb8747c7ea09 100644
+index fcd4dfb13b10ab5f46b453e48cbf4b047154c684..f94865905a0a1be3b1a332d88b64eed66d6517bc 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -272,6 +272,7 @@ llama_context::llama_context(
@@ -61,10 +62,21 @@ index fcd4dfb13b10ab5f46b453e48cbf4b047154c684..a04f134773005d05e24445cc4ca0bb87
  
      // initialized later
      cparams.pipeline_parallel = false;
-@@ -335,6 +336,15 @@ llama_context::llama_context(
+@@ -335,6 +336,26 @@ llama_context::llama_context(
              if (backend == nullptr) {
                  throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
              }
++            if (params.serving.batched) {
++                // the batched path's CUDA kernels (ragged Mamba2, chunked SSD, MTP verify) need compute capability 8.0+
++                using supported_t = bool (*)(ggml_backend_t);
++                auto supported = (supported_t) ggml_backend_reg_get_proc_address(
++                    ggml_backend_dev_backend_reg(dev.dev), "ggml_backend_cuda_serving_supported");
++                if (supported && !supported(backend)) {
++                    ggml_backend_free(backend);
++                    throw std::runtime_error(format("batched serving needs an NVIDIA GPU of compute capability 8.0 or newer (%s)",
++                            ggml_backend_dev_name(dev.dev)));
++                }
++            }
 +            if (params.serving.cuda_serving) {
 +                // serving kernels for this context's CUDA backends (before any graph is reserved)
 +                using set_serving_t = void (*)(ggml_backend_t, const void *);
@@ -77,7 +89,7 @@ index fcd4dfb13b10ab5f46b453e48cbf4b047154c684..a04f134773005d05e24445cc4ca0bb87
              backends.emplace_back(backend);
          }
  
-@@ -3731,6 +3741,7 @@ llama_context_params llama_context_default_params() {
+@@ -3731,6 +3752,7 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -85,7 +97,7 @@ index fcd4dfb13b10ab5f46b453e48cbf4b047154c684..a04f134773005d05e24445cc4ca0bb87
      };
  
      return result;
-@@ -3971,6 +3982,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+@@ -3971,6 +3993,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
      ctx->set_embeddings_nextn(value, masked);
  }
  
