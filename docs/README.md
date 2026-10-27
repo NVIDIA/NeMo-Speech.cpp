@@ -27,6 +27,20 @@ Start with:
 - [Feature matrix and customization](asr/customization.md) - which models
   support which features, and request-time vs startup customization.
 
+## SALM (speech-LLM)
+
+- [Overview](salm/README.md) - quick start and what it does not support.
+- [Models and platforms](salm/models.md) - the model files and which builds run
+  the batched path.
+- [Configuration](salm/configuration.md) - `asr.salm.*` keys, settings for smaller
+  GPUs, concurrency and errors.
+- [Transcripts and translation](salm/transcripts.md) - language, length, silence,
+  custom instructions, streamed output, and speech translation.
+- [Prompts](salm/prompts.md) - the prompts the server sends and example custom
+  instructions.
+- [Word timestamps and speakers](salm/timestamps-and-speakers.md) - how each
+  entrypoint requests them, and speaker turns alone.
+
 ## TTS
 
 - [Models](tts/models.md) - ready-to-run MagpieTTS and NanoCodec GGUF downloads,

@@ -25,6 +25,9 @@ are deprecated spellings of `NEMO_SPEECH_BUILD_NMT` and `NEMO_SPEECH_BUILD_GRPC`
 | `GGML_SKINNY_Q8=0` | enabled | Disable the skinny Q8_0 GEMM for block Q8_0 weights. Planar Q8 weights always use it. |
 | `GGML_SKINNY_Q8_INPLACE=0` | in place; `0` when ASR and NMT share a process | Keep repacked skinny-Q8 weights in a separate buffer. |
 
+The SALM engine reads no environment variables; its settings are `asr.salm.*` keys (see
+[SALM configuration](../salm/configuration.md)).
+
 Upstream switches that are useful for bisecting a CUDA problem:
 `GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_CUDA_DISABLE_FUSION=1`, and
 `GGML_SCHED_DEBUG=2`.

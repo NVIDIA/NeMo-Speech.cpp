@@ -37,7 +37,7 @@ runtime version, compiled capabilities, backend devices, and driver status.
 | HTTP 401 | request `Authorization` header | Send `Authorization: Bearer $NEMO_SPEECH_HTTP_API_KEY`. |
 | HTTP 413 | upload size | Raise `--max-upload-mb` intentionally or split the input. |
 | gRPC UNAVAILABLE | `riva_server` listener and port | Start `riva_server --bind 0.0.0.0:50051`, verify binding/firewall, and use plaintext unless TLS is terminated externally. |
-| Unsupported WAV | file format | Use PCM16 or float32 WAV; the CLI handles mono/stereo and 8-96 kHz. |
+| Unsupported audio (HTTP 422, gRPC INVALID_ARGUMENT) | file format | WAV (PCM 8/16/24/32-bit, IEEE float, A-law, mu-law), FLAC and MP3 are decoded, with any channel count at 8-96 kHz (converted to 16 kHz mono). Convert other formats first, e.g. `ffmpeg -i INPUT -ac 1 -ar 16000 -c:a pcm_s16le output.wav`. |
 | Out of memory | device inventory and composition | Use a smaller quantization, reduce concurrency/context, or load fewer capabilities. |
 
 Keep diagnostics on stderr and command results on stdout when collecting logs.
