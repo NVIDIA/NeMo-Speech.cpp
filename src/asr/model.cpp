@@ -587,6 +587,7 @@ class RnntModel::DecoderBatchers {
         a.ready_items += b.ready_items;
         a.compatible_items += b.compatible_items;
         a.execution_ns += b.execution_ns;
+        a.cancelled_items += b.cancelled_items;
         return a;
     }
     BatchMetrics predictor_metrics() const {

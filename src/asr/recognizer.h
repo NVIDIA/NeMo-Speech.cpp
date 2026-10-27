@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "audio_resampler.h"
@@ -35,9 +36,72 @@ struct BackendConfig {
     }
 };
 
+// SALM is selected by an encoder path; model.path supplies its LLM GGUF.
+struct SalmBackendConfig {
+    std::string encoder_path;
+    // The CTC timestamp head: the encoder file when it carries one (resolve_salm_encoder); not a
+    // setting.
+    std::string ctc_path;
+    // Defaults sized for a 32 GB GPU; raise max_sequences and the batch sizes on larger ones.
+    int max_sequences = 16;
+    int n_ctx_per_sequence = 8192;
+    int max_context = 73728;
+    int n_batch = 2048;
+    int encoder_max_batch = 16;
+    int encoder_ahead_seconds = 20000;
+    int max_new_tokens = 1024;
+    int mtp_draft = 7;
+    std::string dflash_path;
+    void Register(common::ParameterParser& p) {
+        p.Register(
+            "encoder_path", &encoder_path,
+            "SALM encoder GGUF (selects SALM; default: the encoder file the decoder names)",
+            {"--salm-encoder"});
+        p.Register("max_sequences", &max_sequences, "SALM concurrent decode slots");
+        p.Register(
+            "n_ctx_per_sequence", &n_ctx_per_sequence,
+            "SALM KV cells per decode slot (one pool for all slots)");
+        p.Register(
+            "max_context", &max_context,
+            "SALM longest sequence in tokens (prompt + audio + output)");
+        p.Register("n_batch", &n_batch, "SALM prefill token budget");
+        p.Register("encoder_max_batch", &encoder_max_batch, "SALM encoder windows per batch");
+        p.Register(
+            "encoder_ahead_seconds", &encoder_ahead_seconds,
+            "SALM audio seconds encoded ahead of admission, held on the device (0 = unbounded)");
+        p.Register("max_new_tokens", &max_new_tokens, "SALM generation token limit");
+        p.Register("mtp_draft", &mtp_draft, "SALM speculative draft tokens (0 disables MTP)");
+        p.Register(
+            "dflash_path", &dflash_path,
+            "SALM DFlash2 drafter GGUF: drafts mtp_draft tokens per step instead of MTP");
+    }
+};
+
+// Complete-audio backend extension. Implementations own scheduling and must be
+// thread-safe. This keeps ASR independent of the optional speechlm library.
+class OfflineRecognitionBackend {
+   public:
+    virtual ~OfflineRecognitionBackend() = default;
+    virtual Result recognize(const float*, size_t, AsrRequestOptions, const std::string&, int) = 0;
+    virtual void warmup() = 0;
+    virtual int sample_rate() const = 0;
+    virtual bool supports_word_timestamps() const = 0;
+    virtual bool supports_speaker_diarization() const = 0;
+    // Speaker turns alone, without a transcript (only with supports_offline_diarization()):
+    // seconds, speaker = the diarizer's column.
+    virtual bool supports_offline_diarization() const { return false; }
+    virtual std::vector<SpeechLmSegment> diarize(const float*, size_t, int) { return {}; }
+    // Speech translation (AsrRequestOptions::speechlm.task = "translate") and its target languages.
+    virtual bool supports_translation() const { return false; }
+    virtual std::vector<std::string> translation_languages() const { return {}; }
+    virtual std::vector<std::string> supported_languages() const = 0;
+    virtual BatchMetrics batch_metrics() const = 0;
+};
+
 // Startup configuration; per-request options live in AsrRequestOptions.
 struct RecognizerConfig {
     BackendConfig backend;
+    SalmBackendConfig salm;
     BatchingConfig batching;
     ModelConfig model;
     StreamingConfig streaming;  // chunk/padding geometry + cache-aware R
@@ -52,6 +116,7 @@ struct RecognizerConfig {
 
     void Register(common::ParameterParser& p) {
         p.Register("backend", backend);
+        p.Register("salm", salm);
         p.Register("batching", batching);
         p.Register("model", model);
         p.Register("streaming", streaming);
@@ -120,9 +185,18 @@ class RecognitionStream {
     std::string late_punctuation_;
 };
 
+// A speech-LLM decoder GGUF names its encoder file (speech encoder and CTC timestamp head) in
+// nemo_speech.speech_model, a file in the same directory: a SALM encoder path left empty names it,
+// which selects SALM, and a CTC path left empty names the encoder file when it holds the head.
+// Throws std::invalid_argument when the named encoder file is missing, or when the decoder and the
+// encoder file carry different nemo_speech.checkpoint_id. Reads only GGUF headers; a file that is
+// not a GGUF is left to the model loader.
+void resolve_salm_encoder(RecognizerConfig& cfg);
+
 class Recognizer {
    public:
     explicit Recognizer(RecognizerConfig config);
+    Recognizer(RecognizerConfig config, std::unique_ptr<OfflineRecognitionBackend> backend);
     ~Recognizer();
 
     Recognizer(const Recognizer&) = delete;
@@ -146,15 +220,26 @@ class Recognizer {
     AsrModel* model() const { return model_.get(); }
     DiarModel* diar_model() const { return diar_model_.get(); }
     BatchMetrics vad_batch_metrics() const;
+    BatchMetrics pnc_batch_metrics() const;
+    std::vector<std::pair<std::string, BatchMetrics>> batch_metrics() const;
     int sample_rate() const;
+    bool supports_streaming() const;
+    bool supports_word_timestamps() const;
+    bool supports_speaker_diarization() const;
+    bool supports_translation() const;
+    // A complete-audio backend that diarizes without transcribing (the speech-LLM's encoder);
+    // diarize() throws without one.
+    bool supports_offline_diarization() const;
+    std::vector<SpeechLmSegment> diarize(const float* samples, size_t n, int sample_rate) const;
+    std::vector<std::string> translation_languages() const;
     const std::string& model_name() const { return model_name_; }
     std::vector<std::string> supported_languages() const;
     double ms_per_enc_frame() const;
-    postproc::Postprocessor& postproc() { return *postproc_; }
     const RecognizerConfig& config() const { return cfg_; }
 
    private:
     friend class RecognitionStream;
+    postproc::Postprocessor& postproc() { return *postproc_; }
     void log_model_status() const;
     void log_execution_status(bool streaming) const;
     void register_streaming_ingress() {
@@ -170,6 +255,7 @@ class Recognizer {
 
     // BackendManager first (model + postproc load against it; reverse-order
     // destruction). model_ is built in the ctor body after bm_.
+    std::unique_ptr<OfflineRecognitionBackend> offline_backend_;
     std::unique_ptr<ggml_runtime::BackendManager> bm_;
     std::shared_ptr<AsrModel> model_;
     std::unique_ptr<DiarModel> diar_model_;  // loaded iff cfg_.diar.model_path set

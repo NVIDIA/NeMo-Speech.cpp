@@ -137,6 +137,11 @@ class GGUFLoader {
     std::vector<char> m_tensor_buffer;
 };
 
+// Whether the GGUF holds a model of architecture `arch`: its general.architecture, or one of the
+// models listed in nemo_speech.components (a speech-LLM's encoder file holds its speech encoder and
+// CTC timestamp head).
+bool gguf_holds(const GGUFLoader& loader, const std::string& arch);
+
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
 struct ggml_bf_tensor {
@@ -261,10 +266,21 @@ class BackendManager {
     std::mutex compute_mu_;
 };
 
+// Grow-only device buffers shared by every cached run's named tensors (inputs and registered aux
+// outputs). Valid only when runs are serialized and no run's named tensors are read after the next
+// run starts: then each cached run places its named tensors at the start of the same buffers
+// instead of owning a buffer per input shape (whose cudaMalloc/cudaFree on every LRU miss
+// synchronized the device). Growth bumps *generation so older placements are rebuilt before reuse.
+struct SharedNamedArena {
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr> bufs;
+    uint64_t* generation = nullptr;
+};
+
 class TensorContainer {
    public:
     // Arena sizes for metadata and buffer-type-specific graph contexts.
     struct ArenaSizes {
+        SharedNamedArena* shared_named = nullptr;      // sched_managed only
         size_t temp_ctx_bytes = 64 * 1024 * 1024;      // 64 MB virtual default
         size_t default_buft_bytes = 64 * 1024 * 1024;  // 64 MB virtual default
         std::map<ggml_backend_buffer_type_t, size_t> per_buft;
@@ -393,6 +409,16 @@ class Session {
         // Bind an existing backend tensor instead of allocating and uploading
         // a host input. The referenced storage must outlive this Session run.
         const DeviceTensor* device_tensor = nullptr;
+        // Fill the input from device memory instead of host_data: each range copies `bytes` from
+        // `src` (at src_offset past its own offset) to byte dst_offset of the input, on the
+        // input's backend before the graph runs. The ranges must cover the input.
+        struct DeviceRange {
+            const DeviceTensor* src = nullptr;
+            size_t src_offset = 0;
+            size_t dst_offset = 0;
+            size_t bytes = 0;
+        };
+        std::vector<DeviceRange> gather = {};
     };
 
     // Select by exactly one of TensorBag index or cached name. nbytes is the
@@ -406,6 +432,9 @@ class Session {
         // When non-null, receives a non-owning backend reference without
         // synchronizing the graph merely to copy the output to the host.
         DeviceTensor* device_tensor = nullptr;
+        // Download only the tensor's leading bytes (0 = all of it), e.g. the real items of a batch
+        // padded to a reusable shape.
+        size_t download_bytes = 0;
     };
 
     // Reuse a SessionState across calls to preserve device-updated stream state;
@@ -502,13 +531,25 @@ class Session {
     std::unordered_map<uint64_t, CachedRun> run_cache_;
     std::vector<uint64_t> run_cache_lru_;  // back() = most-recent
     size_t run_cache_capacity_ = 4;
+    size_t run_cache_misses_ = 0;
+    size_t run_cache_stale_ = 0;
     // Pool growth invalidates cached device placements.
     std::vector<size_t> sched_pool_sizes_;
     uint64_t sched_pool_generation_ = 0;
 
    public:
+    SharedNamedArena shared_named_;
+    bool share_named_ = false;
+
+   public:
     // Maximum number of cached input shapes.
     void set_run_cache_capacity(size_t cap) { run_cache_capacity_ = cap; }
+    // Graphs built for input shapes that were not cached (diagnostics).
+    size_t run_cache_misses() const { return run_cache_misses_; }
+    // Of those, rebuilds of cached shapes whose placements went stale when the pool grew.
+    size_t run_cache_stale() const { return run_cache_stale_; }
+    // Place every cached run's named tensors in one shared grow-only arena (see SharedNamedArena).
+    void set_shared_named_arena(bool on) { share_named_ = on; }
 };
 
 }  // namespace ggml_runtime

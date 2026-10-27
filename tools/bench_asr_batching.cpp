@@ -537,7 +537,7 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
         const auto vb = recognizer.vad_batch_metrics();
         const auto db =
             recognizer.diar_model() ? recognizer.diar_model()->batch_metrics() : BatchMetrics{};
-        const auto pnb = recognizer.postproc().pnc_batch_metrics();
+        const auto pnb = recognizer.pnc_batch_metrics();
         if (model->head_kind() == HeadKind::Ctc) {
             eb = static_cast<CtcModel*>(model)->batch_metrics();
         } else {
@@ -622,8 +622,7 @@ bench_stream(const Options& o, const std::vector<float>& audio, int sr) {
                 stage_row("diar", delta(recognizer.diar_model()->batch_metrics(), db)));
         }
         if (!o.pnc_model.empty()) {
-            row.stages.push_back(
-                stage_row("pnc", delta(recognizer.postproc().pnc_batch_metrics(), pnb)));
+            row.stages.push_back(stage_row("pnc", delta(recognizer.pnc_batch_metrics(), pnb)));
         }
         rows.push_back(std::move(row));
     }
@@ -712,7 +711,7 @@ bench_offline(const Options& o, const std::vector<float>& audio, int sr) {
         const auto vad_before = recognizer.vad_batch_metrics();
         const auto diar_before =
             recognizer.diar_model() ? recognizer.diar_model()->batch_metrics() : BatchMetrics{};
-        const auto pnc_before = recognizer.postproc().pnc_batch_metrics();
+        const auto pnc_before = recognizer.pnc_batch_metrics();
         if (model->head_kind() == HeadKind::Ctc) {
             auto* ctc = static_cast<CtcModel*>(model);
             fe_before = ctc->offline_frontend_batch_metrics();
@@ -783,7 +782,7 @@ bench_offline(const Options& o, const std::vector<float>& audio, int sr) {
         }
         if (!o.pnc_model.empty()) {
             row.stages.push_back(
-                stage_row("pnc", delta(recognizer.postproc().pnc_batch_metrics(), pnc_before)));
+                stage_row("pnc", delta(recognizer.pnc_batch_metrics(), pnc_before)));
         }
         rows.push_back(std::move(row));
     }

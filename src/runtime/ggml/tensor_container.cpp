@@ -285,9 +285,45 @@ TensorContainer::allocate_tensors_on_backend_buffers() {
             by_buft[kv.second.buft].push_back(t);
         }
         for (auto& kv : by_buft) {
-            ggml_backend_buffer_t buf = alloc_tensor_subset(kv.first, kv.second);
-            if (buf) {
-                backend_buffers.emplace_back(buf);
+            ggml_backend_buffer_type_t buft = kv.first;
+            SharedNamedArena* shared = sizes_.shared_named;
+            if (!shared) {
+                ggml_backend_buffer_t buf = alloc_tensor_subset(buft, kv.second);
+                if (buf) {
+                    backend_buffers.emplace_back(buf);
+                }
+                continue;
+            }
+            const size_t align = ggml_backend_buft_get_alignment(buft);
+            size_t total = 0;
+            for (ggml_tensor* t : kv.second) {
+                const size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
+                total += (sz + align - 1) / align * align;
+            }
+            if (total == 0) {
+                continue;
+            }
+            auto& slot = shared->bufs[buft];
+            const size_t have = slot ? ggml_backend_buffer_get_size(slot.get()) : 0;
+            if (have < total) {
+                slot.reset();  // older placements are invalidated through the generation bump below
+                slot.reset(ggml_backend_buft_alloc_buffer(buft, std::max(total, have + have / 4)));
+                if (shared->generation)
+                    ++*shared->generation;
+            }
+            ggml_backend_buffer_t buf = slot.get();
+            if (!buf) {
+                const char* buft_name = ggml_backend_buft_name(buft);
+                throw std::runtime_error(
+                    std::string("failed to allocate named-tensor buffer for buffer type ") +
+                    (buft_name ? buft_name : "<unknown>") + " (out of device memory?)");
+            }
+            ggml_tallocr ta = ggml_tallocr_new(buf);
+            for (ggml_tensor* t : kv.second) {
+                if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error(
+                        std::string("failed to place named tensor ") + t->name);
+                }
             }
         }
         return;

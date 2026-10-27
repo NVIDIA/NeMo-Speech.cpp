@@ -83,6 +83,8 @@ struct BatchMetrics {
     uint64_t ready_items = 0;
     uint64_t compatible_items = 0;
     uint64_t execution_ns = 0;
+    // Requests dropped because their client went away (AsrRequestOptions::cancelled).
+    uint64_t cancelled_items = 0;
 };
 
 // A transport or pipeline coordinator can establish one expected cohort for

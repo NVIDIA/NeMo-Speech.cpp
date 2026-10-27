@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
@@ -14,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "gguf.h"
 #include "model.h"
 #include "silero_vad.h"
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
@@ -95,6 +97,82 @@ exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int inpu
     return frames > enc.pos_emb_max_len;
 }
 
+namespace {
+
+// The keys of a GGUF's header (no tensor data); empty when the file is not a readable GGUF.
+class GgufHeader {
+   public:
+    explicit GgufHeader(const std::string& path) {
+        gguf_init_params params{};
+        params.no_alloc = true;
+        params.ctx = nullptr;
+        ctx_ = gguf_init_from_file(path.c_str(), params);
+    }
+    ~GgufHeader() {
+        if (ctx_)
+            gguf_free(ctx_);
+    }
+    GgufHeader(const GgufHeader&) = delete;
+    GgufHeader& operator=(const GgufHeader&) = delete;
+
+    explicit operator bool() const { return ctx_ != nullptr; }
+    std::string str(const char* key) const {
+        const int64_t id = ctx_ ? gguf_find_key(ctx_, key) : -1;
+        return id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_STRING
+                   ? gguf_get_val_str(ctx_, id)
+                   : "";
+    }
+    // Whether the string array `key` holds `value`.
+    bool lists(const char* key, std::string_view value) const {
+        const int64_t id = ctx_ ? gguf_find_key(ctx_, key) : -1;
+        if (id < 0 || gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ctx_, id) != GGUF_TYPE_STRING)
+            return false;
+        for (size_t i = 0; i < gguf_get_arr_n(ctx_, id); ++i)
+            if (value == gguf_get_arr_str(ctx_, id, i))
+                return true;
+        return false;
+    }
+
+   private:
+    gguf_context* ctx_ = nullptr;
+};
+
+}  // namespace
+
+void
+resolve_salm_encoder(RecognizerConfig& cfg) {
+    if (cfg.model.path.empty())
+        return;
+    const GgufHeader decoder(cfg.model.path);
+    if (!decoder)
+        return;
+    const std::string named = decoder.str("nemo_speech.speech_model");  // the encoder file
+    if (cfg.salm.encoder_path.empty() && !named.empty()) {
+        const auto path = std::filesystem::path(cfg.model.path).parent_path() / named;
+        if (!std::filesystem::exists(path))
+            throw std::invalid_argument(
+                cfg.model.path + " needs its encoder file " + named +
+                " in the same directory (or asr.salm.encoder_path, --salm-encoder)");
+        cfg.salm.encoder_path = path.string();
+    }
+    if (cfg.salm.encoder_path.empty())
+        return;
+    const GgufHeader encoder(cfg.salm.encoder_path);
+    if (!encoder)
+        return;
+    // the CTC timestamp head (word timestamps, speakers) is part of the encoder file
+    cfg.salm.ctc_path =
+        encoder.lists("nemo_speech.components", "ctc_timestamp") ? cfg.salm.encoder_path : "";
+    const std::string want = decoder.str("nemo_speech.checkpoint_id");
+    const std::string have = encoder.str("nemo_speech.checkpoint_id");
+    if (!want.empty() && !have.empty() && want != have)
+        throw std::invalid_argument(
+            cfg.salm.encoder_path + " and " + cfg.model.path +
+            " come from different checkpoints (nemo_speech.checkpoint_id " + have + " and " + want +
+            ")");
+}
+
 Recognizer::Recognizer(RecognizerConfig cfg)
     : bm_(make_backend(cfg.backend)), cfg_(std::move(cfg)),
       streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
@@ -102,6 +180,8 @@ Recognizer::Recognizer(RecognizerConfig cfg)
         cfg_.streaming.ctc_right_padding < 0.0f)
         throw std::invalid_argument(
             "invalid streaming geometry: chunk_size must be > 0 and paddings must be >= 0");
+    if (!cfg_.salm.encoder_path.empty())
+        throw std::invalid_argument("SALM must be loaded through EngineRegistry::load_asr");
     model_ = AsrModel::load(*bm_, cfg_.model.path, cfg_.batching);
     model_name_ = cfg_.model.name.empty() ? model_->model_name() : cfg_.model.name;
     // Self-punctuating models must bypass the separate PnC model.
@@ -209,13 +289,48 @@ Recognizer::log_execution_status(bool streaming) const {
     std::call_once(streaming ? streaming_status_once_ : offline_status_once_, std::move(emit));
 }
 
+Recognizer::Recognizer(RecognizerConfig cfg, std::unique_ptr<OfflineRecognitionBackend> backend)
+    : offline_backend_(std::move(backend)),
+      model_name_(cfg.model.name.empty() ? "salm" : cfg.model.name), cfg_(std::move(cfg)),
+      streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
+    if (!offline_backend_)
+        throw std::invalid_argument("offline recognition backend is null");
+    if (cfg_.log_status)
+        GGMLF_LOG_INFO("[recognizer] SALM complete-audio backend loaded\n");
+}
+
+std::vector<std::pair<std::string, BatchMetrics>>
+Recognizer::batch_metrics() const {
+    if (offline_backend_)
+        return {{"salm", offline_backend_->batch_metrics()}};
+    std::vector<std::pair<std::string, BatchMetrics>> out{
+        {"frontend", model_->fe().batch_metrics()}};
+    if (model_->head_kind() == HeadKind::Ctc) {
+        out.emplace_back("encoder", static_cast<const CtcModel*>(model_.get())->batch_metrics());
+    } else {
+        const auto* rnnt = static_cast<const RnntModel*>(model_.get());
+        out.emplace_back("encoder", rnnt->encoder_batch_metrics());
+        out.emplace_back("predictor", rnnt->predictor_batch_metrics());
+        out.emplace_back("joint", rnnt->joint_batch_metrics());
+    }
+    return out;
+}
+
 BatchMetrics
 Recognizer::vad_batch_metrics() const {
     return vad_model_ ? vad_model_->batch_metrics() : BatchMetrics{};
 }
 
+BatchMetrics
+Recognizer::pnc_batch_metrics() const {
+    return postproc_ ? postproc_->pnc_batch_metrics() : BatchMetrics{};
+}
+
 std::unique_ptr<AsrRunner>
 Recognizer::make_runner() const {
+    if (offline_backend_)
+        throw std::invalid_argument(
+            "SALM supports complete audio only; streaming recognition is unavailable");
     // head_kind() is the authoritative runner discriminator.
     if (model_->head_kind() != HeadKind::Ctc) {
         auto* transducer = static_cast<RnntModel*>(model_.get());
@@ -230,6 +345,10 @@ Recognizer::make_runner() const {
 
 void
 Recognizer::warmup() {
+    if (offline_backend_) {
+        offline_backend_->warmup();
+        return;
+    }
     // Push ~4 s of silence through a real runner so the lazy per-shape graph
     // build (and, for RNNT, the cache-aware Session setup) happens now. 0.1 s
     // chunks: enough for the buffered runner to emit one full window and the
@@ -621,6 +740,12 @@ Result
 Recognizer::recognize(
     const float* samples, size_t n, AsrRequestOptions opts, const std::string& language_code,
     int sample_rate) {
+    if (offline_backend_) {
+        // Speech-LLM backends keep the model's own punctuation and casing on every transport;
+        // enable_automatic_punctuation selects classic models' PnC. ITN and profanity stay opt-in.
+        opts.enable_automatic_punctuation = true;
+        return offline_backend_->recognize(samples, n, std::move(opts), language_code, sample_rate);
+    }
     // A lone in-flight request skips the ingress gather wait entirely.
     const ScopedActiveCount active(active_offline_requests_);
     const ScopedBatchCohort cohort_scope(offline_ingress_batches_.arrive(active.count()));
@@ -655,13 +780,55 @@ Recognizer::recognize(
     return stream->finish();
 }
 
+bool
+Recognizer::supports_streaming() const {
+    return !offline_backend_ && (model_->head_kind() == HeadKind::Ctc ||
+                                 static_cast<RnntModel*>(model_.get())->supports_cache_streaming());
+}
+
+bool
+Recognizer::supports_word_timestamps() const {
+    return !offline_backend_ || offline_backend_->supports_word_timestamps();
+}
+
+bool
+Recognizer::supports_translation() const {
+    return offline_backend_ && offline_backend_->supports_translation();
+}
+
+std::vector<std::string>
+Recognizer::translation_languages() const {
+    return offline_backend_ ? offline_backend_->translation_languages()
+                            : std::vector<std::string>{};
+}
+
+bool
+Recognizer::supports_offline_diarization() const {
+    return offline_backend_ && offline_backend_->supports_offline_diarization();
+}
+
+std::vector<SpeechLmSegment>
+Recognizer::diarize(const float* samples, size_t n, int sample_rate) const {
+    if (!supports_offline_diarization())
+        throw std::runtime_error("diarization is not loaded");
+    return offline_backend_->diarize(samples, n, sample_rate);
+}
+
+bool
+Recognizer::supports_speaker_diarization() const {
+    return offline_backend_ ? offline_backend_->supports_speaker_diarization()
+                            : diar_model_ != nullptr;
+}
+
 int
 Recognizer::sample_rate() const {
-    return model_->sample_rate();
+    return offline_backend_ ? offline_backend_->sample_rate() : model_->sample_rate();
 }
 
 std::vector<std::string>
 Recognizer::supported_languages() const {
+    if (offline_backend_)
+        return offline_backend_->supported_languages();
     auto languages = model_->prompt_languages();
     if (languages.empty())
         languages.push_back("en-US");
@@ -670,7 +837,7 @@ Recognizer::supported_languages() const {
 
 double
 Recognizer::ms_per_enc_frame() const {
-    return model_->ms_per_enc_frame();
+    return offline_backend_ ? 80.0 : model_->ms_per_enc_frame();
 }
 
 }  // namespace nemo_speech::asr

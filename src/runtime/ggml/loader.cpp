@@ -232,6 +232,14 @@ GGUFLoader::get_str(const std::string& key, const std::string& def) const {
     return std::string(gguf_get_val_str(m_context.get(), id));
 }
 
+bool
+gguf_holds(const GGUFLoader& loader, const std::string& arch) {
+    if (loader.get_str("general.architecture") == arch)
+        return true;
+    const auto components = loader.get_str_array("nemo_speech.components");
+    return std::find(components.begin(), components.end(), arch) != components.end();
+}
+
 std::vector<std::string>
 GGUFLoader::get_str_array(const std::string& key) const {
     std::vector<std::string> out;

@@ -166,10 +166,14 @@ class FeModule : public ggml_runtime::Module {
         ggml_runtime::TensorContainer* tc) override {
         // Packed input shape is (n_audio_padded, refl_flag, batch).  refl_flag
         // remains a shape-key discriminator (only row zero contains audio),
-        // while ne[2] is the real dynamic batch dimension.
+        // while ne[2] is the real dynamic batch dimension. With the statistics inputs (frame mask
+        // (F, 1, B), 1/t and 1/(t-1) (1, 1, B)) the audio is (n_audio_padded, 1, B), reflect_left,
+        // and the graph also returns each item's per-feature mean and unbiased variance over its
+        // first t frames.
         auto x = input_tensors.get_tensor(0);
+        const bool stats = input_tensors.tensor_count() == 4;
         const int n_audio_padded = static_cast<int>(x.tensor->ne[0]);
-        const int refl_flag = static_cast<int>(x.tensor->ne[1]);
+        const int refl_flag = stats ? 2 : static_cast<int>(x.tensor->ne[1]);
         const int batch = static_cast<int>(x.tensor->ne[2]);
         // refl_flag = 2 → reflect_left=true (CPU-side pads n_fft/2 on the
         // left, so im2col pads n_fft/2 too). refl_flag = 1 → reflect_left=false
@@ -200,8 +204,15 @@ class FeModule : public ggml_runtime::Module {
         // entire microbatch without allowing windows to cross item boundaries.
         //
         // Preserve B through the graph so output is directly [mel, frame, batch].
-        ggml_tensor* audio_batch = ggml_view_3d(
-            g, x.tensor, n_audio_padded, 1, batch, x.tensor->nb[1], x.tensor->nb[2], 0);
+        ggml_tensor* audio_batch =
+            stats ? x.tensor
+                  : ggml_view_3d(
+                        g, x.tensor, n_audio_padded, 1, batch, x.tensor->nb[1], x.tensor->nb[2], 0);
+        // With batch > 1 and the reflect discriminator row the view is strided; the CUDA backend
+        // only takes a contiguous im2col source (otherwise the scheduler falls back to the CPU
+        // im2col), so pack it first.
+        if (!ggml_is_contiguous(audio_batch))
+            audio_batch = ggml_cont(g, audio_batch);
         ggml_tensor* frames = ggml_im2col(
             g, kernel.tensor, audio_batch,
             /*s0=*/hop, /*s1=*/0,
@@ -220,6 +231,19 @@ class FeModule : public ggml_runtime::Module {
 
         ggml_runtime::TensorBag out;
         out.add_tensor(ggml_runtime::ggml_bf_tensor(log_mel, x.buft));
+        if (stats) {
+            // NeMo normalize_batch("per_feature") statistics, two-pass: mean, then the masked
+            // squared deviations; time on ne[0] so the sums are row sums.
+            ggml_tensor* mask = input_tensors.get_tensor(1).tensor;                // (F, 1, B)
+            ggml_tensor* inv_t = input_tensors.get_tensor(2).tensor;               // (1, 1, B)
+            ggml_tensor* inv_tm1 = input_tensors.get_tensor(3).tensor;             // (1, 1, B)
+            ggml_tensor* xt = ggml_cont(g, ggml_permute(g, log_mel, 1, 0, 2, 3));  // (F, n_mels, B)
+            ggml_tensor* mean = ggml_mul(g, ggml_sum_rows(g, ggml_mul(g, xt, mask)), inv_t);
+            ggml_tensor* dev = ggml_mul(g, ggml_sub(g, xt, mean), mask);
+            ggml_tensor* var = ggml_mul(g, ggml_sum_rows(g, ggml_sqr(g, dev)), inv_tm1);
+            out.add_tensor(ggml_runtime::ggml_bf_tensor(mean, x.buft));  // (1, n_mels, B)
+            out.add_tensor(ggml_runtime::ggml_bf_tensor(var, x.buft));
+        }
         return out;
     }
 
@@ -313,6 +337,12 @@ MelSpectrogramExtractor::MelSpectrogramExtractor(
         if (batching.enabled && batching.max_batch_size > 1)
             session_->set_run_cache_capacity(
                 std::max(16, std::min(64, batching.max_batch_size * 2)));
+        else
+            session_->set_run_cache_capacity(16);
+        // Runs are serialized and download their output before returning: share one device arena
+        // for the per-shape inputs/outputs instead of allocating (and freeing, with a device sync)
+        // one per input length.
+        session_->set_shared_named_arena(true);
         session_->setup();
         if (batching.enabled && batching.max_batch_size > 1)
             batcher_ = std::make_unique<GpuBatcher>(this, batching);
@@ -646,6 +676,104 @@ read_wav_mono_16k(const std::string& path, std::vector<float>& out_samples, int&
     } else {
         return false;
     }
+    return true;
+}
+
+bool
+MelSpectrogramExtractor::compute_padded_batch(
+    const std::vector<PaddedItem>& items, size_t n_pad, const ggml_runtime::DeviceTensor& dst,
+    float* mean, float* var) const {
+    if (!session_ || items.empty())
+        return false;
+    const int n_audio_padded = static_cast<int>(n_pad) + 1;
+    const int n_frames = frames_for(n_pad);
+    const size_t input_item = static_cast<size_t>(n_audio_padded);
+    const size_t B = items.size();
+    const int n_mels = cfg_.n_mels;
+    std::lock_guard<std::mutex> lock(compute_mu_);
+    ggml_backend_dev_t dev = ggml_backend_get_device(bm_->gpu_backend_handle());
+    ggml_backend_buffer_type_t host = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (!host)
+        host = ggml_backend_cpu_buffer_type();
+    // pinned staging: audio, then the frame mask and the 1/t, 1/(t-1) scales
+    const size_t n_in = input_item * B, n_mask = static_cast<size_t>(n_frames) * B;
+    const size_t bytes = (n_in + n_mask + 2 * B) * sizeof(float);
+    if (!pin_in_ || ggml_backend_buffer_get_size(pin_in_) < bytes) {
+        if (pin_in_)
+            ggml_backend_buffer_free(pin_in_);
+        pin_in_ = ggml_backend_buft_alloc_buffer(host, bytes + bytes / 4);
+        if (!pin_in_)
+            throw std::runtime_error("compute_padded_batch: pinned staging allocation failed");
+    }
+    float* pre = static_cast<float*>(ggml_backend_buffer_get_base(pin_in_));
+    float* mask = pre + n_in;
+    float* inv_t = mask + n_mask;
+    float* inv_tm1 = inv_t + B;
+    const float k = cfg_.preemph;
+    for (size_t b = 0; b < B; ++b) {
+        const PaddedItem& it = items[b];
+        const float* a = it.samples;
+        const size_t n = it.n;
+        if (n == 0 || n > it.n_fe || it.n_fe > n_pad || it.frames < 1 || it.frames > n_frames)
+            throw std::runtime_error("compute_padded_batch: bad item length");
+        float* d = pre + b * input_item;
+        // same values as the single-utterance path on the zero-padded signal
+        d[0] = a[0];
+        if (k != 0.0f) {
+            for (size_t i = 1; i < n; ++i) d[i] = a[i] - k * a[i - 1];
+        } else {
+            std::memcpy(d + 1, a + 1, (n - 1) * sizeof(float));
+        }
+        size_t z = n;
+        if (n < it.n_fe)
+            d[z++] = -k * a[n - 1];
+        std::memset(d + z, 0, (input_item - z) * sizeof(float));
+        float* m = mask + b * n_frames;
+        std::fill(m, m + it.frames, 1.0f);
+        std::fill(m + it.frames, m + n_frames, 0.0f);
+        inv_t[b] = 1.0f / static_cast<float>(it.frames);
+        inv_tm1[b] = it.frames > 1 ? 1.0f / static_cast<float>(it.frames - 1) : 0.0f;
+    }
+    const int64_t nb = static_cast<int64_t>(B);
+    ggml_runtime::DeviceTensor log_mel;
+    std::vector<ggml_runtime::Session::Output> outputs(3);
+    outputs[0].index = 0;
+    outputs[0].device_tensor = &log_mel;
+    for (int o = 1; o < 3; o++) {
+        outputs[o].index = o;
+        outputs[o].host_buffer = o == 1 ? mean : var;
+        outputs[o].nbytes = static_cast<size_t>(n_mels) * B * sizeof(float);
+    }
+    session_->run(
+        {{"fe.in.audio", GGML_TYPE_F32, pre, {n_audio_padded, 1, nb}},
+         {"fe.in.mask", GGML_TYPE_F32, mask, {n_frames, 1, nb}},
+         {"fe.in.inv_t", GGML_TYPE_F32, inv_t, {1, 1, nb}},
+         {"fe.in.inv_tm1", GGML_TYPE_F32, inv_tm1, {1, 1, nb}}},
+        outputs);
+    if (outputs[0].out_shape[2] != nb || outputs[0].out_shape[1] != n_frames)
+        throw std::runtime_error("GPU frontend graph lost its batch dimension");
+    // Each item's frames to the destination on this stream, complete on return: a consumer on
+    // another stream needs no event (whose wait could land in another thread's CUDA graph
+    // capture on that stream).
+    ggml_backend_t backend = bm_->gpu_backend_handle();
+    const size_t frame_bytes = static_cast<size_t>(n_mels) * sizeof(float);
+    for (size_t b = 0; b < B; ++b) {
+        const size_t bytes_b = static_cast<size_t>(items[b].frames) * frame_bytes;
+        if (dst.byte_offset + items[b].dst_offset + bytes_b > ggml_nbytes(dst.tensor))
+            throw std::runtime_error("compute_padded_batch: destination too small");
+        ggml_tensor from = {}, to = {};
+        from.type = to.type = GGML_TYPE_I8;
+        from.ne[0] = to.ne[0] = static_cast<int64_t>(bytes_b);
+        from.ne[1] = from.ne[2] = from.ne[3] = to.ne[1] = to.ne[2] = to.ne[3] = 1;
+        from.nb[0] = to.nb[0] = 1;
+        from.nb[1] = from.nb[2] = from.nb[3] = to.nb[1] = to.nb[2] = to.nb[3] = bytes_b;
+        from.buffer = log_mel.tensor->buffer;
+        from.data = static_cast<char*>(log_mel.tensor->data) + b * n_frames * frame_bytes;
+        to.buffer = dst.tensor->buffer;
+        to.data = static_cast<char*>(dst.tensor->data) + dst.byte_offset + items[b].dst_offset;
+        ggml_backend_tensor_copy_async(backend, backend, &from, &to);
+    }
+    ggml_backend_synchronize(backend);
     return true;
 }
 
