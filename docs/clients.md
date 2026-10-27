@@ -29,8 +29,10 @@ Local names are case-insensitive and can also be written as
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+# the loaded transcription model's id; another id is refused with 404 unknown_model
+model = next(m.id for m in client.models.list() if getattr(m, "capability", None) == "transcription")
 with open("recording.wav", "rb") as audio:
-    result = client.audio.transcriptions.create(model="default", file=audio)
+    result = client.audio.transcriptions.create(model=model, file=audio)
 print(result.text)
 ```
 
@@ -44,8 +46,9 @@ const client = new OpenAI({
   baseURL: "http://127.0.0.1:8080/v1",
   apiKey: "local",
 });
+const models = await client.models.list();
 const result = await client.audio.transcriptions.create({
-  model: "default",
+  model: models.data.find((model) => model.capability === "transcription").id,
   file: createReadStream("recording.wav"),
 });
 console.log(result.text);
@@ -62,7 +65,7 @@ server command above.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/audio/transcriptions \
-  -F file=@recording.wav -F model=default -F response_format=verbose_json
+  -F file=@recording.wav -F response_format=verbose_json
 
 curl -s http://127.0.0.1:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
