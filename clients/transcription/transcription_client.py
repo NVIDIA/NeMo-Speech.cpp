@@ -759,7 +759,8 @@ def request_options(args):
         "audio_format",
         "target_language",
     )
-    opts = {k: getattr(args, k) for k in keys if getattr(args, k, None) not in (None, False)}
+    # absent options are None and unset flags False; 0 (a seed, a temperature) is a value
+    opts = {k: v for k in keys if (v := getattr(args, k, None)) is not None and v is not False}
     opts["extra"] = parse_extras(getattr(args, "extra", None))
     return opts
 

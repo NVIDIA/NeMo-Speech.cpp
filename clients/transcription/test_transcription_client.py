@@ -316,6 +316,14 @@ class ClientTest(unittest.TestCase):
         self.assertIn("<spk:0> Hello world.", out)
         self.assertIn("0.400 -", out)
 
+    def test_chat_sends_zero_seed_and_temperature(self):
+        status, _, _ = self.run_client(
+            "--model", "m", "chat", str(self.audio), "--seed", "0", "--temperature", "0"
+        )
+        self.assertEqual(status, 0)
+        request = self.last("POST", "/v1/chat/completions")[3]
+        self.assertEqual((request["seed"], request["temperature"]), (0, 0.0))
+
     def test_chat_without_instruction_sends_only_audio(self):
         status, _, _ = self.run_client(
             "--model", "m", "chat", str(self.audio), "--audio-format", "wav"
