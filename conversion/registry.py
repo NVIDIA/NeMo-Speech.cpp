@@ -4,14 +4,32 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .source import list_hugging_face_files, read_nemo_config, resolve_nemo_source
+from .source import (
+    is_salm_checkpoint_dir,
+    list_hugging_face_files,
+    read_nemo_config,
+    resolve_nemo_source,
+)
 
-ARCHITECTURES = ("asr", "diarization", "pnc", "vad", "tts", "codec", "nmt", "s2s")
+ARCHITECTURES = (
+    "asr",
+    "diarization",
+    "pee",
+    "salm",
+    "dflash2",
+    "pnc",
+    "vad",
+    "tts",
+    "codec",
+    "nmt",
+    "s2s",
+)
 
 
 @dataclass
@@ -32,12 +50,20 @@ class ConversionRequest:
     llama_cpp: Path | None = None
     llama_quantize: Path | None = None
     auto_build_quantizer: bool = True
+    salm_encoder: str | None = None  # None: the --outtype's default
+    salm_target: str | None = None  # dflash2: the speech-LLM checkpoint the drafter serves
     force: bool = False
     dry_run: bool = False
 
 
 def _architecture_from_config(config: dict) -> str:
     target = str(config.get("target", config.get("_target_", ""))).lower()
+    if (
+        "parallel_expert_encoder" in target
+        or "asr_encoder_cfg" in config
+        or "pe_encoder_config" in config
+    ):
+        return "pee"
     if "sortformer" in target or "sortformer_modules" in config:
         return "diarization"
     if "punctuationcapitalization" in target or ("punct_head" in config and "capit_head" in config):
@@ -58,6 +84,8 @@ def _resolve_nemo_for_detection(
 ) -> Path | None:
     local = Path(request.source).expanduser()
     if local.exists():
+        if local.is_dir() and is_salm_checkpoint_dir(local):
+            return local  # speechlm2 SALM export: perception encoder + projection
         if local.is_dir() and not any(local.rglob("model_config.yaml")):
             return None
         if local.is_file() and local.suffix.lower() != ".nemo":
@@ -81,7 +109,7 @@ def detect_architecture(request: ConversionRequest) -> tuple[str, Path | None]:
             raise ValueError(f"unknown architecture: {request.architecture}")
         if request.architecture in ("vad", "nmt"):
             return request.architecture, None
-        if request.architecture == "s2s":
+        if request.architecture in ("s2s", "salm", "dflash2"):
             local = Path(request.source).expanduser()
             return request.architecture, local.resolve() if local.exists() else None
         return (
@@ -93,15 +121,31 @@ def detect_architecture(request: ConversionRequest) -> tuple[str, Path | None]:
         return "vad", None
     local = Path(request.source).expanduser()
     from . import s2s
+    from .salm_dflash2 import is_dflash2_checkpoint, is_dflash2_config
 
     if local.is_dir():
         if s2s.is_s2s_source(local):
             return "s2s", local.resolve()
+        if is_dflash2_checkpoint(local):
+            return "dflash2", local.resolve()
     files = None
     if not local.exists():
         files = list_hugging_face_files(request.source, request.revision)
         if s2s.is_s2s_file_list(files):
             return "s2s", None
+        if "config.json" in files and not any(name.endswith(".nemo") for name in files):
+            from huggingface_hub import hf_hub_download
+
+            config = Path(
+                hf_hub_download(
+                    request.source,
+                    "config.json",
+                    revision=request.revision,
+                    cache_dir=str(request.cache_dir),
+                )
+            )
+            if is_dflash2_config(json.loads(config.read_text(encoding="utf-8"))):
+                return "dflash2", None
     checkpoint = _resolve_nemo_for_detection(request, files)
     if checkpoint is None:
         return "nmt", None
@@ -112,12 +156,15 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
     defaults = {
         "asr": "q8_0",
         "diarization": "f32",
+        "pee": "f16",
         "pnc": "q8_0",
         "vad": "f32",
         "tts": "q8_0",
         "codec": "f16",
         "nmt": "f16",
         "s2s": "q4_k_m",
+        "salm": "nvfp4",
+        "dflash2": "bf16",
     }
     value = defaults[architecture] if outtype == "auto" else outtype.lower()
     if value == "fp16":
@@ -139,12 +186,15 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
             "nvfp4",
             "mxfp4",
         },
+        "pee": {"f32", "f16", "q8_0"},
         "pnc": {"f16", "bf16", "q8_0"},
         "vad": {"f32"},
         "tts": {"f16", "f32", "q8_0"},
         "codec": {"f16", "f32"},
         "nmt": {"f32", "f16", "bf16", "q8_0", "auto"},
         "s2s": {"bf16", "q4_k_m", "nvfp4"},
+        "salm": {"nvfp4", "iq4_nl"},
+        "dflash2": {"bf16", "f16", "f32"},
     }
     if value not in supported[architecture]:
         choices = ", ".join(sorted(supported[architecture]))
@@ -202,6 +252,11 @@ def convert_model(request: ConversionRequest) -> str:
 
         assert checkpoint is not None
         diarization.convert(checkpoint, request.outfile, "fp16" if outtype == "f16" else outtype)
+    elif architecture == "pee":
+        from . import pee
+
+        assert checkpoint is not None
+        pee.convert(checkpoint, request.outfile, "fp16" if outtype == "f16" else outtype)
     elif architecture == "pnc":
         from . import pnc
 
@@ -234,6 +289,72 @@ def convert_model(request: ConversionRequest) -> str:
         codec.convert(checkpoint, request.outfile, outtype, request.metadata_json)
     elif architecture == "nmt":
         _convert_nmt(request, outtype)
+    elif architecture == "dflash2":
+        from . import salm_dflash2
+        from .s2s_components.voicechat_source import ensure_llama_checkout
+
+        if not request.salm_target:
+            raise ValueError(
+                "dflash2 needs --salm-target, the speech-LLM checkpoint the drafter serves"
+            )
+        repository = Path(__file__).resolve().parent.parent
+        llama_cpp = ensure_llama_checkout(request.llama_cpp or repository / "llama.cpp", repository)
+        target = Path(request.salm_target).expanduser()
+        if not target.exists():  # a Hugging Face repository id: its configs and tokenizer only
+            from huggingface_hub import snapshot_download
+
+            target = Path(
+                snapshot_download(
+                    repo_id=request.salm_target,
+                    allow_patterns=["*.json"],
+                    cache_dir=str(request.cache_dir),
+                )
+            )
+        source = checkpoint
+        if source is None:
+            from huggingface_hub import snapshot_download
+
+            source = Path(
+                snapshot_download(
+                    repo_id=request.source,
+                    revision=request.revision,
+                    cache_dir=str(request.cache_dir),
+                )
+            )
+        salm_dflash2.convert(
+            source,
+            target.resolve(),
+            request.outfile,
+            outtype,
+            llama_cpp=llama_cpp,
+            name=Path(request.salm_target).name,
+            dry_run=request.dry_run,
+        )
+    elif architecture == "salm":
+        from . import salm
+
+        source = checkpoint
+        if source is None:  # a Hugging Face repository id
+            from huggingface_hub import snapshot_download
+
+            source = Path(
+                snapshot_download(
+                    repo_id=request.source,
+                    revision=request.revision,
+                    cache_dir=str(request.cache_dir),
+                )
+            )
+        salm.convert(
+            source,
+            request.outfile,
+            outtype,
+            llama_cpp=request.llama_cpp,
+            quantizer=request.llama_quantize,
+            auto_build_quantizer=request.auto_build_quantizer,
+            dry_run=request.dry_run,
+            encoder=request.salm_encoder,
+            checkpoint_name=Path(request.source).name,
+        )
     else:
         from . import s2s
 

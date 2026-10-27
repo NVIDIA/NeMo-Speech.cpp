@@ -64,9 +64,20 @@ def parse_args() -> argparse.Namespace:
         "--from-whisper-ggml", type=Path, help="convert a whisper.cpp Silero VAD file"
     )
     parser.add_argument(
+        "--salm-encoder",
+        choices=("f16", "none"),
+        help="speech-LLM: f16 (default) writes the encoder file next to the decoder "
+        "(<checkpoint>-Encoder-F16.gguf); none: the decoder only (its encoder file exists)",
+    )
+    parser.add_argument(
+        "--salm-target",
+        help="DFlash2 drafter (--architecture dflash2): the speech-LLM checkpoint it drafts for (directory or "
+        "Hugging Face id); its tokenizer and dimensions go into the drafter GGUF",
+    )
+    parser.add_argument(
         "--llama-cpp",
         type=Path,
-        help="llama.cpp checkout used for S2S and NMT conversion (default: ./llama.cpp)",
+        help="llama.cpp checkout used for S2S, SALM and NMT conversion (default: ./llama.cpp)",
     )
     parser.add_argument(
         "--llama-quantize",
@@ -76,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-build-quantizer",
         action="store_true",
-        help="disable the automatic S2S llama-quantize build",
+        help="disable the automatic S2S and SALM llama-quantize build",
     )
     parser.add_argument(
         "--force", action="store_true", help="overwrite existing S2S bundle artifacts"
@@ -108,6 +119,8 @@ def main() -> int:
         llama_cpp=args.llama_cpp,
         llama_quantize=args.llama_quantize,
         auto_build_quantizer=not args.no_build_quantizer,
+        salm_encoder=args.salm_encoder,
+        salm_target=args.salm_target,
         force=args.force,
         dry_run=args.dry_run,
     )

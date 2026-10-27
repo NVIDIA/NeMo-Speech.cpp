@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import tarfile
 import tempfile
 from contextlib import contextmanager
@@ -84,8 +85,23 @@ def read_checkpoint_config(root: Path) -> dict[str, Any]:
     return value
 
 
+def is_salm_checkpoint_dir(path: Path) -> bool:
+    """A speechlm2 SALM export: config.json carrying pe_encoder_config next to safetensors."""
+    cfg = path / "config.json"
+    if not path.is_dir() or not cfg.is_file():
+        return False
+    try:
+        with cfg.open("r", encoding="utf-8") as stream:
+            return "pe_encoder_config" in json.load(stream)
+    except (OSError, ValueError):
+        return False
+
+
 def read_nemo_config(source: Path) -> dict[str, Any]:
     if source.is_dir():
+        if is_salm_checkpoint_dir(source):
+            with (source / "config.json").open("r", encoding="utf-8") as stream:
+                return json.load(stream)
         return read_checkpoint_config(source)
     with tarfile.open(source, "r:*") as tar:
         candidates = [

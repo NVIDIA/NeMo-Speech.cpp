@@ -52,6 +52,13 @@ from conversion.s2s_components.voicechat_source import (
     find_quantizer,
     load_llm_channel_weights,
 )
+from conversion.salm import DENSE_TYPE as SALM_DENSE_TYPE
+from conversion.salm import checkpoint_id as salm_checkpoint_id
+from conversion.salm import decoder_keys as salm_decoder_keys
+from conversion.salm import encoder_file_name as salm_encoder_file_name
+from conversion.salm import encoder_type as salm_encoder_type
+from conversion.salm import stage as stage_salm
+from conversion.salm import tensor_rules as salm_tensor_rules
 from conversion.source import extract_archive
 
 
@@ -187,6 +194,10 @@ class ConverterContractTest(unittest.TestCase):
                 "decoder": {},
             },
             "diarization": {"target": "nemo.collections.asr.models.SortformerEncLabelModel"},
+            "pee": {
+                "target": "nemo.collections.asr.modules.parallel_expert_encoder.ParallelExpertEncoderPT",
+                "asr_encoder_cfg": {},
+            },
             "pnc": {"target": "nemo.collections.nlp.models.PunctuationCapitalizationModel"},
             "tts": {"target": "nemo.collections.tts.models.magpietts.MagpieTTSModel"},
             "codec": {"target": "nemo.collections.tts.models.AudioCodecModel"},
@@ -200,6 +211,21 @@ class ConverterContractTest(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 self.assertEqual(resolved, checkpoint)
 
+            salm = root / "salm"
+            salm.mkdir()
+            (salm / "config.json").write_text(
+                json.dumps(
+                    {"pe_encoder_config": {"asr_encoder_type": "transformer"}, "llm_config": {}}
+                ),
+                encoding="utf-8",
+            )
+            (salm / "model.safetensors").write_bytes(b"")
+            actual, resolved = detect_architecture(
+                ConversionRequest(source=str(salm), outfile=root / "salm.gguf")
+            )
+            self.assertEqual(actual, "pee")
+            self.assertEqual(resolved, salm)
+
             nmt = root / "nmt"
             nmt.mkdir()
             (nmt / "config.json").write_text("{}\n", encoding="utf-8")
@@ -208,6 +234,18 @@ class ConverterContractTest(unittest.TestCase):
             )
             self.assertEqual(actual, "nmt")
             self.assertIsNone(resolved)
+
+            drafter = root / "dflash2"
+            drafter.mkdir()
+            (drafter / "config.json").write_text(
+                json.dumps({"architectures": ["Qwen3DFlash2DraftModel"]}), encoding="utf-8"
+            )
+            (drafter / "model.safetensors").write_bytes(b"")
+            actual, resolved = detect_architecture(
+                ConversionRequest(source=str(drafter), outfile=root / "drafter.gguf")
+            )
+            self.assertEqual(actual, "dflash2")
+            self.assertEqual(resolved, drafter.resolve())
 
             s2s_version = self._s2s_repository(root / "voicechat-source")
             s2s_root = s2s_version.parents[1]
@@ -232,6 +270,9 @@ class ConverterContractTest(unittest.TestCase):
 
     def test_output_type_defaults_and_validation(self) -> None:
         self.assertEqual(_normalized_outtype("asr", "auto"), "q8_0")
+        self.assertEqual(_normalized_outtype("dflash2", "auto"), "bf16")
+        with self.assertRaises(ValueError):  # the drafter is not quantized
+            _normalized_outtype("dflash2", "q8_0")
         self.assertEqual(_normalized_outtype("diarization", "auto"), "f32")
         self.assertEqual(_normalized_outtype("tts", "fp16"), "f16")
         self.assertEqual(_normalized_outtype("tts", "q8_0"), "q8_0")
@@ -244,6 +285,170 @@ class ConverterContractTest(unittest.TestCase):
             _normalized_outtype("vad", "q8_0")
         with self.assertRaises(ValueError):
             _normalized_outtype("s2s", "q8_0")
+        self.assertEqual(_normalized_outtype("salm", "auto"), "nvfp4")
+        self.assertEqual(_normalized_outtype("salm", "IQ4_NL"), "iq4_nl")
+        for unsupported in ("bf16", "q4_k_m"):
+            with self.assertRaises(ValueError):
+                _normalized_outtype("salm", unsupported)
+
+    def test_salm_quantization_rules(self) -> None:
+        # first match wins: experts, then dense linears, then everything else BF16
+        self.assertEqual(salm_tensor_rules("nvfp4"), ["ffn_(up|down|gate)_exps=nvfp4", ".=bf16"])
+        self.assertEqual(
+            salm_tensor_rules("iq4_nl", "q8_0"),
+            [
+                "ffn_(up|down|gate)_exps=iq4_nl",
+                "ssm_(in|out)=q8_0",
+                "ffn_(up|down)_shexp=q8_0",
+                "attn_(q|k|v|output)=q8_0",
+                ".=bf16",
+            ],
+        )
+        # dense linears: Q8_0 with IQ4_NL experts, BF16 with NVFP4 experts
+        self.assertEqual(SALM_DENSE_TYPE, {"nvfp4": "bf16", "iq4_nl": "q8_0"})
+        # one F16 encoder file serves every profile; "none" writes the decoder alone
+        self.assertEqual(salm_encoder_type("nvfp4"), "f16")
+        self.assertEqual(salm_encoder_type("iq4_nl"), "f16")
+        self.assertEqual(salm_encoder_type("iq4_nl", "none"), "none")
+        self.assertEqual(
+            salm_encoder_file_name("example-salm", "f16"),
+            "example-salm-Encoder-F16.gguf",
+        )
+        # every decoder names its encoder file, also one converted with --salm-encoder none
+        self.assertEqual(
+            salm_decoder_keys("example-salm", "0123"),
+            [
+                "nemo_speech.checkpoint_id=0123",
+                "nemo_speech.speech_model=example-salm-Encoder-F16.gguf",
+            ],
+        )
+
+    def test_salm_checkpoint_id(self) -> None:
+        import numpy as np
+
+        def safetensors(path, tensors):
+            header, data = {}, b""
+            for name, array in tensors.items():
+                raw = array.tobytes()
+                header[name] = {
+                    "dtype": "F32",
+                    "shape": list(array.shape),
+                    "data_offsets": [len(data), len(data) + len(raw)],
+                }
+                data += raw
+            text = json.dumps(header).encode()
+            path.write_bytes(len(text).to_bytes(8, "little") + text + data)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("a", "b", "c"):
+                (root / name).mkdir()
+            big = np.arange(4096, dtype=np.float32)
+            safetensors(root / "a" / "model.safetensors", {"w": big, "v": np.ones(3, np.float32)})
+            safetensors(root / "b" / "model.safetensors", {"w": big, "v": np.ones(3, np.float32)})
+            changed = big.copy()
+            changed[-1] = -1  # in the last 4 KiB
+            safetensors(
+                root / "c" / "model.safetensors", {"w": changed, "v": np.ones(3, np.float32)}
+            )
+            ids = [salm_checkpoint_id(root / name) for name in ("a", "b", "c")]
+            self.assertEqual(ids[0], ids[1])
+            self.assertNotEqual(ids[0], ids[2])
+            self.assertEqual(len(ids[0]), 32)
+
+    def test_salm_encoder_file(self) -> None:
+        sys.path.insert(0, str(ROOT / "llama.cpp" / "gguf-py"))
+        import gguf
+        import numpy as np
+
+        from conversion.salm_encoder import CHECKPOINT_ID_KEY, COMPONENTS_KEY, write_encoder_file
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def part(name, arch, tensors, keys):
+                writer = gguf.GGUFWriter(root / name, arch=arch)
+                writer.add_name(name)
+                for key, value in keys.items():
+                    writer.add_uint32(key, value)
+                for tensor in tensors:
+                    writer.add_tensor(tensor, np.arange(4, dtype=np.float32))
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                return root / name
+
+            decoder = part(
+                "d.gguf", "nemotron_h_moe", ["token_embd.weight"], {"nemotron_h_moe.block_count": 1}
+            )
+            encoder = part("e.gguf", "pee", ["asr.w"], {"pee.asr.n_layers": 2})
+            ctc = part("c.gguf", "ctc_timestamp", ["ctc.classifier.weight"], {"ctc.vocab_size": 3})
+            out = root / "encoder.gguf"
+            write_encoder_file(encoder, ctc, out, checkpoint_id="0123")
+            reader = gguf.GGUFReader(out)
+            fields = reader.fields
+            self.assertEqual(fields["general.architecture"].contents(), "pee")
+            self.assertEqual(fields["general.name"].contents(), "e.gguf")
+            self.assertEqual(fields[COMPONENTS_KEY].contents(), ["pee", "ctc_timestamp"])
+            self.assertEqual(fields[CHECKPOINT_ID_KEY].contents(), "0123")
+            self.assertEqual(fields["pee.asr.n_layers"].contents(), 2)
+            self.assertEqual(fields["ctc.vocab_size"].contents(), 3)
+            self.assertEqual([t.name for t in reader.tensors], ["asr.w", "ctc.classifier.weight"])
+            self.assertEqual(reader.tensors[1].data.tolist(), [0.0, 1.0, 2.0, 3.0])
+            with self.assertRaises(ValueError):  # an encoder that is not one
+                write_encoder_file(ctc, None, root / "bad.gguf")
+            with self.assertRaises(ValueError):  # a decoder is not a part of the encoder file
+                write_encoder_file(encoder, decoder, root / "bad.gguf")
+
+    def test_salm_decoder_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "salm"
+            (source / "llm_backbone").mkdir(parents=True)
+            backbone = {"architectures": ["NemotronHForCausalLM"], "vocab_size": 131072}
+            (source / "config.json").write_text(
+                json.dumps({"pe_encoder_config": {}, "llm_config": {"architectures": ["Other"]}})
+            )
+            (source / "llm_backbone" / "config.json").write_text(json.dumps(backbone))
+            audio = {"id": 131072, "content": "<|audio|>", "special": True}
+            (source / "tokenizer.json").write_text(
+                json.dumps(
+                    {"added_tokens": [{"id": 11, "content": "<|im_end|>"}, audio], "model": {}}
+                )
+            )
+            (source / "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "audio_token": "<|audio|>",
+                        "extra_special_tokens": {"audio_token": "<|audio|>"},
+                        "model_specific_special_tokens": {"audio_token": "<|audio|>"},
+                        "added_tokens_decoder": {"131072": audio, "11": {"content": "<|im_end|>"}},
+                    }
+                )
+            )
+            (source / "model.safetensors").write_bytes(b"weights")
+            staging = root / "staged"
+            stage_salm(source, staging)
+            self.assertEqual(json.loads((staging / "config.json").read_text()), backbone)
+            tokens = json.loads((staging / "tokenizer.json").read_text())["added_tokens"]
+            self.assertEqual([t["content"] for t in tokens], ["<|im_end|>"])
+            tokenizer_config = json.loads((staging / "tokenizer_config.json").read_text())
+            self.assertNotIn("audio_token", tokenizer_config)
+            self.assertNotIn("model_specific_special_tokens", tokenizer_config)
+            self.assertEqual(tokenizer_config["extra_special_tokens"], {})
+            self.assertEqual(list(tokenizer_config["added_tokens_decoder"]), ["11"])
+            self.assertTrue((staging / "model.safetensors").is_symlink())
+            self.assertEqual((staging / "model.safetensors").read_bytes(), b"weights")
+            # a drafter's target: the configs and tokenizer without the weights
+            stage_salm(source, root / "target", weights=False)
+            self.assertFalse((root / "target" / "model.safetensors").exists())
+            self.assertEqual(json.loads((root / "target" / "config.json").read_text()), backbone)
+            # without llm_backbone/, the SALM config's llm_config is the backbone config
+            (source / "llm_backbone" / "config.json").unlink()
+            (source / "llm_backbone").rmdir()
+            with self.assertRaises(RuntimeError):  # llm_config names an unsupported backbone
+                stage_salm(source, staging)
 
     def test_s2s_channel_weights_come_from_source_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -39,6 +39,7 @@ Hugging Face cache. Use `--revision` to pin a remote branch, tag, or commit.
 | Audio codec | F16 | One GGUF | [TTS models](tts/models.md) |
 | NMT | F16 | One GGUF | [NMT models](nmt/models.md) |
 | S2S VoiceChat | Q4_K_M profile | Runtime bundle directory | [VoiceChat conversion](s2s/models.md) |
+| Speech-LLM (SALM) | NVFP4 experts | Decoder GGUF and encoder GGUF | [Speech-LLM (SALM)](#speech-llm-salm) |
 
 Typical one-file conversions look the same across families:
 
@@ -51,6 +52,52 @@ python3 convert_model.py nvidia/Nemotron-3-Diarization \
   --outfile models/diarization-v3.gguf --outtype f32
 python3 convert_model.py silero --outfile models/vad.gguf
 ```
+
+## Speech-LLM (SALM)
+
+A speechlm2 SALM checkpoint converts with one command to two GGUF files: the LLM
+decoder, a standard llama.cpp NemotronH GGUF, and next to it the encoder file: the speech encoder (with its speaker
+branch) and, when the checkpoint carries one, its CTC timestamp head (`ctc_timestamp.*`, for word timestamps and
+speaker labels). The decoder names its encoder file, so the runtime needs only the decoder's path; both files carry
+an id of the checkpoint, and a decoder and encoder file of different checkpoints are refused.
+
+```bash
+python3 convert_model.py checkpoints/salm --architecture salm --outfile models/salm.gguf
+# also writes models/salm-Encoder-F16.gguf
+nemo-speech serve --asr-model models/salm.gguf
+```
+
+`--outtype` selects the decoder's routed experts and, with them, its dense linears (attention, Mamba in/out, shared
+experts); embeddings, the output head and the norms stay BF16/F32:
+
+| `--outtype` | Routed experts | Dense linears | Use |
+|---|---|---|---|
+| `nvfp4` (default) | NVFP4 | BF16 | Blackwell GPUs run the experts natively |
+| `iq4_nl` | IQ4_NL | Q8_0 | GPUs without NVFP4 (Ampere, Ada), CPU, Vulkan, Metal; the smaller file |
+
+The encoder file is the same for every `--outtype` (F16 encoder and F32 CTC head), named after the
+checkpoint, so decoders of several types share one. `--salm-encoder none` writes only the decoder, for a second
+`--outtype` of a checkpoint whose encoder file exists; `--architecture pee` converts only the speech encoder.
+
+The conversion stages the checkpoint's decoder for llama.cpp's NemotronH converter (the pinned `llama.cpp`
+submodule), writes a BF16 intermediate next to the output (the size of the BF16 decoder) and then quantizes it
+with the patched `llama-quantize`, built once on first use like the S2S converter's. `--dry-run` checks the tensor
+mapping without writing.
+
+### DFlash2 draft model
+
+A DFlash2 drafter drafts tokens for speculative decoding instead of the model's MTP head (`asr.salm.dflash_path`,
+batched CUDA path). It converts on its own, with the speech-LLM checkpoint it drafts for: the drafter reads that
+model's embeddings and hidden states, so its GGUF carries the target's tokenizer and dimensions (only the target's
+configs and tokenizer are read).
+
+```bash
+python3 convert_model.py checkpoints/salm-dflash2 --architecture dflash2 \
+  --salm-target checkpoints/salm --outfile models/salm-DFlash2-BF16.gguf
+```
+
+The drafter stays BF16 (`--outtype f16` or `f32` also work); a local drafter directory is detected without
+`--architecture`.
 
 ## Common options
 
