@@ -123,6 +123,7 @@ option(NEMO_SPEECH_BUILD_DIAR      "Build standalone and ASR-integrated diarizat
 option(NEMO_SPEECH_BUILD_TTS       "Build text-to-speech" ON)
 option(NEMO_SPEECH_BUILD_NMT       "Build text translation (links llama.cpp)" ${NEMO_SPEECH_WITH_NMT})
 option(NEMO_SPEECH_BUILD_S2S       "Build full-duplex Nemotron voicechat" OFF)
+option(NEMO_SPEECH_BUILD_SPEECHLM  "Build speech-LLM transcription (speech encoder + llama.cpp decoder)" OFF)
 option(NEMO_SPEECH_BUILD_CLI       "Build the unified nemo-speech CLI" ON)
 option(NEMO_SPEECH_BUILD_MIC_CAPTURE "Build microphone capture in the CLI and examples" ON)
 option(NEMO_SPEECH_BUILD_HTTP      "Build the HTTP server and local playground" OFF)
@@ -330,11 +331,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra>")
 endif()
 
-# llama.cpp for the NMT decoder. It reuses the ggml target added above (its
-# CMake builds its own ggml only when the target is absent), so one ggml backend
-# is shared across asr/tts/nmt. Build only libllama.
-if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S)
-    set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
+# llama.cpp for the NMT, S2S and speech-LLM decoders. It reuses the ggml target added
+# above (its CMake builds its own ggml only when the target is absent), so one
+# ggml backend is shared across asr/tts/nmt/s2s/speechlm. Build only libllama.
+if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S OR NEMO_SPEECH_BUILD_SPEECHLM)
+    # The speech-LLM engine uses llama.cpp's common speculative-decoding driver (MTP).
+    if(NEMO_SPEECH_BUILD_SPEECHLM)
+        set(LLAMA_BUILD_COMMON ON  CACHE BOOL "" FORCE)
+    else()
+        set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+    endif()
     set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
@@ -378,6 +384,12 @@ if(NEMO_SPEECH_BUILD_NMT)
     if(NEMO_SPEECH_BUILD_ASR)
         add_subdirectory(src/speech)
     endif()
+endif()
+if(NEMO_SPEECH_BUILD_SPEECHLM)
+    if(NOT NEMO_SPEECH_BUILD_ASR)
+        message(FATAL_ERROR "NEMO_SPEECH_BUILD_SPEECHLM requires NEMO_SPEECH_BUILD_ASR (speech encoder)")
+    endif()
+    add_subdirectory(src/speechlm)
 endif()
 if(NEMO_SPEECH_BUILD_ASR OR NEMO_SPEECH_BUILD_DIAR OR
    NEMO_SPEECH_BUILD_TTS OR NEMO_SPEECH_BUILD_NMT OR
@@ -450,7 +462,7 @@ if(NEMO_SPEECH_BUILD_HTTP)
     install(FILES third_party/cpp-httplib/LICENSE
         DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/cpp-httplib")
 endif()
-if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S)
+if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S OR NEMO_SPEECH_BUILD_SPEECHLM)
     install(FILES llama.cpp/LICENSE
         DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/llama.cpp")
 endif()

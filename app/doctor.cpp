@@ -43,6 +43,12 @@ build_features() {
     result["integrated_vad"] = false;
     result["punctuation"] = false;
 #endif
+    // Speech-LLM (SALM) transcription through the ASR entrypoints.
+#if defined(NEMO_SPEECH_REGISTRY_SPEECHLM)
+    result["speechlm"] = true;
+#else
+    result["speechlm"] = false;
+#endif
     result["model_pull"] = true;
 #if defined(NEMO_SPEECH_CLI_DIAR)
     result["diarization"] = true;

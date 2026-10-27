@@ -71,6 +71,7 @@ class EngineRegistry {
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_SPEECH)
     std::shared_ptr<speech::SpeechTranslator> speech_translation() const;
+    bool has_speech_translation() const;  // ASR and NMT are loaded
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_S2S)
     std::shared_ptr<s2s::VoiceChat> load_voicechat(s2s::VoiceChatConfig config);

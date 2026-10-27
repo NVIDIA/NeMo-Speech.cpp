@@ -30,3 +30,8 @@ if(NEMO_SPEECH_BUILD_S2S)
     target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_S2S=1)
     target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_s2s)
 endif()
+
+if(NEMO_SPEECH_BUILD_SPEECHLM)
+    target_compile_definitions(nemo_speech_engine_registry PUBLIC NEMO_SPEECH_REGISTRY_SPEECHLM=1)
+    target_link_libraries(nemo_speech_engine_registry PUBLIC nemo_speech_speechlm)
+endif()
