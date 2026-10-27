@@ -68,6 +68,10 @@ class AsrWorkload : public Workload {
         return true;
     }
     void prepare(const CommonOptions& options) override {
+        // Before loading audio or models: SALM recognizes complete audio only.
+        if (stream_ && !config_.salm.encoder_path.empty())
+            throw std::invalid_argument(
+                "SALM supports complete audio only; --mode stream is unavailable");
         if (options.positional.size() != 1)
             throw std::invalid_argument(
                 options.positional.empty() ? "bench asr requires a WAV file or directory"
@@ -94,9 +98,11 @@ class AsrWorkload : public Workload {
         return inputs_[index].path.filename().string();
     }
     void load(const CommonOptions&, int max_concurrency) override {
-        config_.model.path =
-            resolve_model_file(model_.empty() ? config_.model.path : model_, "asr", "ASR model")
-                .string();
+        // SALM without an LLM path reaches the backend's own error instead of resolving (and
+        // possibly downloading) the default ASR model.
+        const std::string reference = model_.empty() ? config_.model.path : model_;
+        if (config_.salm.encoder_path.empty() || !reference.empty())
+            config_.model.path = resolve_model_file(reference, "asr", "ASR model").string();
         config_.batching.enabled = max_concurrency > 1;
         config_.batching.max_batch_size =
             std::max(config_.batching.max_batch_size, max_concurrency);

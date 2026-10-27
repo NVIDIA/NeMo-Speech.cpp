@@ -164,6 +164,14 @@ def main() -> None:
         transcribe_help = run(binary, "transcribe", "--help")
         if transcribe_help.returncode == 0:
             assert "--backend" in transcribe_help.stdout
+            assert "--instruction TEXT" in transcribe_help.stdout
+            assert "--translate-to CODE" in transcribe_help.stdout
+            for empty in (["--instruction"], ["--instruction", " "]):
+                expect_json_error(
+                    run(binary, "--json", "transcribe", "recording.wav", *empty),
+                    2,
+                    "invalid_argument",
+                )
             assert ("--live" in transcribe_help.stdout) == expect_live
             assert "session" not in transcribe_help.stderr
             lifecycle = run(binary, "transcribe")

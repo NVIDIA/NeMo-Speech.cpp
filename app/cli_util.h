@@ -44,4 +44,12 @@ bool cli_verbose();
 int print_cli_error(
     const std::string& command, const std::string& message, int exit_code,
     const std::string& type = "runtime_error");
+// Error category and exit code shared by command-level and per-input failures. The categories match
+// the HTTP and gRPC mapping: invalid_argument (exit 2; HTTP 400), resource_exhausted (429) and
+// unavailable (503) (exit 1), missing_model (3), unsupported_feature (4), runtime_error (1).
+struct CliErrorKind {
+    const char* type;
+    int exit_code;
+};
+CliErrorKind cli_error_kind(const std::exception& error);
 int print_cli_exception(const std::string& command, const std::exception& error);

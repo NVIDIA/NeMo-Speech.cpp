@@ -10,6 +10,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -100,7 +101,7 @@ parse_concurrency(const std::string& value) {
         const size_t comma = value.find(',', begin);
         result.push_back(parse_int(
             value.substr(begin, comma == std::string::npos ? comma : comma - begin),
-            "--concurrency", 1, 1024));
+            "--concurrency", 1, std::numeric_limits<int>::max()));
         if (comma == std::string::npos)
             break;
         begin = comma + 1;

@@ -13,6 +13,10 @@
 #include <stdexcept>
 
 #include "audio_file.h"
+#include "audio_ingest.h"
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+#include "errors.h"
+#endif
 #include "model_logging.h"
 
 #if defined(_WIN32)
@@ -165,15 +169,15 @@ std::vector<std::filesystem::path>
 collect_wav_inputs(const std::filesystem::path& input, bool recursive) {
     std::error_code error;
     if (std::filesystem::is_regular_file(input, error)) {
-        if (!nemo_speech::audio::is_wav_path(input.string()))
-            throw std::invalid_argument("input must be a .wav file");
+        // A named file is decoded by content (audio_ingest.h), whatever its extension.
         return {std::filesystem::absolute(input)};
     }
     if (!std::filesystem::is_directory(input, error))
         throw std::invalid_argument(input.string() + " is not a file or directory");
     std::vector<std::filesystem::path> files;
     auto add = [&](const auto& entry) {
-        if (entry.is_regular_file(error) && nemo_speech::audio::is_wav_path(entry.path().string()))
+        if (entry.is_regular_file(error) &&
+            nemo_speech::audio::is_audio_path(entry.path().string()))
             files.push_back(std::filesystem::absolute(entry.path()));
     };
     if (recursive) {
@@ -183,7 +187,7 @@ collect_wav_inputs(const std::filesystem::path& input, bool recursive) {
     }
     std::sort(files.begin(), files.end());
     if (files.empty())
-        throw std::invalid_argument(input.string() + " contains no WAV files");
+        throw std::invalid_argument(input.string() + " contains no audio files");
     return files;
 }
 
@@ -307,14 +311,25 @@ print_cli_error(
     return exit_code;
 }
 
+CliErrorKind
+cli_error_kind(const std::exception& error) {
+    if (dynamic_cast<const MissingModelError*>(&error))
+        return {"missing_model", kCliExitMissingModel};
+    if (dynamic_cast<const UnsupportedFeatureError*>(&error))
+        return {"unsupported_feature", kCliExitUnsupportedFeature};
+    if (dynamic_cast<const std::invalid_argument*>(&error))
+        return {"invalid_argument", kCliExitInvalidArgument};
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+    if (dynamic_cast<const nemo_speech::asr::ResourceExhausted*>(&error))
+        return {"resource_exhausted", kCliExitRuntime};
+    if (dynamic_cast<const nemo_speech::asr::Unavailable*>(&error))
+        return {"unavailable", kCliExitRuntime};
+#endif
+    return {"runtime_error", kCliExitRuntime};
+}
+
 int
 print_cli_exception(const std::string& command, const std::exception& error) {
-    if (dynamic_cast<const MissingModelError*>(&error))
-        return print_cli_error(command, error.what(), kCliExitMissingModel, "missing_model");
-    if (dynamic_cast<const UnsupportedFeatureError*>(&error))
-        return print_cli_error(
-            command, error.what(), kCliExitUnsupportedFeature, "unsupported_feature");
-    if (dynamic_cast<const std::invalid_argument*>(&error))
-        return print_cli_error(command, error.what(), kCliExitInvalidArgument, "invalid_argument");
-    return print_cli_error(command, error.what(), kCliExitRuntime);
+    const auto kind = cli_error_kind(error);
+    return print_cli_error(command, error.what(), kind.exit_code, kind.type);
 }

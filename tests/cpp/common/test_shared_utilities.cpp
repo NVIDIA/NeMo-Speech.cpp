@@ -16,6 +16,9 @@
 #include "audio_file.h"
 #include "cli_util.h"
 #include "engine_registry.h"
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+#include "errors.h"
+#endif
 #include "ggml_log_filter.h"
 #include "json.h"
 
@@ -69,6 +72,15 @@ require_throws(Function&& function, const char* message) {
     throw std::runtime_error(message);
 }
 
+void
+require_kind(const std::exception& error, const std::string& type, int exit_code) {
+    const auto kind = cli_error_kind(error);
+    if (kind.type != type || kind.exit_code != exit_code)
+        throw std::runtime_error(
+            std::string("CLI error kind for ") + error.what() + ": " + kind.type + " exit " +
+            std::to_string(kind.exit_code));
+}
+
 template <typename Function>
 void
 require_throws_with(Function&& function, const char* expected, const char* message) {
@@ -108,38 +120,60 @@ main() {
         }
         require_throws([&] { deeply_nested.dump(); }, "excessive JSON serialization depth");
 
-        std::string pcm = wav_header(1, 2, 48000, 16, 8);
-        append_u16(pcm, static_cast<uint16_t>(16384));
-        append_u16(pcm, static_cast<uint16_t>(-16384));
-        append_u16(pcm, static_cast<uint16_t>(32767));
-        append_u16(pcm, static_cast<uint16_t>(32767));
+        // load_wav_memory decodes through the audio ingest (audio_ingest.h): 16 kHz mono out,
+        // integer channel mean, at least 320 samples.
+        std::string pcm = wav_header(1, 2, 16000, 16, 400 * 4);
+        for (int frame = 0; frame < 400; ++frame) {
+            const bool loud = frame % 2 == 1;
+            append_u16(pcm, static_cast<uint16_t>(loud ? 32767 : 16384));
+            append_u16(pcm, static_cast<uint16_t>(loud ? 32767 : -16384));
+        }
         const auto stereo = nemo_speech::audio::load_wav_memory(pcm.data(), pcm.size(), "stereo");
-        require(stereo.sample_rate == 48000 && stereo.source_channels == 2, "WAV metadata");
-        require(stereo.samples.size() == 2, "WAV frame count");
+        require(stereo.sample_rate == 16000 && stereo.source_channels == 2, "WAV metadata");
+        require(stereo.samples.size() == 400, "WAV frame count");
         require(std::abs(stereo.samples[0]) < 1e-6f, "stereo downmix");
         require(stereo.samples[1] > 0.99f, "PCM16 decoding");
 
-        const float samples[] = {0.25f, -0.5f};
-        std::string floating = wav_header(3, 1, 44100, 32, sizeof(samples));
-        floating.append(reinterpret_cast<const char*>(samples), sizeof(samples));
+        std::string floating = wav_header(3, 1, 16000, 32, 400 * sizeof(float));
+        for (int i = 0; i < 400; ++i) {
+            const float sample = i % 2 ? -0.5f : 0.25f;
+            floating.append(reinterpret_cast<const char*>(&sample), sizeof(sample));
+        }
         const auto decoded =
             nemo_speech::audio::load_wav_memory(floating.data(), floating.size(), "float");
-        require(decoded.sample_rate == 44100 && decoded.samples.size() == 2, "float WAV metadata");
+        require(
+            decoded.sample_rate == 16000 && decoded.samples.size() == 400, "float WAV metadata");
         require(std::abs(decoded.samples[1] + 0.5f) < 1e-6f, "float WAV decoding");
 
         require_throws(
             [&] { nemo_speech::audio::load_wav_memory(pcm.data(), pcm.size() - 1, "truncated"); },
             "truncated WAV rejection");
+        std::string short_wav = wav_header(1, 1, 16000, 16, 20);
+        short_wav.append(20, '\0');
+        require_throws_with(
+            [&] {
+                nemo_speech::audio::load_wav_memory(short_wav.data(), short_wav.size(), "short");
+            },
+            "shorter than one feature frame", "too-short WAV rejection");
         const std::string unsupported(44, '\0');
         require_throws_with(
             [&] {
                 nemo_speech::audio::load_wav_memory(
                     unsupported.data(), unsupported.size(), "recording.mp3");
             },
-            "ffmpeg -i INPUT -ac 1 -ar 16000 -c:a pcm_s16le output.wav",
-            "unsupported container conversion guidance");
+            "unsupported", "undecodable upload rejection");
         require(nemo_speech::audio::is_wav_path("VOICE.WAVE"), "case-insensitive WAV path");
         require(!nemo_speech::audio::is_wav_path("voice.mp3"), "codec path rejection");
+
+        // The CLI's error categories match the HTTP and gRPC mapping.
+        require_kind(std::invalid_argument("bad"), "invalid_argument", kCliExitInvalidArgument);
+        require_kind(MissingModelError("missing"), "missing_model", kCliExitMissingModel);
+        require_kind(std::runtime_error("engine"), "runtime_error", kCliExitRuntime);
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+        require_kind(
+            nemo_speech::asr::ResourceExhausted("full"), "resource_exhausted", kCliExitRuntime);
+        require_kind(nemo_speech::asr::Unavailable("stopping"), "unavailable", kCliExitRuntime);
+#endif
 
         nemo_speech::EngineRegistry registry;
         require(!registry.ready(), "empty engine registry readiness");
@@ -177,11 +211,15 @@ main() {
         fs::create_directories(inputs / "nested");
         std::ofstream(inputs / "first.wav").put('\0');
         std::ofstream(inputs / "nested" / "second.WAVE").put('\0');
-        std::ofstream(inputs / "ignored.mp3").put('\0');
-        require(collect_wav_inputs(inputs, false).size() == 1, "non-recursive WAV discovery");
-        require(collect_wav_inputs(inputs, true).size() == 2, "recursive WAV discovery");
+        std::ofstream(inputs / "song.mp3").put('\0');
+        std::ofstream(inputs / "ignored.txt").put('\0');
+        require(collect_wav_inputs(inputs, false).size() == 2, "non-recursive audio discovery");
+        require(collect_wav_inputs(inputs, true).size() == 3, "recursive audio discovery");
         require(
-            collect_wav_inputs(inputs / "first.wav", false).size() == 1, "single WAV discovery");
+            collect_wav_inputs(inputs / "first.wav", false).size() == 1, "single file discovery");
+        require(
+            collect_wav_inputs(inputs / "ignored.txt", false).size() == 1,
+            "a named file is passed to the decoder whatever its extension");
         fs::remove_all(inputs);
         std::cout << "shared utility tests passed\n";
         return 0;
