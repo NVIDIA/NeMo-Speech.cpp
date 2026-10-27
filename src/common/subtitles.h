@@ -13,6 +13,10 @@ struct Word {
     int end_ms = 0;
     float confidence = 0.0f;
     int speaker = 0;
+    // Running text when it differs from `text` (a Chinese, Japanese or Thai character keeps the
+    // punctuation around it), and whether it follows the previous word without a space.
+    std::string display;
+    bool joins_previous = false;
 };
 
 struct Cue {
@@ -36,5 +40,34 @@ std::vector<SpeakerTurn> make_speaker_turns(const std::vector<Word>& words);
 
 std::vector<Cue> make_cues(
     const std::vector<Word>& words, const std::string& fallback_text, int audio_ms);
+
+// ---- subtitle cues of the transcription API ----
+// Cues of at most 7 s and two lines of at most 42 extended grapheme clusters, closed at a
+// sentence end once the cue is at least 0.833 s long; every word keeps its timing. Times are
+// seconds; the SRT/VTT renderers round to whole milliseconds (half away from zero).
+
+struct TimedWord {
+    std::string text;
+    double start = 0.0, end = 0.0;  // seconds
+};
+
+struct WordCue {
+    size_t first_word = 0, last_word = 0;  // inclusive positions in the word list
+    double start = 0.0, end = 0.0;         // seconds: first word's start, last word's end
+    std::string text;                      // one line, or two joined by '\n'
+};
+
+// Words must be ordered, non-overlapping, with finite end > start >= 0 and non-blank text;
+// otherwise throws std::invalid_argument ("word N has ..."; clients match these messages).
+std::vector<WordCue> word_cues(const std::vector<TimedWord>& words);
+
+// format "srt" or "vtt". Throws std::invalid_argument for an unknown format, a cue whose
+// millisecond times collapse or overlap after rounding, an empty cue, or (vtt) cue text that
+// contains "-->" or an empty line.
+std::string render_word_cues(const std::vector<WordCue>& cues, const std::string& format);
+
+// Extended grapheme clusters (UAX #29 rules GB1-GB13; the Unicode 15.1 Indic conjunct rule GB9c
+// is not applied) of UTF-8 text; invalid bytes count as one cluster each.
+size_t grapheme_count(const std::string& text);
 
 }  // namespace nemo_speech::subtitle

@@ -3,7 +3,9 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "subtitles.h"
@@ -92,6 +94,24 @@ test_title_abbreviation_does_not_split_sentence() {
     require(cues[0].text == "Dr. Smith arrived.", "abbreviation sentence text");
 }
 
+// Character units (Chinese): cues show the running text, without spaces inside a word; the
+// sentence end comes from the punctuation the unit carries.
+void
+test_character_units_keep_running_text() {
+    std::vector<Word> words{{"我", 0, 200},   {"爱", 200, 400},   {"北", 400, 600},
+                            {"京", 600, 900}, {"你", 2500, 2700}, {"好", 2700, 3000}};
+    words[3].display = "京。";
+    words[5].display = "好！";
+    for (size_t i : {1, 2, 3, 5}) words[i].joins_previous = true;
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 4000);
+    require(cues.size() == 2, "character units split at the pause");
+    require(cues[0].text == "我爱北京。" && cues[1].text == "你好！", "character cue text");
+    words[4].speaker = 1;
+    words[5].speaker = 1;
+    const auto turns = nemo_speech::subtitle::make_speaker_turns(words);
+    require(turns.size() == 2 && turns[0].text == "我爱北京。", "character speaker turn text");
+}
+
 void
 test_suffix_abbreviation_can_end_sentence() {
     const std::vector<Word> words{
@@ -154,6 +174,202 @@ test_speaker_turns() {
     require(turns[1].start_ms == 700 && turns[1].end_ms == 1300, "second speaker turn timing");
 }
 
+
+// ---- transcription API cue builder and renderers ----
+using nemo_speech::subtitle::TimedWord;
+using nemo_speech::subtitle::WordCue;
+
+template <typename F>
+bool
+throws_with(F&& f, const std::string& needle) {
+    try {
+        f();
+    }
+    catch (const std::invalid_argument& error) {
+        return std::string(error.what()).find(needle) != std::string::npos;
+    }
+    return false;
+}
+
+void
+test_word_cues_short_phrase_and_renders() {
+    const std::vector<TimedWord> words{{"Hello", 0.42, 0.81}, {"world.", 0.88, 1.31}};
+    const auto cues = nemo_speech::subtitle::word_cues(words);
+    require(
+        cues.size() == 1 && cues[0].first_word == 0 && cues[0].last_word == 1, "one canonical cue");
+    require(
+        cues[0].start == 0.42 && cues[0].end == 1.31 && cues[0].text == "Hello world.",
+        "cue fields");
+    require(
+        nemo_speech::subtitle::render_word_cues(cues, "srt") ==
+            "1\n00:00:00,420 --> 00:00:01,310\nHello world.\n\n",
+        "srt body");
+    require(
+        nemo_speech::subtitle::render_word_cues(cues, "vtt") ==
+            "WEBVTT\n\n00:00:00.420 --> 00:00:01.310\nHello world.\n\n",
+        "vtt body");
+    require(
+        nemo_speech::subtitle::render_word_cues({}, "srt").empty() &&
+            nemo_speech::subtitle::render_word_cues({}, "vtt") == "WEBVTT\n\n",
+        "no cues");
+}
+
+void
+test_word_cues_two_lines_by_graphemes() {
+    const std::vector<TimedWord> words{
+        {"cafe\xcc\x81", 0.0, 0.3}, {"characters", 0.31, 0.7}, {"remain", 0.71, 1.1},
+        {"whole", 1.11, 1.4},       {"while", 1.41, 1.7},      {"caption", 1.71, 2.0},
+        {"lines", 2.01, 2.3},       {"stay", 2.31, 2.6},       {"readable.", 2.61, 3.0}};
+    const auto cues = nemo_speech::subtitle::word_cues(words);
+    require(cues.size() == 1, "one two-line cue");
+    const auto split = cues[0].text.find('\n');
+    require(split != std::string::npos, "two lines");
+    std::string joined = cues[0].text;
+    joined[split] = ' ';
+    require(
+        joined == "cafe\xcc\x81 characters remain whole while caption lines stay readable.",
+        "words kept whole");
+    require(
+        nemo_speech::subtitle::grapheme_count(cues[0].text.substr(0, split)) <= 42 &&
+            nemo_speech::subtitle::grapheme_count(cues[0].text.substr(split + 1)) <= 42,
+        "lines within 42 graphemes");
+    // 63 graphemes: splits after "whole" (28 | 34) and "while" (34 | 28) tie on balance; the
+    // byte-wise greater first line wins the tie.
+    require(
+        cues[0].text == "cafe\xcc\x81 characters remain whole while\ncaption lines stay readable.",
+        "layout choice");
+}
+
+void
+test_word_cues_sentence_break_and_duration() {
+    // A sentence end closes the cue once the cue is >= 0.833 s; shorter sentences keep going.
+    const std::vector<TimedWord> words{
+        {"Hi.", 0.0, 0.3},  {"How", 0.4, 0.6},    {"are", 0.6, 0.8},
+        {"you?", 0.8, 1.0}, {"Fine", 1.2, 1.5},   {"thanks.", 1.5, 1.9},
+        {"Long", 8.0, 8.5}, {"pause", 9.0, 15.0}, {"after", 15.6, 16.0}};
+    const auto cues = nemo_speech::subtitle::word_cues(words);
+    require(cues.size() == 3, "three cues");
+    require(
+        cues[0].first_word == 0 && cues[0].last_word == 5 &&
+            cues[0].text == "Hi. How are you? Fine thanks.",
+        "last sentence end within 7 s");
+    require(
+        cues[1].first_word == 6 && cues[1].last_word == 7 && cues[1].end == 15.0,
+        "7 s bound is inclusive");
+    require(cues[2].first_word == 8, "next cue");
+}
+
+void
+test_word_cues_oversized_word() {
+    const std::string long_word(60, 'a');
+    const std::vector<TimedWord> words{
+        {"hello", 0.0, 0.4}, {long_word, 0.5, 9.0}, {"world", 9.1, 9.5}};
+    const auto cues = nemo_speech::subtitle::word_cues(words);
+    require(
+        cues.size() == 3 && cues[1].first_word == 1 && cues[1].last_word == 1 &&
+            cues[1].text == long_word && cues[2].text == "world",
+        "oversized word is its own cue");
+}
+
+void
+test_word_cues_render_rounding_and_hours() {
+    const std::vector<TimedWord> words{
+        {"One.", 0.9995, 1.25}, {"Two?", 59.9995, 60.25}, {"Three!", 299.9995, 300.25}};
+    const auto cues = nemo_speech::subtitle::word_cues(words);
+    require(
+        nemo_speech::subtitle::render_word_cues(cues, "srt") ==
+            "1\n00:00:01,000 --> 00:00:01,250\nOne.\n\n2\n00:01:00,000 --> 00:01:00,250\nTwo?\n\n"
+            "3\n00:05:00,000 --> 00:05:00,250\nThree!\n\n",
+        "millisecond rounding rolls over seconds and minutes");
+    const auto hour = nemo_speech::subtitle::word_cues({{"Later.", 3600.42, 3601.31}});
+    require(
+        nemo_speech::subtitle::render_word_cues(hour, "srt")
+                    .find("01:00:00,420 --> 01:00:01,310") != std::string::npos &&
+            nemo_speech::subtitle::render_word_cues(hour, "vtt")
+                    .find("01:00:00.420 --> 01:00:01.310") != std::string::npos,
+        "hour-scale times");
+}
+
+void
+test_word_cues_rejections() {
+    using nemo_speech::subtitle::render_word_cues;
+    using nemo_speech::subtitle::word_cues;
+    require(
+        throws_with(
+            [] { word_cues({{"a", 0.0, 0.5}, {" \t", 0.5, 1.0}}); },
+            "word 1 has empty display text"),
+        "blank word");
+    require(
+        throws_with([] { word_cues({{"a", 0.5, 0.5}}); }, "word 0 has invalid timestamps"),
+        "zero-length word");
+    require(
+        throws_with(
+            [] { word_cues({{"a", 0.0, 0.6}, {"b", 0.5, 1.0}}); },
+            "word 1 overlaps the preceding word"),
+        "overlapping words");
+    const auto brief = word_cues({{"brief", 0.0004, 0.00049}});
+    require(
+        throws_with([&] { render_word_cues(brief, "srt"); }, "must end strictly after its start"),
+        "cue collapsing after rounding");
+    const auto unsafe = word_cues({{"unsafe --> cue", 0.0, 0.5}});
+    require(
+        throws_with(
+            [&] { render_word_cues(unsafe, "vtt"); },
+            "WebVTT cue text contains an invalid separator"),
+        "vtt separator");
+    require(
+        render_word_cues(unsafe, "srt").find("unsafe --> cue") != std::string::npos,
+        "srt keeps the text");
+    require(throws_with([&] { render_word_cues(brief, "txt"); }, "srt or vtt"), "unknown format");
+}
+
+void
+test_grapheme_counts_match_icu() {
+    // Expected counts from ICU 74's character break iterator.
+    const std::vector<std::pair<std::string, size_t>> cases{
+        {"\x70\x6c\x61\x69\x6e\x20\x61\x73\x63\x69\x69\x20\x77\x6f\x72\x64\x73",
+         17},  // plain ascii words
+        {"\x63\x61\x66\x65\xcc\x81\x20\x63\x68\x61\x72\x61\x63\x74\x65\x72\x73",
+         15},                                                      // cafe\u0301 characters
+        {"\x61\x0d\x0a\x62\x0d\x63\x0a\x64", 7},                   // a\r\nb\rc\nd
+        {"\x74\x61\x62\x09\x68\x65\x72\x65\x01\x63\x74\x6c", 12},  // tab\there\x01ctl
+        {"\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa7\x20\x66\x61\x6d"
+         "\x69\x6c\x79",
+         8},  // \U0001f468\u200d\U0001f469\u200d\U0001f467 family
+        {"\xf0\x9f\x87\xba\xf0\x9f\x87\xb8\xf0\x9f\x87\xac\xf0\x9f\x87\xa7\x20\x66\x6c\x61\x67\x73",
+         8},  // \U0001f1fa\U0001f1f8\U0001f1ec\U0001f1e7 flags
+        {"\xf0\x9f\x87\xba\xf0\x9f\x87\xb8\xf0\x9f\x87\xac\x20\x6f\x64\x64",
+         6},  // \U0001f1fa\U0001f1f8\U0001f1ec odd
+        {"\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd\x20\x74\x68\x75\x6d\x62\x73",
+         8},  // \U0001f44d\U0001f3fd thumbs
+        {"\x31\xef\xb8\x8f\xe2\x83\xa3\x20\x6b\x65\x79\x63\x61\x70", 8},  // 1\ufe0f\u20e3 keycap
+        {"\xe1\x84\x80\xe1\x85\xa1\xe1\x86\xa8\x20\x6a\x61\x6d\x6f\x20\xea\xb0\x80\xe1\x86\xa8\x20"
+         "\x6c\x76\x74",
+         12},  // \u1100\u1161\u11a8 jamo \uac00\u11a8 lvt
+        {"\xe0\xa4\x95\xe0\xa4\xbf\x20\x73\x70\x61\x63\x69\x6e\x67", 9},  // \u0915\u093f spacing
+        {"\xd8\x80\xd9\xa1\x20\x70\x72\x65\x70\x65\x6e\x64", 9},          // \u0600\u0661 prepend
+        {"\x61\xe2\x80\x8d\x62\x20\x7a\x77\x6a", 6},                      // a\u200db zwj
+        {"\xe2\x9d\xa4\xef\xb8\x8f\x20\x68\x65\x61\x72\x74", 7},          // \u2764\ufe0f heart
+        {"\xe0\xb8\x81\xe0\xb8\xb3\x20\x74\x68\x61\x69", 6},              // \u0e01\u0e33 thai
+        {"\x65\xcc\x81\xcc\x82\xcc\x83\x20\x73\x74\x61\x63\x6b\x65\x64",
+         9},  // e\u0301\u0302\u0303 stacked
+        {"\xc3\xa9\x74\xc3\xa9\x20\x70\x72\x65\x63\x6f\x6d\x70\x6f\x73\x65\x64",
+         15},  // \xe9t\xe9 precomposed
+        {"\x20\xcc\x81\x20\x6c\x6f\x6e\x65\x20\x6d\x61\x72\x6b\x20\x61\x66\x74\x65\x72\x20\x73\x70"
+         "\x61\x63\x65",
+         23},  //  \u0301 lone mark after space
+        {"\xf0\x9f\x98\x80\xe2\x80\x8d\xe2\x80\x8d\xf0\x9f\x98\x80\x20\x64\x6f\x75\x62\x6c\x65\x20"
+         "\x7a\x77\x6a",
+         13},  // \U0001f600\u200d\u200d\U0001f600 double zwj
+        {"\xf0\x9f\x8f\xb3\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\x8c\x88\x20\x72\x61\x69\x6e\x62\x6f\x77"
+         "\x20\x66\x6c\x61\x67",
+         14},  // \U0001f3f3\ufe0f\u200d\U0001f308 rainbow flag
+    };
+    for (const auto& c : cases)
+        require(
+            nemo_speech::subtitle::grapheme_count(c.first) == c.second,
+            "grapheme count differs from ICU");
+}
 }  // namespace
 
 int
@@ -164,10 +380,18 @@ main() {
     test_short_sentence_with_time_stays_separate();
     test_title_abbreviation_does_not_split_sentence();
     test_suffix_abbreviation_can_end_sentence();
+    test_character_units_keep_running_text();
     test_two_lines_and_utf8_character_count();
     test_duration_and_length_split_are_ordered();
     test_fallback_text();
     test_speaker_turns();
+    test_word_cues_short_phrase_and_renders();
+    test_word_cues_two_lines_by_graphemes();
+    test_word_cues_sentence_break_and_duration();
+    test_word_cues_oversized_word();
+    test_word_cues_render_rounding_and_hours();
+    test_word_cues_rejections();
+    test_grapheme_counts_match_icu();
     std::cout << "subtitle tests passed\n";
     return 0;
 }

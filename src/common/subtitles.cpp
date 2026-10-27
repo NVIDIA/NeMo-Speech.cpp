@@ -5,9 +5,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
 
 namespace nemo_speech::subtitle {
 namespace {
@@ -78,13 +84,19 @@ character_count(const std::string& text) {
     return count;
 }
 
+const std::string&
+shown(const Word& word) {
+    return word.display.empty() ? word.text : word.display;
+}
+
 std::string
 join_words(const std::vector<Word>& words, size_t begin, size_t end) {
     std::ostringstream output;
     for (size_t i = begin; i < end; ++i) {
-        if (output.tellp() > 0 && !attaches_to_previous(words[i].text))
+        if (output.tellp() > 0 && !words[i].joins_previous &&
+            !attaches_to_previous(shown(words[i])))
             output << ' ';
-        output << words[i].text;
+        output << shown(words[i]);
     }
     return output.str();
 }
@@ -108,7 +120,7 @@ format_lines(const std::vector<Word>& words, size_t begin, size_t end) {
             (left_length > kTargetLineCharacters ? left_length - kTargetLineCharacters : 0) +
             (right_length > kTargetLineCharacters ? right_length - kTargetLineCharacters : 0);
         const bool punctuation =
-            sentence_end(words[split - 1].text) || clause_end(words[split - 1].text);
+            sentence_end(shown(words[split - 1])) || clause_end(shown(words[split - 1]));
         const size_t imbalance =
             left_length > right_length ? left_length - right_length : right_length - left_length;
         if (overflow < best_overflow ||
@@ -154,13 +166,14 @@ make_speaker_turns(const std::vector<Word>& words) {
     for (const auto& word : words) {
         int speaker = word.speaker;
         // Standalone closing punctuation stays with the preceding speaker.
-        if (!turns.empty() && attaches_to_previous(word.text))
+        if (!turns.empty() && (word.joins_previous || attaches_to_previous(shown(word))))
             speaker = turns.back().speaker;
         if (turns.empty() || turns.back().speaker != speaker)
             turns.push_back({speaker, word.start_ms, word.end_ms, {}});
-        if (!turns.back().text.empty() && !attaches_to_previous(word.text))
+        if (!turns.back().text.empty() && !word.joins_previous &&
+            !attaches_to_previous(shown(word)))
             turns.back().text += ' ';
-        turns.back().text += word.text;
+        turns.back().text += shown(word);
         turns.back().end_ms = std::max(turns.back().end_ms, word.end_ms);
     }
     return turns;
@@ -195,11 +208,11 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
                     break;
                 }
             }
-            if (clause_end(words[current].text)) {
+            if (clause_end(shown(words[current]))) {
                 last_clause = end;
                 has_clause = true;
             }
-            if (sentence_end(words[current].text) &&
+            if (sentence_end(shown(words[current])) &&
                 has_minimum_display_time(words, begin, end, audio_ms))
                 break;
         }
@@ -231,6 +244,348 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
         cues.push_back(std::move(cue));
     }
     return cues;
+}
+
+// ---- subtitle cues of the transcription API ----
+
+namespace {
+
+enum GraphemeBreak : uint8_t {
+    kOther = 0,
+    kCR,
+    kLF,
+    kControl,
+    kExtend,
+    kZWJ,
+    kRegionalIndicator,
+    kPrepend,
+    kSpacingMark,
+    kL,
+    kV,
+    kT,
+    kLV,
+    kLVT
+};
+struct BreakRange {
+    uint32_t first, last;
+    uint8_t value;  // GraphemeBreak | 0x80 for Extended_Pictographic
+};
+constexpr BreakRange kBreakRanges[] = {
+#include "grapheme_break_table.inc"
+};
+
+uint8_t
+break_value(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(kBreakRanges) / sizeof(kBreakRanges[0]);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (kBreakRanges[mid].last < cp)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < sizeof(kBreakRanges) / sizeof(kBreakRanges[0]) && kBreakRanges[lo].first <= cp
+               ? kBreakRanges[lo].value
+               : uint8_t(0);
+}
+
+// Decodes one UTF-8 code point at text[i], advancing i; an invalid or truncated sequence yields
+// U+FFFD for its first byte.
+uint32_t
+next_code_point(const std::string& text, size_t& i) {
+    const auto byte = [&](size_t k) { return static_cast<unsigned char>(text[k]); };
+    const unsigned char b0 = byte(i);
+    int length = 0;
+    uint32_t cp = 0;
+    if (b0 < 0x80) {
+        ++i;
+        return b0;
+    } else if ((b0 & 0xe0) == 0xc0 && b0 >= 0xc2) {
+        length = 2, cp = b0 & 0x1f;
+    } else if ((b0 & 0xf0) == 0xe0) {
+        length = 3, cp = b0 & 0x0f;
+    } else if ((b0 & 0xf8) == 0xf0 && b0 <= 0xf4) {
+        length = 4, cp = b0 & 0x07;
+    } else {
+        ++i;
+        return 0xfffd;
+    }
+    if (i + length > text.size()) {
+        ++i;
+        return 0xfffd;
+    }
+    for (int k = 1; k < length; ++k) {
+        const unsigned char b = byte(i + k);
+        if ((b & 0xc0) != 0x80) {
+            ++i;
+            return 0xfffd;
+        }
+        cp = (cp << 6) | (b & 0x3f);
+    }
+    if ((length == 3 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) ||
+        (length == 4 && (cp < 0x10000 || cp > 0x10ffff))) {
+        ++i;
+        return 0xfffd;
+    }
+    i += length;
+    return cp;
+}
+
+// Unicode White_Space.
+bool
+rust_whitespace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0d) || cp == 0x20 || cp == 0x85 || cp == 0xa0 || cp == 0x1680 ||
+           (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 || cp == 0x202f ||
+           cp == 0x205f || cp == 0x3000;
+}
+
+std::vector<uint32_t>
+code_points(const std::string& text) {
+    std::vector<uint32_t> out;
+    for (size_t i = 0; i < text.size();) out.push_back(next_code_point(text, i));
+    return out;
+}
+
+bool
+blank(const std::string& text) {
+    for (uint32_t cp : code_points(text))
+        if (!rust_whitespace(cp))
+            return false;
+    return true;
+}
+
+// The last character after trailing whitespace is one of . ! ? …
+bool
+cue_sentence_end(const std::string& text) {
+    const auto cps = code_points(text);
+    for (size_t k = cps.size(); k-- > 0;) {
+        if (rust_whitespace(cps[k]))
+            continue;
+        return cps[k] == '.' || cps[k] == '!' || cps[k] == '?' || cps[k] == 0x2026;
+    }
+    return false;
+}
+
+constexpr double kMaxCueSeconds = 7.0;
+constexpr size_t kMaxLineGraphemes = 42;
+constexpr double kMinSentenceBreakSeconds = 0.833;
+
+std::string
+join_texts(const std::vector<TimedWord>& words, size_t begin, size_t end) {
+    std::string out;
+    for (size_t k = begin; k < end; ++k) {
+        if (k > begin)
+            out += ' ';
+        out += words[k].text;
+    }
+    return out;
+}
+
+// One line when it fits, else the best two-line split (sentence end at the
+// split first, then balance, then the byte-wise greater first line); false when nothing fits.
+bool
+cue_layout(
+    const std::vector<TimedWord>& words, size_t begin, size_t end_inclusive, std::string& out) {
+    const size_t end = end_inclusive + 1;
+    const std::string single = join_texts(words, begin, end);
+    if (grapheme_count(single) <= kMaxLineGraphemes) {
+        out = single;
+        return true;
+    }
+    bool have = false;
+    size_t best_punct = 0, best_balance = 0;
+    std::string best_first, best_second;
+    for (size_t split = begin + 1; split < end; ++split) {
+        std::string first = join_texts(words, begin, split), second = join_texts(words, split, end);
+        const size_t first_length = grapheme_count(first), second_length = grapheme_count(second);
+        if (first_length > kMaxLineGraphemes || second_length > kMaxLineGraphemes)
+            continue;
+        const size_t punct = cue_sentence_end(words[split - 1].text) ? 1 : 0;
+        const size_t balance = std::numeric_limits<size_t>::max() -
+                               (first_length > second_length ? first_length - second_length
+                                                             : second_length - first_length);
+        const auto candidate = std::tie(punct, balance, first, second);
+        if (!have || candidate > std::tie(best_punct, best_balance, best_first, best_second)) {
+            have = true;
+            best_punct = punct, best_balance = balance;
+            best_first = std::move(first), best_second = std::move(second);
+        }
+    }
+    if (!have)
+        return false;
+    out = best_first + "\n" + best_second;
+    return true;
+}
+
+uint64_t
+subtitle_milliseconds(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0)
+        throw std::invalid_argument("subtitle cue times must be finite and non-negative");
+    const double milliseconds = std::round(seconds * 1000.0);
+    if (milliseconds > static_cast<double>(std::numeric_limits<uint64_t>::max()))
+        throw std::invalid_argument("subtitle cue time is outside the supported range");
+    return static_cast<uint64_t>(milliseconds);
+}
+
+std::string
+format_milliseconds(uint64_t milliseconds, char separator) {
+    char buffer[64];
+    std::snprintf(
+        buffer, sizeof(buffer), "%02llu:%02llu:%02llu%c%03llu",
+        static_cast<unsigned long long>(milliseconds / 3600000),
+        static_cast<unsigned long long>((milliseconds / 60000) % 60),
+        static_cast<unsigned long long>((milliseconds / 1000) % 60), separator,
+        static_cast<unsigned long long>(milliseconds % 1000));
+    return buffer;
+}
+
+}  // namespace
+
+size_t
+grapheme_count(const std::string& text) {
+    const auto cps = code_points(text);
+    size_t clusters = 0;
+    uint8_t previous = 0;
+    bool previous_is_zwj_after_pictographic = false;  // GB11: ExtPict Extend* ZWJ
+    bool in_pictographic_run = false;                 // ExtPict Extend* seen so far
+    size_t regional_run = 0;                          // RIs ending at the previous code point
+    for (size_t k = 0; k < cps.size(); ++k) {
+        const uint8_t value = break_value(cps[k]);
+        const uint8_t cls = value & 0x7f;
+        const bool pictographic = (value & 0x80) != 0;
+        bool boundary = true;
+        if (k > 0) {
+            const uint8_t prev = previous & 0x7f;
+            if (prev == kCR && cls == kLF)
+                boundary = false;  // GB3
+            else if (prev == kControl || prev == kCR || prev == kLF)
+                boundary = true;  // GB4
+            else if (cls == kControl || cls == kCR || cls == kLF)
+                boundary = true;  // GB5
+            else if (prev == kL && (cls == kL || cls == kV || cls == kLV || cls == kLVT))
+                boundary = false;  // GB6
+            else if ((prev == kLV || prev == kV) && (cls == kV || cls == kT))
+                boundary = false;  // GB7
+            else if ((prev == kLVT || prev == kT) && cls == kT)
+                boundary = false;  // GB8
+            else if (cls == kExtend || cls == kZWJ)
+                boundary = false;  // GB9
+            else if (cls == kSpacingMark)
+                boundary = false;  // GB9a
+            else if (prev == kPrepend)
+                boundary = false;  // GB9b
+            else if (previous_is_zwj_after_pictographic && pictographic)
+                boundary = false;  // GB11
+            else if (
+                prev == kRegionalIndicator && cls == kRegionalIndicator && regional_run % 2 == 1)
+                boundary = false;  // GB12/GB13
+        }
+        if (boundary)
+            ++clusters;
+        // State for GB11 and GB12/13.
+        previous_is_zwj_after_pictographic = cls == kZWJ && in_pictographic_run;
+        if (pictographic)
+            in_pictographic_run = true;
+        else if (cls != kExtend)
+            in_pictographic_run = false;
+        regional_run = cls == kRegionalIndicator ? regional_run + 1 : 0;
+        previous = value;
+    }
+    return clusters;
+}
+
+std::vector<WordCue>
+word_cues(const std::vector<TimedWord>& words) {
+    double previous_end = 0.0;
+    for (size_t index = 0; index < words.size(); ++index) {
+        const auto& word = words[index];
+        if (blank(word.text))
+            throw std::invalid_argument(
+                "word " + std::to_string(index) + " has empty display text");
+        if (!std::isfinite(word.start) || !std::isfinite(word.end) || word.start < 0.0 ||
+            word.end <= word.start)
+            throw std::invalid_argument(
+                "word " + std::to_string(index) + " has invalid timestamps");
+        if (index > 0 && word.start < previous_end)
+            throw std::invalid_argument(
+                "word " + std::to_string(index) + " overlaps the preceding word");
+        previous_end = word.end;
+    }
+    std::vector<WordCue> cues;
+    size_t first = 0;
+    while (first < words.size()) {
+        bool have_valid = false, have_sentence = false;
+        size_t last_valid = 0, last_sentence = 0;
+        std::string layout;
+        for (size_t candidate = first; candidate < words.size(); ++candidate) {
+            const double duration = words[candidate].end - words[first].start;
+            if (duration > kMaxCueSeconds)
+                break;
+            if (!cue_layout(words, first, candidate, layout))
+                break;
+            have_valid = true, last_valid = candidate;
+            if (duration >= kMinSentenceBreakSeconds && cue_sentence_end(words[candidate].text))
+                have_sentence = true, last_sentence = candidate;
+        }
+        WordCue cue;
+        cue.first_word = first;
+        if (have_sentence || have_valid) {
+            cue.last_word = have_sentence ? last_sentence : last_valid;
+            cue_layout(words, first, cue.last_word, cue.text);
+        } else {
+            // A single word that cannot meet the layout or duration bounds is its own cue.
+            cue.last_word = first;
+            cue.text = words[first].text;
+        }
+        cue.start = words[first].start;
+        cue.end = words[cue.last_word].end;
+        first = cue.last_word + 1;
+        cues.push_back(std::move(cue));
+    }
+    return cues;
+}
+
+std::string
+render_word_cues(const std::vector<WordCue>& cues, const std::string& format) {
+    const bool vtt = format == "vtt";
+    if (!vtt && format != "srt")
+        throw std::invalid_argument("subtitle format must be srt or vtt");
+    std::vector<std::pair<uint64_t, uint64_t>> times;
+    times.reserve(cues.size());
+    bool have_previous = false;
+    uint64_t previous_end = 0;
+    for (size_t index = 0; index < cues.size(); ++index) {
+        if (blank(cues[index].text))
+            throw std::invalid_argument(
+                "subtitle cue " + std::to_string(index) + " has empty text");
+        const uint64_t start = subtitle_milliseconds(cues[index].start);
+        const uint64_t end = subtitle_milliseconds(cues[index].end);
+        if (end <= start)
+            throw std::invalid_argument(
+                "subtitle cue " + std::to_string(index) + " must end strictly after its start");
+        if (have_previous && start < previous_end)
+            throw std::invalid_argument(
+                "subtitle cue " + std::to_string(index) + " overlaps the preceding cue");
+        have_previous = true, previous_end = end;
+        times.emplace_back(start, end);
+    }
+    std::string body = vtt ? "WEBVTT\n\n" : "";
+    for (size_t index = 0; index < cues.size(); ++index) {
+        const std::string& text = cues[index].text;
+        if (vtt) {
+            bool empty_line = text.empty() || text.front() == '\n' || text.back() == '\n' ||
+                              text.find("\n\n") != std::string::npos;
+            if (text.find("-->") != std::string::npos || empty_line)
+                throw std::invalid_argument("WebVTT cue text contains an invalid separator");
+        } else {
+            body += std::to_string(index + 1) + "\n";
+        }
+        body += format_milliseconds(times[index].first, vtt ? '.' : ',');
+        body += " --> ";
+        body += format_milliseconds(times[index].second, vtt ? '.' : ',');
+        body += "\n" + text + "\n\n";
+    }
+    return body;
 }
 
 }  // namespace nemo_speech::subtitle
