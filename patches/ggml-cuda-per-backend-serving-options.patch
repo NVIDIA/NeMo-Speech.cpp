@@ -1,0 +1,93 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: per-backend serving options
+
+ggml_backend_cuda_set_serving() turns on, for one CUDA backend, the kernels the
+following patches add for batched speech-LLM serving (NeMo-Speech.cpp's SALM
+engine):
+
+- fused: exact fused kernels (chunked SSD, no stream-K for short attention
+  spans).
+
+A zero-initialized struct, the default, keeps upstream behavior, so other
+models in the same process are unaffected. llama.cpp applies the options to a
+context's backends through the registry (llama_serving_params.cuda_serving).
+
+Upstream: not planned (NeMo serving path).
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index fbbfaf56abd8938910ea71a649baf02de7aed087..9b5ba0dd7e04ac5ae84f05056f04b4ace9befb6c 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -35,6 +35,18 @@ GGML_BACKEND_API void ggml_backend_cuda_set_stream_priority(ggml_backend_t backe
+ // lock and stall kernel launches issued by other threads.
+ GGML_BACKEND_API void ggml_backend_cuda_set_graphs_enabled(ggml_backend_t backend, bool enabled);
+ 
++// Kernels for batched speech-LLM serving (NeMo-Speech.cpp SALM), per backend. Zero-initialized (the default) keeps
++// upstream behavior. Set before the backend computes its first graph; also reachable through the registry as
++// "ggml_backend_cuda_set_serving".
++struct ggml_backend_cuda_serving {
++    // Exact fused kernels: fused chunked SSD, no stream-K for short attention spans.
++    bool fused;
++};
++GGML_BACKEND_API void ggml_backend_cuda_set_serving(ggml_backend_t backend, const struct ggml_backend_cuda_serving * serving);
++// Whether the serving kernels can run on this backend's GPU: NVIDIA, compute capability 8.0 or newer (they use Ampere
++// tensor cores and asynchronous copies).
++GGML_BACKEND_API bool ggml_backend_cuda_serving_supported(ggml_backend_t backend);
++
+ // Returns the backend-owned native CUDA/HIP graph template for a stable GGML graph after its
+ // normal warm-up/capture has completed. The opaque handle is borrowed and is intended for runtime
+ // graph composition (for example, adding GGML inference as a child node of a larger pipeline
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index a8bbc07b63d7057a54c7a01a7470e8f8a447b904..b7bcc820beb85dcb695398eaa2eac0e94469871b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1494,6 +1494,11 @@ struct ggml_backend_cuda_context {
+     // instantiate calls hold the driver lock long enough to stall launches on other threads.
+     bool graphs_enabled = true;
+ 
++    // ggml_backend_cuda_set_serving: kernels for batched speech-LLM serving (all off by default)
++    struct serving_options {
++        bool fused = false;
++    } serving;
++
+ #ifdef USE_CUDA_GRAPH
+     // The structural signature separates batch shapes and graph topologies even
+     // when a freed host tensor arena is recycled at the same first-node address.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 538da52595bdd669aa9a601240e9b3bd4ee40e89..7506524feb9f333c9633be9d78df88202701ae77 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5543,6 +5543,23 @@ void ggml_backend_cuda_set_graphs_enabled(ggml_backend_t backend, bool enabled)
+     cuda_ctx->graphs_enabled = enabled;
+ }
+ 
++void ggml_backend_cuda_set_serving(ggml_backend_t backend, const struct ggml_backend_cuda_serving * serving) {
++    if (!ggml_backend_is_cuda(backend) || serving == nullptr) {
++        return;
++    }
++    auto & s = ((ggml_backend_cuda_context *) backend->context)->serving;
++    s = {};
++    s.fused = serving->fused;
++}
++
++bool ggml_backend_cuda_serving_supported(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[((ggml_backend_cuda_context *) backend->context)->device].cc;
++    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
++}
++
+ void * ggml_backend_cuda_get_graph_template(
+     ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+     if (!ggml_backend_is_cuda(backend) || cgraph == nullptr) {
+@@ -6475,6 +6492,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_set_serving") == 0) {
++        return (void *)ggml_backend_cuda_set_serving;
++    }
+     return nullptr;
+ }
+ 

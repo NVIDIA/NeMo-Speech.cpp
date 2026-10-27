@@ -1,0 +1,1947 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml: ragged Mamba2 and KQ mask ops for packed multi-sequence batches
+
+Ops for serving many sequences of different lengths in one ubatch of a hybrid
+(Mamba2 + attention) model, with CUDA implementations:
+
+- ggml_ssm_conv_ragged and ggml_ssm_scan_ragged: packed sequences delimited by
+  an offsets tensor. Variants write the final scan states straight into the
+  recurrent cache (ggml_ssm_scan_to[_indexed]), update the conv states in place
+  for one-token decode (_inplace), fuse the conv bias and SiLU, and verify MTP
+  drafts without committing them (_verify, ReplaySSM checkpoint rows).
+- Chunked SSD for long segments (ggml_ssm_scan_set_chunks; a fused kernel on
+  backends with serving.fused). The fused prefill kernel is bounded to three
+  128-thread CTAs per SM (its 45 KB of shared memory fits three times): 12 warps
+  instead of 8 hide the latency of its sequential 64-token steps.
+- ggml_ssm_gate_norm: the Mamba2 output gate (y + x*D) * silu(z) and its
+  grouped RMS norm in one pass.
+- ggml_build_kq_mask: the causal KQ mask built on the device from key
+  positions, sequence-membership words and query (pos, seq) pairs. The _meta
+  variant carries only per-sequence cell lists, for flash attention.
+
+The CPU backend reports these unsupported.
+
+Upstream: not planned in this form; ragged Mamba2 batching could be proposed
+once the op interface settles.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 21015f8a9fac02038874027836b9cb02827989e9..3851585d3b956e9014f7d96cb60e7a9502f5367b 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -603,6 +603,8 @@ extern "C" {
+ 
+         GGML_OP_FUSED_ATTN,
+         GGML_OP_CONV1D_FUSED,
++        GGML_OP_BUILD_KQ_MASK,
++        GGML_OP_SSM_GATE_NORM,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -2657,6 +2659,64 @@ extern "C" {
+             struct ggml_tensor  * sx,
+             struct ggml_tensor  * c);
+ 
++    // Packed Mamba2 inputs; offsets contains n_sequences+1 cumulative token counts.
++    // Outputs concatenate token results and K final/rollback state snapshots.
++    // Causal mask from key positions, key sequence-membership words [nkv,nwords],
++    // and interleaved query position/sequence pairs [2,nquery].
++    GGML_API struct ggml_tensor * ggml_build_kq_mask(
++            struct ggml_context * ctx, struct ggml_tensor * key_pos,
++            struct ggml_tensor * key_seq, struct ggml_tensor * query,
++            enum ggml_type type);
++    // Mask with the same shape and op as ggml_build_kq_mask, but only metadata: rows have zero stride.
++    // seq_off I32 [n_seq+1] and seq_cells I32 [n_kv] list the cells of each sequence sorted by position.
++    GGML_API struct ggml_tensor * ggml_build_kq_mask_meta(
++            struct ggml_context * ctx, struct ggml_tensor * key_pos, struct ggml_tensor * key_seq,
++            struct ggml_tensor * query, struct ggml_tensor * seq_off, struct ggml_tensor * seq_cells, enum ggml_type type);
++
++    // Return only scan activations and write snapshots directly to dst [state,
++    // sequence, rollback]. scan's initial states must already be gathered in
++    // sequence order and must not alias dst; input ids are then unnecessary.
++    GGML_API struct ggml_tensor * ggml_ssm_scan_to(
++            struct ggml_context * ctx, struct ggml_tensor * scan, struct ggml_tensor * dst);
++    // Like ggml_ssm_scan_to, but keeps the scan's ids: initial states are read
++    // from s[ids[i]] (s may be the whole state cache) instead of s[i].
++    GGML_API struct ggml_tensor * ggml_ssm_scan_to_indexed(struct ggml_context * ctx, struct ggml_tensor * scan, struct ggml_tensor * dst);
++    // I32 [4, n_chunks] rows {segment, start, length, chunk index in segment}; backends may use it for chunked SSD.
++    GGML_API void ggml_ssm_scan_set_chunks(struct ggml_tensor * scan, struct ggml_tensor * chunks);
++
++    GGML_API struct ggml_tensor * ggml_ssm_conv_ragged(
++            struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * c,
++            struct ggml_tensor * states, struct ggml_tensor * offsets, int64_t K);
++    // Mamba-2 output gate in one op: out[:, t] = rmsnorm_per_group((y + x*D) * silu(z)) * w, groups of
++    // head_dim*n_head/n_group channels. y, x, z: F32 [head_dim, n_head, T] with unit element stride (views allowed);
++    // D: [n_head]; w: [head_dim*n_head]. Result F32 [head_dim*n_head, T], contiguous.
++    GGML_API struct ggml_tensor * ggml_ssm_gate_norm(struct ggml_context * ctx, struct ggml_tensor * y,
++            struct ggml_tensor * x, struct ggml_tensor * D, struct ggml_tensor * z, struct ggml_tensor * w,
++            int n_group, float eps);
++
++    // Fuse the conv bias add and SiLU into the ragged conv's token output (the carried states stay raw).
++    GGML_API void ggml_ssm_conv_ragged_set_bias_silu(struct ggml_tensor * conv, struct ggml_tensor * bias);
++
++    // MTP verify (serving mtp_replay): commits the accepted inputs of the previous call (hist), y for the new tokens.
++    GGML_API struct ggml_tensor * ggml_ssm_conv_ragged_verify(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * c,
++            struct ggml_tensor  * rows,
++            struct ggml_tensor  * hist,
++            struct ggml_tensor  * offsets,
++            struct ggml_tensor  * ids);
++
++    // One token per sequence, states updated in place: reads the (width-1) previous inputs of sequence s from row
++    // ids[s] of rows (F32 [(width-1)*channels, n_rows]), writes the shifted window to row ids[n_seq + s]; returns y.
++    GGML_API struct ggml_tensor * ggml_ssm_conv_ragged_inplace(
++            struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * c,
++            struct ggml_tensor * rows, struct ggml_tensor * offsets, struct ggml_tensor * ids);
++    GGML_API struct ggml_tensor * ggml_ssm_scan_ragged(
++            struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x,
++            struct ggml_tensor * dt, struct ggml_tensor * A, struct ggml_tensor * B,
++            struct ggml_tensor * C, struct ggml_tensor * ids, struct ggml_tensor * offsets, int64_t K);
++
+     GGML_API struct ggml_tensor * ggml_ssm_scan(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * s,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 2ff83dfeeb81b633c2fd0fc5afee81c1fec1efa5..4993b5768335aac437eba5c6754ef90a8ddd8a59 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2042,6 +2042,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 GGML_ABORT("CONV1D_FUSED has no CPU path (CUDA-only)");
+             } break;
++        case GGML_OP_BUILD_KQ_MASK:
++            {
++                GGML_ABORT("BUILD_KQ_MASK has no CPU path (CUDA-only)");
++            } break;
++        case GGML_OP_SSM_GATE_NORM:
++            {
++                GGML_ABORT("SSM_GATE_NORM has no CPU path (CUDA-only)");
++            } break;
+         case GGML_OP_FLASH_ATTN_BACK:
+             {
+                 int32_t t = ggml_get_op_params_i32(tensor, 0);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 194c87e2f5306b08c5431f2f1216e1d09100b0fc..1db9077634ea99ff4576f57b2d250d14a95e7c24 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -439,6 +439,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+         }
+     }
+ 
++    if (op->op == GGML_OP_BUILD_KQ_MASK || op->op == GGML_OP_SSM_GATE_NORM) return false;
++    if ((op->op == GGML_OP_SSM_SCAN && (op->src[7] || op->src[8])) || (op->op == GGML_OP_SSM_CONV && op->src[3])) {
++        return false; // packed Mamba operators currently have a CUDA implementation
++    }
+     switch (op->op) {
+         case GGML_OP_CONV1D_FUSED:
+         case GGML_OP_FUSED_ATTN:
+diff --git a/ggml/src/ggml-cuda/diagmask.cu b/ggml/src/ggml-cuda/diagmask.cu
+index 4b713ba22eb539980b41c8df71d109b0e3cc83ba..3277905a54e5b68c22aaab738b6fce7a5319f079 100644
+--- a/ggml/src/ggml-cuda/diagmask.cu
++++ b/ggml/src/ggml-cuda/diagmask.cu
+@@ -38,3 +38,63 @@ void ggml_cuda_op_diag_mask_inf(ggml_backend_cuda_context & ctx, ggml_tensor * d
+ 
+     diag_mask_inf_f32_cuda(src0_d, dst_d, ne00, nrows0, ne01, n_past, stream);
+ }
++
++// Each CTA writes a contiguous stripe of one query's mask. Only compact integer
++// metadata crosses PCIe; the dense FP16/F32 mask stays entirely on the device.
++template<typename T>
++static __global__ void build_kq_mask(const int32_t * pos, const uint32_t * seq,
++        const int32_t * query, T * out, int64_t nk) {
++    const int64_t k = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    const int q = blockIdx.y;
++    if (k >= nk) return;
++    const int qp = query[2*q], qs = query[2*q+1];
++    const bool visible = (seq[int64_t(qs/32)*nk+k] & (uint32_t(1) << (qs%32))) && pos[k] <= qp;
++    out[int64_t(q)*nk+k] = (T)(visible ? 0.0f : -INFINITY);
++}
++
++// Dense mask from the per-sequence cell lists (src[3] offsets, src[4] cells): row q is -inf except the cells of its
++// own sequence at or before its position. Needs no membership words, so the host does not upload them.
++static __global__ void build_kq_mask_lists(const int32_t * pos, const int32_t * query, const int32_t * seq_off,
++        const int32_t * seq_cells, half * out, int64_t nk) {
++    const int q = blockIdx.x;
++    const int qp = query[2*q], qs = query[2*q+1];
++    half * row = out + int64_t(q)*nk;
++    for (int64_t k = threadIdx.x; k < nk; k += blockDim.x) row[k] = half(-INFINITY);
++    __syncthreads();
++    const int b = seq_off[qs], e = seq_off[qs + 1];
++    for (int i = b + threadIdx.x; i < e; i += blockDim.x) {
++        const int c = seq_cells[i];
++        if (pos[c] <= qp) row[c] = half(0.0f);
++    }
++}
++
++void ggml_cuda_build_dense_kq_mask(const ggml_tensor * meta, half * out, cudaStream_t stream) {
++    if (meta->src[3] && meta->src[4]) {
++        build_kq_mask_lists<<<meta->ne[1], 256, 0, stream>>>((const int32_t *) meta->src[0]->data,
++            (const int32_t *) meta->src[2]->data, (const int32_t *) meta->src[3]->data,
++            (const int32_t *) meta->src[4]->data, out, meta->ne[0]);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++    const dim3 grid((meta->ne[0]+255)/256, meta->ne[1]);
++    build_kq_mask<<<grid, 256, 0, stream>>>((const int32_t *) meta->src[0]->data,
++            (const uint32_t *) meta->src[1]->data, (const int32_t *) meta->src[2]->data, out, meta->ne[0]);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_op_build_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 1) {
++        return; // metadata only, flash attention reads the sources
++    }
++    const dim3 grid((dst->ne[0]+255)/256, dst->ne[1]);
++    if (dst->type == GGML_TYPE_F16) {
++        build_kq_mask<<<grid, 256, 0, ctx.stream()>>>((const int32_t *) dst->src[0]->data,
++                (const uint32_t *) dst->src[1]->data, (const int32_t *) dst->src[2]->data,
++                (half *) dst->data, dst->ne[0]);
++    } else {
++        build_kq_mask<<<grid, 256, 0, ctx.stream()>>>((const int32_t *) dst->src[0]->data,
++                (const uint32_t *) dst->src[1]->data, (const int32_t *) dst->src[2]->data,
++                (float *) dst->data, dst->ne[0]);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/diagmask.cuh b/ggml/src/ggml-cuda/diagmask.cuh
+index 6cdbef17e3452e76107bb8a528f0be65e82f8109..41709f3894fb958c1b16ee86b0cff77c9067007c 100644
+--- a/ggml/src/ggml-cuda/diagmask.cuh
++++ b/ggml/src/ggml-cuda/diagmask.cuh
+@@ -3,3 +3,8 @@
+ #define CUDA_DIAG_MASK_INF_BLOCK_SIZE 32
+ 
+ void ggml_cuda_op_diag_mask_inf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_op_build_kq_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// Dense [n_kv, n_tokens] mask of a metadata-only mask node into out.
++void ggml_cuda_build_dense_kq_mask(const ggml_tensor * meta, half * out, cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7506524feb9f333c9633be9d78df88202701ae77..83f430f1ca777b53d8bafed8e24477259f96d473 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8,6 +8,7 @@
+ #include "ggml-cuda/add-id.cuh"
+ #include "ggml-cuda/arange.cuh"
+ #include "ggml-cuda/argmax.cuh"
++#include "ggml-cuda/ssm-gate-norm.cuh"
+ #include "ggml-cuda/argsort.cuh"
+ #include "ggml-cuda/binbcast.cuh"
+ #include "ggml-cuda/clamp.cuh"
+@@ -2449,6 +2450,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_MEAN:
+             ggml_cuda_op_mean(ctx, dst);
+             break;
++        case GGML_OP_BUILD_KQ_MASK:
++            ggml_cuda_op_build_kq_mask(ctx, dst);
++            break;
++        case GGML_OP_SSM_GATE_NORM:
++            ggml_cuda_op_ssm_gate_norm(ctx, dst);
++            break;
+         case GGML_OP_SSM_CONV:
+             ggml_cuda_op_ssm_conv(ctx, dst);
+             break;
+@@ -6199,7 +6206,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 return op->src[0]->ne[0] == 16 && op->src[0]->ne[1] == 1 && op->src[0]->ne[2] % 128 == 0 && op->src[4]->ne[1] == 1;
+             }
+         }
++        case GGML_OP_BUILD_KQ_MASK:
++            return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
++        case GGML_OP_SSM_GATE_NORM:
++            return op->type == GGML_TYPE_F32;
+         case GGML_OP_SSM_CONV: {
++            if (op->src[3]) return op->src[0]->type == GGML_TYPE_F32;
+             // assumes d_inner % threads == 0
+             return op->src[0]->ne[1] % 128 == 0;
+         }
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 1463169cf78bf875a8b3da98ae1c5798d77ab9ae..93f3a7f802237445c977375e40cb314914872590 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -2,6 +2,158 @@
+ #include "ssm-conv.cuh"
+ #include "unary.cuh"
+ 
++// Packed convolution: sequence boundaries are runtime data, not graph shapes.
++template <bool bias_silu>
++static __global__ void ssm_conv_ragged_f32(const float * x, const float * w, const float * states,
++        const int * offsets, float * y, int channels, int tokens, int sequences, int width, int stride,
++        const float * bias) {
++    const int ch = blockIdx.x*blockDim.x + threadIdx.x;
++    if (ch >= channels) return;
++    const int first = blockIdx.y*32;
++    int lo = 0, hi = sequences;
++    while (lo+1 < hi) { const int mid = (lo+hi)/2; if (offsets[mid] <= first) lo=mid; else hi=mid; }
++    int seq = lo;
++    for (int t = first; t < min(tokens, first+32); ++t) {
++        while (seq+1 < sequences && t >= offsets[seq+1]) ++seq;
++        const int local = t-offsets[seq];
++        float sum = 0;
++        for (int j = 0; j < width; ++j) {
++            const int pos = local+j-(width-1);
++            const float v = pos >= 0 ? x[(int64_t)(offsets[seq]+pos)*stride+ch]
++                : states[(seq*channels+ch)*(width-1)+pos+width-1];
++            sum += v*w[ch*width+j];
++        }
++        if constexpr (bias_silu) {
++            sum += bias[ch];
++            sum = sum / (1.0f + expf(-sum));
++        }
++        y[(int64_t)t*channels+ch] = sum;
++    }
++}
++
++// Final conv states (the last width-1 inputs of each sequence) into out[slot][seq] rows.
++static __global__ void ssm_conv_ragged_states(const float * x, const float * states, const int * offsets,
++        float * out, int channels, int sequences, int width, int stride, int K) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    const int D = channels*(width-1);
++    if (i >= K*sequences*D) return;
++    const int j = i % (width-1), ch = (i/(width-1)) % channels;
++    const int seq = (i/D) % sequences, slot = i/(D*sequences);
++    const int end = max(0, offsets[seq+1]-offsets[seq]-slot);
++    const int pos = end-(width-1)+j;
++    const float v = pos >= 0 ? x[(int64_t)(offsets[seq]+pos)*stride+ch]
++        : states[(seq*channels+ch)*(width-1)+pos+width-1];
++    out[i] = v;
++}
++
++// One token per sequence (decode): y and the shifted state window in one pass, state rows addressed by cell id
++// (read row ids[s], write row ids[n_seq + s]; pinned recurrent cells).
++template <bool bias_silu>
++static __global__ void ssm_conv_decode_inplace_f32(const float * __restrict__ x, int stride, const float * __restrict__ w,
++        float * rows, int64_t row_stride, const int * __restrict__ ids, const int * __restrict__ offsets, int n_seq,
++        int channels, float * __restrict__ y, const float * __restrict__ bias) {
++    constexpr int W = 4;
++    const int ch = blockIdx.x*blockDim.x + threadIdx.x, seq = blockIdx.y;
++    if (ch >= channels) return;
++    const int t = offsets[seq];
++    const float * src = rows + (int64_t) ids[seq]*row_stride + (int64_t) ch*(W-1);
++    float * dst = rows + (int64_t) ids[n_seq + seq]*row_stride + (int64_t) ch*(W-1);
++    const float s0 = src[0], s1 = src[1], s2 = src[2];
++    const float xt = x[(int64_t) t*stride + ch];
++    const float4 wv = *(const float4 *) (w + (int64_t) ch*W);
++    float sum = s0*wv.x + s1*wv.y + s2*wv.z + xt*wv.w;
++    if constexpr (bias_silu) {
++        sum += bias[ch];
++        sum = sum / (1.0f + expf(-sum));
++    }
++    y[(int64_t) t*channels + ch] = sum;
++    dst[0] = s1; dst[1] = s2; dst[2] = xt;
++}
++
++// MTP verify (serving mtp_replay): each sequence brings seg tokens. First commit the previous call's accepted inputs:
++// the window advances by adv = ids[2n + s] rows of the input history (hist row of the write cell, [MAXT][channels]).
++// Then y for the seg new tokens; their inputs replace the history and the stored window stays at the committed point.
++template <bool bias_silu>
++static __global__ void ssm_conv_verify_f32(const float * __restrict__ x, int stride, const float * __restrict__ w,
++        float * rows, int64_t row_stride, float * hist, int64_t hist_stride, int maxt, const int * __restrict__ ids,
++        const int * __restrict__ offsets, int n_seq, int channels, float * __restrict__ y, const float * __restrict__ bias) {
++    constexpr int W = 4;
++    const int ch = blockIdx.x*blockDim.x + threadIdx.x, seq = blockIdx.y;
++    if (ch >= channels) return;
++    const int rid = ids[seq], wid = ids[n_seq + seq], adv = rid == wid ? ids[2*n_seq + seq] : 0;
++    const float * src = rows + (int64_t) rid*row_stride + (int64_t) ch*(W-1);
++    float * dst = rows + (int64_t) wid*row_stride + (int64_t) ch*(W-1);
++    float * hrow = hist + (int64_t) wid*hist_stride + ch;
++    float s0 = src[0], s1 = src[1], s2 = src[2];
++    for (int k = 0; k < adv && k < maxt; ++k) { s0 = s1; s1 = s2; s2 = hrow[(int64_t) k*channels]; }
++    dst[0] = s0; dst[1] = s1; dst[2] = s2;
++    const float4 wv = *(const float4 *) (w + (int64_t) ch*W);
++    const int t0 = offsets[seq], seg = min(offsets[seq+1] - t0, maxt);
++    for (int i = 0; i < seg; ++i) {
++        const float xt = x[(int64_t) (t0 + i)*stride + ch];
++        float sum = s0*wv.x + s1*wv.y + s2*wv.z + xt*wv.w;
++        if constexpr (bias_silu) {
++            sum += bias[ch];
++            sum = sum / (1.0f + expf(-sum));
++        }
++        y[(int64_t) (t0 + i)*channels + ch] = sum;
++        hrow[(int64_t) i*channels] = xt;
++        s0 = s1; s1 = s2; s2 = xt;
++    }
++}
++
++static void ssm_conv_ragged_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const auto * x = dst->src[0], * w = dst->src[1], * state = dst->src[2], * offsets = dst->src[3];
++    if (ggml_get_op_params_i32(dst, 2) == 3) {  // MTP verify (ggml_ssm_conv_ragged_verify)
++        const int channels = x->ne[0], n_seq = offsets->ne[0]-1, width = w->ne[0], stride = x->nb[1]/sizeof(float);
++        const ggml_tensor * hist = dst->src[6], * ids = dst->src[5];
++        GGML_ASSERT(width == 4 && x->nb[0] == sizeof(float) && ids && ids->ne[0] == 3*n_seq && hist && hist->type == GGML_TYPE_F32);
++        const int maxt = (int) (hist->ne[0] / channels);
++        const dim3 grid((channels+127)/128, n_seq);
++        const bool bs = ggml_get_op_params_i32(dst, 1) == 1;
++        auto * fn = bs ? ssm_conv_verify_f32<true> : ssm_conv_verify_f32<false>;
++        fn<<<grid,128,0,ctx.stream()>>>((const float *)x->data, stride, (const float *)w->data, (float *)state->data,
++            state->nb[1]/sizeof(float), (float *)hist->data, hist->nb[1]/sizeof(float), maxt, (const int *)ids->data,
++            (const int *)offsets->data, n_seq, channels, (float *)dst->data, bs ? (const float *)dst->src[4]->data : nullptr);
++        return;
++    }
++    if (ggml_get_op_params_i32(dst, 2) == 2) {  // decode, in place (ggml_ssm_conv_ragged_inplace)
++        const int channels = x->ne[0], n_seq = offsets->ne[0]-1, width = w->ne[0], stride = x->nb[1]/sizeof(float);
++        GGML_ASSERT(width == 4 && x->ne[1] == n_seq && x->nb[0] == sizeof(float) && dst->src[5]);
++        const dim3 grid((channels+127)/128, n_seq);
++        const int64_t row_stride = state->nb[1]/sizeof(float);
++        const bool bs = ggml_get_op_params_i32(dst, 1) == 1;
++        auto * fn = bs ? ssm_conv_decode_inplace_f32<true> : ssm_conv_decode_inplace_f32<false>;
++        fn<<<grid,128,0,ctx.stream()>>>((const float *)x->data, stride, (const float *)w->data, (float *)state->data,
++            row_stride, (const int *)dst->src[5]->data, (const int *)offsets->data, n_seq, channels, (float *)dst->data,
++            bs ? (const float *)dst->src[4]->data : nullptr);
++        return;
++    }
++    const int channels=x->ne[0], tokens=x->ne[1], sequences=offsets->ne[0]-1, width=w->ne[0];
++    const int K=ggml_get_op_params_i32(dst, 0);
++    const int stride=x->nb[1]/sizeof(float);
++    GGML_ASSERT(x->nb[0] == sizeof(float) && ggml_is_contiguous(w) && ggml_is_contiguous(state));
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    const dim3 grid((channels+127)/128, (tokens+31)/32);
++    const bool bias_silu = ggml_get_op_params_i32(dst, 1) == 1;
++    GGML_ASSERT(!bias_silu || dst->src[4] != nullptr);
++    const float * bias = bias_silu ? (const float *) dst->src[4]->data : nullptr;
++    const float * xd = (const float *) x->data;
++    float * yd = (float *) dst->data;
++    if (bias_silu) {
++        ssm_conv_ragged_f32<true><<<grid,128,0,ctx.stream()>>>(xd,(const float *)w->data,
++            (const float *)state->data,(const int *)offsets->data,yd,channels,tokens,sequences,width,stride,bias);
++    } else {
++        ssm_conv_ragged_f32<false><<<grid,128,0,ctx.stream()>>>(xd,(const float *)w->data,
++            (const float *)state->data,(const int *)offsets->data,yd,channels,tokens,sequences,width,stride,nullptr);
++    }
++    const int count=K*sequences*channels*(width-1);
++    float * sout = (float *) dst->data + (size_t) channels*tokens;
++    ssm_conv_ragged_states<<<(count+255)/256,256,0,ctx.stream()>>>(xd,
++        (const float *)state->data,(const int *)offsets->data,sout,
++        channels,sequences,width,stride,K);
++}
++
+ template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
+                                     const float * bias_ptr,
+@@ -158,6 +310,12 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+ }
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
++    if (dst->src[3]) {
++        GGML_ASSERT(!silu_dst && !bias_add_node);
++        ssm_conv_ragged_cuda(ctx, dst);
++        return;
++    }
++
+     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
+     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+     const bool fuse_bias = bias_add_node != nullptr;
+diff --git a/ggml/src/ggml-cuda/ssm-gate-norm.cu b/ggml/src/ggml-cuda/ssm-gate-norm.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d23011d0e9a7544441f289fcbf5e535b3738c54
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ssm-gate-norm.cu
+@@ -0,0 +1,62 @@
++#include "ssm-gate-norm.cuh"
++
++// One block per (group, token): v = (y + x*D[head]) * silu(z); out = v * rsqrt(mean(v^2) + eps) * w.
++// Replaces mul, add, cont(z), swiglu, rms_norm and the weight mul of the unfused Mamba-2 output path.
++template <int NPT>
++static __global__ void ssm_gate_norm_f32(const float * __restrict__ y, const float * __restrict__ x,
++        const float * __restrict__ D, const float * __restrict__ z, const float * __restrict__ w,
++        float * __restrict__ out, const int head_dim, const int gs, const int64_t y_h, const int64_t y_t,
++        const int64_t x_h, const int64_t x_t, const int64_t z_h, const int64_t z_t, const int64_t o_t, const float eps) {
++    const int g = blockIdx.x;
++    const int64_t t = blockIdx.y;
++    float v[NPT];
++    float ss = 0.0f;
++#pragma unroll
++    for (int k = 0; k < NPT; ++k) {
++        const int c = g*gs + threadIdx.x + k*blockDim.x;
++        v[k] = 0.0f;
++        if (threadIdx.x + k*blockDim.x < gs) {
++            const int h = c / head_dim, p = c % head_dim;
++            const float zz = z[t*z_t + h*z_h + p];
++            const float val = (y[t*y_t + h*y_h + p] + x[t*x_t + h*x_h + p]*D[h]) * (zz / (1.0f + expf(-zz)));
++            v[k] = val;
++            ss += val*val;
++        }
++    }
++    ss = warp_reduce_sum(ss);
++    __shared__ float s_part[32];
++    const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
++    if (lane == 0) s_part[warp] = ss;
++    __syncthreads();
++    if (warp == 0) {
++        ss = lane < (int) (blockDim.x / WARP_SIZE) ? s_part[lane] : 0.0f;
++        ss = warp_reduce_sum(ss);
++        if (lane == 0) s_part[0] = ss;
++    }
++    __syncthreads();
++    const float scale = rsqrtf(s_part[0] / gs + eps);
++#pragma unroll
++    for (int k = 0; k < NPT; ++k) {
++        const int c = g*gs + threadIdx.x + k*blockDim.x;
++        if (threadIdx.x + k*blockDim.x < gs) out[t*o_t + c] = v[k] * scale * w[c];
++    }
++}
++
++void ggml_cuda_op_ssm_gate_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * y = dst->src[0], * x = dst->src[1], * D = dst->src[2], * z = dst->src[3], * w = dst->src[4];
++    const int n_group = ggml_get_op_params_i32(dst, 0);
++    const float eps = ggml_get_op_params_f32(dst, 1);
++    const int head_dim = (int) y->ne[0], n_head = (int) y->ne[1];
++    const int64_t T = y->ne[2];
++    const int gs = head_dim*n_head / n_group;
++    const int threads = 256;
++    GGML_ASSERT(gs <= threads*4);
++    const dim3 grid(n_group, (unsigned) T);
++    const auto e = [](const ggml_tensor * t, int i) { return (int64_t) (t->nb[i] / sizeof(float)); };
++#define LAUNCH(NPT) ssm_gate_norm_f32<NPT><<<grid, threads, 0, ctx.stream()>>>((const float *) y->data, \
++        (const float *) x->data, (const float *) D->data, (const float *) z->data, (const float *) w->data, \
++        (float *) dst->data, head_dim, gs, e(y,1), e(y,2), e(x,1), e(x,2), e(z,1), e(z,2), e(dst,1), eps)
++    if (gs <= threads) { LAUNCH(1); } else if (gs <= 2*threads) { LAUNCH(2); } else { LAUNCH(4); }
++#undef LAUNCH
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/ssm-gate-norm.cuh b/ggml/src/ggml-cuda/ssm-gate-norm.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d171068feb1ef99beecbf2b599f8eeb08c75a56
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ssm-gate-norm.cuh
+@@ -0,0 +1,4 @@
++#pragma once
++#include "common.cuh"
++
++void ggml_cuda_op_ssm_gate_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index 40cb38dee759cc34135bfb9132f5201d60351588..ff53ebbe6155aa12f7a901f93f5673aab0f8a65c 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -8,6 +8,8 @@ using namespace cub;
+ #endif // USE_CUB
+ 
+ #include "ssm-scan.cuh"
++#include "ssm-ssd-ragged.cuh"
++#include "convert.cuh"
+ 
+ 
+ // Minimum number of tokens to use SSD (State Space Duality) matmul path instead of scan path.
+@@ -140,45 +142,49 @@ __global__ void __launch_bounds__(splitD, 1)
+ #endif // __clang__
+ 
+ // assumes as many threads as d_state
+-template <int c_factor, int d_state>
++template <int c_factor, int d_state, typename TI, typename TO>
+ __global__ void __launch_bounds__(d_state, 1)
+     ssm_scan_f32_group(
+-        const float * src0_ptr, const float * src1_ptr, const float * src2_ptr,
++        const TI * src0_ptr, const float * src1_ptr, const float * src2_ptr,
+         const float * src3_ptr, const float * src4_ptr, const float * src5_ptr,
+         const int32_t * src6_ptr, float * dst_ptr,
+         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
+         const int src2_nb1, const int src2_nb2, const int src3_nb1,
+         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+-        const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K) {
+-    const float   * GGML_CUDA_RESTRICT src0 = src0_ptr;
+-    const float   * GGML_CUDA_RESTRICT src1 = src1_ptr;
++        const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K, const int32_t * offsets, TO * state_out, int64_t snapshot_stride, const int skip_len, const int64_t out_row,
++        const int32_t * wids) {
++    const TI      * GGML_CUDA_RESTRICT src0 = src0_ptr;
++    const float      * GGML_CUDA_RESTRICT src1 = src1_ptr;
+     const float   * GGML_CUDA_RESTRICT src2 = src2_ptr;
+     const float   * GGML_CUDA_RESTRICT src3 = src3_ptr;
+-    const float   * GGML_CUDA_RESTRICT src4 = src4_ptr;
+-    const float   * GGML_CUDA_RESTRICT src5 = src5_ptr;
++    const float      * GGML_CUDA_RESTRICT src4 = src4_ptr;
++    const float      * GGML_CUDA_RESTRICT src5 = src5_ptr;
+     const int32_t * GGML_CUDA_RESTRICT src6 = src6_ptr;
+-    float         * GGML_CUDA_RESTRICT dst  = dst_ptr;
++    float            * GGML_CUDA_RESTRICT dst  = dst_ptr;
+ 
+     const int warp     = threadIdx.x / WARP_SIZE;
+     const int lane     = threadIdx.x % WARP_SIZE;
+     const int warp_idx = blockIdx.x  * c_factor + warp;
+ 
+     const int head_idx =  warp_idx / d_head;
+-    const int head_off = (warp_idx % d_head) * sizeof(float);
++    const int head_p   = warp_idx % d_head;
+     const int seq_idx  = blockIdx.y;
++    const int64_t start = offsets ? offsets[seq_idx] : seq_idx*n_tok;
++    const int64_t length = offsets ? offsets[seq_idx+1]-start : n_tok;
++    if (skip_len > 0 && length >= skip_len) return; // done by chunked SSD
+ 
+     const int group_off = (head_idx / (n_head / n_group)) * d_state * sizeof(float);
+ 
+     ggml_cuda_pdl_sync();
+     // TODO: refactor strides to be in elements/floats instead of bytes to be cleaner and consistent with the rest of the codebase
+-    const float * s0_warp = (const float *) ((const char *) src0 + src6[seq_idx] * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+-    const float * x_warp  = (const float *) ((const char *) src1 + (seq_idx * src1_nb3) + (warp_idx * sizeof(float)));
+-    const float * dt_warp = (const float *) ((const char *) src2 + (seq_idx * src2_nb2) + head_idx * sizeof(float));
++    const TI *    s0_warp = (const TI *) ((const char *) src0 + int64_t(src6 ? src6[seq_idx] : seq_idx) * src0_nb3 + head_idx * src0_nb2) + int64_t(head_p) * d_state;
++    const float *    x_warp  = (const float *) ((const char *) src1 + (offsets ? start * src1_nb2 : seq_idx * src1_nb3) + (warp_idx * sizeof(float)));
++    const float * dt_warp = (const float *) ((const char *) src2 + (offsets ? start * src2_nb1 : seq_idx * src2_nb2) + head_idx * sizeof(float));
+     const float * A_warp  = (const float *) ((const char *) src3 + head_idx * src3_nb1);
+-    const float * B_warp  = (const float *) ((const char *) src4 + (seq_idx * src4_nb3) + (group_off));
+-    const float * C_warp  = (const float *) ((const char *) src5 + (seq_idx * src5_nb3) + (group_off));
+-    float *       y_warp  = dst + (seq_idx * n_tok * n_head * d_head) + warp_idx;
+-    float *       s_warp  = (float *) ((char *) dst + s_off + seq_idx * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
++    const float *    B_warp  = (const float *) ((const char *) src4 + (offsets ? start * src4_nb2 : seq_idx * src4_nb3) + (group_off));
++    const float *    C_warp  = (const float *) ((const char *) src5 + (offsets ? start * src5_nb2 : seq_idx * src5_nb3) + (group_off));
++    float *          y_warp  = dst + (start * n_head * d_head) + warp_idx;
++    TO *          s_warp  = state_out + int64_t(wids ? wids[seq_idx] : seq_idx) * out_row + (int64_t(head_idx) * d_head + head_p) * d_state;
+ 
+     // strides across n_seq_tokens
+     const int stride_x  = src1_nb2 / sizeof(float);
+@@ -191,22 +197,30 @@ __global__ void __launch_bounds__(d_state, 1)
+     float state_sum = 0.0f;
+ 
+ #pragma unroll
+-    for (int j = 0; j < c_factor; j++) {
+-        state[j] = s0_warp[WARP_SIZE * j + lane];
++    for (int j = 0; j < c_factor; j++) state[j] = ggml_cuda_cast<float>(s0_warp[WARP_SIZE * j + lane]);
++
++    // Snapshots preceding this segment retain its initial state. Verification
++    // segments keep their complete rollback tail, but short prefills need every
++    // allocated output slot initialized as well.
++    if (offsets) {
++        for (int64_t slot = length; slot < K; ++slot) {
++            TO * out = s_warp + slot*snapshot_stride;
++            for (int j = 0; j < c_factor; ++j) out[WARP_SIZE*j+lane] = ggml_cuda_cast<TO>(state[j]);
++        }
+     }
+ 
+-    for (int64_t i = 0; i < n_tok; i++) {
++    for (int64_t i = 0; i < length; i++) {
+         // NOTE: dt_soft_plus, dA and x_dt have the same value for a warp here.
+         // Recalculation is intentional; sharing via shuffles/smem proved slower due to sync overhead.
+         const float dt_soft_plus = (dt_warp[i * stride_dt] <= 20.0f ? log1pf(expf(dt_warp[i * stride_dt])) : dt_warp[i * stride_dt]);
+ 
+         state_sum = 0.0f;
+         const float dA   = expf(dt_soft_plus * A_warp[0]);
+-        const float x_dt = x_warp[i * stride_x] * dt_soft_plus;
++        const float x_dt = ggml_cuda_cast<float>(x_warp[i * stride_x]) * dt_soft_plus;
+ #pragma unroll
+         for (int j = 0; j < c_factor; j++) {
+-            const float B_val = B_warp[i * stride_B + WARP_SIZE * j + lane];
+-            const float C_val = C_warp[i * stride_C + WARP_SIZE * j + lane];
++            const float B_val = ggml_cuda_cast<float>(B_warp[i * stride_B + WARP_SIZE * j + lane]);
++            const float C_val = ggml_cuda_cast<float>(C_warp[i * stride_C + WARP_SIZE * j + lane]);
+             state[j] = (state[j] * dA) + (B_val * x_dt);
+             state_sum += state[j] * C_val;
+         }
+@@ -215,16 +229,16 @@ __global__ void __launch_bounds__(d_state, 1)
+         state_sum = warp_reduce_sum(state_sum);
+ 
+         if (lane == 0) {
+-            y_warp[i * stride_y] = state_sum;
++            y_warp[i * stride_y] = ggml_cuda_cast<float>(state_sum);
+         }
+ 
+         // Slot 0 is the final state written below; slots 1..K-1 are rollback snapshots.
+-        const int64_t slot = n_tok - 1 - i;
++        const int64_t slot = length - 1 - i;
+         if (K > 1 && slot > 0 && slot < K) {
+-            float * s_snapshot_warp = (float *) ((char *) dst + s_off + (slot * gridDim.y + seq_idx) * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
++            TO * s_snapshot_warp = s_warp + slot*snapshot_stride;
+ #pragma unroll
+             for (int j = 0; j < c_factor; j++) {
+-                s_snapshot_warp[WARP_SIZE * j + lane] = state[j];
++                s_snapshot_warp[WARP_SIZE * j + lane] = ggml_cuda_cast<TO>(state[j]);
+             }
+         }
+     }
+@@ -232,17 +246,20 @@ __global__ void __launch_bounds__(d_state, 1)
+     // write back the state
+ #pragma unroll
+     for (int j = 0; j < c_factor; j++) {
+-        s_warp[WARP_SIZE * j + lane] = state[j];
++        s_warp[WARP_SIZE * j + lane] = ggml_cuda_cast<TO>(state[j]);
+     }
+ }
+ 
+-static void ssm_scan_f32_cuda(const float * src0, const float * src1, const float * src2, const float * src3,
++template <typename TI, typename TO>
++static void ssm_scan_f32_cuda(const TI * src0, const float * src1, const float * src2, const float * src3,
+                               const float * src4, const float * src5, const int32_t * src6, float * dst,
+                               const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3, const int src2_nb1,
+                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
+                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
+                               const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
+-                              const int64_t K, cudaStream_t stream) {
++                              const int64_t K, const int32_t * offsets, TO * state_out, int64_t snapshot_stride, cudaStream_t stream, int skip_len = 0,
++                              int64_t out_row = 0, const int32_t * wids = nullptr) {
++    if (out_row == 0) out_row = n_head * head_dim * d_state;
+     // NOTE: if you change conditions here, be sure to update the corresponding supports_op condition!
+     if (src3_nb1 == sizeof(float)) {
+         // Mamba-2
+@@ -252,24 +269,24 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
+ 
+             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+-            ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
++            ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128, TI, TO>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, offsets, state_out, snapshot_stride, skip_len, out_row, wids);
+         } else if (d_state == 256) { // Falcon-H1
+             constexpr int threads   = 256;
+             constexpr int num_warps = threads/WARP_SIZE;
+ 
+             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+-            ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
++            ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256, TI, TO>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K);
++                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok, K, offsets, state_out, snapshot_stride, skip_len, out_row, wids);
+         } else {
+             GGML_ABORT("doesn't support d_state!=(128 or 256).");
+         }
+-    } else {
++    } else if constexpr (std::is_same_v<TI, float> && std::is_same_v<TO, float>) {
+         // Mamba-1
+         GGML_ASSERT(K == 1);
+         constexpr int threads = 128;
+@@ -764,6 +781,320 @@ static void ssm_scan_ssd_f32_cuda(
+ }
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ 
++// ---- ReplaySSM decode (serving mtp_replay) ----------------------------------------------------------------------
++// Row layout (F16 elements): state [H][P][N] | pos[H] | dt[L][H] (F32) | x[L][H*P] | B[L][G*N].
++// One block per (sequence, head). The state h0 is a checkpoint: each step appends (x, softplus(dt), B) and computes
++// y = exp(sum dA) * C.h0 + sum_k exp(sum_{m>k} dA_m) dt_k (C.B_k) x_k; h0 is rewritten only every L tokens.
++static __global__ void ssm_replay_reset_pos(half * rows, int64_t row, int64_t S, const int32_t * wids) {
++    rows[(wids ? wids[blockIdx.x] : blockIdx.x) * row + S + threadIdx.x] = __float2half(0.0f);
++}
++
++template <int L>
++static __global__ void __launch_bounds__(128) ssm_replay_f16(
++        half * __restrict__ rows, const int64_t row_stride, const int64_t S,
++        const float * __restrict__ x, const int64_t x_tok, const float * __restrict__ dt, const int64_t dt_tok,
++        const float * __restrict__ A, const int64_t A_h, const float * __restrict__ B, const int64_t B_tok,
++        const float * __restrict__ C, const int64_t C_tok, const int32_t * __restrict__ offsets,
++        float * __restrict__ y, const int H, const int G, const int32_t * __restrict__ wids) {
++    constexpr int P = 64, N = 128;
++    const int seq = blockIdx.x, h = blockIdx.y, g = h / (H / G);
++    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE;
++    const int64_t t = offsets[seq];
++    half * row = rows + (int64_t) (wids ? wids[seq] : seq) * row_stride;  // pinned cells: the row is the sequence's cell
++    half * h0 = row + (int64_t) h * P * N;
++    half * pos = row + S;
++    float * dtc = (float *) (row + S + H);
++    half * xc = row + S + H + 2 * L * H;
++    half * bc = xc + (int64_t) L * H * P;
++
++    __shared__ float s_C[N], s_Bt[N], s_dt[L], s_cb[L], s_coef[L], s_dd[L], s_y[P], s_total;
++    __shared__ int s_j;
++    const float a = A[h * A_h];
++    if (tid == 0) s_j = (int) __half2float(pos[h]);
++    s_C[tid] = C[t * C_tok + g * N + tid];
++    s_Bt[tid] = B[t * B_tok + g * N + tid];
++    __syncthreads();
++    const int j = s_j;
++    if (tid == 0) {
++        float d = dt[t * dt_tok + h];
++        s_dt[j] = d <= 20.0f ? log1pf(expf(d)) : d;
++    }
++    if (tid < j) s_dt[tid] = dtc[tid * H + h];
++    for (int k = warp; k <= j; k += 4) {
++        float acc = 0.0f;
++        for (int n = lane; n < N; n += WARP_SIZE) {
++            const float bk = k < j ? __half2float(bc[(int64_t) k * G * N + g * N + n]) : s_Bt[n];
++            acc += bk * s_C[n];
++        }
++        acc = warp_reduce_sum(acc);
++        if (lane == 0) s_cb[k] = acc;
++    }
++    __syncthreads();
++    if (tid == 0) {
++        float dec = 1.0f;  // exp(sum_{m=k+1..j} dA_m)
++        for (int k = j; k >= 0; --k) {
++            s_dd[k] = dec * s_dt[k];
++            s_coef[k] = s_dd[k] * s_cb[k];
++            dec *= expf(s_dt[k] * a);
++        }
++        s_total = dec;
++    }
++    __syncthreads();
++    const float xt = tid < P ? x[t * x_tok + h * P + tid] : 0.0f;
++    if (tid < P) {
++        float acc = s_coef[j] * xt;
++        for (int k = 0; k < j; ++k) acc += s_coef[k] * __half2float(xc[(int64_t) k * H * P + h * P + tid]);
++        s_y[tid] = acc;
++        xc[(int64_t) j * H * P + h * P + tid] = __float2half(xt);
++    }
++    bc[(int64_t) j * G * N + g * N + tid] = __float2half(s_Bt[tid]);  // identical values from every head of the group
++    if (tid == 0) dtc[j * H + h] = s_dt[j];
++    __syncthreads();
++    const float total = s_total;
++    // 16-byte loads: half a warp per checkpoint row (N = 128 halves), two rows per warp per iteration
++    const int l16 = lane & 15;
++#pragma unroll
++    for (int it = 0; it < P / 8; ++it) {
++        const int p = warp * (P / 4) + it * 2 + (lane >> 4);
++        float acc = 0.0f;
++        const uint4 v = ((const uint4 *) (h0 + (int64_t) p * N))[l16];
++        const half2 * hv = (const half2 *) &v;
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            const float2 f = __half22float2(hv[q]);
++            const int n = l16 * 8 + q * 2;
++            acc += f.x * s_C[n] + f.y * s_C[n + 1];
++        }
++#pragma unroll
++        for (int off = 8; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
++        if (l16 == 0) y[t * H * P + h * P + p] = total * acc + s_y[p];
++    }
++    if (j == L - 1) {
++        __shared__ float s_xk[L][P], s_bk[L][N];
++        __syncthreads();
++        for (int i = tid; i < L * P; i += blockDim.x) s_xk[i / P][i % P] = __half2float(xc[(int64_t) (i / P) * H * P + h * P + i % P]);
++        for (int k = 0; k < L; ++k) s_bk[k][tid] = k < j ? __half2float(bc[(int64_t) k * G * N + g * N + tid]) : s_Bt[tid];
++        __syncthreads();
++        for (int e = tid; e < P * N; e += blockDim.x) {
++            const int p = e / N, n = e % N;
++            float v;
++            v = total * __half2float(h0[e]);
++#pragma unroll
++            for (int k = 0; k < L; ++k) v += s_dd[k] * s_xk[k][p] * s_bk[k][n];
++            h0[e] = __float2half(v);
++        }
++        if (tid == 0) pos[h] = __float2half(0.0f);
++    } else if (tid == 0) {
++        pos[h] = __float2half((float) (j + 1));
++    }
++}
++
++
++// ---- ReplaySSM verify (serving mtp_replay: speculative decoding with native rollback) ------------------------------
++// Each sequence brings seg <= MAXT tokens (last accepted token + drafts). Committed cache entries: j = pos[h] + adv[s]
++// (adv = rows of the previous call the host accepted). If j + seg > L the committed entries are folded into the
++// checkpoint first (j = 0). The seg new entries are appended at [j, j + seg) but stay uncommitted (pos[h] = j), so a
++// rejected draft costs nothing: the next call's adv simply does not cover it and the slots are overwritten.
++// y_i = exp(cum[e]) C_i.h0 + sum_{k<=e} exp(cum[e]-cum[k]) dt_k (C_i.B_k) x_k with e = j + i, cum = prefix sums of dt*A.
++// Fold pass of the verify step: sequences whose committed entries plus this step's tokens overflow the cache fold the
++// committed entries into the checkpoint here (a separate kernel keeps the verify kernel's register count low), and
++// store pos = -adv so the verify kernel's j = pos + adv starts at 0.
++template <int L>
++static __global__ void __launch_bounds__(128) ssm_replay_fold(
++        half * __restrict__ rows, const int64_t row_stride, const int64_t S, const float * __restrict__ A,
++        const int64_t A_h, const int32_t * __restrict__ offsets, const int H, const int G, const int32_t * __restrict__ ids,
++        const int n_seq, const int maxt) {
++    constexpr int P = 64, N = 128;
++    const int seq = blockIdx.x, h = blockIdx.y, g = h / (H / G);
++    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE;
++    const int seg = min((int) (offsets[seq + 1] - offsets[seq]), maxt);
++    const int rid = ids[seq], wid = ids[n_seq + seq], adv = ids[2 * n_seq + seq];
++    if (rid != wid) return;
++    half * row = rows + (int64_t) wid * row_stride;
++    half * h0 = row + (int64_t) h * P * N;
++    half * pos = row + S;
++    const int j = min(max((int) __half2float(pos[h]) + adv, 0), L);
++    if (j + seg <= L) return;
++    const float * dtc = (const float *) (row + S + H);
++    const half * xc = row + S + H + 2 * L * H;
++    const half * bc = xc + (int64_t) L * H * P;
++    const float a = A[h * A_h];
++    __shared__ float s_x[L][P];  // dd_k * x_k[p]
++    __shared__ float s_dd[L], s_d[L], s_tot;
++    if (tid < j) s_d[tid] = dtc[tid * H + h];  // parallel loads; the scan below runs on shared memory
++    __syncthreads();
++    if (tid == 0) {
++        float dec = 1.0f;  // exp(sum_{m=k+1..j-1} dA_m)
++        for (int k = j - 1; k >= 0; --k) {
++            s_dd[k] = dec * s_d[k];
++            dec *= __expf(s_d[k] * a);
++        }
++        s_tot = dec;
++    }
++    __syncthreads();
++    for (int i = tid; i < j * P; i += blockDim.x) {
++        const int k = i / P, p = i % P;
++        s_x[k][p] = s_dd[k] * __half2float(xc[(int64_t) k * H * P + h * P + p]);
++    }
++    // B_k columns of this lane (4 consecutive n), 8-byte loads
++    float bk[L][4];
++#pragma unroll
++    for (int k = 0; k < L; ++k) {
++        if (k < j) {
++            const uint2 v = *(const uint2 *) (bc + (int64_t) k * G * N + g * N + lane * 4);
++            const half2 * hh = (const half2 *) &v;
++            const float2 f0 = __half22float2(hh[0]), f1 = __half22float2(hh[1]);
++            bk[k][0] = f0.x; bk[k][1] = f0.y; bk[k][2] = f1.x; bk[k][3] = f1.y;
++        } else {
++            bk[k][0] = bk[k][1] = bk[k][2] = bk[k][3] = 0.0f;
++        }
++    }
++    __syncthreads();
++    const float total = s_tot;
++    // all of this warp's checkpoint rows are loaded up front (independent loads in flight)
++    constexpr int RPW = P / 4;
++#pragma unroll
++    for (int r = 0; r < RPW; ++r) {
++        const int p = warp + 4 * r;
++        float v[4];
++#pragma unroll
++        for (int q = 0; q < 4; ++q) v[q] = total * __half2float(h0[(int64_t) p * N + lane * 4 + q]);
++#pragma unroll
++        for (int k = 0; k < L; ++k) {
++            const float xk = k < j ? s_x[k][p] : 0.0f;
++#pragma unroll
++            for (int q = 0; q < 4; ++q) v[q] += xk * bk[k][q];
++        }
++#pragma unroll
++        for (int q = 0; q < 4; ++q) h0[(int64_t) p * N + lane * 4 + q] = __float2half(v[q]);
++    }
++    __syncthreads();
++    if (tid == 0) pos[h] = __float2half((float) -adv);
++}
++
++template <int L, int MAXT>
++static __global__ void __launch_bounds__(128) ssm_replay_verify(
++        half * __restrict__ rows, const int64_t row_stride, const int64_t S,
++        const float * __restrict__ x, const int64_t x_tok, const float * __restrict__ dt, const int64_t dt_tok,
++        const float * __restrict__ A, const int64_t A_h, const float * __restrict__ B, const int64_t B_tok,
++        const float * __restrict__ C, const int64_t C_tok, const int32_t * __restrict__ offsets,
++        float * __restrict__ y, const int H, const int G, const int32_t * __restrict__ ids, const int n_seq) {
++    constexpr int P = 64, N = 128;
++    const int seq = blockIdx.x, h = blockIdx.y, g = h / (H / G);
++    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE;
++    const int64_t t0 = offsets[seq];
++    const int seg = min((int) (offsets[seq + 1] - t0), MAXT);
++    const int rid = ids[seq], wid = ids[n_seq + seq], adv = ids[2 * n_seq + seq];
++    half * row = rows + (int64_t) wid * row_stride;
++    half * h0 = row + (int64_t) h * P * N;
++    half * pos = row + S;
++    float * dtc = (float *) (row + S + H);
++    half * xc = row + S + H + 2 * L * H;
++    half * bc = xc + (int64_t) L * H * P;
++    const float a = A[h * A_h];
++
++    // ~5 KB of shared memory at MAXT = 4 (occupancy: the kernel is a state-streaming one)
++    __shared__ float s_C[MAXT][N], s_Bn[MAXT][N], s_ch[MAXT][P];
++    __shared__ float s_dt[L], s_cum[L], s_coef[MAXT][L], s_dtn[MAXT], s_tot[MAXT];
++    __shared__ int s_j;
++
++    if (tid == 0) {
++        const int j = rid == wid ? (int) __half2float(pos[h]) + adv : 0;  // a fresh cell (read row != write row) starts empty
++        s_j = min(max(j, 0), L);
++    }
++    __syncthreads();
++    int j = s_j;
++
++    if (rid != wid) {
++        // fresh cell: zero checkpoint (the cache entries are unused at j = 0)
++        for (int e = tid; e < P * N; e += blockDim.x) h0[e] = __float2half(0.0f);
++        __syncthreads();
++    }
++
++    for (int i = 0; i < seg; ++i) {
++        s_C[i][tid]  = C[(t0 + i) * C_tok + g * N + tid];
++        s_Bn[i][tid] = B[(t0 + i) * B_tok + g * N + tid];
++    }
++    if (tid < seg) {
++        const float d = dt[(t0 + tid) * dt_tok + h];
++        s_dtn[tid] = d <= 20.0f ? log1pf(expf(d)) : d;
++    }
++    __syncthreads();
++    // dt over the window [0, j + seg): committed entries from the cache, then the new tokens
++    const int E = j + seg;
++    if (tid < j) s_dt[tid] = dtc[tid * H + h];
++    else if (tid < E) s_dt[tid] = s_dtn[tid - j];
++    __syncthreads();
++    if (tid == 0) {
++        float c = 0.0f;
++        for (int k = 0; k < E; ++k) { c += s_dt[k] * a; s_cum[k] = c; }
++    }
++    // coef[i][k] = exp(cum[e]-cum[k]) dt_k (C_i.B_k) for k <= e = j + i (one warp per pair for the dot product)
++    for (int pr = warp; pr < seg * E; pr += 4) {
++        const int i = pr / E, k = pr % E;
++        float acc = 0.0f;
++        if (k <= j + i) {
++            for (int n = lane; n < N; n += WARP_SIZE) {
++                const float bkv = k < j ? __half2float(bc[(int64_t) k * G * N + g * N + n]) : s_Bn[k - j][n];
++                acc += bkv * s_C[i][n];
++            }
++            acc = warp_reduce_sum(acc);
++        }
++        __syncwarp();
++        if (lane == 0) s_coef[i][k] = acc;  // C.B for now, scaled below
++    }
++    __syncthreads();
++    for (int t = tid; t < seg * E; t += blockDim.x) {  // seg * E exceeds the block from MAXT 9 (E <= L)
++        const int i = t / E, k = t % E;
++        s_coef[i][k] = k <= j + i ? expf(s_cum[j + i] - s_cum[k]) * s_dt[k] * s_coef[i][k] : 0.0f;
++    }
++    if (tid < seg) s_tot[tid] = expf(s_cum[j + tid]);
++
++    // C_i . h0 (16 lanes per state row, two rows per warp per iteration): the checkpoint is read once for all tokens
++    const int l16 = lane & 15;
++#pragma unroll 2
++    for (int it = 0; it < P / 8; ++it) {
++        const int p = warp * (P / 4) + it * 2 + (lane >> 4);
++        float hv[8];
++        const uint4 v = ((const uint4 *) (h0 + (int64_t) p * N))[l16];
++        const half2 * hh = (const half2 *) &v;
++#pragma unroll
++        for (int q = 0; q < 4; ++q) { const float2 f = __half22float2(hh[q]); hv[2*q] = f.x; hv[2*q+1] = f.y; }
++#pragma unroll
++        for (int i = 0; i < MAXT; ++i) {
++            float acc = 0.0f;
++            if (i < seg) {
++#pragma unroll
++                for (int q = 0; q < 8; ++q) acc += hv[q] * s_C[i][l16 * 8 + q];
++            }
++#pragma unroll
++            for (int off = 8; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
++            if (l16 == 0 && i < seg) s_ch[i][p] = acc;
++        }
++    }
++    __syncthreads();
++    if (tid < P) {
++        float yx[MAXT];
++#pragma unroll
++        for (int i = 0; i < MAXT; ++i) yx[i] = 0.0f;
++        for (int k = 0; k < E; ++k) {
++            const float xk = k < j ? __half2float(xc[(int64_t) k * H * P + h * P + tid]) : x[(t0 + k - j) * x_tok + h * P + tid];
++#pragma unroll
++            for (int i = 0; i < MAXT; ++i) yx[i] += i < seg ? s_coef[i][k] * xk : 0.0f;
++        }
++#pragma unroll
++        for (int i = 0; i < MAXT; ++i) {
++            if (i < seg) {
++                y[(t0 + i) * H * P + h * P + tid] = s_tot[i] * s_ch[i][tid] + yx[i];
++                xc[(int64_t) (j + i) * H * P + h * P + tid] = __float2half(x[(t0 + i) * x_tok + h * P + tid]);
++            }
++        }
++    }
++    for (int i = 0; i < seg; ++i) bc[(int64_t) (j + i) * G * N + g * N + tid] = __float2half(s_Bn[i][tid]);
++    if (tid < seg) dtc[(j + tid) * H + h] = s_dtn[tid];
++    if (tid == 0) pos[h] = __float2half((float) j);  // the new entries stay uncommitted until the next call's adv
++}
++
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const struct ggml_tensor * src0 = dst->src[0];  // s
+     const struct ggml_tensor * src1 = dst->src[1];  // x
+@@ -778,36 +1109,77 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t nh  = src1->ne[1];  // n_head
+     const int64_t ng  = src4->ne[1];  // n_group
+     const int64_t n_t = src1->ne[2];  // number of tokens per sequence
+-    const int64_t n_s = src1->ne[3];  // number of sequences in the batch
++    const int64_t n_s = dst->src[7] ? dst->src[7]->ne[0]-1 : src1->ne[3];  // packed or equal sequences
+     const int32_t K_param = ggml_get_op_params_i32(dst, 0);
+     const int64_t K = K_param > 0 ? K_param : 1;
+ 
+     const int64_t s_off = ggml_nelements(src1) * sizeof(float);
+ 
+-    GGML_ASSERT(ggml_nelements(src1) + K*nc*nr*nh*n_s == ggml_nelements(dst));
+-    GGML_ASSERT(src0->nb[0] == sizeof(float));
++    GGML_ASSERT(ggml_nelements(src1) + (dst->src[8] ? 0 : K*nc*nr*nh*n_s) == ggml_nelements(dst));
++    GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+     GGML_ASSERT(src1->nb[0] == sizeof(float));
+     GGML_ASSERT(src2->nb[0] == sizeof(float));
+     GGML_ASSERT(src3->nb[0] == sizeof(float));
+     GGML_ASSERT(src4->nb[0] == sizeof(float));
+     GGML_ASSERT(src5->nb[0] == sizeof(float));
+-    GGML_ASSERT(src6->nb[0] == sizeof(int32_t));
++    GGML_ASSERT(!src6 || src6->nb[0] == sizeof(int32_t));
+     GGML_ASSERT(src3->ne[0] == 1 || K == 1);
+ 
+-    const float * src0_d = (const float *) src0->data;
++    const float * src0_d = src0->type == GGML_TYPE_F32 ? (const float *) src0->data : nullptr; // F32-only paths
+     const float * src1_d = (const float *) src1->data;
+     const float * src2_d = (const float *) src2->data;
+     const float * src3_d = (const float *) src3->data;
+     const float * src4_d = (const float *) src4->data;
+     const float * src5_d = (const float *) src5->data;
+-    const int32_t * src6_d = (const int32_t *) src6->data;
++    const int32_t * src6_d = src6 ? (const int32_t *) src6->data : nullptr;
+     float *       dst_d  = (float *) dst->data;
+     cudaStream_t  stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT(src6->type == GGML_TYPE_I32);
++    const ggml_tensor * sdst = dst->src[8];
++    // op_params[4] (pinned recurrent cells): ids holds [read cells | write cells]; states are written to their cell rows
++    const int32_t * wids = ggml_get_op_params_i32(dst, 4) ? src6_d + n_s : nullptr;
++    GGML_ASSERT(!wids || (sdst && K == 1));
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
++    GGML_ASSERT(!sdst || sdst->type == GGML_TYPE_F32 || sdst->type == GGML_TYPE_F16);
++    const bool f32_state = src0->type == GGML_TYPE_F32 && (!sdst || sdst->type == GGML_TYPE_F32);
++    GGML_ASSERT(!src6 || src6->type == GGML_TYPE_I32);
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+ 
++    if (ggml_get_op_params_i32(dst, 3) > 0 && ggml_get_op_params_i32(dst, 5) > 0) {
++        // MTP verify: ids = [read | write | accepted rows of the previous call] (serving mtp_replay)
++        constexpr int L = 16;
++        const int maxt = ggml_get_op_params_i32(dst, 5);
++        GGML_ASSERT(ggml_get_op_params_i32(dst, 3) == L && maxt <= L && K == 1 && sdst &&
++                    sdst->type == GGML_TYPE_F16 && nc == 128 && nr == 64 && dst->src[7] && src3->nb[1] == sizeof(float) &&
++                    src6 && src6->ne[0] == 3 * n_s);
++        GGML_ASSERT(sdst->nb[1] >= (size_t) (nc*nr*nh + nh + 2*L*nh + L*nh*nr + L*ng*nc) * sizeof(half));
++        const dim3 grid((unsigned) n_s, (unsigned) nh);
++        ssm_replay_fold<L><<<grid, 128, 0, stream>>>((half *) sdst->data, (int64_t) (sdst->nb[1] / sizeof(half)), nc*nr*nh, src3_d,
++            (int64_t) (src3->nb[1] / sizeof(float)), (const int32_t *) dst->src[7]->data, (int) nh, (int) ng, src6_d, (int) n_s, maxt);
++        auto * kern = maxt <= 4 ? ssm_replay_verify<L, 4> : maxt <= 8 ? ssm_replay_verify<L, 8>
++                    : maxt <= 12 ? ssm_replay_verify<L, 12> : ssm_replay_verify<L, L>;
++        kern<<<grid, 128, 0, stream>>>((half *) sdst->data, (int64_t) (sdst->nb[1] / sizeof(half)),
++            nc*nr*nh, src1_d, (int64_t) (src1->nb[2] / sizeof(float)), src2_d, (int64_t) (src2->nb[1] / sizeof(float)),
++            src3_d, (int64_t) (src3->nb[1] / sizeof(float)), src4_d, (int64_t) (src4->nb[2] / sizeof(float)),
++            src5_d, (int64_t) (src5->nb[2] / sizeof(float)), (const int32_t *) dst->src[7]->data, (float *) dst_d, (int) nh, (int) ng,
++            src6_d, (int) n_s);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++    if (ggml_get_op_params_i32(dst, 3) > 0) {
++        constexpr int L = 16;
++        GGML_ASSERT(ggml_get_op_params_i32(dst, 3) == L && K == 1 && sdst && sdst->type == GGML_TYPE_F16 &&
++                    nc == 128 && nr == 64 && dst->src[7] && src3->nb[1] == sizeof(float));
++        GGML_ASSERT(sdst->nb[1] >= (size_t) (nc*nr*nh + nh + 2*L*nh + L*nh*nr + L*ng*nc) * sizeof(half));
++        const dim3 grid((unsigned) n_s, (unsigned) nh);
++        ssm_replay_f16<L><<<grid, 128, 0, stream>>>((half *) sdst->data, (int64_t) (sdst->nb[1] / sizeof(half)),
++            nc*nr*nh, src1_d, (int64_t) (src1->nb[2] / sizeof(float)), src2_d, (int64_t) (src2->nb[1] / sizeof(float)),
++            src3_d, (int64_t) (src3->nb[1] / sizeof(float)), src4_d, (int64_t) (src4->nb[2] / sizeof(float)),
++            src5_d, (int64_t) (src5->nb[2] / sizeof(float)), (const int32_t *) dst->src[7]->data, dst_d, (int) nh, (int) ng, wids);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++
+     // Byte strides are narrowed to int for both scan and SSD paths.
+     GGML_ASSERT(src0->nb[2] <= (size_t)INT_MAX);
+     GGML_ASSERT(src0->nb[3] <= (size_t)INT_MAX);
+@@ -826,7 +1198,7 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     // Requires NVIDIA Turing+ otherwise fallback to scan.
+     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
++    const bool use_ssd = f32_state && !dst->src[8] && !dst->src[7] && is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
+                       && K == 1
+                       && n_t <= SSM_SSD_MAX_TOKENS
+                       && GGML_CUDA_CC_IS_NVIDIA(cc)
+@@ -852,8 +1224,33 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         return;
+     }
+ #endif
+-    ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
+-                      src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
+-                      src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
+-                      s_off, nc, nr, nh, ng, n_t, n_s, K, stream);
++    const bool chunked = ggml_cuda_ssm_ssd_ragged_supported(dst);
++    if (chunked) {
++        ggml_cuda_ssm_ssd_ragged(ctx, dst);
++    }
++    // final and snapshot states: into src[8] (the cache) or after y in dst (F32)
++    const int32_t * offsets_d = dst->src[7] ? (const int32_t *) dst->src[7]->data : nullptr;
++    const int skip = chunked ? GGML_SSM_SSD_MIN_LEN : 0;
++    const int64_t out_snap = sdst ? sdst->nb[2] / ggml_type_size(sdst->type) : n_s*nc*nr*nh;
++    auto run = [&](auto * s0, auto * out) {
++        ssm_scan_f32_cuda(s0, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
++                          src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
++                          src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
++                          s_off, nc, nr, nh, ng, n_t, n_s, K, offsets_d, out, out_snap, stream, skip,
++                          sdst ? (int64_t) (sdst->nb[1] / ggml_type_size(sdst->type)) : 0, wids);
++    };
++    float * out_f32 = sdst ? (float *) sdst->data : (float *) ((char *) dst_d + s_off);
++    const bool out_f16 = sdst && sdst->type == GGML_TYPE_F16;
++    if (src0->type == GGML_TYPE_F16) {
++        if (out_f16) run((const half *) src0->data, (half *) sdst->data);
++        else         run((const half *) src0->data, out_f32);
++    } else {
++        if (out_f16) run((const float *) src0->data, (half *) sdst->data);
++        else         run((const float *) src0->data, out_f32);
++    }
++    // ReplaySSM rows carry a per-head write position after the state: a prefilled state is a fresh checkpoint.
++    if (out_f16 && sdst->nb[1] > (size_t) nc*nr*nh*sizeof(half)) {
++        const int64_t row = sdst->nb[1] / sizeof(half);
++        ssm_replay_reset_pos<<<(unsigned) n_s, (unsigned) nh, 0, stream>>>((half *) sdst->data, row, nc*nr*nh, wids);
++    }
+ }
+diff --git a/ggml/src/ggml-cuda/ssm-ssd-ragged.cu b/ggml/src/ggml-cuda/ssm-ssd-ragged.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..2796f58c6c61201c016ca09f294e45b050b37101
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ssm-ssd-ragged.cu
+@@ -0,0 +1,553 @@
++#include "ssm-ssd-ragged.cuh"
++#include "convert.cuh"
++#include <vector>
++
++// Shapes: d_state N, head_dim P, n_head H, n_group G, HG = H/G heads per group, Q = chunk length.
++// Per (chunk c, group g) buffers keep the HG heads of the group side by side (row width HG*P),
++// so every GEMM below has uniform strides over the batch index b = c*G + g.
++//   Xd [b][Q][HG*P]  x*dt, zero after the chunk end
++//   Xw [b][Q][HG*P]  Xd * exp(cs_last - cs_t)
++//   Bc, Cc [b][Q][N]
++//   CB [b][Q][Q]     Cc * Bc^T
++//   M  [c][h][Q][Q]  CB * exp(cs_i - cs_j), causal
++//   S  [b][N][HG*P]  chunk state, Sp: state before the chunk
++//   Yi, Ys [b][Q][HG*P]  intra-chunk and state contributions
++
++static constexpr int Q = GGML_SSM_SSD_CHUNK;
++
++static __device__ __forceinline__ float softplus_dt(float v) {
++    return v <= 20.0f ? log1pf(expf(v)) : v;
++}
++
++// One block per (chunk, head). Writes dt_sp and the inclusive cumsum of dt_sp*A.
++static __global__ void ssd_cumsum_kernel(
++        const int32_t * chunks, const float * dt, const float * A, int64_t dt_stride_tok, int64_t A_stride,
++        int H, float * cs, float * dts) {
++    const int c = blockIdx.x, h = blockIdx.y, t = threadIdx.x;
++    const int start = chunks[4*c + 1], len = chunks[4*c + 2];
++    const float a = A[h * A_stride];
++    const float d = t < len ? softplus_dt(dt[(start + t) * dt_stride_tok + h]) : 0.0f;
++    __shared__ float buf[Q];
++    buf[t] = d * a;
++    __syncthreads();
++    for (int off = 1; off < Q; off <<= 1) {
++        const float v = t >= off ? buf[t - off] : 0.0f;
++        __syncthreads();
++        buf[t] += v;
++        __syncthreads();
++    }
++    cs [((int64_t) c * H + h) * Q + t] = buf[t];
++    dts[((int64_t) c * H + h) * Q + t] = d;
++}
++
++// Packs x*dt (plain and decay-weighted), B and C of every chunk, zero-padded to Q rows.
++template <typename TP>
++static __global__ void ssd_pack_kernel(
++        const int32_t * chunks, const float * x, const float * B, const float * C,
++        int64_t x_stride_tok, int64_t B_stride_tok, int64_t C_stride_tok,
++        const float * cs, const float * dts, int H, int G, int P, int N,
++        TP * Xd, TP * Xw, TP * Bc, TP * Cc) {
++    const int c = blockIdx.x, g = blockIdx.y, t = blockIdx.z;
++    const int HG = H / G, W = HG * P;
++    const int start = chunks[4*c + 1], len = chunks[4*c + 2];
++    const bool valid = t < len;
++    const int64_t b = (int64_t) c * G + g;
++    for (int i = threadIdx.x; i < W; i += blockDim.x) {
++        const int hg = i / P, p = i % P, h = g * HG + hg;
++        const int64_t ch = ((int64_t) c * H + h) * Q;
++        const float xd = valid ? x[(start + t) * x_stride_tok + h * P + p] * dts[ch + t] : 0.0f;
++        Xd[(b * Q + t) * W + i] = ggml_cuda_cast<TP>(xd);
++        Xw[(b * Q + t) * W + i] = ggml_cuda_cast<TP>(xd * expf(cs[ch + Q - 1] - cs[ch + t]));
++    }
++    for (int n = threadIdx.x; n < N; n += blockDim.x) {
++        Bc[(b * Q + t) * N + n] = ggml_cuda_cast<TP>(valid ? B[(start + t) * B_stride_tok + g * N + n] : 0.0f);
++        Cc[(b * Q + t) * N + n] = ggml_cuda_cast<TP>(valid ? C[(start + t) * C_stride_tok + g * N + n] : 0.0f);
++    }
++}
++
++// Yi[b][t][hg*P+p] = sum_{s<=t} CB[b][t][s] * exp(cs_t - cs_s) * Xd[b][s][hg*P+p], one block per (chunk, head),
++// four rows at a time: the decay-masked rows are formed in shared memory instead of a [c][h][Q][Q] buffer.
++template <typename TP>
++static __global__ void ssd_intra_kernel(const float * __restrict__ CB, const TP * __restrict__ Xd,
++        const float * __restrict__ cs, int H, int G, int P, float * __restrict__ Yi) {
++    const int c = blockIdx.x, h = blockIdx.y;
++    const int HG = H / G, g = h / HG, hg = h % HG, W = HG * P;
++    const int64_t b = (int64_t) c * G + g;
++    __shared__ float s_x[Q * 64];
++    __shared__ float s_cs[Q];
++    __shared__ float s_w[4][Q];
++    const float * cs_h = cs + ((int64_t) c * H + h) * Q;
++    for (int i = threadIdx.x; i < Q; i += blockDim.x) s_cs[i] = cs_h[i];
++    for (int i = threadIdx.x; i < Q * P; i += blockDim.x) {
++        const int t = i / P, p = i % P;
++        s_x[i] = ggml_cuda_cast<float>(Xd[(b * Q + t) * W + hg * P + p]);
++    }
++    __syncthreads();
++    const int p = threadIdx.x % 64, r = threadIdx.x / 64;
++    for (int t0 = 0; t0 < Q; t0 += 4) {
++        for (int i = threadIdx.x; i < 4 * Q; i += blockDim.x) {
++            const int rr = i / Q, s2 = i % Q, t = t0 + rr;
++            s_w[rr][s2] = s2 <= t ? CB[(b * Q + t) * Q + s2] * expf(s_cs[t] - s_cs[s2]) : 0.0f;
++        }
++        __syncthreads();
++        const int t = t0 + r;
++        float acc = 0.0f;
++        for (int s2 = 0; s2 <= t; ++s2) acc += s_w[r][s2] * s_x[s2 * P + p];
++        Yi[(b * Q + t) * W + hg * P + p] = acc;
++        __syncthreads();
++    }
++}
++
++// Walks the chunks of each segment in order. One block per (first chunk of a segment, head).
++// Reads the initial state through ids, stores the state before every chunk, writes the final state.
++template <typename TI, typename TO, typename TS>
++static __global__ void ssd_state_pass_kernel(
++        const int32_t * chunks, int n_chunks, const TI * s0, const int32_t * ids, int64_t s0_row,
++        int64_t s0_head, const float * S, const float * cs, int H, int G, int P, int N,
++        TS * Sp, TO * s_out, int K, int64_t snap_stride, int64_t out_row) {
++    const int c0 = blockIdx.x, h = blockIdx.y;
++    if (chunks[4*c0 + 3] != 0) return;
++    const int seg = chunks[4*c0];
++    const int HG = H / G, g = h / HG, hg = h % HG, W = HG * P;
++    const TI * src = s0 + (int64_t) (ids ? ids[seg] : seg) * s0_row + h * s0_head;
++    TO * dst = s_out + (int64_t) seg * out_row + (int64_t) h * P * N;
++    for (int e = threadIdx.x; e < P * N; e += blockDim.x) {
++        const int n = e / P, p = e % P;
++        float s = ggml_cuda_cast<float>(src[p * N + n]);
++        for (int c = c0; c < n_chunks && chunks[4*c] == seg; ++c) {
++            const int64_t at = (((int64_t) c * G + g) * N + n) * W + hg * P + p;
++            Sp[at] = ggml_cuda_cast<TS>(s);
++            s = s * expf(cs[((int64_t) c * H + h) * Q + Q - 1]) + S[at];
++        }
++        // slot 0 is the final state; a prompt segment is never rolled back, so the snapshot slots get it too
++        for (int k = 0; k < K; ++k) dst[k * snap_stride + p * N + n] = ggml_cuda_cast<TO>(s);
++    }
++}
++
++// y[token][h][p] = Yi + exp(cs_t) * Ys for the valid rows of every chunk.
++static __global__ void ssd_unpack_kernel(
++        const int32_t * chunks, const float * Yi, const float * Ys, const float * cs,
++        int H, int G, int P, float * y) {
++    const int c = blockIdx.x, g = blockIdx.y, t = blockIdx.z;
++    const int HG = H / G, W = HG * P;
++    const int start = chunks[4*c + 1], len = chunks[4*c + 2];
++    if (t >= len) return;
++    const int64_t row = ((int64_t) c * G + g) * Q + t;
++    for (int i = threadIdx.x; i < W; i += blockDim.x) {
++        const int h = g * HG + i / P;
++        const float decay = expf(cs[((int64_t) c * H + h) * Q + t]);
++        y[(int64_t) (start + t) * H * P + h * P + i % P] = Yi[row * W + i] + decay * Ys[row * W + i];
++    }
++}
++
++// ---- Sequential-segment SSD (default fused path): one CTA per (segment, head) walks the segment in 64-token steps.
++// The running state (N x P, F32) stays in registers across steps: no chunk-state buffers, no separate state pass.
++// Per step: y = exp(cs_t) C_t.S + sum_{s<=t} (C_t.B_s) exp(cs_t - cs_s) dt_s x_s,  S <- exp(cs_last) S + sum_s exp(cs_last - cs_s) dt_s B_s x_s^T.
++// 4 warps; warp w owns output rows [16w, 16w+16) of the step and state rows n in [32w, 32w+32). BF16 mma.sync, F32 accumulation.
++namespace ssdq {
++constexpr int N = 128, P = 64, QS = 64, NT = 128;
++constexpr int B_LD = N + 8, X_LD = P + 8, S_LD = P + 8;   // padded rows: conflict-free ldmatrix
++constexpr size_t SB_BYTES = (size_t) QS * B_LD * 2, SX_BYTES = (size_t) QS * X_LD * 2, SS_BYTES = (size_t) N * S_LD * 2;
++constexpr size_t SMEM = SB_BYTES + SX_BYTES + SS_BYTES;    // also holds the F32 state staging (P*N*4 bytes)
++static_assert(SMEM >= (size_t) P * N * 4, "state staging must fit");
++
++static __device__ __forceinline__ uint32_t pack(float a, float b) {
++    __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
++    return *(uint32_t *) &v;
++}
++static __device__ __forceinline__ uint32_t scale2(uint32_t u, float a, float b) {
++    const float2 f = __bfloat1622float2(*(__nv_bfloat162 *) &u);
++    return pack(f.x * a, f.y * b);
++}
++// The kernel needs Ampere tensor cores (BF16 mma.sync); serving runs it on SM80 and newer only.
++static __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void * p) {
++#ifdef AMPERE_MMA_AVAILABLE
++    const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++#else
++    GGML_UNUSED_VARS(r, p);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++static __device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void * p) {
++#ifdef AMPERE_MMA_AVAILABLE
++    const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++#else
++    GGML_UNUSED_VARS(r, p);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++static __device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++#else
++    GGML_UNUSED_VARS(d, a, b0, b1);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++}
++
++// x/B/C and y F32 (operands staged as BF16).
++template <typename TI, typename TO>
++static __global__ void __launch_bounds__(ssdq::NT, 3) ssd_seq_kernel(
++        const int32_t * __restrict__ chunks, int n_chunks,
++        const float * __restrict__ x, int64_t x_st, const float * __restrict__ dt, int64_t dt_st,
++        const float * __restrict__ A, int64_t A_st, const float * __restrict__ B, int64_t B_st,
++        const float * __restrict__ C, int64_t C_st, const TI * s0, const int32_t * __restrict__ ids,
++        const int32_t * __restrict__ wids,
++        int64_t s0_row, int64_t s0_head, float * __restrict__ y, TO * s_out, int K, int64_t snap, int64_t out_row,
++        int H, int G) {
++    using namespace ssdq;
++    const int h = blockIdx.x, c0 = blockIdx.y;
++    if (chunks[4*c0 + 3] != 0) return;
++    const int seg = chunks[4*c0], start = chunks[4*c0 + 1];
++    int L = 0;
++    for (int c = c0; c < n_chunks && chunks[4*c] == seg; ++c) L += chunks[4*c + 2];
++    const int g = h / (H / G);
++    const int tid = threadIdx.x, w = tid / 32, lane = tid % 32, gr = lane / 4, qc = lane % 4;
++
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    __nv_bfloat16 * sB = (__nv_bfloat16 *) smem_raw;                          // [QS][B_LD]  B rows of the step
++    __nv_bfloat16 * sX = (__nv_bfloat16 *) (smem_raw + SB_BYTES);             // [QS][X_LD]  x rows
++    __nv_bfloat16 * sS = (__nv_bfloat16 *) (smem_raw + SB_BYTES + SX_BYTES);  // [N][S_LD]   state (BF16 copy)
++    float * stage = (float *) smem_raw;                                        // [P][N] state staging (in/out)
++    __shared__ float sCs[QS], sDt[QS];
++
++    // initial state -> registers (state rows n = 32w + 16mt + gr (+8), cols p = 8j + 2qc (+1))
++    float sacc[2][8][4];
++    int nz = 0;
++    {
++        const TI * src = s0 + (int64_t) (ids ? ids[seg] : seg) * s0_row + (int64_t) h * s0_head;
++        for (int i = tid; i < P * N; i += NT) {
++            const float v = ggml_cuda_cast<float>(src[i]);
++            stage[i] = v;
++            nz |= v != 0.0f;
++        }
++        nz = __syncthreads_or(nz);
++#pragma unroll
++        for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++        for (int j = 0; j < 8; ++j)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            const int n = 32*w + 16*mt + gr + 8*(e >> 1), p = 8*j + 2*qc + (e & 1);
++            sacc[mt][j][e] = nz ? stage[p * N + n] : 0.0f;
++        }
++        __syncthreads();
++    }
++    const float a_h = A[(int64_t) h * A_st];
++    const int64_t yrow = (int64_t) H * P;
++
++    for (int t0 = 0; t0 < L; t0 += QS) {
++        const int l = min(QS, L - t0);
++        const int tok0 = start + t0;
++        if (w == 0) {
++            float v[2], d[2];
++#pragma unroll
++            for (int u = 0; u < 2; ++u) {
++                const int t = 2*lane + u;
++                d[u] = t < l ? softplus_dt(dt[(int64_t) (tok0 + t) * dt_st + h]) : 0.0f;
++                v[u] = d[u] * a_h;
++            }
++            float s = v[0] + v[1];
++#pragma unroll
++            for (int off = 1; off < 32; off <<= 1) {
++                const float o = __shfl_up_sync(0xffffffff, s, off);
++                if (lane >= off) s += o;
++            }
++            sCs[2*lane] = s - v[1];
++            sCs[2*lane + 1] = s;
++            sDt[2*lane] = d[0];
++            sDt[2*lane + 1] = d[1];
++        }
++        for (int i = tid; i < QS * (N / 4); i += NT) {
++            const int t = i / (N / 4), q = i % (N / 4);
++            uint2 o = make_uint2(0u, 0u);
++            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            if (t < l) v = *(const float4 *) (B + (int64_t) (tok0 + t) * B_st + g * N + 4*q);
++            o.x = pack(v.x, v.y); o.y = pack(v.z, v.w);
++            *(uint2 *) (sB + t * B_LD + 4*q) = o;
++        }
++        for (int i = tid; i < QS * (P / 4); i += NT) {
++            const int t = i / (P / 4), q = i % (P / 4);
++            uint2 o = make_uint2(0u, 0u);
++            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            if (t < l) v = *(const float4 *) (x + (int64_t) (tok0 + t) * x_st + h * P + 4*q);
++            o.x = pack(v.x, v.y); o.y = pack(v.z, v.w);
++            *(uint2 *) (sX + t * X_LD + 4*q) = o;
++        }
++        if (nz) {
++#pragma unroll
++            for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                const int n = 32*w + 16*mt + gr, p = 8*j + 2*qc;
++                *(uint32_t *) (sS + n * S_LD + p)       = pack(sacc[mt][j][0], sacc[mt][j][1]);
++                *(uint32_t *) (sS + (n + 8) * S_LD + p) = pack(sacc[mt][j][2], sacc[mt][j][3]);
++            }
++        }
++        __syncthreads();
++
++        // ---- outputs for rows [16w, 16w+16) of the step
++        if (16*w < l) {
++            uint32_t ca[8][4];
++            {
++                const int r0 = 16*w + gr, r1 = r0 + 8;
++                const float * c0p = C + (int64_t) (tok0 + r0) * C_st + g * N + 2*qc;
++                const float * c1p = C + (int64_t) (tok0 + r1) * C_st + g * N + 2*qc;
++#pragma unroll
++                for (int kk = 0; kk < 8; ++kk) {
++                    const float2 z = make_float2(0.0f, 0.0f);
++                    const float2 a0 = r0 < l ? *(const float2 *) (c0p + 16*kk)     : z;
++                    const float2 a1 = r1 < l ? *(const float2 *) (c1p + 16*kk)     : z;
++                    const float2 a2 = r0 < l ? *(const float2 *) (c0p + 16*kk + 8) : z;
++                    const float2 a3 = r1 < l ? *(const float2 *) (c1p + 16*kk + 8) : z;
++                    ca[kk][0] = pack(a0.x, a0.y); ca[kk][1] = pack(a1.x, a1.y);
++                    ca[kk][2] = pack(a2.x, a2.y); ca[kk][3] = pack(a3.x, a3.y);
++                }
++            }
++            float yacc[8][4];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) yacc[j][0] = yacc[j][1] = yacc[j][2] = yacc[j][3] = 0.0f;
++            const int tr0 = 16*w + gr, tr1 = tr0 + 8;
++            const float cs0 = sCs[tr0], cs1 = sCs[tr1];
++            if (nz) {
++#pragma unroll
++                for (int kk = 0; kk < 8; ++kk) {
++#pragma unroll
++                    for (int jj = 0; jj < 4; ++jj) {
++                        uint32_t b[4];
++                        ldsm4t(b, sS + (16*kk + (lane & 7) + ((lane >> 3) & 1) * 8) * S_LD + 16*jj + (lane >> 4) * 8);
++                        mma(yacc[2*jj], ca[kk], b[0], b[1]);
++                        mma(yacc[2*jj + 1], ca[kk], b[2], b[3]);
++                    }
++                }
++                const float e0 = __expf(cs0), e1 = __expf(cs1);
++#pragma unroll
++                for (int j = 0; j < 8; ++j) { yacc[j][0] *= e0; yacc[j][1] *= e0; yacc[j][2] *= e1; yacc[j][3] *= e1; }
++            }
++            for (int js = 0; js <= w; ++js) {
++                float cb[2][4] = {};
++#pragma unroll
++                for (int kk = 0; kk < 8; ++kk) {
++                    uint32_t b[4];
++                    ldsm4(b, sB + (16*js + (lane & 7) + ((lane >> 4) << 3)) * B_LD + 16*kk + ((lane >> 3) & 1) * 8);
++                    mma(cb[0], ca[kk], b[0], b[1]);
++                    mma(cb[1], ca[kk], b[2], b[3]);
++                }
++                uint32_t pa[4];
++#pragma unroll
++                for (int hh = 0; hh < 2; ++hh) {
++                    const int s = 16*js + 8*hh + 2*qc;
++                    const float cA = sCs[s], cB = sCs[s + 1], dA = sDt[s], dB = sDt[s + 1];
++                    const float v00 = s     <= tr0 ? cb[hh][0] * __expf(cs0 - cA) * dA : 0.0f;
++                    const float v01 = s + 1 <= tr0 ? cb[hh][1] * __expf(cs0 - cB) * dB : 0.0f;
++                    const float v10 = s     <= tr1 ? cb[hh][2] * __expf(cs1 - cA) * dA : 0.0f;
++                    const float v11 = s + 1 <= tr1 ? cb[hh][3] * __expf(cs1 - cB) * dB : 0.0f;
++                    pa[2*hh]     = pack(v00, v01);
++                    pa[2*hh + 1] = pack(v10, v11);
++                }
++#pragma unroll
++                for (int jj = 0; jj < 4; ++jj) {
++                    uint32_t b[4];
++                    ldsm4t(b, sX + (16*js + (lane & 7) + ((lane >> 3) & 1) * 8) * X_LD + 16*jj + (lane >> 4) * 8);
++                    mma(yacc[2*jj], pa, b[0], b[1]);
++                    mma(yacc[2*jj + 1], pa, b[2], b[3]);
++                }
++            }
++            float * y0 = y + (int64_t) (tok0 + tr0) * yrow + h * P + 2*qc;
++            float * y1 = y + (int64_t) (tok0 + tr1) * yrow + h * P + 2*qc;
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                if (tr0 < l) *(float2 *) (y0 + 8*j) = make_float2(yacc[j][0], yacc[j][1]);
++                if (tr1 < l) *(float2 *) (y1 + 8*j) = make_float2(yacc[j][2], yacc[j][3]);
++            }
++        }
++
++        // ---- state update for rows n in [32w, 32w+32)
++        {
++            const float cl = sCs[QS - 1];
++            if (nz) {
++                const float e = __expf(cl);
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++                for (int j = 0; j < 8; ++j)
++#pragma unroll
++                for (int q = 0; q < 4; ++q) sacc[mt][j][q] *= e;
++            }
++            const int ks_n = (l + 15) / 16;
++            for (int ks = 0; ks < ks_n; ++ks) {
++                const int s = 16*ks + 2*qc;
++                const float w0 = __expf(cl - sCs[s]) * sDt[s],         w1 = __expf(cl - sCs[s + 1]) * sDt[s + 1];
++                const float w8 = __expf(cl - sCs[s + 8]) * sDt[s + 8], w9 = __expf(cl - sCs[s + 9]) * sDt[s + 9];
++                uint32_t bx[4][4];
++#pragma unroll
++                for (int jj = 0; jj < 4; ++jj)
++                    ldsm4t(bx[jj], sX + (16*ks + (lane & 7) + ((lane >> 3) & 1) * 8) * X_LD + 16*jj + (lane >> 4) * 8);
++#pragma unroll
++                for (int mt = 0; mt < 2; ++mt) {
++                    uint32_t a[4];
++                    ldsm4t(a, sB + (16*ks + (lane & 7) + (lane >> 4) * 8) * B_LD + 32*w + 16*mt + ((lane >> 3) & 1) * 8);
++                    a[0] = scale2(a[0], w0, w1); a[1] = scale2(a[1], w0, w1);
++                    a[2] = scale2(a[2], w8, w9); a[3] = scale2(a[3], w8, w9);
++#pragma unroll
++                    for (int jj = 0; jj < 4; ++jj) {
++                        mma(sacc[mt][2*jj], a, bx[jj][0], bx[jj][1]);
++                        mma(sacc[mt][2*jj + 1], a, bx[jj][2], bx[jj][3]);
++                    }
++                }
++            }
++        }
++        nz = 1;
++        __syncthreads();
++    }
++
++    // final state -> all K slots, [p][n] layout, coalesced through shared memory
++#pragma unroll
++    for (int mt = 0; mt < 2; ++mt)
++#pragma unroll
++    for (int j = 0; j < 8; ++j)
++#pragma unroll
++    for (int e = 0; e < 4; ++e) {
++        const int n = 32*w + 16*mt + gr + 8*(e >> 1), p = 8*j + 2*qc + (e & 1);
++        stage[p * N + n] = sacc[mt][j][e];
++    }
++    __syncthreads();
++    TO * dst = s_out + (int64_t) (wids ? wids[seg] : seg) * out_row + (int64_t) h * P * N;  // pinned cells: written by id
++    for (int k = 0; k < K; ++k) {
++        TO * d = dst + (int64_t) k * snap;
++        for (int i = tid; i < P * N / 4; i += NT) {
++            const float4 v = *(const float4 *) (stage + 4*i);
++            d[4*i] = ggml_cuda_cast<TO>(v.x); d[4*i + 1] = ggml_cuda_cast<TO>(v.y);
++            d[4*i + 2] = ggml_cuda_cast<TO>(v.z); d[4*i + 3] = ggml_cuda_cast<TO>(v.w);
++        }
++    }
++}
++
++static void ssd_seq(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * s0 = dst->src[0], * x = dst->src[1], * dt = dst->src[2], * A = dst->src[3];
++    const ggml_tensor * B = dst->src[4], * C = dst->src[5], * ids = dst->src[6], * ch = dst->src[9];
++    const int n_chunks = (int) ch->ne[1];
++    const int N = (int) s0->ne[0], P = (int) s0->ne[1], H = (int) x->ne[1], G = (int) B->ne[1];
++    GGML_ASSERT(N == ssdq::N && P == ssdq::P);
++    cudaStream_t stream = ctx.stream();
++    const int32_t * chunks = (const int32_t *) ch->data;
++    const ggml_tensor * sdst = dst->src[8];
++    const size_t ts = ggml_type_size(s0->type);
++    const int32_t * ids_d = ids ? (const int32_t *) ids->data : nullptr;
++    const int K = std::max(1, (int) ggml_get_op_params_i32(dst, 0));
++    const int64_t n_seq = dst->src[7]->ne[0] - 1;
++    const int64_t snap = sdst ? (int64_t) (sdst->nb[2] / ggml_type_size(sdst->type)) : n_seq * H * P * N;
++    const int64_t out_row = !sdst ? (int64_t) H * P * N : (int64_t) (sdst->nb[1] / ggml_type_size(sdst->type));
++    const int64_t x_st = x->nb[2] / sizeof(float), B_st = B->nb[2] / sizeof(float), C_st = C->nb[2] / sizeof(float);
++    float * yd = (float *) dst->data;
++    float * out_f32 = sdst ? (float *) sdst->data : (float *) ((char *) dst->data + ggml_nelements(x) * sizeof(float));
++    const bool out_f16 = sdst && sdst->type == GGML_TYPE_F16;
++    // op_params[4]: ids holds [read cells | write cells] (pinned recurrent cells)
++    const int32_t * wids = ggml_get_op_params_i32(dst, 4) ? ids_d + n_seq : nullptr;
++    const dim3 grid(H, n_chunks);
++    auto run = [&](auto * s0_d, auto * out) {
++        ssd_seq_kernel<<<grid, ssdq::NT, ssdq::SMEM, stream>>>(chunks, n_chunks,
++            (const float *) x->data, x_st, (const float *) dt->data, (int64_t) (dt->nb[1] / sizeof(float)),
++            (const float *) A->data, (int64_t) (A->nb[1] / sizeof(float)), (const float *) B->data, B_st,
++            (const float *) C->data, C_st, s0_d, ids_d, wids, (int64_t) (s0->nb[3] / ts), (int64_t) (s0->nb[2] / ts),
++            yd, out, K, snap, out_row, H, G);
++    };
++    if (s0->type == GGML_TYPE_F16) {
++        if (out_f16) run((const half *) s0->data, (half *) sdst->data); else run((const half *) s0->data, out_f32);
++    } else {
++        if (out_f16) run((const float *) s0->data, (half *) sdst->data); else run((const float *) s0->data, out_f32);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++bool ggml_cuda_ssm_ssd_ragged_supported(const ggml_tensor * dst) {
++    const ggml_tensor * s = dst->src[0], * x = dst->src[1], * A = dst->src[3], * B = dst->src[4], * ch = dst->src[9];
++    return ch && dst->src[7] && ggml_get_op_params_i32(dst, 0) <= 8 && A->ne[0] == 1 && A->nb[1] == sizeof(float) &&
++        s->ne[0] == B->ne[0] && x->ne[1] % B->ne[1] == 0 && ch->type == GGML_TYPE_I32 && ch->ne[0] == 4 &&
++        ggml_is_contiguous(ch) && s->nb[1] == s->ne[0] * ggml_type_size(s->type) && s->nb[2] == s->ne[0] * s->ne[1] * ggml_type_size(s->type);
++}
++
++void ggml_cuda_ssm_ssd_ragged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * s0 = dst->src[0], * x = dst->src[1], * dt = dst->src[2], * A = dst->src[3];
++    const ggml_tensor * B = dst->src[4], * C = dst->src[5], * ids = dst->src[6], * ch = dst->src[9];
++    const int n_chunks = (int) ch->ne[1];
++    if (n_chunks == 0) return;
++    const int N = (int) s0->ne[0], P = (int) s0->ne[1], H = (int) x->ne[1], G = (int) B->ne[1];
++    const int HG = H / G, W = HG * P;
++    const int64_t nb = (int64_t) n_chunks * G;
++    cudaStream_t stream = ctx.stream();
++    const int32_t * chunks = (const int32_t *) ch->data;
++    GGML_ASSERT(P == 64);
++    using TP = nv_bfloat16;  // packed GEMM operands; accumulation, chunk states and outputs stay F32
++    if (ctx.serving.fused && N == ssdq::N) {
++        ssd_seq(ctx, dst);
++        return;
++    }
++
++    ggml_cuda_pool_alloc<float> cs(ctx.pool(), (size_t) n_chunks * H * Q), dts(ctx.pool(), (size_t) n_chunks * H * Q);
++    ggml_cuda_pool_alloc<TP> Xd(ctx.pool(), (size_t) nb * Q * W), Xw(ctx.pool(), (size_t) nb * Q * W);
++    ggml_cuda_pool_alloc<TP> Bc(ctx.pool(), (size_t) nb * Q * N), Cc(ctx.pool(), (size_t) nb * Q * N);
++    ggml_cuda_pool_alloc<float> CB(ctx.pool(), (size_t) nb * Q * Q);
++    ggml_cuda_pool_alloc<float> S(ctx.pool(), (size_t) nb * N * W);
++    ggml_cuda_pool_alloc<TP> Sp(ctx.pool(), (size_t) nb * N * W);
++    ggml_cuda_pool_alloc<float> Yi(ctx.pool(), (size_t) nb * Q * W), Ys(ctx.pool(), (size_t) nb * Q * W);
++
++    ssd_cumsum_kernel<<<dim3(n_chunks, H), Q, 0, stream>>>(chunks, (const float *) dt->data, (const float *) A->data,
++        dt->nb[1] / sizeof(float), A->nb[1] / sizeof(float), H, cs.get(), dts.get());
++    ssd_pack_kernel<TP><<<dim3(n_chunks, G, Q), 256, 0, stream>>>(chunks, (const float *) x->data,
++        (const float *) B->data, (const float *) C->data, x->nb[2] / sizeof(float), B->nb[2] / sizeof(float),
++        C->nb[2] / sizeof(float), cs.get(), dts.get(), H, G, P, N, Xd.get(), Xw.get(), Bc.get(), Cc.get());
++
++    // Row-major Out(m x n) = L(m x k) * R(k x n) is cuBLAS col-major Out^T = R^T * L^T.
++    cublasHandle_t handle = ctx.cublas_handle();
++    CUBLAS_CHECK(cublasSetStream(handle, stream));
++    const float one = 1.0f, zero = 0.0f;
++    const cublasComputeType_t ct = CUBLAS_COMPUTE_32F;
++    // CB = Cc * Bc^T (per group)
++    CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, Q, Q, N, &one,
++        Bc.get(), CUDA_R_16BF, N, (int64_t) Q * N, Cc.get(), CUDA_R_16BF, N, (int64_t) Q * N, &zero,
++        CB.get(), CUDA_R_32F, Q, (int64_t) Q * Q, nb, ct, CUBLAS_GEMM_DEFAULT));
++    // Yi: decay-masked CB times Xd per head, formed in shared memory
++    ssd_intra_kernel<TP><<<dim3(n_chunks, H), 256, 0, stream>>>(CB.get(), Xd.get(), cs.get(), H, G, P, Yi.get());
++    // S = Bc^T * Xw
++    CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, W, N, Q, &one,
++        Xw.get(), CUDA_R_16BF, W, (int64_t) Q * W, Bc.get(), CUDA_R_16BF, N, (int64_t) Q * N, &zero,
++        S.get(), CUDA_R_32F, W, (int64_t) N * W, nb, ct, CUBLAS_GEMM_DEFAULT));
++
++    // final states go to src[8] (the cache) or after y in dst, rows of H*P*N elements
++    GGML_ASSERT(!ggml_get_op_params_i32(dst, 4) && "pinned recurrent cells need the ssd_seq path");
++    const ggml_tensor * sdst = dst->src[8];
++    GGML_ASSERT(!sdst || sdst->nb[1] >= (size_t) H * P * N * ggml_type_size(sdst->type));
++    const int64_t out_row = sdst ? (int64_t) (sdst->nb[1] / ggml_type_size(sdst->type)) : (int64_t) H * P * N;
++    const size_t ts = ggml_type_size(s0->type);
++    const int32_t * ids_d = ids ? (const int32_t *) ids->data : nullptr;
++    const int K = std::max(1, (int) ggml_get_op_params_i32(dst, 0));
++    const int64_t n_seq = dst->src[7]->ne[0] - 1;
++    const int64_t snap = sdst ? (int64_t) (sdst->nb[2] / ggml_type_size(sdst->type)) : n_seq * H * P * N;
++    auto pass = [&](auto * s0_d, auto * out) {
++        ssd_state_pass_kernel<<<dim3(n_chunks, H), 256, 0, stream>>>(chunks, n_chunks, s0_d, ids_d,
++            (int64_t) (s0->nb[3] / ts), (int64_t) (s0->nb[2] / ts), S.get(), cs.get(), H, G, P, N, Sp.get(), out,
++            K, snap, out_row);
++    };
++    float * out_f32 = sdst ? (float *) sdst->data : (float *) ((char *) dst->data + ggml_nelements(x) * sizeof(float));
++    const bool out_f16 = sdst && sdst->type == GGML_TYPE_F16;
++    if (s0->type == GGML_TYPE_F16) {
++        if (out_f16) pass((const half *) s0->data, (half *) sdst->data); else pass((const half *) s0->data, out_f32);
++    } else {
++        if (out_f16) pass((const float *) s0->data, (half *) sdst->data); else pass((const float *) s0->data, out_f32);
++    }
++    // Ys = Cc * Sp
++    CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, W, Q, N, &one,
++        Sp.get(), CUDA_R_16BF, W, (int64_t) N * W, Cc.get(), CUDA_R_16BF, N, (int64_t) Q * N, &zero,
++        Ys.get(), CUDA_R_32F, W, (int64_t) Q * W, nb, ct, CUBLAS_GEMM_DEFAULT));
++    ssd_unpack_kernel<<<dim3(n_chunks, G, Q), 256, 0, stream>>>(chunks, Yi.get(), Ys.get(), cs.get(), H, G, P,
++        (float *) dst->data);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/ssm-ssd-ragged.cuh b/ggml/src/ggml-cuda/ssm-ssd-ragged.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ae98a9915b02aabdb62f645978732d3152e6335
+--- /dev/null
++++ b/ggml/src/ggml-cuda/ssm-ssd-ragged.cuh
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include "common.cuh"
++
++// Chunked SSD for packed Mamba-2 prefill. src[9] of the scan op lists chunks of the long segments.
++#define GGML_SSM_SSD_CHUNK   128
++#define GGML_SSM_SSD_MIN_LEN 64
++
++bool ggml_cuda_ssm_ssd_ragged_supported(const ggml_tensor * dst);
++
++
++// Writes y rows and final states of the chunked segments. The scan kernel skips them.
++void ggml_cuda_ssm_ssd_ragged(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 178d2bc275e4c1efce9aeffd62f3fc5565385f39..394c2dfd9f35a172222bb3ffd8f8acc97416428f 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1102,9 +1102,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+ 
+     "FUSED_ATTN",
+     "CONV1D_FUSED",
++    "BUILD_KQ_MASK",
++    "SSM_GATE_NORM",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1220,9 +1222,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+ 
+     "fused_attn(q,k,v,p)",
+     "conv1d_fused(x,w)",
++    "build_kq_mask(pos,seq,query)",
++    "ssm_gate_norm(y,x,D,z,w)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5946,6 +5950,172 @@ struct ggml_tensor * ggml_ssm_conv(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_build_kq_mask(
++        struct ggml_context * ctx, struct ggml_tensor * key_pos,
++        struct ggml_tensor * key_seq, struct ggml_tensor * query, enum ggml_type type) {
++    GGML_ASSERT(key_pos->type == GGML_TYPE_I32 && key_seq->type == GGML_TYPE_I32 && query->type == GGML_TYPE_I32);
++    // key_seq->ne[0] == 1: no membership words (per-sequence cell lists, ggml_build_kq_mask_meta)
++    GGML_ASSERT((key_pos->ne[0] == key_seq->ne[0] || key_seq->ne[0] == 1) && query->ne[0] == 2);
++    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
++    struct ggml_tensor * r = ggml_new_tensor_2d(ctx, type, key_pos->ne[0], query->ne[1]);
++    r->op = GGML_OP_BUILD_KQ_MASK;
++    r->src[0] = key_pos;
++    r->src[1] = key_seq;
++    r->src[2] = query;
++    return r;
++}
++
++struct ggml_tensor * ggml_build_kq_mask_meta(
++        struct ggml_context * ctx, struct ggml_tensor * key_pos, struct ggml_tensor * key_seq,
++        struct ggml_tensor * query, struct ggml_tensor * seq_off, struct ggml_tensor * seq_cells, enum ggml_type type) {
++    GGML_ASSERT(seq_off->type == GGML_TYPE_I32 && seq_cells->type == GGML_TYPE_I32 && seq_cells->ne[0] >= key_pos->ne[0]);
++    struct ggml_tensor * r = ggml_build_kq_mask(ctx, key_pos, key_seq, query, type);
++    r->src[3] = seq_off;
++    r->src[4] = seq_cells;
++    ggml_set_op_params_i32(r, 1, 1);
++    r->nb[1] = r->nb[2] = r->nb[3] = 0;
++    return r;
++}
++
++struct ggml_tensor * ggml_ssm_conv_ragged(
++        struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * c,
++        struct ggml_tensor * states, struct ggml_tensor * offsets, int64_t K) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 && states->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_matrix(x) && ggml_is_matrix(c));
++    GGML_ASSERT(x->ne[0] == c->ne[1]);
++    GGML_ASSERT(states->ne[0] == (c->ne[0]-1)*c->ne[1]);
++    GGML_ASSERT(states->ne[1] == offsets->ne[0]-1);
++    GGML_ASSERT(offsets->type == GGML_TYPE_I32 && ggml_is_vector(offsets));
++    GGML_ASSERT(K >= 1 && K <= INT32_MAX);
++    struct ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + K*ggml_nelements(states));
++    r->op = GGML_OP_SSM_CONV;
++    r->src[0] = x; r->src[1] = c; r->src[2] = states; r->src[3] = offsets;
++    ggml_set_op_params_i32(r, 0, (int32_t) K);
++    return r;
++}
++
++struct ggml_tensor * ggml_ssm_gate_norm(struct ggml_context * ctx, struct ggml_tensor * y,
++        struct ggml_tensor * x, struct ggml_tensor * D, struct ggml_tensor * z, struct ggml_tensor * w,
++        int n_group, float eps) {
++    GGML_ASSERT(y->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32);
++    GGML_ASSERT(D->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && ggml_is_contiguous(D) && ggml_is_contiguous(w));
++    GGML_ASSERT(ggml_are_same_shape(y, x) && ggml_are_same_shape(y, z) && y->ne[3] == 1);
++    GGML_ASSERT(y->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && z->nb[0] == sizeof(float));
++    GGML_ASSERT(ggml_nelements(D) == y->ne[1] && ggml_nelements(w) == y->ne[0]*y->ne[1]);
++    GGML_ASSERT(n_group > 0 && (y->ne[0]*y->ne[1]) % n_group == 0);
++    struct ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, y->ne[0]*y->ne[1], y->ne[2]);
++    r->op = GGML_OP_SSM_GATE_NORM;
++    r->src[0] = y; r->src[1] = x; r->src[2] = D; r->src[3] = z; r->src[4] = w;
++    ggml_set_op_params_i32(r, 0, n_group);
++    ggml_set_op_params_f32(r, 1, eps);
++    return r;
++}
++
++struct ggml_tensor * ggml_ssm_conv_ragged_inplace(
++        struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * c,
++        struct ggml_tensor * rows, struct ggml_tensor * offsets, struct ggml_tensor * ids) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_matrix(x) && ggml_is_matrix(c) && ggml_is_contiguous(c) && x->ne[0] == c->ne[1]);
++    GGML_ASSERT(rows->ne[0] == (c->ne[0]-1)*c->ne[1] && rows->nb[0] == sizeof(float));
++    GGML_ASSERT(offsets->type == GGML_TYPE_I32 && ggml_is_vector(offsets) && x->ne[1] == offsets->ne[0]-1);
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0] == 2*(offsets->ne[0]-1));
++    struct ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x));
++    r->op = GGML_OP_SSM_CONV;
++    r->src[0] = x; r->src[1] = c; r->src[2] = rows; r->src[3] = offsets; r->src[5] = ids;
++    ggml_set_op_params_i32(r, 0, 1);
++    ggml_set_op_params_i32(r, 2, 2);  // in place
++    return r;
++}
++
++// MTP verify conv (serving mtp_replay): rows = conv cache [(d_conv-1)*channels, cells], hist = [MAXT*channels, cells]
++// raw inputs of the last verify call, ids = [read | write | accepted rows] (3 * n_seq).
++struct ggml_tensor * ggml_ssm_conv_ragged_verify(
++        struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * c,
++        struct ggml_tensor * rows, struct ggml_tensor * hist, struct ggml_tensor * offsets, struct ggml_tensor * ids) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 && rows->type == GGML_TYPE_F32 && hist->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_matrix(x) && ggml_is_matrix(c) && ggml_is_contiguous(c) && x->ne[0] == c->ne[1]);
++    GGML_ASSERT(rows->ne[0] == (c->ne[0]-1)*c->ne[1] && rows->nb[0] == sizeof(float) && hist->ne[0] % c->ne[1] == 0);
++    GGML_ASSERT(offsets->type == GGML_TYPE_I32 && ggml_is_vector(offsets));
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0] == 3*(offsets->ne[0]-1));
++    struct ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x));
++    r->op = GGML_OP_SSM_CONV;
++    r->src[0] = x; r->src[1] = c; r->src[2] = rows; r->src[3] = offsets; r->src[5] = ids; r->src[6] = hist;
++    ggml_set_op_params_i32(r, 0, 1);
++    ggml_set_op_params_i32(r, 2, 3);  // MTP verify
++    return r;
++}
++
++void ggml_ssm_conv_ragged_set_bias_silu(struct ggml_tensor * conv, struct ggml_tensor * bias) {
++    GGML_ASSERT(conv->op == GGML_OP_SSM_CONV && conv->src[3] != NULL);
++    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == conv->src[0]->ne[0] && ggml_is_contiguous(bias));
++    conv->src[4] = bias;
++    ggml_set_op_params_i32(conv, 1, 1);
++}
++
++struct ggml_tensor * ggml_ssm_scan_ragged(
++        struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x,
++        struct ggml_tensor * dt, struct ggml_tensor * A, struct ggml_tensor * B,
++        struct ggml_tensor * C, struct ggml_tensor * ids, struct ggml_tensor * offsets, int64_t K) {
++    GGML_ASSERT((s->type == GGML_TYPE_F32 || s->type == GGML_TYPE_F16) && x->type == GGML_TYPE_F32);
++    GGML_ASSERT(B->type == GGML_TYPE_F32 && C->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32);
++    GGML_ASSERT(s->nb[0] == ggml_type_size(s->type) && s->nb[1] == s->ne[0]*s->nb[0] && s->nb[2] == s->ne[1]*s->nb[1]);
++    GGML_ASSERT(ggml_is_contiguous(dt) && ggml_is_contiguous(A));
++    GGML_ASSERT(x->ne[3] == 1 && B->ne[3] == 1 && C->ne[3] == 1 && dt->ne[2] == 1);
++    GGML_ASSERT(s->ne[1] == x->ne[0] && s->ne[2] == x->ne[1]);
++    GGML_ASSERT(dt->ne[0] == x->ne[1] && dt->ne[1] == x->ne[2]);
++    GGML_ASSERT(A->ne[0] == 1 && A->ne[1] == x->ne[1]);
++    GGML_ASSERT(B->ne[0] == s->ne[0] && B->ne[2] == x->ne[2] && ggml_are_same_shape(B,C));
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && offsets->type == GGML_TYPE_I32);
++    // ids: [n_seq] read rows, or [2*n_seq] read rows then write rows (pinned recurrent cells)
++    GGML_ASSERT(offsets->ne[0] == ids->ne[0]+1 || ids->ne[0] == 2*(offsets->ne[0]-1) || ids->ne[0] == 3*(offsets->ne[0]-1));
++    GGML_ASSERT(K >= 1 && K <= INT32_MAX);
++    struct ggml_tensor * r = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
++        ggml_nelements(x) + K*s->ne[0]*s->ne[1]*s->ne[2]*ids->ne[0]);
++    r->op = GGML_OP_SSM_SCAN;
++    r->src[0]=s; r->src[1]=x; r->src[2]=dt; r->src[3]=A;
++    r->src[4]=B; r->src[5]=C; r->src[6]=ids; r->src[7]=offsets;
++    ggml_set_op_params_i32(r, 0, (int32_t) K);
++    return r;
++}
++
++struct ggml_tensor * ggml_ssm_scan_to(struct ggml_context * ctx, struct ggml_tensor * scan, struct ggml_tensor * dst) {
++    GGML_ASSERT(scan->op == GGML_OP_SSM_SCAN && scan->src[3]->ne[0] == 1);
++    GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) && dst->nb[0] == ggml_type_size(dst->type));
++    const int64_t n_seq = scan->src[7] ? scan->src[7]->ne[0]-1 : scan->src[1]->ne[3];
++    const int64_t ds = scan->src[0]->ne[0]*scan->src[0]->ne[1]*scan->src[0]->ne[2];
++    GGML_ASSERT(scan->src[0]->ne[3] == n_seq && dst->ne[0] == ds && dst->ne[1] == n_seq);
++    GGML_ASSERT(dst->nb[1] >= ds*ggml_type_size(dst->type) && dst->ne[2] == ggml_get_op_params_i32(scan, 0));
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(scan->src[1]));
++    result->op = GGML_OP_SSM_SCAN;
++    memcpy(result->src, scan->src, sizeof(result->src));
++    memcpy(result->op_params, scan->op_params, sizeof(result->op_params));
++    result->src[6] = NULL;
++    result->src[8] = dst;
++    return result;
++}
++
++void ggml_ssm_scan_set_chunks(struct ggml_tensor * scan, struct ggml_tensor * chunks) {
++    GGML_ASSERT(scan->op == GGML_OP_SSM_SCAN && scan->src[7]);
++    GGML_ASSERT(chunks->type == GGML_TYPE_I32 && chunks->ne[0] == 4);
++    scan->src[9] = chunks;
++}
++
++struct ggml_tensor * ggml_ssm_scan_to_indexed(struct ggml_context * ctx, struct ggml_tensor * scan, struct ggml_tensor * dst) {
++    GGML_ASSERT(scan->op == GGML_OP_SSM_SCAN && scan->src[3]->ne[0] == 1 && scan->src[6] && scan->src[7]);
++    GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16) && dst->nb[0] == ggml_type_size(dst->type));
++    const int64_t n_seq = scan->src[7]->ne[0]-1;
++    const int64_t ds = scan->src[0]->ne[0]*scan->src[0]->ne[1]*scan->src[0]->ne[2];
++    GGML_ASSERT((scan->src[6]->ne[0] == n_seq || scan->src[6]->ne[0] == 2*n_seq || scan->src[6]->ne[0] == 3*n_seq) &&
++                dst->ne[0] == ds && dst->ne[1] == n_seq);
++    GGML_ASSERT(dst->nb[1] >= ds*ggml_type_size(dst->type) && dst->ne[2] == ggml_get_op_params_i32(scan, 0));
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(scan->src[1]));
++    result->op = GGML_OP_SSM_SCAN;
++    memcpy(result->src, scan->src, sizeof(result->src));
++    memcpy(result->op_params, scan->op_params, sizeof(result->op_params));
++    result->src[8] = dst;
++    return result;
++}
++
+ // ggml_ssm_scan
+ 
+ struct ggml_tensor * ggml_ssm_scan(
+@@ -5960,7 +6130,8 @@ struct ggml_tensor * ggml_ssm_scan(
+         int64_t               K) {
+     GGML_ASSERT(K >= 1);
+     GGML_ASSERT(K <= INT32_MAX);
+-    GGML_ASSERT(ggml_is_contiguous(s));
++    // state rows may be strided (ReplaySSM rows carry extra data after the state)
++    GGML_ASSERT(s->nb[0] == ggml_type_size(s->type) && s->nb[1] == s->ne[0]*s->nb[0] && s->nb[2] == s->ne[1]*s->nb[1]);
+     GGML_ASSERT(ggml_is_contiguous(dt));
+     GGML_ASSERT(ggml_is_contiguous(A));
+     GGML_ASSERT(x->nb[0] == ggml_type_size(x->type));
