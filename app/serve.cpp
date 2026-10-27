@@ -548,12 +548,17 @@ run_server(int argc, char** argv) {
     }
 #endif
 #if defined(NEMO_SPEECH_CLI_ASR)
-    // HTTP workers block in recognize(), so the pool bounds concurrent SALM sequences. Size it to
-    // the decode slots plus headroom for other routes (httplib starts every worker up front).
+    // HTTP workers block in recognize(), so the pool bounds concurrent SALM requests: the decode
+    // slots plus headroom for other routes, and at least kSalmMinWorkers. A keep-alive connection
+    // holds its worker for up to 100 requests (httplib), so clients beyond the workers would wait
+    // for whole connections to finish; with enough workers their requests wait in the engine's
+    // queue (asr.batching.max_queue_depth) in arrival order instead. httplib starts every worker up
+    // front.
     if (start_asr && speech_llm) {
+        constexpr int kSalmMinWorkers = 256;
         if (!http_threads_set) {
-            server_config.threads =
-                std::max(server_config.threads, asr_config.salm.max_sequences + 8);
+            server_config.threads = std::max(
+                {server_config.threads, asr_config.salm.max_sequences + 8, kSalmMinWorkers});
         } else if (server_config.threads < asr_config.salm.max_sequences) {
             std::fprintf(
                 stderr,
@@ -741,7 +746,7 @@ print_serve_help(const char* program) {
         "  --host ADDRESS          Bind address (default: 127.0.0.1)\n"
         "  --port N                HTTP port (default: 8080)\n"
         "  --threads N             Bounded HTTP worker count (default: 4; with SALM,\n"
-        "                          asr.salm.max_sequences + 8)\n"
+        "                          asr.salm.max_sequences + 8, at least 256)\n"
         "  --max-upload-mb N       Maximum request body (default: 512)\n"
         "  --read-timeout SEC      Socket read timeout (default: 30)\n"
         "  --write-timeout SEC     Socket write timeout (default: 30)\n"

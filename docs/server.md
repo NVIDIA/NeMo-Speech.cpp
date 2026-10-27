@@ -98,7 +98,7 @@ HTTP listener settings use the same precedence:
 | `--tls-key` / `http.tls-key` | none | TLS private-key path |
 | `--cors-origin` / `http.cors-origin` | none | allowed browser origin |
 | `--no-ui` / `http.playground` | playground on | disable the embedded playground |
-| `--threads` / `http.threads` | `4` | bounded worker pool; with a SALM model, `asr.salm.max_sequences + 8` |
+| `--threads` / `http.threads` | `4` | bounded worker pool; with a SALM model, `asr.salm.max_sequences + 8` and at least 256 |
 | `--max-upload-mb` / `http.max-upload-mb` | `512` | request-body limit |
 | `--read-timeout` / `http.read-timeout` | `30` | socket read timeout in seconds |
 | `--write-timeout` / `http.write-timeout` | `30` | socket write timeout in seconds |

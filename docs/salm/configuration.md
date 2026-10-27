@@ -57,8 +57,9 @@ small GPU lower `max_sequences` and raise `n_ctx_per_sequence` to keep the pool:
 
 One loaded model serves every caller and decodes up to `max_sequences` requests at once; others wait in a queue of
 `batching.max_queue_depth`. For throughput, send requests concurrently (CLI `-c N` for directories). The HTTP server
-blocks one worker per request, so it starts `max_sequences + 8` workers unless `http.threads` is set; connections
-beyond the workers wait in the listen backlog.
+blocks one worker per request, so it starts `max_sequences + 8` workers, at least 256, unless `http.threads` is set.
+A connection beyond the workers waits for a free one, and a keep-alive connection keeps its worker for up to 100
+requests, so keep `http.threads` above the number of clients.
 
 | Error | HTTP | gRPC | CLI exit |
 |---|---|---|---|
