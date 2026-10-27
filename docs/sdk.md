@@ -135,6 +135,13 @@ individual stream from one thread. Enabling `nemo_speech_asr_batching_config` on
 shared recognizer allows compatible work from concurrent utterances to form GPU
 microbatches without creating additional model copies.
 
+A `nemo_speech_asr_salm_config` with an `encoder_path` selects the speech-LLM (SALM)
+backend; `nemo_speech_asr_model_config.path` then names the LLM GGUF (see
+[SALM](salm/README.md)). SALM recognizes complete audio only: streaming calls return
+`NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT`. `NEMO_SPEECH_ASR_ERROR_RESOURCE_EXHAUSTED`
+(full request queue; retry later) and `NEMO_SPEECH_ASR_ERROR_UNAVAILABLE` (shutting
+down) match HTTP 429 and 503.
+
 ## Other capability flows
 
 - **Diarization:** create `nemo_speech_diar_model`, use `nemo_speech_diar_offline_f32` or a

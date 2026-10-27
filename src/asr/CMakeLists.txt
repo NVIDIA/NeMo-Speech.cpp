@@ -81,6 +81,12 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(nemo_speech_asr_c SHARED c_api.cpp)
 target_link_libraries(nemo_speech_asr_c PRIVATE nemo_speech_asr)
+# SALM selection (nemo_speech_asr_salm_config). nemo_speech_speechlm is defined later
+# (src/speechlm, which needs this ASR library); CMake resolves the target at generation.
+if(NEMO_SPEECH_BUILD_SPEECHLM)
+    target_link_libraries(nemo_speech_asr_c PRIVATE nemo_speech_speechlm)
+    target_compile_definitions(nemo_speech_asr_c PRIVATE NEMO_SPEECH_C_API_SALM=1)
+endif()
 target_include_directories(nemo_speech_asr_c PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)

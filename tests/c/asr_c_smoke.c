@@ -3,8 +3,10 @@
 /* C ABI smoke test - compiled as C (not C++) to prove include/nemo_speech/asr.h
  * is valid C and the nemo_speech_asr_c library links and runs end to end.
  *
- *   asr_c_smoke                 -> link/symbol/header check only (prints version)
+ *   asr_c_smoke                 -> link/symbol/header and SALM config checks (no model)
  *   asr_c_smoke MODEL.gguf WAV  -> offline + streaming recognition via the C ABI
+ *   asr_c_smoke LLM.gguf WAV GPU PEE.gguf
+ *                               -> SALM: offline recognition; streaming is rejected
  *
  * WAV must be 16 kHz mono 16-bit PCM (the test reads it as such).
  */
@@ -45,13 +47,51 @@ read_wav_f32(const char* path, size_t* n_out) {
     return out;
 }
 
+_Static_assert(NEMO_SPEECH_ASR_ERROR_RESOURCE_EXHAUSTED == 5, "status values are append-only");
+_Static_assert(NEMO_SPEECH_ASR_ERROR_UNAVAILABLE == 6, "status values are append-only");
+
+/* SALM selection through the append-only recognizer config; needs no model. */
+static int
+check_salm_config(void) {
+    nemo_speech_asr_salm_config salm = nemo_speech_asr_salm_config_default();
+    if (salm.size != sizeof(salm) || salm.encoder_path || salm.max_sequences != 0 ||
+        salm.mtp_draft >= 0) {
+        fprintf(stderr, "nemo_speech_asr_salm_config_default does not keep the defaults\n");
+        return 1;
+    }
+    salm.encoder_path = "/nonexistent/pee.gguf";
+    nemo_speech_asr_recognizer_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.size = sizeof(cfg);
+    cfg.salm = &salm;
+    nemo_speech_asr_recognizer* rec = NULL;
+    /* No LLM path: SALM's own error, or the build error without speechlm. */
+    if (nemo_speech_asr_create(&cfg, &rec) != NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT || rec ||
+        (!strstr(nemo_speech_asr_last_error(), "LLM GGUF") &&
+         !strstr(nemo_speech_asr_last_error(), "NEMO_SPEECH_BUILD_SPEECHLM"))) {
+        fprintf(stderr, "SALM selection: %s\n", nemo_speech_asr_last_error());
+        return 1;
+    }
+    /* A caller built against the header before `salm` sends a smaller size: no SALM. */
+    cfg.size = offsetof(nemo_speech_asr_recognizer_config, salm);
+    if (nemo_speech_asr_create(&cfg, &rec) != NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT || rec ||
+        !strstr(nemo_speech_asr_last_error(), "model.path is required")) {
+        fprintf(stderr, "older config size: %s\n", nemo_speech_asr_last_error());
+        return 1;
+    }
+    return 0;
+}
+
 int
 main(int argc, char** argv) {
     printf("nemo_speech_asr_version: %s\n", nemo_speech_asr_version());
+    if (check_salm_config() != 0)
+        return 1;
     if (argc < 3) {
-        printf("[link/header OK] pass MODEL WAV to run recognition\n");
+        printf("[link/header/SALM config OK] pass MODEL WAV to run recognition\n");
         return 0;
     }
+    const char* salm_encoder = argc > 4 ? argv[4] : NULL;
     const char* model = argv[1];
     const char* wav = argv[2];
 
@@ -73,12 +113,17 @@ main(int argc, char** argv) {
     batching.max_queue_depth = 16;
     batching.state_arena_slots = 4;
 
+    nemo_speech_asr_salm_config salm = nemo_speech_asr_salm_config_default();
+    salm.encoder_path = salm_encoder;
+    salm.max_sequences = 16;
+
     nemo_speech_asr_recognizer_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.size = sizeof(cfg);
     cfg.backend = &backend;
     cfg.model = &mc;
     cfg.batching = &batching;
+    cfg.salm = salm_encoder ? &salm : NULL;
 
     nemo_speech_asr_recognizer* rec = NULL;
     if (nemo_speech_asr_create(&cfg, &rec) != NEMO_SPEECH_ASR_OK) {
@@ -95,7 +140,7 @@ main(int argc, char** argv) {
     }
 
     nemo_speech_asr_recognition_options opt = nemo_speech_asr_recognition_options_default();
-    opt.enable_word_time_offsets = true;
+    opt.enable_word_time_offsets = salm_encoder == NULL; /* SALM timestamps need a CTC adapter */
 
     /* ---- offline ---- */
     nemo_speech_asr_result* r = NULL;
@@ -108,6 +153,21 @@ main(int argc, char** argv) {
     printf("offline: %s\n", nemo_speech_asr_result_transcript(r, 0));
     printf("offline words: %zu\n", nemo_speech_asr_result_word_count(r, 0));
     nemo_speech_asr_result_destroy(r);
+
+    if (salm_encoder) {
+        /* SALM recognizes complete audio only. */
+        nemo_speech_asr_stream* rejected = NULL;
+        const nemo_speech_asr_status status =
+            nemo_speech_asr_streaming_recognize(rec, &opt, &rejected);
+        free(audio);
+        nemo_speech_asr_destroy(rec);
+        if (status != NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT || rejected) {
+            fprintf(stderr, "SALM streaming was not rejected\n");
+            return 1;
+        }
+        printf("streaming: rejected (%s)\n[C ABI SALM smoke OK]\n", nemo_speech_asr_last_error());
+        return 0;
+    }
 
     /* ---- streaming (160 ms chunks) ---- */
     nemo_speech_asr_stream* st = NULL;

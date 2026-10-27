@@ -46,6 +46,11 @@ typedef enum nemo_speech_asr_status {
     NEMO_SPEECH_ASR_ERROR_OUT_OF_MEMORY = 2,
     NEMO_SPEECH_ASR_ERROR_RUNTIME = 3,
     NEMO_SPEECH_ASR_ERROR_CANCELLED = 4,
+    // Capacity is exhausted right now (e.g. the speech-LLM request queue is full); retry later.
+    // Transports map it to HTTP 429 / gRPC RESOURCE_EXHAUSTED.
+    NEMO_SPEECH_ASR_ERROR_RESOURCE_EXHAUSTED = 5,
+    // The recognizer cannot take requests (shutting down). HTTP 503 / gRPC UNAVAILABLE.
+    NEMO_SPEECH_ASR_ERROR_UNAVAILABLE = 6,
 } nemo_speech_asr_status;
 
 typedef enum nemo_speech_asr_decoder_kind {
@@ -142,6 +147,24 @@ typedef struct nemo_speech_asr_batching_config {
     int32_t state_arena_slots;
 } nemo_speech_asr_batching_config;
 
+// Speech-LLM (SALM) transcription: nemo_speech_asr_model_config.path names the
+// decoder GGUF, which names its encoder file (in the same directory) or takes
+// one from encoder_path; word timestamps and speakers need the CTC timestamp
+// head the encoder file carries. SALM recognizes
+// complete audio only (nemo_speech_asr_streaming_recognize returns
+// INVALID_ARGUMENT), batches concurrent nemo_speech_asr_recognize_f32 calls
+// continuously (of the batching config only max_queue_depth applies), and keeps
+// the model's own punctuation and casing. Requires a library built with
+// NEMO_SPEECH_BUILD_SPEECHLM; otherwise creation returns INVALID_ARGUMENT. A
+// zeroed struct sets mtp_draft = 0 (MTP off); start from
+// nemo_speech_asr_salm_config_default() to keep every library default.
+typedef struct nemo_speech_asr_salm_config {
+    size_t size;
+    const char* encoder_path;  // encoder GGUF; NULL/"" = the encoder file the decoder names
+    int32_t max_sequences;     // concurrent decode slots; <= 0 = default
+    int32_t mtp_draft;         // speculative draft tokens; 0 disables MTP; < 0 = default
+} nemo_speech_asr_salm_config;
+
 typedef struct nemo_speech_asr_recognizer_config {
     size_t size;
     const nemo_speech_asr_backend_config* backend;
@@ -153,6 +176,7 @@ typedef struct nemo_speech_asr_recognizer_config {
     const nemo_speech_asr_postproc_config* postproc;
     const nemo_speech_asr_diar_config* diar;
     const nemo_speech_asr_batching_config* batching;
+    const nemo_speech_asr_salm_config* salm;  // NULL = not SALM
 } nemo_speech_asr_recognizer_config;
 
 // ---- Per-request options ----
@@ -169,8 +193,8 @@ typedef struct nemo_speech_asr_recognition_options {
     const char* request_id;     // echoed by transports; not used for state
     const char* language_code;  // prompt selection; NULL/"" = auto/default
     bool interim_results;
-    bool enable_word_time_offsets;
-    bool enable_automatic_punctuation;
+    bool enable_word_time_offsets;      // SALM: requires the CTC timestamp head (encoder file)
+    bool enable_automatic_punctuation;  // SALM keeps the model's own punctuation either way
     bool verbatim_transcripts;
     bool profanity_filter;
     int32_t stop_history_eou_ms;  // <= 0 = server default
@@ -183,10 +207,10 @@ typedef struct nemo_speech_asr_recognition_options {
     int32_t max_alternatives;
     // Tag each word of the top alternative with a 1-based speaker id
     // (nemo_speech_asr_result_word_speaker_tag). Requires the recognizer to have been
-    // created with a diar model (nemo_speech_asr_diar_config.model_path), else the
-    // request fails with INVALID_ARGUMENT. max_speaker_count is accepted for
-    // compatibility but is ignored; capacity is determined by the loaded
-    // Sortformer model (four speakers for V2, eight for supported V3).
+    // created with a diar model (nemo_speech_asr_diar_config.model_path) or, for SALM,
+    // an encoder file with the CTC timestamp head, else the request fails with INVALID_ARGUMENT.
+    // max_speaker_count is accepted for compatibility but is ignored; capacity is determined by the
+    // loaded Sortformer model (four speakers for V2, eight for supported V3).
     bool enable_speaker_diarization;
     int32_t max_speaker_count;
 } nemo_speech_asr_recognition_options;
@@ -195,6 +219,7 @@ typedef struct nemo_speech_asr_recognition_options {
 // library's defaults.
 NEMO_SPEECH_ASR_API nemo_speech_asr_recognition_options
 nemo_speech_asr_recognition_options_default(void);
+NEMO_SPEECH_ASR_API nemo_speech_asr_salm_config nemo_speech_asr_salm_config_default(void);
 
 // ---- Recognizer ----
 

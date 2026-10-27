@@ -12,10 +12,14 @@
 #include <vector>
 
 #include "diar/diarizer.h"
+#include "errors.h"
 #include "nemo_speech/asr.h"
 #include "nemo_speech/diar.h"
 #include "recognizer.h"
 #include "types.h"
+#if defined(NEMO_SPEECH_C_API_SALM)
+#include "salm_recognizer.h"
+#endif
 
 namespace asr_core = nemo_speech::asr;
 
@@ -183,6 +187,15 @@ to_config(const nemo_speech_asr_recognizer_config* c) {
             b->state_arena_slots > 0)
             cfg.batching.state_arena_slots = b->state_arena_slots;
     }
+    if (HAS_FIELD(c, nemo_speech_asr_recognizer_config, salm) && c->salm) {
+        const auto* s = c->salm;
+        if (HAS_FIELD(s, nemo_speech_asr_salm_config, encoder_path))
+            cfg.salm.encoder_path = str_or_empty(s->encoder_path);
+        if (HAS_FIELD(s, nemo_speech_asr_salm_config, max_sequences) && s->max_sequences > 0)
+            cfg.salm.max_sequences = s->max_sequences;
+        if (HAS_FIELD(s, nemo_speech_asr_salm_config, mtp_draft) && s->mtp_draft >= 0)
+            cfg.salm.mtp_draft = s->mtp_draft;
+    }
     return cfg;
 }
 
@@ -248,6 +261,14 @@ guard(F&& f) {
         set_last_error(e.what());
         return NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT;
     }
+    catch (const asr_core::ResourceExhausted& e) {
+        set_last_error(e.what());
+        return NEMO_SPEECH_ASR_ERROR_RESOURCE_EXHAUSTED;
+    }
+    catch (const asr_core::Unavailable& e) {
+        set_last_error(e.what());
+        return NEMO_SPEECH_ASR_ERROR_UNAVAILABLE;
+    }
     catch (const std::exception& e) {
         set_last_error(e.what());
         return NEMO_SPEECH_ASR_ERROR_RUNTIME;
@@ -271,6 +292,15 @@ nemo_speech_asr_recognition_options_default(void) {
     return o;
 }
 
+nemo_speech_asr_salm_config
+nemo_speech_asr_salm_config_default(void) {
+    nemo_speech_asr_salm_config c;
+    std::memset(&c, 0, sizeof(c));
+    c.size = sizeof(c);
+    c.mtp_draft = -1;  // library default
+    return c;
+}
+
 nemo_speech_asr_status
 nemo_speech_asr_create(
     const nemo_speech_asr_recognizer_config* cfg, nemo_speech_asr_recognizer** out) {
@@ -279,12 +309,26 @@ nemo_speech_asr_create(
     *out = nullptr;
     return guard([&] {
         asr_core::RecognizerConfig rc = to_config(cfg);
-        if (rc.model.path.empty()) {
-            set_last_error("recognizer config: model.path is required");
-            return NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT;
-        }
+        asr_core::resolve_salm_encoder(rc);
         auto h = std::make_unique<nemo_speech_asr_recognizer>();
-        h->impl = std::make_unique<asr_core::Recognizer>(std::move(rc));
+        if (!rc.salm.encoder_path.empty()) {
+#if defined(NEMO_SPEECH_C_API_SALM)
+            // model.path is the LLM GGUF; the backend reports a missing one like every entrypoint.
+            auto backend = nemo_speech::speechlm::make_salm_backend(rc);
+            h->impl = std::make_unique<asr_core::Recognizer>(std::move(rc), std::move(backend));
+#else
+            set_last_error(
+                "recognizer config: salm.encoder_path requires a library built with "
+                "NEMO_SPEECH_BUILD_SPEECHLM");
+            return NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT;
+#endif
+        } else {
+            if (rc.model.path.empty()) {
+                set_last_error("recognizer config: model.path is required");
+                return NEMO_SPEECH_ASR_ERROR_INVALID_ARGUMENT;
+            }
+            h->impl = std::make_unique<asr_core::Recognizer>(std::move(rc));
+        }
         *out = h.release();
         return NEMO_SPEECH_ASR_OK;
     });
