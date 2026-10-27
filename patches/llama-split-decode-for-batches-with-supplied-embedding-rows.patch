@@ -1,0 +1,213 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: split decode for batches with supplied embedding rows
+
+llama_decode_prepare also accepts batches of tokens and supplied embedding
+rows (llama_batch.embd_input), whose outputs only need to be in batch order
+(rows without one may sit between them), so a batching server can build its
+next prefill pass while the previous one runs. llama_decode_launch now
+extracts the NextN rows (host or device) like llama_decode, through one shared
+helper, so a prepared pass feeds the MTP drafter, and the sampling transaction
+begins in llama_decode_prepare, before the inputs are set, so samplers with
+several outputs per sequence draw from the same generator state as in
+llama_decode.
+
+Upstream: not planned (batched serving path).
+
+diff --git a/include/llama.h b/include/llama.h
+index 64cafd06be99a8db3f6354325cb3c4bc7ca4aa12..529dd1c15b0683f5324b5a23a3528dac9d055db5 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1022,7 +1022,8 @@ extern "C" {
+             struct llama_context * ctx,
+               struct llama_batch   batch);
+ 
+-    // Split decode for overlapping host work with the previous decode's GPU time (single-ubatch token batches only):
++    // Split decode for overlapping host work with the previous decode's GPU time (single-ubatch batches of tokens, or of tokens
++    // and supplied embedding rows (embd_input); not embd batches):
+     // prepare does everything up to the inputs (the previous decode's outputs stay readable until launch); launch sets
+     // the token ids (batch order; NULL keeps the prepared ones) and computes. 0 on success.
+     LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch batch);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 57f82c914edd8a8005fe1320a594f7272924b9f0..f058b0010d3651e55c4167cfcb9f05b84156be01 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1789,9 +1789,63 @@ void llama_context::note_raw_logits() {
+     }
+ }
+ 
++// extract nextn embeddings (hidden state before the final output norm) of one ubatch, to the host or the device
++// rows (llama_set_embeddings_nextn_device); only meaningful in LLAMA_POOLING_TYPE_NONE (per-token)
++void llama_context::extract_nextn(const llama_ubatch & ubatch, ggml_tensor * t_h_nextn, int64_t n_outputs,
++                                  int64_t n_outputs_prev, int64_t n_tokens_prev) {
++    const auto & hparams = model.hparams;
++    const bool masked    = cparams.embeddings_nextn_masked;
++    const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
++    const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
++
++    if ((embd_nextn.data || use_nextn_device) && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
++        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++        GGML_ASSERT(backend_h != nullptr);
++
++        const uint32_t n_embd  = hparams.n_embd_out();
++        float * embd_nextn_out = embd_nextn.data ? embd_nextn.data + offset*n_embd : nullptr;
++
++        GGML_ASSERT(use_nextn_device || (offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
++        if (use_nextn_device) {
++            GGML_ASSERT(!masked);
++            if (!nextn_device) {
++                ctx_nextn_device.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
++                nextn_device = ggml_new_tensor_2d(ctx_nextn_device.get(), GGML_TYPE_F32, n_embd, cparams.n_batch);
++                buf_nextn_device.reset(ggml_backend_alloc_ctx_tensors(ctx_nextn_device.get(), backend_h));
++                GGML_ASSERT(buf_nextn_device);
++                nextn_device_backend = backend_h;
++            }
++            GGML_ASSERT(nextn_device_backend == backend_h);
++            for (int64_t i = 0; i < n_rows;) {
++                const int64_t dst_row = ubatch.token_indices ? ubatch.token_indices[i] : offset+i;
++                int64_t end = i+1;
++                while (end < n_rows && (!ubatch.token_indices || ubatch.token_indices[end] == dst_row+end-i)) ++end;
++                auto src = llama_tensor_row_view(t_h_nextn, i, end-i);
++                auto dst = llama_tensor_row_view(nextn_device, dst_row, end-i);
++                ggml_backend_tensor_copy_async(backend_h, backend_h, &src, &dst);
++                i = end;
++            }
++        } else if (!masked && ubatch.token_indices) {
++            // Dense hidden states are indexed by the original batch, not micro-batch order.
++            const size_t row_bytes = n_embd*sizeof(float);
++            for (int64_t i = 0; i < n_rows;) {
++                int64_t end = i + 1;
++                while (end < n_rows && ubatch.token_indices[end] == ubatch.token_indices[i] + end - i) ++end;
++                ggml_backend_tensor_get_async(backend_h, t_h_nextn,
++                        embd_nextn.data + (size_t) ubatch.token_indices[i]*n_embd,
++                        i*row_bytes, (end-i)*row_bytes);
++                i = end;
++            }
++        } else {
++            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++        }
++    }
++}
++
+ int llama_context::decode_prepare(const llama_batch & batch_inp) {
+     GGML_ASSERT(!pend.active && "llama_decode_prepare: a prepared decode is pending");
+-    GGML_ASSERT(memory && batch_inp.token && !batch_inp.embd && !batch_inp.embd_input && batch_inp.logits);
++    // token batches, or mixed ones (token rows plus supplied embedding rows, llama_batch.embd_input)
++    GGML_ASSERT(memory && batch_inp.token && !batch_inp.embd && batch_inp.logits);
+     GGML_ASSERT(!cparams.embeddings && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
+     if (batch_inp.n_tokens == 0) {
+         return -1;
+@@ -1825,6 +1879,11 @@ int llama_context::decode_prepare(const llama_batch & batch_inp) {
+     } else {
+         for (uint32_t i = 0; i < ubatch.n_tokens; i++) n_outputs_new += (int32_t) (ubatch.output[i] != 0);
+     }
++    // the sampling transaction starts before the inputs are set: transactional samplers (several outputs per
++    // sequence) draw their uniforms then
++    for (const auto & entry : sampling.samplers) {
++        llama_sampler_backend_begin(entry.second);
++    }
+     // the previous decode's outputs stay readable until launch: n_outputs is only borrowed for the graph build
+     const int32_t n_outputs_keep = n_outputs;
+     n_outputs = n_outputs_new;
+@@ -1856,9 +1915,6 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+         pend = {};
+         return -2;
+     }
+-    for (const auto & entry : sampling.samplers) {
+-        llama_sampler_backend_begin(entry.second);
+-    }
+     nextn_device_rows  = pend.n_tokens_all;
+     nextn_host_current = false;
+     n_outputs = pend.n_outputs;
+@@ -1874,6 +1930,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
+     }
+     extract_layer_inputs(res, 0, ubatch.n_tokens);
++    extract_nextn(ubatch, cparams.embeddings_nextn ? res->get_h_nextn() : nullptr, n_outputs, 0, 0);
+     if (!sampling.samplers.empty()) {
+         copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,       0, sched.get());
+         copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
+@@ -1884,10 +1941,11 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+     if (n_outputs > 0) {
+         auto & out_ids = balloc->get_out_ids();
+         GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
++        // outputs in increasing batch order (rows without an output may sit between them)
+         bool sorted_output = true;
+         for (int64_t i = 0; i < n_outputs; ++i) {
+             output_ids[out_ids[i]] = i;
+-            sorted_output &= out_ids[i] == i;
++            sorted_output &= i == 0 || out_ids[i] > out_ids[i - 1];
+         }
+         GGML_ASSERT(sorted_output && "llama_decode_launch: outputs must be in batch order");
+     }
+@@ -2207,56 +2265,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+ 
+-        // extract nextn embeddings before
+-        // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
+-        {
+-            const bool masked    = cparams.embeddings_nextn_masked;
+-            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+-            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+-
+-            if ((embd_nextn.data || use_nextn_device) && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+-                GGML_ASSERT(backend_h != nullptr);
+-
+-                const uint32_t n_embd  = hparams.n_embd_out();
+-                float * embd_nextn_out = embd_nextn.data ? embd_nextn.data + offset*n_embd : nullptr;
+-
+-                GGML_ASSERT(use_nextn_device || (offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+-                if (use_nextn_device) {
+-                    GGML_ASSERT(!masked);
+-                    if (!nextn_device) {
+-                        ctx_nextn_device.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+-                        nextn_device = ggml_new_tensor_2d(ctx_nextn_device.get(), GGML_TYPE_F32, n_embd, cparams.n_batch);
+-                        buf_nextn_device.reset(ggml_backend_alloc_ctx_tensors(ctx_nextn_device.get(), backend_h));
+-                        GGML_ASSERT(buf_nextn_device);
+-                        nextn_device_backend = backend_h;
+-                    }
+-                    GGML_ASSERT(nextn_device_backend == backend_h);
+-                    for (int64_t i = 0; i < n_rows;) {
+-                        const int64_t dst_row = ubatch.token_indices ? ubatch.token_indices[i] : offset+i;
+-                        int64_t end = i+1;
+-                        while (end < n_rows && (!ubatch.token_indices || ubatch.token_indices[end] == dst_row+end-i)) ++end;
+-                        auto src = llama_tensor_row_view(t_h_nextn, i, end-i);
+-                        auto dst = llama_tensor_row_view(nextn_device, dst_row, end-i);
+-                        ggml_backend_tensor_copy_async(backend_h, backend_h, &src, &dst);
+-                        i = end;
+-                    }
+-                } else if (!masked && ubatch.token_indices) {
+-                    // Dense hidden states are indexed by the original batch, not micro-batch order.
+-                    const size_t row_bytes = n_embd*sizeof(float);
+-                    for (int64_t i = 0; i < n_rows;) {
+-                        int64_t end = i + 1;
+-                        while (end < n_rows && ubatch.token_indices[end] == ubatch.token_indices[i] + end - i) ++end;
+-                        ggml_backend_tensor_get_async(backend_h, t_h_nextn,
+-                                embd_nextn.data + (size_t) ubatch.token_indices[i]*n_embd,
+-                                i*row_bytes, (end-i)*row_bytes);
+-                        i = end;
+-                    }
+-                } else {
+-                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+-                }
+-            }
+-        }
++        extract_nextn(ubatch, t_h_nextn, n_outputs, n_outputs_prev, n_tokens_prev);
+ 
+         if (has_samplers) {
+             const auto stride = n_vocab;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 8d3966d560838fdd9db53071eb7f658d6b88d70e..aeb8f5cf9a7bf976835385d44c120e2adc4645ec 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -259,6 +259,9 @@ private:
+     bool raw_logits_reserved = false;
+     void note_raw_logits();
+ 
++    void extract_nextn(const llama_ubatch & ubatch, ggml_tensor * t_h_nextn, int64_t n_outputs, int64_t n_outputs_prev,
++                       int64_t n_tokens_prev);
++
+     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
+     // from backend into host-side embd_layer_inp buffers
+     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);

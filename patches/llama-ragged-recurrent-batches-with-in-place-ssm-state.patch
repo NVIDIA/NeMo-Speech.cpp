@@ -1,0 +1,1158 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: ragged recurrent batches with in-place SSM state
+
+For serving hundreds of Nemotron-H sequences of different lengths, with
+llama_serving_params.batched (Nemotron-H MoE, unified KV cache):
+
+- split_ragged packs sequences of unequal length into one ubatch described by
+  seq_offsets. The Mamba2 layer uses the ragged conv and scan ops, chunked SSD
+  for long segments, and the fused conv bias + SiLU and gate norm.
+- Recurrent state stays in place: one pinned F16 cell per sequence, read and
+  written directly by the scan, with ReplaySSM rows for one-token decode.
+  MTP verify steps (mtp_replay) append uncommitted rows and the next step
+  commits only the accepted tokens.
+- The KV length is padded to kv_bucket so decode graphs are reused, and the
+  masks reserved at init cover at most kv_reserve_cells cells.
+- LLAMA_MAX_SEQ 4096, O(1) seq_pos_min/max, and batch-allocator fast paths for
+  many sequences.
+
+Upstream: not planned in this form (Nemotron-H only).
+
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a552f48f73ed7c29c2e3e48383245f5d39ec..6aae78e18ea31c8803861727af86b95e24e68b38 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -167,7 +167,8 @@ bool llama_batch_allocr::init(
+         for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+             const llama_seq_id s1 = batch.seq_id[i][s];
+ 
+-            seq_pos[s1].insert(batch.pos[i]);
++            // positions arrive increasing per sequence: the end hint makes the insert amortized O(1)
++            seq_pos[s1].insert(seq_pos[s1].end(), batch.pos[i]);
+ 
+             if (s > 0) {
+                 // mark that sequence s1 is coupled to s0
+@@ -185,6 +186,8 @@ bool llama_batch_allocr::init(
+     {
+         seq_set_t seq_set_unq;
+ 
++        seq_set.reserve(batch.n_tokens);
++        idx_vec_t * last_vec = nullptr;  // runs of tokens of the same sequence set share one map lookup
+         for (int32_t i = 0; i < batch.n_tokens; ++i) {
+             seq_set_t cur;
+             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+@@ -194,8 +197,11 @@ bool llama_batch_allocr::init(
+                 seq_set_unq.set(seq_id);
+             }
+ 
++            if (last_vec == nullptr || cur != seq_set.back()) {
++                last_vec = &seq_set_map[cur];
++            }
+             seq_set.push_back(cur);
+-            seq_set_map[cur].push_back(i);
++            last_vec->push_back(i);
+         }
+ 
+         for (uint32_t s = 0; s < n_seq_max; ++s) {
+@@ -320,7 +326,7 @@ bool llama_batch_allocr::init(
+         }
+     }
+ 
+-    if (memory) {
++    if (memory && has_cpl) {  // n_seq_max^2 bit tests otherwise (0.6M per call at 768 sequences)
+         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
+                 if (seq_cpl[s0][s1]) {
+@@ -352,8 +358,8 @@ bool llama_batch_allocr::init(
+     // seq_id[i][0]: 0 0 1 1 0 1 0
+     //
+     {
+-        seq_set_t cur_seq_set[LLAMA_MAX_SEQ];
+-        for (uint32_t s = 0; s < n_seq_max; ++s) {
++        static thread_local seq_set_t cur_seq_set[LLAMA_MAX_SEQ];
++        for (uint32_t s = 0; has_cpl && s < n_seq_max; ++s) {
+             cur_seq_set[s].set();
+         }
+ 
+@@ -368,9 +374,12 @@ bool llama_batch_allocr::init(
+             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+                 const llama_seq_id seq_id = batch.seq_id[i][s];
+ 
+-                cur_seq_set[seq_id] &= seq_set[i];
++                // without coupled sequences every token's set is {seq_id}: the subset check cannot fail
++                if (has_cpl) {
++                    cur_seq_set[seq_id] &= seq_set[i];
++                }
+ 
+-                if (cur_seq_set[seq_id].none()) {
++                if (has_cpl && cur_seq_set[seq_id].none()) {
+                     LLAMA_LOG_ERROR("%s: sequence %d belongs to incompatible sequence sets (not allowed)\n", __func__, seq_id);
+                     return false;
+                 }
+@@ -720,6 +729,41 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+     return ubatch_add(idxs, 1, true);
+ }
+ 
++llama_ubatch llama_batch_allocr::split_ragged(uint32_t n_ubatch, uint32_t n_keep_tail) {
++    GGML_ASSERT(!has_cpl);
++    std::vector<int32_t> idxs;
++    std::vector<uint32_t> offsets = {0};
++    seq_set_t seen;
++    for (uint32_t i = 0; i < get_n_tokens(); ++i) {
++        if (used[i] || seen.test(batch.seq_id[i][0])) continue;
++        GGML_ASSERT(batch.n_seq_id[i] == 1);
++        seen.set(batch.seq_id[i][0]);
++        const auto & rows = seq_set_map.at(seq_set[i]);
++        std::vector<int32_t> pending;
++        for (int32_t row : rows) if (!used[row]) pending.push_back(row);
++        uint32_t take = std::min<uint32_t>(pending.size(), n_ubatch - idxs.size());
++        // Keep all rollback snapshots in the final segment of each sequence.
++        if (take < pending.size() && pending.size() - take < n_keep_tail) {
++            take = pending.size() > n_keep_tail ? pending.size() - n_keep_tail : 0;
++        }
++        if (!take) break;
++        for (uint32_t j = 0; j < take; ++j) {
++            idxs.push_back(pending[j]);
++            used[pending[j]] = true;
++            ++n_used;
++        }
++        offsets.push_back(idxs.size());
++        if (idxs.size() == n_ubatch) break;
++    }
++    if (idxs.empty()) return {};
++    // Equal segments (decode steps) stay ragged too: the equal-seqs Mamba path copies every state.
++    auto result = ubatch_add(idxs, idxs.size(), false);
++    result.n_seqs = offsets.size()-1;
++    result.n_seq_tokens = 0;
++    result.seq_offsets = std::move(offsets);
++    return result;
++}
++
+ void llama_batch_allocr::clear() {
+     n_outputs = 0;
+ 
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index a3d1889d4a041be695a91b72a2a7f3badcb46fca..c1d953cf8a9cfb46f20ad5a5919a531b062d08db 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -66,6 +66,11 @@ struct llama_ubatch {
+ 
+     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
+     std::shared_ptr<data_t> data;
++    // Packed sequence boundaries for hybrid recurrent batches of unequal lengths.
++    // Empty for the original equal-length representation.
++    std::vector<uint32_t> seq_offsets = {};
++    uint32_t seq_start(uint32_t s) const { return seq_offsets.empty() ? s*n_seq_tokens : seq_offsets[s]; }
++    uint32_t seq_length(uint32_t s) const { return seq_offsets.empty() ? n_seq_tokens : seq_offsets[s+1]-seq_offsets[s]; }
+ };
+ 
+ // a helper for sanitizing, fulfilling and splitting a batch
+@@ -109,6 +114,7 @@ public:
+ 
+     // sequence-set-wise split - each ubatch contains a single sequence-set
+     llama_ubatch split_seq(uint32_t n_ubatch);
++    llama_ubatch split_ragged(uint32_t n_ubatch, uint32_t n_keep_tail);
+ 
+     // a helper method for creating a well-defined ubatch of tokens
+     // TODO: support embeddings if needed in the future
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 0c77170209bf370930ca901e05190615c7170184..cdbb8f4ee219b5be2b9396375c1d213afe431154 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -5,7 +5,7 @@
+ #include <cstdint>
+ #include <vector>
+ 
+-#define LLAMA_MAX_SEQ 256
++#define LLAMA_MAX_SEQ 4096
+ 
+ struct llama_cparams {
+     uint32_t n_ctx;           // context size used during inference
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 07ca49ad09d11c42e8669869a5feedec9e6e3989..8805a29c83d370b0207ab9ae3ec1e75cc2e6b738 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -331,7 +331,9 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_n_rs();
+ 
+-    if (s_copy) {
++    if (pinned) {
++        llama_rs_fill_pinned(this, ubatch, mctx);  // s_copy is unused (and unallocated) with pinned cells
++    } else if (s_copy) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+         int32_t * data = (int32_t *) s_copy->data;
+ 
+@@ -356,6 +358,12 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+ 
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
++    res &= pinned == (!params.ubatch.seq_offsets.empty() && mctx->is_pinned());
++    {
++        const int64_t nch = !params.ubatch.seq_offsets.empty() && mctx->is_pinned() ?
++            llama_ssd_chunk_rows(params.ubatch, nullptr) : 0;
++        res &= (ssd_chunks ? ssd_chunks->ne[1] : 0) == nch;
++    }
+ 
+     return res;
+ }
+@@ -1087,6 +1095,15 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
+ }
+ 
+ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
++    if (inp_rs->ssd_chunks) {
++        std::vector<int32_t> rows(4*inp_rs->ssd_chunks->ne[1]);
++        GGML_ASSERT(llama_ssd_chunk_rows(*ubatch, rows.data()) == inp_rs->ssd_chunks->ne[1]);
++        ggml_backend_tensor_set(inp_rs->ssd_chunks, rows.data(), 0, rows.size()*sizeof(int32_t));
++    }
++    if (inp_rs->seq_offsets) {
++        ggml_backend_tensor_set(inp_rs->seq_offsets, ubatch->seq_offsets.data(), 0,
++            ubatch->seq_offsets.size()*sizeof(uint32_t));
++    }
+     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+ 
+@@ -1102,7 +1119,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->pinned) {
++        llama_rs_fill_pinned(inp_rs.get(), ubatch, mctx->get_recr());  // s_copy is unused (and unallocated) with pinned cells
++    } else if (inp_rs->s_copy) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1132,6 +1151,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= inp_rs->pinned == (!params.ubatch.seq_offsets.empty() && mctx->get_recr()->is_pinned());
++    {
++        const int64_t nch = !params.ubatch.seq_offsets.empty() && mctx->get_recr()->is_pinned() ?
++            llama_ssd_chunk_rows(params.ubatch, nullptr) : 0;
++        res &= (inp_rs->ssd_chunks ? inp_rs->ssd_chunks->ne[1] : 0) == nch;
++    }
+ 
+     return res;
+ }
+@@ -1146,7 +1171,9 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->pinned) {
++        llama_rs_fill_pinned(inp_rs.get(), ubatch, mctx->get_recr());  // s_copy is unused (and unallocated) with pinned cells
++    } else if (inp_rs->s_copy) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1175,6 +1202,12 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= inp_rs->pinned == (!params.ubatch.seq_offsets.empty() && mctx->get_recr()->is_pinned());
++    {
++        const int64_t nch = !params.ubatch.seq_offsets.empty() && mctx->get_recr()->is_pinned() ?
++            llama_ssd_chunk_rows(params.ubatch, nullptr) : 0;
++        res &= (inp_rs->ssd_chunks ? inp_rs->ssd_chunks->ne[1] : 0) == nch;
++    }
+ 
+     return res;
+ }
+@@ -1220,7 +1253,9 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->pinned) {
++        llama_rs_fill_pinned(inp_rs.get(), ubatch, mctx->get_recr());  // s_copy is unused (and unallocated) with pinned cells
++    } else if (inp_rs->s_copy) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1263,6 +1298,12 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= inp_rs->pinned == (!params.ubatch.seq_offsets.empty() && mctx->get_recr()->is_pinned());
++    {
++        const int64_t nch = !params.ubatch.seq_offsets.empty() && mctx->get_recr()->is_pinned() ?
++            llama_ssd_chunk_rows(params.ubatch, nullptr) : 0;
++        res &= (inp_rs->ssd_chunks ? inp_rs->ssd_chunks->ne[1] : 0) == nch;
++    }
+ 
+     return res;
+ }
+@@ -3511,6 +3552,36 @@ ggml_tensor * llm_graph_context::build_rs(
+     return output_states;
+ }
+ 
++// Chunk rows {segment, start, length, index in segment} for segments long enough for chunked SSD.
++// Must match GGML_SSM_SSD_CHUNK / GGML_SSM_SSD_MIN_LEN in ggml-cuda/ssm-ssd-ragged.cuh.
++int64_t llama_ssd_chunk_rows(const llama_ubatch & ubatch, int32_t * rows) {
++    constexpr int32_t chunk = 128, min_len = 64;
++    int64_t n = 0;
++    for (size_t s = 0; s + 1 < ubatch.seq_offsets.size(); ++s) {
++        const int32_t start = ubatch.seq_offsets[s], len = ubatch.seq_offsets[s+1] - start;
++        if (len < min_len) continue;
++        for (int32_t k = 0; k*chunk < len; ++k, ++n) {
++            if (rows) {
++                rows[4*n + 0] = (int32_t) s;
++                rows[4*n + 1] = start + k*chunk;
++                rows[4*n + 2] = std::min(chunk, len - k*chunk);
++                rows[4*n + 3] = k;
++            }
++        }
++    }
++    return n;
++}
++
++void llama_rs_fill_pinned(const llm_graph_input_rs * inp, const llama_ubatch * ubatch,
++                          const llama_memory_recurrent_context * rctx) {
++    // [read cells | write cells (| committed verify rows with mtp_replay)]
++    const uint32_t n_seqs = ubatch->n_seqs;
++    const bool mtp = rctx->get_mtp_maxt() > 0;
++    std::vector<int32_t> ids((mtp ? 3 : 2)*n_seqs);
++    rctx->pinned_ids(*ubatch, ids.data(), ids.data() + n_seqs, mtp ? ids.data() + 2*n_seqs : nullptr);  // the caller's context (inp->mctx is stale on graph reuse)
++    ggml_backend_tensor_set(inp->own_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
++}
++
+ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+            ggml_context * ctx0,
+      const llama_ubatch & ubatch,
+@@ -3528,8 +3599,24 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
+     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+ 
++    if (!ubatch.seq_offsets.empty()) {
++        inp->seq_offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs+1);
++        ggml_set_input(inp->seq_offsets);
++    }
++    if (!ubatch.seq_offsets.empty() && mctx_cur->is_pinned()) {
++        const int64_t n_chunks = llama_ssd_chunk_rows(ubatch, nullptr);
++        if (n_chunks > 0) {
++            inp->ssd_chunks = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, n_chunks);
++            ggml_set_input(inp->ssd_chunks);
++        }
++    }
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
++    inp->pinned = !ubatch.seq_offsets.empty() && mctx_cur->is_pinned();
++    if (inp->pinned) {
++        inp->own_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (mctx_cur->get_mtp_maxt() > 0 ? 3 : 2)*n_seqs);
++        ggml_set_input(inp->own_ids);
++    }
+ 
+     return inp;
+ }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc4110639d4b8417564b34baa99475e026f8b7db..ed9b1cb3a70ae3af0ce0b73c5d4087a67ad48835 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -269,6 +269,8 @@ public:
+     bool can_reuse(const llm_graph_params & params) override;
+ 
+     ggml_tensor * s_copy;  // I32 [n_rs]
++    ggml_tensor * seq_offsets = nullptr; // I32 [n_seqs+1] for packed Mamba
++    ggml_tensor * ssd_chunks  = nullptr; // I32 [4, n_chunks] chunked-SSD rows
+ 
+     // views of s_copy, computed once per graph
+     // and shared across layers which use build_rs
+@@ -280,8 +282,17 @@ public:
+     // used in view offsets, need to match for valid graph reuse
+     uint32_t head;
+     int32_t rs_z;
++    bool     pinned   = false; // ragged ubatch on pinned recurrent cells (states never move); part of the reuse key
++    ggml_tensor * own_ids = nullptr; // I32 [read cells | write cells (| committed verify rows)], n_seqs each
+ };
+ 
++// Rows for llm_graph_input_rs::ssd_chunks; returns the row count, fills rows when not null.
++int64_t llama_ssd_chunk_rows(const llama_ubatch & ubatch, int32_t * rows);
++
++// Fills own_ids of a pinned-cell input from the recurrent memory context.
++void llama_rs_fill_pinned(const llm_graph_input_rs * inp, const llama_ubatch * ubatch,
++                          const llama_memory_recurrent_context * rctx);
++
+ class llm_graph_input_cross_embd : public llm_graph_input_i {
+ public:
+     llm_graph_input_cross_embd(
+@@ -820,6 +831,7 @@ struct llm_graph_params {
+             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
+             ubatch.n_seqs       == other.ubatch.n_seqs &&
+             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
++            ubatch.seq_offsets.empty() == other.ubatch.seq_offsets.empty() &&
+             (
+                 (!ubatch.token && !other.ubatch.token) ||
+                 (!ubatch.embd  && !other.ubatch.embd)  ||
+diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
+index 34b3c688019afcce4ffc86308c3b71e7a764ff0c..465bc7211c3b93f0641d1c170bd4b3d2ba21bbba 100644
+--- a/src/llama-hparams.cpp
++++ b/src/llama-hparams.cpp
+@@ -233,7 +233,7 @@ uint32_t llama_hparams::n_embd_r() const {
+     return n_conv;
+ }
+ 
+-uint32_t llama_hparams::n_embd_s() const {
++uint32_t llama_hparams::n_embd_s(uint32_t ssm_replay) const {
+     if (wkv_head_size != 0) {
+         // corresponds to RWKV's wkv_states size
+         return n_embd * wkv_head_size;
+@@ -253,7 +253,14 @@ uint32_t llama_hparams::n_embd_s() const {
+         return n_embd_head_la * n_embd_head_la * n_head();  // 128 * 128 * 64 = 1048576
+     }
+ 
+-    // corresponds to Mamba's ssm_states size
++    // corresponds to Mamba's ssm_states size; ssm_replay = L appends the ReplaySSM checkpoint cache
++    // (pos[H] | dt[L][H] as F32 | x[L][d_inner] | B[L][n_group*d_state], in F16 elements)
++    const uint32_t replay = ssm_replay;
++    if (replay > 0 && ssm_dt_rank > 0 && ssm_n_group > 0) {
++        const uint32_t H = ssm_dt_rank;
++        const uint32_t extra = H + 2*replay*H + replay*ssm_d_inner + replay*ssm_n_group*ssm_d_state;
++        return ssm_d_state * ssm_d_inner + ((extra + 7) / 8) * 8;
++    }
+     return ssm_d_state * ssm_d_inner;
+ }
+ 
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 73dffcc9f700806477cda08b8873c6f3e77a40c9..78723af01b90754add042b5426262ce9a5c2905c 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -448,7 +448,7 @@ struct llama_hparams {
+     uint32_t n_embd_r() const;
+ 
+     // dimension of the recurrent state embeddings
+-    uint32_t n_embd_s() const;
++    uint32_t n_embd_s(uint32_t ssm_replay = 0) const;  // ssm_replay: ReplaySSM rows appended per state (Mamba-2)
+ 
+     uint32_t n_pos_per_embd() const;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 332d1abe028f23b974e47d9643cdd849afcd75a0..32a6fb4303f7fe7626a1b0d713e6b93cf846eac8 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1247,12 +1247,20 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+     return v_cells[seq_to_stream[seq_id]];
+ }
+ 
++void llama_kv_cache::set_n_kv_padding(uint32_t bucket, uint32_t reserve_cells) {
++    n_kv_bucket        = bucket;
++    n_kv_reserve_cells = reserve_cells;
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+     // pad the n_kv value so that the graph remains constant across batches and can be reused
+     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
++    uint32_t n_pad_cur = std::max(n_pad, 256u);
++    if (n_stream == 1 && n_kv_bucket > 0) {
++        n_pad_cur = std::max(n_pad_cur, (uint32_t) GGML_PAD(n_kv_bucket, 256));
++    }
+ 
+     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+         const auto & cells = v_cells[sinfo.strm[s]];
+@@ -2672,6 +2680,11 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
+ llama_kv_cache_context::llama_kv_cache_context(
+         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+     n_kv = kv->get_size();
++    // Cap the reserve mask size (set_n_kv_padding): runtime n_kv covers only used cells, and the allocator grows if
++    // needed.
++    if (kv->get_reserve_cells() > 0) {
++        n_kv = std::min<uint32_t>(n_kv, GGML_PAD(kv->get_reserve_cells(), 256));
++    }
+ 
+     const uint32_t n_stream = kv->get_n_stream();
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699def1216170b3d7d00ba2f8712070ebfcf..9dd35c2012f46a31b9c761ba9ef24c898b6ca439 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -118,6 +118,11 @@ public:
+ 
+     ~llama_kv_cache() = default;
+ 
++    // Batched serving: pad n_kv to a multiple of bucket (graph reuse across decode steps) and cap the cells covered by
++    // the masks reserved at init (0 keeps the defaults).
++    void set_n_kv_padding(uint32_t bucket, uint32_t reserve_cells);
++    uint32_t get_reserve_cells() const { return n_kv_reserve_cells; }
++
+     //
+     // llama_memory_i
+     //
+@@ -267,6 +272,9 @@ private:
+     // required padding
+     const uint32_t n_pad = 1;
+ 
++    uint32_t n_kv_bucket        = 0;  // set_n_kv_padding
++    uint32_t n_kv_reserve_cells = 0;
++
+     // SWA
+     const uint32_t n_swa = 0;
+ 
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 577844e070989eb6a541ef773bddc57b53dcfc22..d2392c0876a69f02316cb7854c709fe6546ad042 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -29,8 +29,10 @@ llama_memory_hybrid::llama_memory_hybrid(
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn,
+-    const layer_filter_cb & filter_recr) :
++    const layer_filter_cb & filter_recr,
++const llama_serving_params * serving) :
+     hparams(model.hparams),
++    ragged(model.arch == LLM_ARCH_NEMOTRON_H_MOE && unified && serving && serving->batched),
+     mem_attn(new llama_kv_cache(
+         model,
+         model.hparams,
+@@ -61,8 +63,13 @@ llama_memory_hybrid::llama_memory_hybrid(
+         n_rs_seq,
+         filter_recr == nullptr ?
+             [&](int32_t il) { return hparams.is_recr(il); }
+-            : filter_recr
+-    )) {}
++            : filter_recr,
++        serving
++    )) {
++    if (ragged) {
++        mem_attn->set_n_kv_padding(serving->kv_bucket, serving->kv_reserve_cells);
++    }
++}
+ 
+ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+     do {
+@@ -89,7 +96,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
+             const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+ 
+             GGML_UNUSED(embd_all);
+-            ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
++            // ragged: sequences of different lengths in one ubatch (ragged batches)
++            ubatch = ragged ? balloc.split_ragged(n_ubatch, n_rs_seq > 0 ? n_rs_seq + 1 : 0)
++                            : balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+ 
+             if (ubatch.n_tokens == 0) {
+                 break;
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb749910567b8c50ec36d46bdb678c75426..f5650405eb201136d9d60d11b231916e3e351001 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -39,7 +39,8 @@ public:
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn = nullptr,
+-    const layer_filter_cb & filter_recr = nullptr);
++    const layer_filter_cb & filter_recr = nullptr,
++   const llama_serving_params * serving = nullptr);
+ 
+     ~llama_memory_hybrid() = default;
+ 
+@@ -85,6 +86,7 @@ public:
+ 
+ private:
+     const llama_hparams & hparams;
++    bool ragged = false;
+ 
+     const std::unique_ptr<llama_kv_cache> mem_attn;
+     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 954b86fe52425658959c07fb0c0ef8543355b550..4781095b76fe32cbcfa8fff1d73bfb692eb1cc18 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -25,10 +25,26 @@ llama_memory_recurrent::llama_memory_recurrent(
+                  uint32_t   mem_size,
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
+-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
++    const layer_filter_cb & filter,
++const llama_serving_params * serving) : hparams(model.hparams), n_seq_max(n_seq_max) {
+     const int32_t n_layer = hparams.n_layer();
+ 
++    if (serving && serving->batched && model.arch == LLM_ARCH_NEMOTRON_H_MOE) {
++        pinned     = true;
++        // a verify ubatch (the last accepted token plus the drafts) stays uncommitted in the replay cache, so it
++        // must fit there; a longer one would be taken for a prefill and its rejected drafts could not roll back
++        if (serving->mtp_replay > LLAMA_SSM_REPLAY_ROWS) {
++            throw std::runtime_error(format("MTP verify of %d tokens per sequence exceeds the %d-row replay cache",
++                    (int) serving->mtp_replay, LLAMA_SSM_REPLAY_ROWS));
++        }
++        mtp_maxt   = std::max(0, (int) serving->mtp_replay);
++        ssm_replay = LLAMA_SSM_REPLAY_ROWS;
++    }
++    n_embd_s_row = hparams.n_embd_s(ssm_replay);
++
+     head = 0;
++    // pinned cells: one extra cell, kept zeroed, is the initial state of fresh sequences.
++    if (pinned) mem_size += 1;
+     size = mem_size;
+     used = 0;
+ 
+@@ -71,6 +87,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+     };
+ 
+     r_l.resize(n_layer);
++    h_l.resize(n_layer);
+     s_l.resize(n_layer);
+     p_l.resize(n_layer);
+ 
+@@ -100,11 +117,17 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
++        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, n_embd_s_row, n_rows);
+         ggml_format_name(r, "cache_r_l%d", i);
+         ggml_format_name(s, "cache_s_l%d", i);
+         r_l[i] = r;
+         s_l[i] = s;
++        if (mtp_maxt > 0 && hparams.ssm_d_conv > 1) {
++            const int64_t channels = hparams.n_embd_r() / (hparams.ssm_d_conv - 1);
++            ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels * mtp_maxt, n_rows);
++            ggml_format_name(h, "cache_h_l%d", i);
++            h_l[i] = h;
++        }
+ 
+         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
+         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+@@ -190,6 +213,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+         if (tail_id >= 0) {
+             auto & cell = cells[tail_id];
+ 
++            // mtp_replay: uncommitted verify rows roll back by position only (the next ubatch commits the rest)
++            if (mtp_maxt > 0 && 0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
++                if (p0 - 1 >= cell.base) {
++                    cell.pos = p0 - 1;
++                    return true;
++                }
++                return false;
++            }
+             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                 const llama_pos rollback = cell.pos - (p0 - 1);
+@@ -260,6 +291,11 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+     }
+ 
+     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
++        // A speculative rollback is consumed on the next decode, not by seq_rm.
++        // Preserve its snapshot selection when a sequence is copied or moved.
++        if ((size_t) seq_id_dst < rs_idx.size() && (size_t) seq_id_src < rs_idx.size()) {
++            rs_idx[seq_id_dst] = rs_idx[seq_id_src];
++        }
+         auto & tail_src = cells[seq_id_src];
+         auto & tail_dst = cells[seq_id_dst];
+         if (tail_dst.tail >= 0) {
+@@ -375,7 +411,15 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
+     }
+ }
+ 
++// A sequence's state lives in exactly one cell, its tail (find_slot/seq_cp keep that invariant): O(1) instead of a
++// scan of every cell per call (batch validation queries every sequence of every batch). Debug builds scan and compare.
+ llama_pos llama_memory_recurrent::seq_pos_min(llama_seq_id seq_id) const {
++#ifdef NDEBUG
++    if (seq_id >= 0 && (uint32_t) seq_id < size) {
++        const int32_t tail = cells[seq_id].tail;
++        return tail >= 0 ? cells[tail].pos : -1;
++    }
++#endif
+     llama_pos result = std::numeric_limits<llama_pos>::max();
+ 
+     for (uint32_t i = 0; i < size; ++i) {
+@@ -387,11 +431,23 @@ llama_pos llama_memory_recurrent::seq_pos_min(llama_seq_id seq_id) const {
+     if (result == std::numeric_limits<llama_pos>::max()) {
+         result = -1;
+     }
++#ifndef NDEBUG
++    if (seq_id >= 0 && (uint32_t) seq_id < size) {
++        const int32_t tail = cells[seq_id].tail;
++        assert(result == (tail >= 0 ? cells[tail].pos : -1) && "seq_pos_min differs from the tail cell");
++    }
++#endif
+ 
+     return result;
+ }
+ 
+ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
++#ifdef NDEBUG
++    if (seq_id >= 0 && (uint32_t) seq_id < size) {
++        const int32_t tail = cells[seq_id].tail;
++        return tail >= 0 ? cells[tail].pos : -1;
++    }
++#endif
+     llama_pos result = -1;
+ 
+     for (uint32_t i = 0; i < size; ++i) {
+@@ -399,6 +455,12 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
+             result = std::max(result, cells[i].pos);
+         }
+     }
++#ifndef NDEBUG
++    if (seq_id >= 0 && (uint32_t) seq_id < size) {
++        const int32_t tail = cells[seq_id].tail;
++        assert(result == (tail >= 0 ? cells[tail].pos : -1) && "seq_pos_max differs from the tail cell");
++    }
++#endif
+ 
+     return result;
+ }
+@@ -509,7 +571,6 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+ }
+ 
+ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+-    const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+     const uint32_t n_seqs       = ubatch.n_seqs;
+ 
+     // if we have enough unused cells before the current head ->
+@@ -523,14 +584,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+     // A slot should be always be contiguous.
+ 
+     // can only process batches with an equal number of new tokens in each sequence
+-    GGML_ASSERT(ubatch.equal_seqs());
++    GGML_ASSERT(ubatch.equal_seqs() || !ubatch.seq_offsets.empty());
+ 
+     int32_t min = size - 1;
+     int32_t max = 0;
+ 
+     // everything should fit if all seq_ids are smaller than the max
+     for (uint32_t s = 0; s < n_seqs; ++s) {
+-        const uint32_t i = s*n_seq_tokens; // first token of sequence set s
++        const uint32_t i = ubatch.seq_start(s); // first token of sequence set s
+         const uint32_t n_seq_id = ubatch.n_seq_id[i];
+ 
+         for (uint32_t j = 0; j < n_seq_id; ++j) {
+@@ -560,6 +621,66 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+         }
+     }
+ 
++    if (pinned) {
++        // Every sequence keeps its cell for life: no gather/reorder, so no state is ever moved. The graph reads and
++        // writes states through per-sequence cell ids (pinned_ids); a fresh cell reads the reserved zero cell.
++        const int32_t zero_cell = (int32_t) size - 1;
++        int32_t lo = zero_cell, hi = -1;
++        const int maxt = mtp_maxt;
++        bool verify = maxt > 0;
++        for (uint32_t s = 0; s < n_seqs && verify; ++s) verify = (int) ubatch.seq_length(s) <= maxt;
++        for (uint32_t s = 0; s < n_seqs; ++s) {
++            const uint32_t i = ubatch.seq_start(s);
++            const llama_seq_id seq_id = ubatch.seq_id[i][0];
++            GGML_ASSERT(ubatch.n_seq_id[i] == 1 && seq_id < zero_cell);
++            int32_t c = cells[seq_id].tail;
++            bool fresh = false;
++            int32_t src_cell = -1;  // shared tail (seq_cp from a prompt template): read from it, write an own cell
++            bool allocated = false;
++            if (c >= 0 && !(cells[c].seq_id.size() == 1 && cells[c].has_seq_id(seq_id))) {
++                src_cell = c;
++                cells[c].seq_id.erase(seq_id);
++                GGML_ASSERT(!cells[c].is_empty());
++                cells[seq_id].tail = -1;
++                c = -1;
++            }
++            if (c < 0) {
++                c = cells[seq_id].is_empty() ? seq_id : -1;
++                for (int32_t j = 0; c < 0 && j < zero_cell; ++j) {
++                    if (cells[j].is_empty()) c = j;
++                }
++                GGML_ASSERT(c >= 0 && "pinned recurrent cells: no free cell");
++                cells[seq_id].tail = c;
++                fresh = src_cell < 0;
++                allocated = true;
++            }
++            auto & cell = cells[c];
++            GGML_ASSERT(allocated || (cell.seq_id.size() == 1 && cell.has_seq_id(seq_id)));
++            fresh = fresh || (src_cell < 0 && cell.src < 0);
++            cell.seq_id.clear();
++            cell.seq_id.insert(seq_id);
++            const llama_pos old_pos = cell.pos;
++            cell.pos = ubatch.pos[i + ubatch.seq_length(s) - 1];
++            if (maxt > 0) {
++                // verify ubatches leave their rows uncommitted (base = last committed position); prefill commits all
++                const bool newcell = allocated || fresh;
++                GGML_ASSERT(!(verify && newcell) && "mtp_replay: verify ubatch on a fresh recurrent cell");
++                GGML_ASSERT((verify || newcell || old_pos == cell.base) && "mtp_replay: prefill over uncommitted rows");
++                cell.adv  = verify && !newcell ? (int32_t) (old_pos - cell.base) : 0;
++                cell.base = verify ? old_pos : cell.pos;
++            }
++            cell.src0 = fresh ? zero_cell : src_cell >= 0 ? src_cell : c;
++            cell.src = c;
++            lo = std::min(lo, c);
++            hi = std::max(hi, c);
++        }
++        rs_z = zero_cell;
++        head = lo;
++        n = hi - lo + 1;
++        used = std::count_if(cells.begin(), cells.end(), [](const mem_cell & cell) { return !cell.is_empty(); });
++        return true;
++    }
++
+ #ifndef NDEBUG
+     {
+         std::vector<int32_t> tails_verif;
+@@ -593,7 +714,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+ 
+     // find usable cell range
+     for (uint32_t s = 0; s < n_seqs; ++s) {
+-        const uint32_t i = s*n_seq_tokens;
++        const uint32_t i = ubatch.seq_start(s);
+         const llama_seq_id seq_id = ubatch.seq_id[i][0];
+         auto & seq_meta = cells[seq_id];
+         bool has_cell = false;
+@@ -632,7 +753,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+ 
+     // gather and re-order
+     for (uint32_t s = 0; s < n_seqs; ++s) {
+-        const uint32_t i = s*n_seq_tokens;
++        const uint32_t i = ubatch.seq_start(s);
+         const int32_t dst_id = s + min;
+         const int32_t src_id = cells[ubatch.seq_id[i][0]].tail;
+         if (dst_id != src_id) {
+@@ -657,7 +778,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+ 
+     // update the pos of the used seqs
+     for (uint32_t s = 0; s < n_seqs; ++s) {
+-        const uint32_t i = s*n_seq_tokens;
++        const uint32_t i = ubatch.seq_start(s);
++        const uint32_t n_seq_tokens = ubatch.seq_length(s);
+         const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
+         const int32_t cell_id = s + min;
+         auto & cell = cells[cell_id];
+@@ -951,7 +1073,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             io.write(&s_type_i, sizeof(s_type_i));
+ 
+             // Write row size of S tensor
+-            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
++            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, n_embd_s_row);
+             io.write(&s_size_row, sizeof(s_size_row));
+ 
+             // Write each logical cell row range. With pending recurrent rollback,
+@@ -969,7 +1091,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
+             if (s_l[il] == nullptr) continue;
+ 
+-            const uint32_t n_embd_s = hparams.n_embd_s();
++            const uint32_t n_embd_s = n_embd_s_row;
+ 
+             // Write S tensor type
+             const int32_t s_type_i = (int32_t)s_l[il]->type;
+@@ -1171,7 +1293,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+             // Read row size of value
+             uint64_t s_size_row_ref;
+             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
+-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
++            const size_t s_size_row = ggml_row_size(s_l[il]->type, n_embd_s_row);
+             if (s_size_row != s_size_row_ref) {
+                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
+                 return false;
+@@ -1188,7 +1310,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+             // skip null layers
+             if (s_l[il] == nullptr) continue;
+ 
+-            const uint32_t n_embd_s = hparams.n_embd_s();
++            const uint32_t n_embd_s = n_embd_s_row;
+ 
+             // Read type of value
+             int32_t s_type_i_ref;
+@@ -1309,6 +1431,41 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+     return mem->p_l[il];
+ }
+ 
++void llama_memory_recurrent_context::pinned_ids(const llama_ubatch & ub, int32_t * read, int32_t * write, int32_t * adv) const {
++    for (uint32_t s = 0; s < ub.n_seqs; ++s) {
++        if (is_full) {
++            read[s] = write[s] = (int32_t) s;
++            if (adv) adv[s] = 0;
++            continue;
++        }
++        const int32_t c = mem->cells[ub.seq_id[ub.seq_start(s)][0]].tail;
++        GGML_ASSERT(c >= 0);
++        write[s] = c;
++        read[s] = mem->cells[c].src0;
++        if (adv) adv[s] = mem->cells[c].adv;
++    }
++}
++
++bool llama_memory_recurrent_context::is_pinned() const {
++    return mem->pinned;
++}
++
++int llama_memory_recurrent_context::get_mtp_maxt() const {
++    return mem->mtp_maxt;
++}
++
++uint32_t llama_memory_recurrent_context::get_ssm_replay() const {
++    return mem->ssm_replay;
++}
++
++uint32_t llama_memory_recurrent_context::get_n_embd_s() const {
++    return mem->n_embd_s_row;
++}
++
++ggml_tensor * llama_memory_recurrent_context::get_h_l(int32_t il) const {
++    return mem->h_l[il];
++}
++
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     const uint32_t cell_idx = i + mem->head;
+     const int32_t  src0     = mem->cells[cell_idx].src0;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 4abb3f5cf5c09611844dff5361ca36e51ff9c07f..e186796e17d42fee2794ede1f4b823f45c2aaf16 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -14,6 +14,9 @@
+ 
+ // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
+ //       see the implementation of llama_kv_cache_context_i for an example how to do it
++// ReplaySSM rows per state for one-token decode in batched serving (llama_serving_params.batched)
++#define LLAMA_SSM_REPLAY_ROWS 16
++
+ class llama_memory_recurrent : public llama_memory_i {
+ public:
+     llama_memory_recurrent(
+@@ -24,7 +27,8 @@ public:
+                      uint32_t   mem_size,
+                      uint32_t   n_seq_max,
+                      uint32_t   n_rs_seq,
+-        const layer_filter_cb & filter);
++        const layer_filter_cb & filter,
++   const llama_serving_params * serving = nullptr);
+ 
+     ~llama_memory_recurrent() = default;
+ 
+@@ -73,6 +77,15 @@ public:
+     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+     uint32_t n_rs_seq = 0;
+ 
++    // Batched serving (llama_serving_params.batched, Nemotron-H): sequences keep their recurrent cell for life (pinned),
++    // with ReplaySSM rows after each state (ssm_replay); speculative verify ubatches (every sequence <= mtp_maxt
++    // tokens) append to the replay cache uncommitted and the next ubatch commits the accepted rows, so rejected MTP
++    // drafts roll back without state snapshots.
++    bool     pinned       = false;
++    int      mtp_maxt     = 0;
++    uint32_t ssm_replay   = 0;
++    uint32_t n_embd_s_row = 0;  // state row width: hparams.n_embd_s(ssm_replay)
++
+     // per-seq rollback index
+     std::vector<uint32_t> rs_idx;
+ 
+@@ -90,6 +103,8 @@ public:
+         int32_t   src  = -1; // used to know where states should be copied from
+         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
+         int32_t   tail = -1;
++        llama_pos base = -1; // mtp_replay: last committed position when the latest ubatch started
++        int32_t   adv  = 0;  // mtp_replay: rows of the previous verify ubatch committed by this ubatch
+ 
+         std::set<llama_seq_id> seq_id;
+ 
+@@ -110,6 +125,7 @@ public:
+ 
+     // per layer
+     std::vector<ggml_tensor *> r_l;
++    std::vector<ggml_tensor *> h_l; // mtp_replay: raw conv inputs of the latest verify ubatch [maxt*channels, cells]
+     std::vector<ggml_tensor *> s_l;
+     // a second conv history that must stay replicated across devices, so it cannot share the r row
+     std::vector<ggml_tensor *> p_l;
+@@ -172,11 +188,20 @@ public:
+     uint32_t get_size() const;
+ 
+     ggml_tensor * get_r_l(int32_t il) const;
++    ggml_tensor * get_h_l(int32_t il) const;
+     ggml_tensor * get_s_l(int32_t il) const;
+     ggml_tensor * get_p_l(int32_t il) const;
+ 
++    bool     is_pinned()      const;
++    int      get_mtp_maxt()   const;
++    uint32_t get_ssm_replay() const;
++    uint32_t get_n_embd_s()   const;  // state row width (ReplaySSM rows included)
++
+     int32_t s_copy(int i) const;
+ 
++    // pinned cells: per ubatch sequence, the cell its state is read from (zero cell when fresh) and written to.
++    void pinned_ids(const llama_ubatch & ub, int32_t * read, int32_t * write, int32_t * adv = nullptr) const;
++
+ private:
+     const llama_memory_status status;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50d0bde50333eef771a651cebde87d9616f..b1214e0244d453444dc1605c8ecfc985126e7d04 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2641,14 +2641,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* attn_n_swa        */ hparams.n_swa,
+                             /* attn_swa_type     */ hparams.swa_type,
+                             /* recurrent_type_k  */ GGML_TYPE_F32,
+-                            /* recurrent_type_v  */ GGML_TYPE_F32,
++                            // batched serving keeps F16 state rows (ReplaySSM)
++                            /* recurrent_type_v  */ cparams.serving.batched && arch == LLM_ARCH_NEMOTRON_H_MOE ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+-                            /* filter_recr       */ std::move(filter_recr));
++                            /* filter_recr       */ std::move(filter_recr),
++                            /* serving           */ &cparams.serving);
+                     }
+                 } else {
+                     llama_kv_cache::layer_filter_cb filter = nullptr;
+diff --git a/src/models/mamba-base.cpp b/src/models/mamba-base.cpp
+index 370de0f0141dbed7453d153e1c3ed8b94a73d8cc..99d7d74eb99789ff9f134a09fee005b35ed9c0ac 100644
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -171,6 +171,104 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+     const int64_t K            = cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
+ 
++    if (!ubatch.seq_offsets.empty()) {
++        // Sequence boundaries remain runtime inputs to conv and scan. Every
++        // projection, normalization and MoE operates on the packed token axis.
++        const int64_t T = ubatch.n_tokens;
++        const int64_t channels = d_inner + 2*n_group*d_state;
++        const int64_t conv_D = (d_conv-1)*channels;
++        const int64_t state_D = d_state*d_inner;
++        auto * conv_cache = mctx_cur->get_r_l(il);
++        auto * ssm_cache = mctx_cur->get_s_l(il);
++        // pinned cells (batched serving): own_ids = [read cells | write cells]; states stay in their sequence's cell
++        GGML_ASSERT(inp->pinned && K == 1 && "ragged ubatches need pinned recurrent cells");
++        ggml_tensor * read_ids  = ggml_view_1d(ctx0, inp->own_ids, n_seqs, 0);
++        ggml_tensor * write_ids = ggml_view_1d(ctx0, inp->own_ids, n_seqs, n_seqs*ggml_element_size(inp->own_ids));
++        ggml_tensor * conv_rows = ggml_reshape_2d(ctx0, conv_cache, hparams.n_embd_r(), conv_cache->ne[1]);
++        // MTP verify (mtp_replay): ubatches whose sequences all have <= maxt tokens are speculative verify (or decode)
++        // steps: conv and ReplaySSM append uncommitted rows and commit the previous step's accepted ones (own_ids[2n..3n))
++        const int mtp_maxt = mctx_cur->get_mtp_maxt();
++        bool verify = mtp_maxt > 0;
++        for (int64_t s = 0; verify && s < n_seqs; ++s) verify = (int) ubatch.seq_length(s) <= mtp_maxt;
++        // decode ubatches (one token per sequence) update the pinned conv state rows inside the conv kernel (no gather of
++        // the old window, no scatter of the new one)
++        const bool conv_ip = !verify && (int64_t) ubatch.n_tokens == n_seqs;
++        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0,
++            ggml_view_1d(ctx0, conv_rows, hparams.n_embd_r(), inp->rs_z*conv_rows->nb[1]), 0));
++        ggml_tensor * old_conv = !conv_ip && !verify ? ggml_get_rows(ctx0, conv_rows, read_ids) : nullptr;
++        auto * proj = build_lora_mm(model.layers[il].ssm_in, cur, model.layers[il].ssm_in_s);
++        auto * z = ggml_view_4d(ctx0, proj, head_dim, n_head, T, 1,
++            head_dim*proj->nb[0], proj->nb[1], T*proj->nb[1], 0);
++        auto * raw_xBC = ggml_view_2d(ctx0, proj, channels, T, proj->nb[1], d_inner*proj->nb[0]);
++        auto * dt = ggml_view_2d(ctx0, proj, n_head, T, proj->nb[1],
++            (2*d_inner+2*n_group*d_state)*proj->nb[0]);
++        auto * conv = verify
++            ? ggml_ssm_conv_ragged_verify(ctx0, raw_xBC, model.layers[il].ssm_conv1d, conv_rows,
++                  ggml_reshape_2d(ctx0, mctx_cur->get_h_l(il), mctx_cur->get_h_l(il)->ne[0], mctx_cur->get_h_l(il)->ne[1]),
++                  inp->seq_offsets, inp->own_ids)
++            : conv_ip
++            ? ggml_ssm_conv_ragged_inplace(ctx0, raw_xBC, model.layers[il].ssm_conv1d, conv_rows, inp->seq_offsets, inp->own_ids)
++            : ggml_ssm_conv_ragged(ctx0, raw_xBC, model.layers[il].ssm_conv1d, old_conv, inp->seq_offsets, K);
++        const size_t conv_row = conv_D*sizeof(float);
++        if (conv_ip || verify) {
++            ggml_build_forward_expand(gf, conv);  // writes the new windows into conv_rows
++        } else {
++            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, conv_rows,
++                ggml_view_2d(ctx0, conv, conv_D, n_seqs, conv_row, channels*T*sizeof(float)), write_ids));
++        }
++        // the conv bias add and SiLU run inside the ragged conv
++        ggml_ssm_conv_ragged_set_bias_silu(conv, model.layers[il].ssm_conv1d_b);
++        const size_t cts = ggml_type_size(conv->type);
++        auto * xBC = ggml_view_3d(ctx0, conv, channels, T, 1, channels*cts, channels*T*cts, 0);
++        auto * x = ggml_view_4d(ctx0, xBC, head_dim, n_head, T, 1,
++            head_dim*xBC->nb[0], xBC->nb[1], xBC->nb[2], 0);
++        auto * B = ggml_view_4d(ctx0, xBC, d_state, n_group, T, 1,
++            d_state*xBC->nb[0], xBC->nb[1], xBC->nb[2], d_inner*xBC->nb[0]);
++        auto * C = ggml_view_4d(ctx0, xBC, d_state, n_group, T, 1,
++            d_state*xBC->nb[0], xBC->nb[1], xBC->nb[2], (d_inner+n_group*d_state)*xBC->nb[0]);
++        dt = ggml_add(ctx0, ggml_cont(ctx0, dt), model.layers[il].ssm_dt_b);
++        ggml_tensor * y_ssm = nullptr;
++        const size_t cache_row = ssm_cache->nb[1];                            // state cache row (F32 or F16; may carry ReplaySSM data)
++        auto * state_dst = ggml_view_3d(ctx0, ssm_cache, state_D, n_seqs, K,
++            ssm_cache->nb[1], mem_size*cache_row, 0);
++        // The scan reads each sequence's state from its read cell and writes it to its write cell (pinned cells).
++        auto * rows = ggml_reshape_2d(ctx0, ssm_cache, mctx_cur->get_n_embd_s(), ssm_cache->ne[1]);
++        if (inp->rs_z >= 0) {
++            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, ggml_view_1d(ctx0, rows, mctx_cur->get_n_embd_s(), inp->rs_z*rows->nb[1]), 0));
++        }
++        auto * all = ggml_view_4d(ctx0, ssm_cache, d_state, head_dim, n_head, ssm_cache->ne[1],
++            ggml_row_size(ssm_cache->type, d_state), ggml_row_size(ssm_cache->type, d_state*head_dim), ssm_cache->nb[1], 0);
++        // the whole [read | write] id tensor (a view would be copied to the GPU without the write half)
++        y_ssm = ggml_ssm_scan_ragged(ctx0, all, x, dt, model.layers[il].ssm_a, B, C, inp->own_ids, inp->seq_offsets, K);
++        if (inp->ssd_chunks) ggml_ssm_scan_set_chunks(y_ssm, inp->ssd_chunks);
++        y_ssm = ggml_ssm_scan_to_indexed(ctx0, y_ssm, state_dst);
++        y_ssm->op_params[4] = 1;  // write ids follow the read ids (see ggml-cuda ssm-scan)
++        // ReplaySSM decode: every sequence contributes one token (op_params[3] = cache length)
++        const int replay = (int) mctx_cur->get_ssm_replay();
++        if (replay > 0 && K == 1 && (int64_t) ubatch.n_tokens == n_seqs) y_ssm->op_params[3] = replay;
++        if (verify) {
++            GGML_ASSERT(replay > 0 && "MTP verify steps need ReplaySSM rows");
++            y_ssm->op_params[3] = replay;
++            y_ssm->op_params[5] = mtp_maxt;
++        }
++        ggml_build_forward_expand(gf, y_ssm);
++        const size_t yts = ggml_type_size(y_ssm->type);
++        auto * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, T, 1,
++            head_dim*yts, d_inner*yts, T*d_inner*yts, 0);
++        if (model.layers[il].ssm_norm) {
++            // (y + x*D) * silu(z) and the grouped RMS norm in one op
++            y = ggml_ssm_gate_norm(ctx0, y, x, model.layers[il].ssm_d, z, model.layers[il].ssm_norm, n_group,
++                                   hparams.f_norm_rms_eps);
++        } else {
++            y = ggml_add(ctx0, y, ggml_mul(ctx0, x, model.layers[il].ssm_d));
++            y = ggml_swiglu_split(ctx0, ggml_cont(ctx0, z), y);
++        }
++        y = ggml_reshape_2d(ctx0, y, d_inner, T);
++        auto * output = build_lora_mm(model.layers[il].ssm_out, y, model.layers[il].ssm_out_s);
++        cb(output, "mamba_out", il);
++        return output;
++    }
++
+     GGML_ASSERT(n_seqs != 0);
+     GGML_ASSERT(ubatch.equal_seqs());
+     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+@@ -256,7 +354,8 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+         // (this is necessary in order to properly use the states before they are overwritten,
+         //  while avoiding to make unnecessary copies of the states)
+         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+-            ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
++            ggml_tensor * ssm = ggml_view_4d(ctx, states, d_state, head_dim, n_head, state_slots,
++                ggml_row_size(states->type, d_state), ggml_row_size(states->type, d_state*head_dim), states->nb[1], 0);
+ 
+             // TODO: use semistructured matrices to implement state-space duality
+             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
+@@ -264,19 +363,33 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+             return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, K);
+         };
+ 
+-        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
++        ggml_tensor * y_ssm = nullptr;
+         const int64_t D            = d_state * d_inner;
+         const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
+-        const size_t  row_size     = ggml_row_size(ssm_states_all->type, D);
+-        const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);
++        const size_t  row_size     = ssm_states_all->nb[1];  // state row (may carry ReplaySSM data after D)
++        const size_t  y_row_size   = ggml_row_size(GGML_TYPE_F32, D);
+         const size_t  state_offset = ggml_nelements(x) * ggml_element_size(x);
+ 
+-        ggml_build_forward_expand(
+-            gf, ggml_cpy(ctx0,
+-                         ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
+-                                      y_row_size, y_row_size * n_seqs, state_offset),
+-                         ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
+-                                      ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
++        if (mctx_cur->is_pinned()) {
++            // batched serving (equal-length ubatches, e.g. the reserve graphs): scan the gathered states and write the
++            // final states straight into the (wider, ReplaySSM) cache rows
++            auto * initial = build_rs(inp, ssm_states_all, mctx_cur->get_n_embd_s(), n_seqs);
++            auto * states = ggml_view_4d(ctx0, initial, d_state, head_dim, n_head, n_seqs,
++                ggml_row_size(initial->type, d_state), ggml_row_size(initial->type, d_state*head_dim), initial->nb[1], 0);
++            auto * state_dst = ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, K,
++                ssm_states_all->nb[1], (size_t) mem_size*row_size, kv_head*row_size);
++            y_ssm = ggml_ssm_scan(ctx0, states, x, dt, A, B, C, inp->s_copy_main, K);
++            y_ssm = ggml_ssm_scan_to(ctx0, y_ssm, state_dst);
++            ggml_build_forward_expand(gf, y_ssm);
++        } else {
++            y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
++            ggml_build_forward_expand(
++                gf, ggml_cpy(ctx0,
++                             ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
++                                          y_row_size, y_row_size * n_seqs, state_offset),
++                             ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
++                                          ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
++        }
+ 
+         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
+                                        n_seq_tokens * n_head * x->nb[1], 0);

@@ -1,0 +1,1285 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: mixed embedding batches and device-resident MTP drafting
+
+- llama_batch.embd_input: rows that carry both a token id and an embedding
+  (zero for text tokens; audio embeddings with token -1) in one batch.
+  embd_input_device lets the graph read rows already staged on the device.
+- MTP hidden states can stay on the device (llama_set_embeddings_nextn_device,
+  batch.embd_device), and draft steps chain on the device
+  (llama_set_mtp_chain): argmax ids and hidden rows are written back in place,
+  with no host round trip between drafts.
+- The draft context accepts position gaps for deferred catch-up and can wait on
+  another context's event (llama_set_input_wait_event).
+- common/speculative's MTP driver uses these paths when the target context has
+  batched serving. Its queued row moves run as one gather and one scatter per
+  (source, destination) pair, and common_speculative_copy_state copies a
+  sequence's drafter state on the device.
+
+Upstream: not planned in this form; device-resident drafting may be proposed
+alongside upstream's MTP work.
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535f3f5d41164b31c10d390699fcba274a..b197dbb794a4945cb2542e4fb9c8cf9afb49ae7d 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3,6 +3,8 @@
+ #include "common.h"
+ #include "ggml.h"
+ #include "ggml-cpp.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
+ #include "llama.h"
+ #include "log.h"
+ #include "ngram-cache.h"
+@@ -18,6 +20,7 @@
+ #include <cstring>
+ #include <iomanip>
+ #include <map>
++#include <unordered_set>
+ #include <cinttypes>
+ 
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -174,6 +177,7 @@ struct common_speculative_impl {
+     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
+     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
+     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
++    virtual bool copy_state(llama_seq_id /*src*/, llama_seq_id /*dst*/) { return false; }
+ };
+ 
+ struct common_speculative_impl_draft_simple : public common_speculative_impl {
+@@ -635,6 +639,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+                 /*.n_seq_id =*/ nullptr,
+                 /*.seq_id   =*/ nullptr,
+                 /*.logits   =*/ nullptr,
++                /*.embd_input        =*/ nullptr,
++                /*.embd_device       =*/ nullptr,
++                /*.embd_input_device =*/ nullptr,
+             };
+             const int32_t rc = llama_encode(ctx_dft, enc_batch);
+             if (rc != 0) {
+@@ -1363,6 +1370,167 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    bool gpu_mtp = false;  // device-resident drafting: batched serving, one NextN head, separate draft memory
++    ggml_backend_t hidden_backend = nullptr;
++    ggml_context_ptr hidden_ctx;
++    ggml_backend_buffer_ptr hidden_buffer;
++    ggml_tensor * pending_device = nullptr;
++    ggml_tensor * input_device = nullptr;
++    ggml_tensor * verify_device = nullptr;
++
++    void init_device_hidden() {
++        if (hidden_buffer) return;
++        hidden_ctx.reset(ggml_init({6*ggml_tensor_overhead(), nullptr, true}));
++        pending_device = ggml_new_tensor_2d(hidden_ctx.get(), GGML_TYPE_F32, n_embd, n_seq);
++        input_device = ggml_new_tensor_2d(hidden_ctx.get(), GGML_TYPE_F32, n_embd, llama_n_batch(params.ctx_dft));
++        stash_device = ggml_new_tensor_2d(hidden_ctx.get(), GGML_TYPE_F32, n_embd, llama_n_batch(params.ctx_tgt));
++        chain_tok = ggml_new_tensor_1d(hidden_ctx.get(), GGML_TYPE_I32, (int64_t) n_seq * std::max(1, this->params.n_max));
++        for (auto & t : chain_hb) t = ggml_new_tensor_2d(hidden_ctx.get(), GGML_TYPE_F32, n_embd, n_seq);
++        hidden_buffer.reset(ggml_backend_alloc_ctx_tensors(hidden_ctx.get(), hidden_backend));
++        GGML_ASSERT(hidden_buffer);
++        std::vector<float> initial;
++        initial.reserve((size_t) n_seq*n_embd);
++        for (const auto & row : pending_h) initial.insert(initial.end(), row.begin(), row.end());
++        ggml_backend_tensor_set(pending_device, initial.data(), 0, initial.size()*sizeof(float));
++    }
++
++    // Batched single-row moves on the hidden backend: queued (src row -> dst row) pairs run as one get_rows/set_rows
++    // graph per flush instead of one synchronous copy each (thousands per step with hundreds of sequences).
++    // Device-resident drafting (gpu_mtp):
++    // - verify batches are not ingested on their own. process() stashes their target hidden rows (one bulk copy);
++    //   the next draft() feeds the accepted rows (pos < pos0) in front of its first draft row, so the drafter's catch-up
++    //   costs no extra decode and rejected rows never enter its KV.
++    // - the K draft decodes are issued back to back; each reads the previous one's argmax ids and head hidden rows
++    //   from device buffers (llama_set_mtp_chain) and the ids are read once at the end.
++    // - row moves and the drafter's decodes are ordered on the GPU by an event recorded on the target stream instead
++    //   of a host wait, so the drafter's host work overlaps the target pass (the drafter reads the target's hidden rows
++    //   in place).
++    ggml_tensor * stash_device = nullptr;
++    std::vector<int32_t> st_beg, st_rows;
++    std::vector<llama_pos> st_pos0;
++    std::vector<std::vector<llama_token>> st_tok;
++    ggml_backend_event_t hidden_event = nullptr;
++
++    // after the queued moves are issued: the drafter's next graph waits for them on the GPU
++    void moves_ready_for_drafter() {
++        flush_rows(false);
++        if (!hidden_event) hidden_event = ggml_backend_event_new(ggml_backend_get_device(hidden_backend));
++        ggml_backend_event_record(hidden_event, hidden_backend);
++        llama_set_input_wait_event(params.ctx_dft, hidden_event);
++    }
++    ggml_tensor * chain_tok = nullptr;
++    ggml_tensor * chain_hb[2] = {nullptr, nullptr};  // ping-pong head hidden rows of chained drafts
++    int defer_maxt = 8;  // tokens per verify step (llama_serving_params.mtp_replay)
++
++    // Queued moves are grouped by (src, dst) pair: a flush gathers every group's rows, then scatters them, two
++    // kernels per pair rather than per run of consecutive moves (draft() alternates pairs row by row). A move that
++    // reads or rewrites a row an earlier queued move writes starts a new phase, so a flush equals the moves done one by
++    // one in queue order.
++    struct row_move { ggml_tensor * src; ggml_tensor * dst; int phase; std::vector<int32_t> s, d; };
++    std::vector<row_move> moves;
++    int mv_phase = 0;
++    std::vector<const ggml_tensor *> mv_tensors;  // small ids for the written-row keys
++    std::unordered_set<uint64_t> mv_written;      // rows written in the current phase
++
++    uint64_t row_key(const ggml_tensor * t, int64_t row) {
++        size_t id = std::find(mv_tensors.begin(), mv_tensors.end(), t) - mv_tensors.begin();
++        if (id == mv_tensors.size()) mv_tensors.push_back(t);
++        return ((uint64_t) id << 40) | (uint64_t) row;
++    }
++
++    void queue_row(ggml_tensor * src, int64_t from, ggml_tensor * dst, int64_t to) {
++        const uint64_t written = row_key(dst, to);
++        if (mv_written.count(row_key(src, from)) || mv_written.count(written)) {
++            ++mv_phase;
++            mv_written.clear();
++        }
++        mv_written.insert(written);
++        row_move * m = nullptr;
++        for (auto it = moves.rbegin(); it != moves.rend() && it->phase == mv_phase; ++it) {
++            if (it->src == src && it->dst == dst) {
++                m = &*it;
++                break;
++            }
++        }
++        if (m == nullptr) {
++            moves.push_back({src, dst, mv_phase, {}, {}});
++            m = &moves.back();
++        }
++        m->s.push_back((int32_t) from);
++        m->d.push_back((int32_t) to);
++    }
++
++    // persistent mover buffers (allocated on first use): indices [2, cap] I32 and gathered rows [n_embd, cap] F32
++    ggml_context_ptr mv_ctx;
++    ggml_backend_buffer_ptr mv_buf;
++    ggml_tensor * mv_idx = nullptr;
++    ggml_tensor * mv_rows = nullptr;
++    int64_t mv_cap = 0;
++    std::vector<int32_t> mv_host;
++
++    // Runs the queued moves on the hidden backend's stream without a host wait (stream-ordered after the target's
++    // outputs); sync = true also waits for completion.
++    void flush_rows(bool sync = true) {
++        if (moves.empty()) return;
++        int64_t total = 0;
++        for (auto & m : moves) total += (int64_t) m.s.size();
++        if (total > mv_cap) {
++            if (mv_buf) ggml_backend_synchronize(hidden_backend);
++            mv_cap = std::max<int64_t>(total, 4096) * 2;
++            mv_ctx.reset(ggml_init({2*ggml_tensor_overhead(), nullptr, true}));
++            mv_idx  = ggml_new_tensor_1d(mv_ctx.get(), GGML_TYPE_I32, 2*mv_cap);
++            mv_rows = ggml_new_tensor_2d(mv_ctx.get(), GGML_TYPE_F32, n_embd, mv_cap);
++            mv_buf.reset(ggml_backend_alloc_ctx_tensors(mv_ctx.get(), hidden_backend));
++            GGML_ASSERT(mv_buf);
++        }
++        // indices: all sources first, then all destinations (one async upload, stream-ordered)
++        mv_host.resize(2*total);
++        int64_t o = 0;
++        for (auto & m : moves) { std::copy(m.s.begin(), m.s.end(), mv_host.begin() + o); o += (int64_t) m.s.size(); }
++        for (auto & m : moves) { std::copy(m.d.begin(), m.d.end(), mv_host.begin() + o); o += (int64_t) m.d.size(); }
++        ggml_backend_tensor_set_async(hidden_backend, mv_idx, mv_host.data(), 0, 2*total*sizeof(int32_t));
++        const size_t n_nodes = moves.size()*6 + 16;
++        ggml_init_params ip = { ggml_tensor_overhead()*n_nodes + ggml_graph_overhead_custom(n_nodes, false), nullptr, true };
++        ggml_context * ctx = ggml_init(ip);
++        ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_nodes, false);
++        // per phase: every gather, then every scatter (the graph runs in node order on one stream)
++        std::vector<ggml_tensor *> gathered(moves.size());
++        int64_t off = 0;
++        for (size_t a = 0, b = 0; a < moves.size(); a = b) {
++            int64_t o = off;
++            for (b = a; b < moves.size() && moves[b].phase == moves[a].phase; ++b) {
++                const int64_t k = (int64_t) moves[b].s.size();
++                ggml_tensor * si = ggml_view_1d(ctx, mv_idx, k, o*sizeof(int32_t));
++                ggml_tensor * g  = ggml_get_rows(ctx, moves[b].src, si);
++                // the gathered rows live in the persistent scratch (no allocator, no reallocation)
++                ggml_tensor * gv = ggml_view_2d(ctx, mv_rows, n_embd, k, mv_rows->nb[1], o*mv_rows->nb[1]);
++                g->data = gv->data; g->buffer = mv_rows->buffer; g->view_src = nullptr;
++                ggml_build_forward_expand(gf, g);
++                gathered[b] = g;
++                o += k;
++            }
++            for (size_t i = a; i < b; ++i) {
++                const int64_t k = (int64_t) moves[i].d.size();
++                ggml_tensor * di = ggml_view_1d(ctx, mv_idx, k, (total + off)*sizeof(int32_t));
++                ggml_build_forward_expand(gf, ggml_set_rows(ctx, moves[i].dst, gathered[i], di));
++                off += k;
++            }
++        }
++        GGML_ASSERT(ggml_backend_graph_compute_async(hidden_backend, gf) == GGML_STATUS_SUCCESS);
++        if (sync) ggml_backend_synchronize(hidden_backend);
++        ggml_free(ctx);
++        moves.clear();
++        mv_phase = 0;
++        mv_written.clear();
++    }
++
++    void copy_device_rows(const ggml_tensor * src, ggml_tensor * dst, int64_t from, int64_t to, int64_t rows = 1) const {
++        if (rows == 0) return;
++        auto source = llama_tensor_row_view(src, from, rows);
++        auto target = llama_tensor_row_view(dst, to, rows);
++        ggml_backend_tensor_copy_async(hidden_backend, hidden_backend, &source, &target);
++    }
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1376,6 +1544,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 "MTP input row width must match the target h_nextn width");
+         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+ 
++        // device-resident drafting for batched serving (one NextN head, separate draft memory)
++        const llama_serving_params serving = llama_get_serving_params(ctx_tgt);
++        gpu_mtp = serving.batched && n_mtp_layers == 1 && llama_get_ctx_other(ctx_dft) != ctx_tgt;
++        if (serving.mtp_replay > 0) defer_maxt = serving.mtp_replay;
++
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
+@@ -1396,17 +1569,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         for (auto & s : smpls) {
+             common_params_sampling sparams;
+             sparams.no_perf  = false;
+-            sparams.top_k    = 10;
++            // batched serving (greedy targets) also drafts greedily, which accepts more drafts
++            sparams.top_k    = llama_get_serving_params(ctx_tgt).batched ? 1 : 10;
+             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+         }
+ 
+         // offload draft sampling to the backend
+         backend_chains.assign(n_seq, nullptr);
+-        if (this->params.backend_sampling) {
++        if (this->params.backend_sampling && !gpu_mtp) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                llama_sampler_chain_add(chain, llama_get_serving_params(ctx_tgt).batched ? llama_sampler_init_greedy() : llama_sampler_init_top_k(10));
+ 
+                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+@@ -1438,12 +1612,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
++        st_beg.assign(n_seq, 0);
++        st_rows.assign(n_seq, 0);
++        st_pos0.assign(n_seq, 0);
++        st_tok.assign(n_seq, {});
+ 
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
++        if (gpu_mtp) llama_set_embeddings_nextn_device(ctx_tgt, true);
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
++        if (hidden_backend) ggml_backend_synchronize(hidden_backend);
++        if (hidden_event) ggml_backend_event_free(hidden_event);
++        if (gpu_mtp) llama_set_embeddings_nextn_device(params.ctx_tgt, false);
+         auto * ctx_dft = this->params.ctx_dft;
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+@@ -1498,23 +1680,49 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+ 
+         for (int k = 0; k < n_tokens; ++k) {
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+-
+-                if (batch_in.seq_id[k][0] == seq_id) {
+-                    i_batch_end[seq_id] = k;
+-                    if (i_batch_beg[seq_id] < 0) {
+-                        i_batch_beg[seq_id] = k;
+-                    }
+-                }
+-            }
++            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
++            const auto seq_id = batch_in.seq_id[k][0];
++            GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
++            i_batch_end[seq_id] = k;
++            if (i_batch_beg[seq_id] < 0) i_batch_beg[seq_id] = k;
+         }
+ 
+         auto * ctx_tgt = this->params.ctx_tgt;
+         auto * ctx_dft = this->params.ctx_dft;
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
++        const float * target_hidden = nullptr;
++        if (gpu_mtp) {
++            verify_device = llama_get_embeddings_nextn_device(ctx_tgt, &hidden_backend);
++            init_device_hidden();
++        } else {
++            target_hidden = llama_get_embeddings_nextn(ctx_tgt);
++        }
++        if (gpu_mtp) {
++            bool verify = true;
++            for (llama_seq_id seq_id = 0; verify && seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (i_batch_beg[seq_id] >= 0) verify = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1 <= defer_maxt;
++            }
++            if (verify) {
++                flush_rows();
++                copy_device_rows(verify_device, stash_device, 0, 0, n_tokens);
++                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                    if (i_batch_beg[seq_id] < 0) continue;
++                    st_beg[seq_id] = i_batch_beg[seq_id];
++                    st_rows[seq_id] = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
++                    st_pos0[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
++                    st_tok[seq_id].assign(batch_in.token + i_batch_beg[seq_id], batch_in.token + i_batch_end[seq_id] + 1);
++                    verify_h_rows[seq_id] = 0;  // accept() leaves pending alone; draft() takes it from the stash
++                }
++                return true;
++            }
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (i_batch_beg[seq_id] >= 0) st_rows[seq_id] = 0;
++            }
++        }
+ 
++        batch.embd_input = batch_in.embd_input;
++        batch.embd_input_device = batch_in.embd_input_device;  // device-staged audio rows (read in place)
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+         if (!is_mem_shared) {
+             common_batch_clear(batch);
+@@ -1529,8 +1737,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             //                                                       ^--- this is a problem
+             // TODO:this is generally true, but would be nice to assert it
+             {
+-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
++                if (gpu_mtp) {
++                    llama_synchronize(ctx_dft);  // the drafter's previous graph may still read input_device
++                    for (int k = 1; k < n_tokens; ++k) queue_row(verify_device, k-1, input_device, k);
++                } else std::memcpy(batch.embd + (size_t) 1 * n_embd, target_hidden, row_bytes * (n_tokens-1));
+             }
+ 
+             // fill the pending embeddings from a previous run
+@@ -1543,9 +1753,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
+-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
++                if (gpu_mtp) queue_row(pending_device, seq_id, input_device, i_batch_beg[seq_id]);
++                else set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+             }
+ 
++            batch.embd_device = gpu_mtp ? input_device : nullptr;
++            if (gpu_mtp) moves_ready_for_drafter();
++
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+@@ -1573,6 +1787,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (chain_heads) {
+                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+             }
++            batch.embd_input = nullptr;
++            batch.embd_input_device = nullptr;
++            batch.embd_device = nullptr;
+             if (!ok) {
+                 return false;
+             }
+@@ -1585,16 +1802,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
++            if (gpu_mtp) {
++                queue_row(verify_device, i_batch_end[seq_id], pending_device, seq_id);
++                continue;
++            }
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+ 
+             for (int32_t i = 0; i < n_rows; ++i) {
+-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
++                const float * h = target_hidden + (size_t) (i_batch_beg[seq_id] + i) * n_embd;
+                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+             }
+ 
+             std::memcpy(pending_h[seq_id].data(),
+                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+         }
++        if (gpu_mtp) flush_rows(false);  // stream-ordered before the next target decode overwrites the rows
+ 
+         return true;
+     }
+@@ -1603,6 +1825,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         auto & ctx_dft = params.ctx_dft;
+ 
+         common_batch_clear(batch);
++        if (gpu_mtp) llama_synchronize(ctx_dft);  // an async prompt ingest may still read input_device
+ 
+         // keep track of which sequences are still drafting
+         int n_drafting = 0;
+@@ -1619,10 +1842,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             n_drafting++;
+             drafting[seq_id] = true;
+-            common_sampler_reset(smpls[seq_id].get());
+-
+-            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
+-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
++            if (!gpu_mtp) {  // chained drafts take the device argmax: the host samplers are unused (a reset reseeds)
++                common_sampler_reset(smpls[seq_id].get());
++            }
++
++            if (gpu_mtp && st_rows[seq_id] > 0) {
++                // deferred catch-up: the accepted verify rows (positions < pos0) go in front of the draft row
++                const int32_t A = dp.pos0 - st_pos0[seq_id];
++                GGML_ASSERT(A >= 1 && A <= st_rows[seq_id] && "deferred MTP ingest: unexpected draft position");
++                for (int32_t k = 0; k < A; ++k) {
++                    common_batch_add(batch, st_tok[seq_id][k], st_pos0[seq_id] + k, { seq_id }, false);
++                    if (k == 0) queue_row(pending_device, seq_id, input_device, batch.n_tokens-1);
++                    else        queue_row(stash_device, st_beg[seq_id] + k - 1, input_device, batch.n_tokens-1);
++                }
++                common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
++                queue_row(stash_device, st_beg[seq_id] + A - 1, input_device, batch.n_tokens-1);
++                queue_row(stash_device, st_beg[seq_id] + A - 1, pending_device, seq_id);
++                st_rows[seq_id] = 0;
++            } else {
++                common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
++                if (gpu_mtp) queue_row(pending_device, seq_id, input_device, batch.n_tokens-1);
++                else std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
++            }
+ 
+             i_last[seq_id] = batch.n_tokens - 1;
+ 
+@@ -1631,6 +1872,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+         }
+ 
++        batch.embd_device = gpu_mtp ? input_device : nullptr;
++        if (gpu_mtp) moves_ready_for_drafter();
++        if (gpu_mtp && n_drafting > 0) {  // chained drafts
++            std::vector<llama_seq_id> rows;  // draft rows (one per drafting sequence) in batch order
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) if (drafting[seq_id]) rows.push_back(seq_id);
++            const int64_t nr = (int64_t) rows.size();
++            const int kmax = params.n_max;
++            int done = 0;
++            for (int it = 0; it < kmax; ++it) {
++                llama_set_mtp_chain(ctx_dft, chain_tok, it == 0 ? -1 : (it - 1) * nr, it * nr,
++                                    it == 0 ? nullptr : chain_hb[(it - 1) % 2], chain_hb[it % 2]);
++                if (it > 0) {
++                    common_batch_clear(batch);
++                    batch.embd_device = nullptr;
++                    for (llama_seq_id seq_id : rows) common_batch_add(batch, 0, dparams[seq_id].pos0 + it, { seq_id }, true);
++                }
++                const int ret = llama_decode(ctx_dft, batch);
++                if (ret != 0) {
++                    SPC_ERR("chained llama_decode[%d] returned %d\n", it, ret);
++                    break;
++                }
++                done = it + 1;
++            }
++            llama_set_mtp_chain(ctx_dft, nullptr, -1, -1, nullptr, nullptr);
++            batch.embd_device = nullptr;
++            if (done > 0) {
++                std::vector<int32_t> ids((size_t) done * nr);
++                llama_synchronize(ctx_dft);
++                ggml_backend_tensor_get(chain_tok, ids.data(), 0, ids.size() * sizeof(int32_t));
++                for (int64_t r = 0; r < nr; ++r) {
++                    auto & result = *dparams[rows[r]].result;
++                    for (int it = 0; it < done; ++it) result.push_back(ids[(size_t) it * nr + r]);
++                }
++            }
++            return;
++        }
+         int i = 0;
+ 
+         while (n_drafting > 0) {
+@@ -1660,6 +1937,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             // new token (the KV already holds the prefix), while chained heads re-add the
+             // whole prefix at the next head. dropped sequences are simply not re-added.
+             common_batch_clear(batch);
++            batch.embd_device = nullptr;
+ 
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 if (!drafting[seq_id]) {
+@@ -1668,22 +1946,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
+-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+-
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+-
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
++                llama_token id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
++                float probability = 1.0f;
++                if (id == LLAMA_TOKEN_NULL) {
++                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
++                    id = cur_p->data[0].id;
++                    probability = cur_p->data[0].p;
+                 }
++                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+-                // add drafted token for each sequence
+-                const llama_token id = cur_p->data[0].id;
+-
+-                // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
++                if (probability < params.p_min) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+ 
+@@ -1750,6 +2023,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+     }
+ 
++    // At the boundary after accept(), only pending_h survives into the next
++    // draft. Verification rows are replaced by the next process() call.
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return false;
++        data.resize((size_t) n_embd * sizeof(float));
++        if (gpu_mtp && pending_device) {
++            const_cast<common_speculative_impl_draft_mtp *>(this)->flush_rows();
++            ggml_backend_synchronize(hidden_backend);
++            ggml_backend_tensor_get(pending_device, data.data(), (size_t) seq_id*data.size(), data.size());
++        } else std::memcpy(data.data(), pending_h[seq_id].data(), data.size());
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
++        GGML_ASSERT(data.size() == (size_t) n_embd * sizeof(float));
++        if (gpu_mtp && pending_device) {
++            flush_rows();
++            st_rows[seq_id] = 0;
++            ggml_backend_synchronize(hidden_backend);
++            ggml_backend_tensor_set(pending_device, data.data(), (size_t) seq_id*data.size(), data.size());
++        } else std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
++        verify_h_rows[seq_id] = 0;
++    }
++
++    // set_state(dst, get_state(src)) without the host round trip: a queued row move on the GPU
++    bool copy_state(llama_seq_id src, llama_seq_id dst) override {
++        if (src < 0 || src >= (llama_seq_id) n_seq || dst < 0 || dst >= (llama_seq_id) n_seq) return false;
++        if (gpu_mtp && pending_device) {
++            queue_row(pending_device, src, pending_device, dst);
++            st_rows[dst] = 0;
++        } else pending_h[dst] = pending_h[src];  // (uploaded with the others when the device rows are made)
++        verify_h_rows[dst] = 0;
++        return true;
++    }
++
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+@@ -1762,7 +2071,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
++        if (gpu_mtp) queue_row(verify_device, i_batch_beg[seq_id]+i_h, pending_device, seq_id);
++        else std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+     }
+ };
+ 
+@@ -2950,6 +3260,20 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
+     }
+ }
+ 
++bool common_speculative_copy_state(common_speculative * spec, llama_seq_id src, llama_seq_id dst) {
++    if (spec == nullptr) {
++        return false;
++    }
++
++    for (auto & impl : spec->impls) {
++        if (impl->copy_state(src, dst)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ void common_speculative_print_stats(const common_speculative * spec) {
+     if (spec == nullptr) {
+         return;
+diff --git a/common/speculative.h b/common/speculative.h
+index c968750e2d80e490f60ad365828552ad0c644c2f..d891b28495e0404d7dc7b6e5d3c795539b72d5c1 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -88,6 +88,9 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
+ // (optional) get/set internal state
+ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
++// copy the state of sequence src to dst as set_state(get_state(src)) would, without a host round trip where the
++// implementation keeps it on the device; false if no implementation can
++bool common_speculative_copy_state(common_speculative * spec, llama_seq_id src, llama_seq_id dst);
+ 
+ // print statistics about the speculative decoding
+ void common_speculative_print_stats(const common_speculative * spec);
+diff --git a/include/llama.h b/include/llama.h
+index 869abcf35a28ef4d53e9d44b44ce6a0b1b97cd54..6f79582f090da11be735386ef56d34d7a18fd22c 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -269,6 +269,10 @@ extern "C" {
+         int32_t      *  n_seq_id;
+         llama_seq_id ** seq_id;
+         int8_t       *  logits;   // TODO: rename this to "output"
++        float        *  embd_input; // borrowed MTP token embeddings, separate from hidden states in embd
++        struct ggml_tensor * embd_device; // optional device hidden states, indexed in original batch order
++        struct ggml_tensor * embd_input_device; // optional device copy of embd_input (F32 [n_embd, >= n_tokens], batch
++                                                // order); the graph reads it in place instead of uploading embd_input
+     } llama_batch;
+ 
+     enum llama_model_kv_override_type {
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 6aae78e18ea31c8803861727af86b95e24e68b38..b6583145e4bcf929c13d5b3ab6fc6ff545b7046f 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -48,6 +48,7 @@ bool llama_batch_allocr::init(
+ 
+     if (batch.token) {
+         for (int32_t i = 0; i < batch.n_tokens; ++i) {
++            if (batch.embd_input && batch.token[i] == LLAMA_TOKEN_NULL) continue;
+             if (batch.token[i] < 0 || (uint32_t) batch.token[i] >= vocab.n_tokens()) {
+                 LLAMA_LOG_ERROR("%s: invalid token[%d] = %d\n", __func__, i, batch.token[i]);
+                 return false;
+@@ -303,7 +304,7 @@ bool llama_batch_allocr::init(
+             if (p0 >= 0) {
+                 bool ok = true;
+ 
+-                if (seq_pos_min(s) != p0 + 1) {
++                if (seq_pos_min(s) != p0 + 1 && !(allow_pos_gaps && seq_pos_min(s) > p0)) {
+                     ok = false;
+                 }
+ 
+@@ -319,7 +320,7 @@ bool llama_batch_allocr::init(
+                 }
+             }
+ 
+-            if (seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
++            if (!allow_pos_gaps && seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
+                 LLAMA_LOG_ERROR("%s: sequence %d positions are not continuous\n", __func__, s);
+                 return false;
+             }
+@@ -797,11 +798,38 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+ 
+     auto udata = std::make_shared<llama_ubatch::data_t>();
+ 
+-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
+ 
++    bool contiguous = !idxs.empty();
++    for (size_t i = 1; i < idxs.size() && contiguous; ++i) {
++        contiguous = idxs[i] == idxs[0] + (int32_t) i;
++    }
++    // Batch input remains valid through decode. Borrow contiguous embedding
++    // spans; reordered spans are copied without first zeroing the destination.
++    auto embeddings = [&](float * src, std::vector<float> & dst) -> float * {
++        if (!src || idxs.empty()) {
++            return nullptr;
++        }
++        if (contiguous) {
++            return src + (int64_t) idxs[0]*n_embd;
++        }
++        dst.reserve((size_t) n_tokens*n_embd);
++        for (size_t i = 0; i < idxs.size();) {
++            size_t end = i + 1;
++            while (end < idxs.size() && idxs[end] == idxs[i] + (int32_t) (end-i)) {
++                ++end;
++            }
++            const float * first = src + (int64_t) idxs[i]*n_embd;
++            dst.insert(dst.end(), first, first+(end-i)*n_embd);
++            i = end;
++        }
++        return dst.data();
++    };
++    float * embd = batch.embd_device ? batch.embd : embeddings(batch.embd, udata->embd);
++    float * embd_input = embeddings(batch.embd_input, udata->embd_input);
++
+     udata->token     .resize(n_tokens);
+-    udata->embd      .resize(n_embd_all);
++    udata->token_indices = idxs;
+     udata->pos       .resize(n_pos_all);
+     udata->n_seq_id  .resize(n_tokens);
+     udata->seq_id    .resize(n_tokens);
+@@ -818,10 +846,6 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+             udata->token[i] = batch.token[idxs[i]];
+         }
+ 
+-        if (batch.embd) {
+-            memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+-        }
+-
+         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
+             // if we are using M-RoPE
+             //     if the current batch is text, we need to broadcast the same position across all RoPE sections
+@@ -868,7 +892,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+         /*.n_pos        =*/ n_pos_per_embd,
+ 
+         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
+-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
++        /*.embd         =*/ embd,
+         /*.pos          =*/ udata->pos.data(),
+         /*.n_seq_id     =*/ udata->n_seq_id.data(),
+         /*.seq_id       =*/ udata->seq_id.data(),
+@@ -878,6 +902,13 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+         /*.data         =*/ std::move(udata),
+     };
+ 
++    res.embd_input = embd_input;
++    res.embd_device = batch.embd_device;
++    if (batch.embd_input_device && contiguous) {
++        res.embd_input_device = batch.embd_input_device;
++        res.embd_input_row0   = idxs[0];
++    }
++    res.token_indices = res.data->token_indices.data();
+     if (debug > 0) {
+         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
+ 
+@@ -983,6 +1014,9 @@ struct llama_batch llama_batch_get_one(
+         /*n_seq_id =*/ nullptr,
+         /*seq_id   =*/ nullptr,
+         /*logits   =*/ nullptr,
++        /*embd_input        =*/ nullptr,
++        /*embd_device       =*/ nullptr,
++        /*embd_input_device =*/ nullptr,
+     };
+ }
+ 
+@@ -995,6 +1029,9 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
+         /*n_seq_id =*/ nullptr,
+         /*seq_id   =*/ nullptr,
+         /*logits   =*/ nullptr,
++        /*embd_input        =*/ nullptr,
++        /*embd_device       =*/ nullptr,
++        /*embd_input_device =*/ nullptr,
+     };
+ 
+     if (embd) {
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index c1d953cf8a9cfb46f20ad5a5919a531b062d08db..7d41dd43f806f982763c770602d429c0a4cf1591 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -54,6 +54,8 @@ struct llama_ubatch {
+     struct data_t {
+         std::vector<llama_token>    token;
+         std::vector<float>          embd;
++        std::vector<float>          embd_input;
++        std::vector<int32_t>        token_indices;
+         std::vector<llama_pos>      pos;
+         std::vector<int32_t>        n_seq_id;
+         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
+@@ -66,6 +68,11 @@ struct llama_ubatch {
+ 
+     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
+     std::shared_ptr<data_t> data;
++    float * embd_input = nullptr;
++    ggml_tensor * embd_device = nullptr;
++    ggml_tensor * embd_input_device = nullptr;  // rows [embd_input_row0, +n_tokens) are this ubatch's embd_input
++    int64_t       embd_input_row0   = -1;
++    const int32_t * token_indices = nullptr;
+     // Packed sequence boundaries for hybrid recurrent batches of unequal lengths.
+     // Empty for the original equal-length representation.
+     std::vector<uint32_t> seq_offsets = {};
+@@ -76,6 +83,7 @@ struct llama_ubatch {
+ // a helper for sanitizing, fulfilling and splitting a batch
+ class llama_batch_allocr {
+ public:
++    bool allow_pos_gaps = false;  // MTP draft context: positions may jump forward (deferred / partial catch-up)
+     llama_batch_allocr(uint32_t n_pos_per_embd);
+ 
+     // sanitize and auto-gen missing data in the input batch
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e1535dbd9b9989716a9625871d82b0b160b863c3..f6ec63c4f6f829085a09d062be59ccf01197a6be 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1011,13 +1011,35 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
+     return it->second.data();
+ }
+ 
++void llama_context::set_embeddings_nextn_device(bool value) {
++    GGML_ASSERT(!value || (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked));
++    use_nextn_device = value;
++}
++
++ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backend) {
++    GGML_ASSERT(use_nextn_device && nextn_device);
++    *backend = nextn_device_backend;
++    return nextn_device;
++}
++
++void llama_context::download_embeddings_nextn() {
++    if (use_nextn_device && nextn_device && !nextn_host_current) {
++        ggml_backend_tensor_get_async(nextn_device_backend, nextn_device, embd_nextn.data,
++                0, size_t(nextn_device_rows)*nextn_device->nb[1]);
++        ggml_backend_synchronize(nextn_device_backend);
++        nextn_host_current = true;
++    }
++}
++
+ float * llama_context::get_embeddings_nextn() {
++    download_embeddings_nextn();
+     output_reorder();
+ 
+     return embd_nextn.data;
+ }
+ 
+ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
++    download_embeddings_nextn();
+     output_reorder();
+ 
+     try {
+@@ -1413,7 +1435,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    if (!graph_reuse_disable && !cparams.mtp_tok && gf_res_prev_active == res && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1789,6 +1811,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         }
+     }
+ 
++    balloc->allow_pos_gaps = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+         return -1;
+@@ -1889,6 +1912,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
++    nextn_device_rows = n_tokens_all;
++    nextn_host_current = false;
+ 
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+@@ -2049,7 +2074,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+ 
+                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                if (use_nextn_device) {
++                    GGML_ASSERT(!masked);
++                    if (!nextn_device) {
++                        ctx_nextn_device.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
++                        nextn_device = ggml_new_tensor_2d(ctx_nextn_device.get(), GGML_TYPE_F32, n_embd, cparams.n_batch);
++                        buf_nextn_device.reset(ggml_backend_alloc_ctx_tensors(ctx_nextn_device.get(), backend_h));
++                        GGML_ASSERT(buf_nextn_device);
++                        nextn_device_backend = backend_h;
++                    }
++                    GGML_ASSERT(nextn_device_backend == backend_h);
++                    for (int64_t i = 0; i < n_rows;) {
++                        const int64_t dst_row = ubatch.token_indices ? ubatch.token_indices[i] : offset+i;
++                        int64_t end = i+1;
++                        while (end < n_rows && (!ubatch.token_indices || ubatch.token_indices[end] == dst_row+end-i)) ++end;
++                        auto src = llama_tensor_row_view(t_h_nextn, i, end-i);
++                        auto dst = llama_tensor_row_view(nextn_device, dst_row, end-i);
++                        ggml_backend_tensor_copy_async(backend_h, backend_h, &src, &dst);
++                        i = end;
++                    }
++                } else if (!masked && ubatch.token_indices) {
++                    // Dense hidden states are indexed by the original batch, not micro-batch order.
++                    const size_t row_bytes = n_embd*sizeof(float);
++                    for (int64_t i = 0; i < n_rows;) {
++                        int64_t end = i + 1;
++                        while (end < n_rows && ubatch.token_indices[end] == ubatch.token_indices[i] + end - i) ++end;
++                        ggml_backend_tensor_get_async(backend_h, t_h_nextn,
++                                embd_nextn.data + (size_t) ubatch.token_indices[i]*n_embd,
++                                i*row_bytes, (end-i)*row_bytes);
++                        i = end;
++                    }
++                } else {
++                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                }
+             }
+         }
+ 
+@@ -2341,7 +2398,7 @@ void llama_context::output_reorder() {
+             }
+         }
+ 
+-        if (embd_nextn.size > 0) {
++        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
+             for (uint64_t k = 0; k < n_embd_out; k++) {
+                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
+             }
+@@ -2615,6 +2672,14 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
++    if (input_wait_event) {
++        for (auto & b : backends) {
++            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                ggml_backend_event_wait(b.get(), input_wait_event);
++            }
++        }
++        input_wait_event = nullptr;
++    }
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+@@ -4006,6 +4071,23 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
+     return ctx->get_cparams().serving;
+ }
+ 
++void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
++    ctx->set_input_wait_event(ev);
++}
++
++void llama_set_mtp_chain(llama_context * ctx, ggml_tensor * tok, int64_t tok_in, int64_t tok_out, ggml_tensor * h_in,
++                         ggml_tensor * h_out) {
++    ctx->set_mtp_chain(tok, tok_in, tok_out, h_in, h_out);
++}
++
++void llama_set_embeddings_nextn_device(llama_context * ctx, bool value) {
++    ctx->set_embeddings_nextn_device(value);
++}
++
++ggml_tensor * llama_get_embeddings_nextn_device(llama_context * ctx, ggml_backend_t * backend) {
++    return ctx->get_embeddings_nextn_device(backend);
++}
++
+ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 77ef92fc6ab294698e1fabf6864064989dcd779f..ec0249a7f8d5ab9334028f3fd29a3c9ff46014b4 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -88,6 +88,17 @@ struct llama_context {
+ 
+     float * get_embeddings_nextn();
+     float * get_embeddings_nextn_ith(int32_t i);
++    ggml_tensor * get_embeddings_nextn_device(ggml_backend_t * backend);
++    void set_embeddings_nextn_device(bool value);
++    // one-shot: the next graph's GPU stream waits for this event before its inputs / kernels (cross-context ordering)
++    ggml_backend_event_t input_wait_event = nullptr;
++    void set_input_wait_event(ggml_backend_event_t ev) { input_wait_event = ev; }
++
++    void set_mtp_chain(ggml_tensor * tok, int64_t tok_in, int64_t tok_out, ggml_tensor * h_in, ggml_tensor * h_out) {
++        cparams.mtp_tok = tok; cparams.mtp_tok_in = tok_in; cparams.mtp_tok_out = tok_out;
++        cparams.mtp_h_in = tok ? h_in : nullptr; cparams.mtp_h_out = tok ? h_out : nullptr;
++    }
++    void download_embeddings_nextn();
+ 
+     float * get_embeddings_layer_inp(uint32_t lid);
+ 
+@@ -302,6 +313,13 @@ private:
+     // populated only when cparams.embeddings_nextn is enabled and the model graph
+     // sets llm_graph_result::t_h_nextn
+     buffer_view<float> embd_nextn = {nullptr, 0};
++    bool use_nextn_device = false;
++    bool nextn_host_current = false;
++    uint32_t nextn_device_rows = 0;
++    ggml_context_ptr ctx_nextn_device;
++    ggml_backend_buffer_ptr buf_nextn_device;
++    ggml_tensor * nextn_device = nullptr;
++    ggml_backend_t nextn_device_backend = nullptr;
+ 
+     // host buffers for output layer input embeddings, per layer
+     // populated when cparams.output_layer_inp[il] is true
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index cdbb8f4ee219b5be2b9396375c1d213afe431154..d1599fd379ca2e6e20e99e518bdfe897d6a64ed3 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -35,6 +35,15 @@ struct llama_cparams {
+     bool embeddings;
+     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
++
++    // MTP chained drafting (llama_set_mtp_chain): the MTP graph reads its token ids / hidden rows from device buffers
++    // and writes argmax ids / output hidden rows back in place (no host outputs, no host round trip between drafts)
++    struct ggml_tensor * mtp_tok   = nullptr; // I32 ids
++    int64_t              mtp_tok_in  = -1;    // element offset of this decode's input ids (-1: ids come from the batch)
++    int64_t              mtp_tok_out = -1;    // element offset of this decode's argmax ids
++    struct ggml_tensor * mtp_h_in  = nullptr; // F32 [n_embd, >= n_tokens] input hidden rows (nullptr: from the batch)
++    struct ggml_tensor * mtp_h_out = nullptr; // F32 [n_embd, >= n_outputs] output hidden rows
++
+     llama_serving_params serving = {};  // high-throughput hybrid serving (llama.h)
+ 
+     bool causal_attn;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 5b55819129b812cbb5bc0ac9bb253b18c0efc76f..92eefeb4ff19f1ed1ed95ea5a506a29f73fdb318 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -98,6 +98,29 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
+ // Serving parameters the context was created with (llama_context_params.serving).
+ LLAMA_API struct llama_serving_params llama_get_serving_params(const struct llama_context * ctx);
+ 
++// The next graph of ctx waits (on its GPU streams) for ev before running: orders it after work on another context.
++LLAMA_API void llama_set_input_wait_event(struct llama_context * ctx, ggml_backend_event_t ev);
++
++// MTP chained drafting: see llama_cparams::mtp_tok. tok = nullptr clears the chain.
++LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, struct ggml_tensor * tok, int64_t tok_in, int64_t tok_out,
++                                   struct ggml_tensor * h_in, struct ggml_tensor * h_out);
++
++// Device output is unmasked and remains valid until the next decode.
++LLAMA_API void llama_set_embeddings_nextn_device(struct llama_context * ctx, bool value);
++LLAMA_API ggml_tensor * llama_get_embeddings_nextn_device(struct llama_context * ctx, ggml_backend_t * backend);
++
++inline ggml_tensor llama_tensor_row_view(const ggml_tensor * tensor, int64_t first, int64_t rows) {
++    GGML_ASSERT(ggml_is_contiguous(tensor) && tensor->ne[2] == 1 && tensor->ne[3] == 1);
++    GGML_ASSERT(first >= 0 && rows > 0 && first + rows <= tensor->ne[1]);
++    ggml_tensor view = *tensor;
++    view.data = (char *) tensor->data + first*tensor->nb[1];
++    view.ne[1] = rows;
++    view.nb[2] = view.nb[3] = rows*view.nb[1];
++    view.view_src = nullptr;
++    view.view_offs = 0;
++    return view;
++}
++
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+ // chain multiple trained NextN heads. Default 0 (first head).
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index aee9ee4b3dc59a2e96274209b23db5e64341a286..4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-batch.h"
++#include "llama-ext.h"
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
+ 
+@@ -118,7 +119,27 @@ static bool can_reuse_kq_mask(
+ 
+ // impl
+ 
++// Mixed input rows carry token=-1 for supplied audio embeddings and a normal
++// token id with a zero supplied vector for text. Keep both on the packed axis.
++static void set_mixed_input(const llama_ubatch * ubatch, ggml_tensor * tokens, ggml_tensor * embd, ggml_tensor * mask) {
++    std::vector<llama_token> ids(ubatch->n_tokens);
++    std::vector<float> scales(ubatch->n_tokens);
++    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++        ids[i] = std::max<llama_token>(ubatch->token[i], 0);
++        scales[i] = ubatch->token[i] < 0 ? 0.0f : 1.0f;
++    }
++    ggml_backend_tensor_set(tokens, ids.data(), 0, ids.size()*sizeof(llama_token));
++    ggml_backend_tensor_set(mask, scales.data(), 0, scales.size()*sizeof(float));
++    if (!ubatch->embd_input_device) {
++        ggml_backend_tensor_set(embd, ubatch->embd_input, 0, ggml_nbytes(embd));
++    }
++}
++
+ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
++    if (ubatch->embd_input) {
++        set_mixed_input(ubatch, tokens, embd, token_mask);
++        return;
++    }
+     if (ubatch->token) {
+         const int64_t n_tokens = ubatch->n_tokens;
+ 
+@@ -135,7 +156,8 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+ }
+ 
+ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
+-    bool res = true;
++    bool res = (token_mask != nullptr) == (params.ubatch.embd_input != nullptr);
++    res &= !embd_on_device && !params.ubatch.embd_input_device;  // the view's row offset is baked into the graph
+ 
+     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+@@ -146,8 +168,12 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
+ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+-    if (ubatch->token) {
+-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
++    if (ubatch->embd_input) {
++        set_mixed_input(ubatch, tokens, embd, token_mask);
++    } else if (ubatch->token) {
++        if (tokens->buffer) {  // unallocated when chained MTP ids come from the device
++            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
++        }
+     } else {
+         // note: mtmd embedding input goes through here
+         GGML_ASSERT(ubatch->embd);
+@@ -159,15 +185,28 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
+     //       for now, we assume that the hidden state is always provided as an embedding
+     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
+-    if (ubatch->embd) {
++    if (ubatch->embd && h->buffer) {  // h is unallocated when chained MTP hidden rows come from the device
+         GGML_ASSERT(n_embd == h->ne[0]);
+ 
+-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
++        if (ubatch->embd_device) {
++            for (int64_t i = 0; i < n_tokens;) {
++                const int64_t src_row = ubatch->token_indices ? ubatch->token_indices[i] : i;
++                int64_t end = i+1;
++                while (end < n_tokens && (!ubatch->token_indices || ubatch->token_indices[end] == src_row+end-i)) ++end;
++                auto src = llama_tensor_row_view(ubatch->embd_device, src_row, end-i);
++                auto dst = llama_tensor_row_view(h, i, end-i);
++                ggml_backend_tensor_copy(&src, &dst);
++                i = end;
++            }
++        } else {
++            ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
++        }
+     }
+ }
+ 
+ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+-    bool res = true;
++    bool res = !params.ubatch.embd_input_device;  // a device view's row offset is baked into the graph
++    res &= use_embd_input == (params.ubatch.embd_input != nullptr);
+ 
+     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
+@@ -2465,9 +2504,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     ggml_set_input(inp->tokens);
+     res->t_inp_tokens = inp->tokens;
+ 
+-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
++    if (ubatch.embd_input && ubatch.embd_input_device) {
++        // the caller staged the input rows on the device: read them in place (no host input, no upload)
++        ggml_tensor * dev = ubatch.embd_input_device;
++        GGML_ASSERT(dev->type == GGML_TYPE_F32 && dev->ne[0] == n_embd_inp && ubatch.embd_input_row0 + ubatch.n_tokens <= dev->ne[1]);
++        inp->embd = ggml_view_2d(ctx0, dev, n_embd_inp, ubatch.n_tokens, dev->nb[1], ubatch.embd_input_row0*dev->nb[1]);
++        inp->embd_on_device = true;
++    } else {
++        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
++        ggml_set_input(inp->embd);
++    }
+     cb(inp->embd, "inp_embd", -1);
+-    ggml_set_input(inp->embd);
+ 
+     // select one of the 2 inputs, based on the batch contents
+     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
+@@ -2500,6 +2547,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+         if (n_embd_inp != n_embd) {
+             cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+         }
++        if (ubatch.embd_input) {
++            inp->token_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
++            ggml_set_input(inp->token_mask);
++            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, inp->token_mask), inp->embd);
++        }
+     }
+ 
+     // vector embeddings path (ubatch.embd != nullptr)
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index bf2ef32d99c62e6b849e1cbc8d6c815ac01b8ce1..fc175e92abb4d5f998879256b30ed61e00a4e3f7 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -133,8 +133,10 @@ public:
+ 
+     bool can_reuse(const llm_graph_params & params) override;
+ 
++    ggml_tensor * token_mask = nullptr; // F32 [1, n_batch], mixed token/audio input
+     ggml_tensor * tokens = nullptr; // I32 [n_batch]
+     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
++    bool embd_on_device = false;    // embd is a view of ubatch.embd_input_device (nothing to upload)
+ 
+     const int64_t n_embd = 0;
+ };
+@@ -149,9 +151,11 @@ public:
+ 
+     bool can_reuse(const llm_graph_params & params) override;
+ 
++    ggml_tensor * token_mask = nullptr; // F32 [1, n_batch], mixed token/audio input
+     ggml_tensor * tokens = nullptr; // I32 [n_batch]
+     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
++    bool use_embd_input = false;
+ 
+     const int64_t n_embd = 0;
+ };
+diff --git a/src/models/nemotron-h-moe.cpp b/src/models/nemotron-h-moe.cpp
+index b4fb254300a8b720de92a2131d3e6edc390e9870..f3b9656df3c53003329dde25470df708d95ef199 100644
+--- a/src/models/nemotron-h-moe.cpp
++++ b/src/models/nemotron-h-moe.cpp
+@@ -26,16 +26,33 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
+     GGML_ASSERT(tok_embd_w != nullptr && "NEMOTRON_H_MOE MTP requires token embeddings");
+ 
+     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
++    inp->use_embd_input = ubatch.embd_input != nullptr;
+ 
+     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+     ggml_set_input(inp->tokens);
+ 
+-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+-    ggml_set_input(inp->embd);
++    if (ubatch.embd_input && ubatch.embd_input_device) {
++        // staged on the device by the caller: read in place
++        ggml_tensor * dev = ubatch.embd_input_device;
++        GGML_ASSERT(dev->type == GGML_TYPE_F32 && dev->ne[0] == hparams.n_embd_inp() && ubatch.embd_input_row0 + n_tokens <= dev->ne[1]);
++        inp->embd = ggml_view_2d(ctx0, dev, hparams.n_embd_inp(), n_tokens, dev->nb[1], ubatch.embd_input_row0*dev->nb[1]);
++    } else {
++        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
++        ggml_set_input(inp->embd);
++    }
+ 
+     ggml_tensor * tok_embd;
+-    if (ubatch.token) {
++    if (cparams.mtp_tok && cparams.mtp_tok_in >= 0) {
++        // chained drafting: the ids are the previous draft's argmax, already on the device
++        ggml_tensor * ids = ggml_view_1d(ctx0, cparams.mtp_tok, n_tokens, cparams.mtp_tok_in*ggml_element_size(cparams.mtp_tok));
++        tok_embd = ggml_get_rows(ctx0, tok_embd_w, ids);
++    } else if (ubatch.token) {
+         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
++        if (ubatch.embd_input) {
++            inp->token_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
++            ggml_set_input(inp->token_mask);
++            tok_embd = ggml_add(ctx0, ggml_mul(ctx0, tok_embd, inp->token_mask), inp->embd);
++        }
+     } else {
+         tok_embd = inp->embd;
+     }
+@@ -44,8 +61,32 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
+     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+     ggml_set_input(inp->h);
+     ggml_set_name(inp->h, "mtp_h_input");
++    if (cparams.serving.batched) {  // hidden rows live on the output device (device-resident MTP drafting)
++        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++            auto backend = ggml_backend_sched_get_backend(sched, i);
++            if (ggml_backend_get_device(backend) == model.dev_output()) {
++                ggml_backend_sched_set_tensor_backend(sched, inp->h, backend);
++                break;
++            }
++        }
++    }
+ 
+     ggml_tensor * h_embd = inp->h;
++    // batched serving: device hidden rows (batch.embd_device, batch order) are read in place instead of copied
++    if (cparams.serving.batched && ubatch.embd_device && !(cparams.mtp_tok && cparams.mtp_h_in)) {
++        bool contiguous = true;
++        const int64_t r0 = ubatch.token_indices ? ubatch.token_indices[0] : 0;
++        for (int64_t i = 1; ubatch.token_indices && contiguous && i < n_tokens; ++i) contiguous = ubatch.token_indices[i] == r0 + i;
++        if (contiguous) {
++            ggml_tensor * dev = ubatch.embd_device;
++            GGML_ASSERT(dev->ne[0] == hparams.n_embd && r0 + n_tokens <= dev->ne[1]);
++            h_embd = ggml_view_2d(ctx0, dev, hparams.n_embd, n_tokens, dev->nb[1], r0*dev->nb[1]);
++        }
++    }
++    if (cparams.mtp_tok && cparams.mtp_h_in) {
++        GGML_ASSERT(cparams.mtp_h_in->ne[0] == hparams.n_embd && cparams.mtp_h_in->ne[1] >= n_tokens);
++        h_embd = ggml_view_2d(ctx0, cparams.mtp_h_in, hparams.n_embd, n_tokens, cparams.mtp_h_in->nb[1], 0);
++    }
+ 
+     res->add_input(std::move(inp));
+ 
+@@ -161,4 +202,21 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
+ 
+     res->t_logits = cur;
+     ggml_build_forward_expand(gf, cur);
++
++    if (cparams.mtp_tok && cparams.mtp_tok_out >= 0) {
++        // chained drafting: argmax ids and the head's hidden rows stay on the device for the next draft; nothing is
++        // extracted to the host
++        ggml_tensor * am = ggml_argmax(ctx0, cur);
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, am,
++            ggml_view_1d(ctx0, cparams.mtp_tok, am->ne[0], cparams.mtp_tok_out*ggml_element_size(cparams.mtp_tok))));
++        if (cparams.mtp_h_out) {
++            ggml_tensor * hn = res->t_h_nextn;
++            if (!crop_before_ffn && inp_out_ids) hn = ggml_get_rows(ctx0, hn, inp_out_ids);
++            GGML_ASSERT(cparams.mtp_h_out->ne[1] >= hn->ne[1]);
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, hn,
++                ggml_view_2d(ctx0, cparams.mtp_h_out, hn->ne[0], hn->ne[1], cparams.mtp_h_out->nb[1], 0)));
++        }
++        res->t_logits = nullptr;
++        res->t_h_nextn = nullptr;
++    }
+ }

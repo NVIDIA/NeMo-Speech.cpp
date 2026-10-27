@@ -1,0 +1,255 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: draw the temperature-sampled rows of a batched step together
+
+Batched serving gave every row of a sequence with a [temp, dist] sampler
+chain its own sampler graph: a scale, softmax, cumulative sum and threshold
+over the whole vocabulary per row. The rows of all such sequences are now
+gathered once and drawn together, each scaled by its own inverse temperature
+and compared with its own uniform draw, which the dist sampler fills from its
+generator in the same order as before. A step with fewer than 16 sampled rows
+runs the same per-row kernels, so its draws are unchanged.
+
+Attaching or detaching a sampler no longer re-reserves the scheduler in
+batched serving (worst-case prefill and decode graphs on the next decode):
+the sampling subgraph is built every step and its compute buffer grows on
+demand.
+
+Upstream: not planned (batched serving path).
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 15306644fd2b55c51e119cd12cfa0cdbcf14d202..57f82c914edd8a8005fe1320a594f7272924b9f0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1336,6 +1336,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+         sampler->iface->backend_apply &&
+         llama_sampler_chain_n(sampler) > 0;
+ 
++    // Batched serving builds the sampling subgraph every step (build_sampling) and lets its compute buffer grow on
++    // demand, so attaching or detaching a sampler does not re-reserve the scheduler (worst-case prefill and decode
++    // graphs) on the next decode.
++    const bool reserve = !cparams.serving.batched;
++
+     if (sampler && can_offload) {
+         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
+ 
+@@ -1343,7 +1348,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+         sampling.samplers[seq_id] = sampler;
+ 
+-        sched_need_reserve = true;
++        sched_need_reserve = sched_need_reserve || reserve;
+ 
+         return true;
+     }
+@@ -1362,7 +1367,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+     sampling.samplers.erase(seq_id);
+ 
+-    sched_need_reserve = true;
++    sched_need_reserve = sched_need_reserve || reserve;
+ 
+     return true;
+ }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9410f850fe02cb96a8742f3961b9c9aec0443bb7..8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1420,6 +1420,12 @@ void llm_graph_input_token_mask::set_input(const llama_ubatch * ubatch) {
+     ggml_backend_tensor_set(rows, sel.data(), 0, ggml_nbytes(rows));
+ }
+ 
++void llm_graph_input_sampled_rows::set_input(const llama_ubatch * ubatch) {
++    GGML_UNUSED(ubatch);
++    ggml_backend_tensor_set(rows,     rows_host.data(),     0, ggml_nbytes(rows));
++    ggml_backend_tensor_set(inv_temp, inv_temp_host.data(), 0, ggml_nbytes(inv_temp));
++}
++
+ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
+     // set the inputs only for the active samplers in the current ubatch
+     std::unordered_set<llama_seq_id> active_samplers;
+@@ -4057,10 +4063,57 @@ void llm_graph_context::build_sampling() const {
+         ggml_set_name(ids, "batched_greedy_argmax");
+         ggml_set_output(ids);
+         ggml_build_forward_expand(gf, ids);
++        // Rows sampled at a temperature ([temp, dist] chains) are gathered once and drawn together: the scaled
++        // softmax, its cumulative sum and each row's uniform threshold, as the dist sampler does per row.
++        std::vector<int32_t> dist_rows;
++        std::vector<float> dist_inv_temp;
++        std::vector<llama_sampler *> dist_samplers;
++        for (const auto & [seq_id, rows] : sampling_rows) {
++            const auto it = samplers.find(seq_id);
++            float inv_temp = 1.0f;
++            if (it == samplers.end() || is_greedy(it->second) || !llama_sampler_backend_dist_rows(it->second, &inv_temp)) {
++                continue;
++            }
++            if (it->second->iface->backend_reset) {
++                it->second->iface->backend_reset(it->second);
++            }
++            for (uint32_t row : rows) {
++                dist_rows.push_back((int32_t) row);
++                dist_inv_temp.push_back(inv_temp);
++                dist_samplers.push_back(it->second);
++            }
++        }
++        std::unordered_set<llama_sampler *> batched_dist(dist_samplers.begin(), dist_samplers.end());
++        if (!dist_rows.empty()) {
++            const int64_t n = (int64_t) dist_rows.size();
++            const int64_t n_vocab = logits->ne[0];
++            auto inp = std::make_unique<llm_graph_input_sampled_rows>(dist_rows, dist_inv_temp);
++            inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
++            ggml_set_input(inp->rows);
++            inp->inv_temp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n);
++            ggml_set_input(inp->inv_temp);
++            ggml_tensor * uniforms = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n);
++            ggml_set_input(uniforms);
++            for (int64_t r = 0; r < n; ++r) {
++                llama_sampler_backend_dist_add_row(dist_samplers[r], uniforms, r);
++            }
++            ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, ggml_get_rows(ctx0, logits, inp->rows), inp->inv_temp));
++            ggml_tensor * mask  = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), uniforms));
++            ggml_tensor * idxf  = ggml_clamp(ctx0, ggml_sum_rows(ctx0, mask), 1.0f, n_vocab);
++            ggml_tensor * drawn = ggml_cast(ctx0, ggml_scale_bias(ctx0, idxf, -1.0f, n_vocab), GGML_TYPE_I32);
++            ggml_set_name(drawn, "batched_dist_sampled");
++            ggml_set_output(drawn);
++            ggml_build_forward_expand(gf, drawn);
++            for (int64_t r = 0; r < n; ++r) {
++                res->t_sampled[dist_rows[r]] = ggml_view_1d(ctx0, drawn, 1, r*sizeof(llama_token));
++            }
++            res->add_input(std::move(inp));
++        }
+         for (const auto & [seq_id, rows] : sampling_rows) {
+             const auto it = samplers.find(seq_id);
+             if (it == samplers.end()) continue;  // no sampler: the host reads the logits
+             auto * sampler = it->second;
++            if (batched_dist.count(sampler)) continue;
+             if (is_greedy(sampler)) {
+                 // per-row views for the output copy (it reads view_src + view_offs), kept out of the graph: one
+                 // view node per row made the node count follow the lane count, so every decode step re-planned
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 590555c8a72c0283de5a2a5315c2fb159ddb7049..0dfc2a6d4e82e6f60339567303a85e4ce61d3b4c 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -793,6 +793,21 @@ public:
+     ggml_tensor * rows  = nullptr;  // I32 [n_rows], the table row of each output row (mixed rows only)
+ };
+ 
++// batched serving: the output rows sampled at a temperature, and the inverse temperature of each
++class llm_graph_input_sampled_rows : public llm_graph_input_i {
++public:
++    llm_graph_input_sampled_rows(std::vector<int32_t> rows, std::vector<float> inv_temp) :
++        rows_host(std::move(rows)), inv_temp_host(std::move(inv_temp)) {}
++    virtual ~llm_graph_input_sampled_rows() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    std::vector<int32_t> rows_host;
++    std::vector<float>   inv_temp_host;
++    ggml_tensor * rows     = nullptr;  // I32 [n]
++    ggml_tensor * inv_temp = nullptr;  // F32 [1, n]
++};
++
+ class llm_graph_input_sampling : public llm_graph_input_i {
+ public:
+     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 46eb382c3fdbc7bcb2111ff5d48d99bdab076b3d..d5cfa45171017f34e078a8df5ae75e888c8ca608 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1131,6 +1131,8 @@ struct llama_sampler_dist : public llama_sampler_backend {
+ 
+     // inputs for the current sampling graph
+     std::vector<ggml_tensor *> inp_uniforms;
++    // batched serving: elements of a shared uniforms tensor (llama_sampler_backend_dist_add_row)
++    std::vector<std::pair<ggml_tensor *, int64_t>> inp_uniform_rows;
+ 
+     void copy_state(const llama_sampler_dist & src) {
+         // note: inp_uniforms and backend_transactional belong to the current sampling graph
+@@ -1338,7 +1340,7 @@ static void llama_sampler_dist_backend_apply(
+ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+ 
+-    GGML_ASSERT(!sctx->inp_uniforms.empty());
++    GGML_ASSERT(!sctx->inp_uniforms.empty() || !sctx->inp_uniform_rows.empty());
+ 
+     // We sample in double precision and cast to float to match rnd numbers of
+     // llama_sampler_dist which uses double precision (sampling from
+@@ -1359,11 +1361,21 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+             ++sctx->n_backend_draws_generated;
+         }
+     }
++
++    for (const auto & [uniforms, i] : sctx->inp_uniform_rows) {
++        const float rnd = dist(rng);
++        ggml_backend_tensor_set(uniforms, &rnd, i*sizeof(float), sizeof(float));
++
++        if (sctx->backend_transactional) {
++            ++sctx->n_backend_draws_generated;
++        }
++    }
+ }
+ 
+ static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
+     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+     sctx->inp_uniforms.clear();
++    sctx->inp_uniform_rows.clear();
+ }
+ 
+ static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token token) {
+@@ -4385,3 +4397,40 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
+     ctx->t_sample_us = 0;
+     ctx->n_sample    = 0;
+ }
++
++bool llama_sampler_backend_dist_rows(llama_sampler * smpl, float * inv_temp) {
++    if (smpl->iface != &llama_sampler_chain_i) {
++        return false;
++    }
++    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
++    const size_t n = chain->samplers.size();
++    if (n < 1 || n > 2) {
++        return false;
++    }
++    for (const auto & entry : chain->samplers) {
++        if (!entry.is_backend) {
++            return false;
++        }
++    }
++    if (chain->samplers[n - 1].ptr->iface != &llama_sampler_dist_i) {
++        return false;
++    }
++    *inv_temp = 1.0f;
++    if (n == 2) {
++        if (chain->samplers[0].ptr->iface != &llama_sampler_temp_i) {
++            return false;
++        }
++        const float temp = ((const llama_sampler_temp *) chain->samplers[0].ptr->ctx)->temp;
++        if (temp <= 0.0f) {
++            return false;  // the temperature sampler's greedy form
++        }
++        *inv_temp = 1.0f / temp;
++    }
++    return true;
++}
++
++void llama_sampler_backend_dist_add_row(llama_sampler * smpl, ggml_tensor * uniforms, int64_t i) {
++    const auto * chain = (const llama_sampler_chain *) smpl->ctx;
++    auto * sctx = (llama_sampler_dist *) chain->samplers.back().ptr->ctx;
++    sctx->inp_uniform_rows.emplace_back(uniforms, i);
++}
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+index e5db2982bd3e01d6823b09e9c3d3e059911526fe..4967b09689c9cb2be2145a8eed360ba868284700 100644
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -38,6 +38,12 @@ struct llama_sampler_chain {
+ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+ void llama_sampler_backend_begin(llama_sampler * sampler);
+ 
++// Batched serving samples every [temp, dist] (or [dist]) chain's rows in one graph: true for such a chain, with its
++// inverse temperature (1 without a temp sampler).
++bool llama_sampler_backend_dist_rows(llama_sampler * smpl, float * inv_temp);
++// The uniform draw of one row of such a chain is element `i` of `uniforms`, filled with its other draws in row order.
++void llama_sampler_backend_dist_add_row(llama_sampler * smpl, ggml_tensor * uniforms, int64_t i);
++
+ struct llama_sampler * llama_sampler_init_dry_testing(
+         float   dry_multiplier,
+         float   dry_base,

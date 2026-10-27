@@ -1,0 +1,718 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: device KQ masks from per-sequence cell lists
+
+With batched serving (unified KV, causal attention):
+
+- KV positions, sequence-membership words and query (pos, seq) pairs are
+  uploaded and the mask is built on the device instead of filling an
+  [n_kv, n_tokens] host mask.
+- With flash attention, the KV cells keep per-sequence cell lists and only
+  those are uploaded; the attention kernel selects the cells, bounded by the
+  longest sequence's KV length. A prompt prefix copied to many sequences is
+  listed once per sequence, so the list tensor is sized from the cells summed
+  over sequences, padded to 64Ki entries, and graph reuse checks that it still
+  fits. The mask also carries the query rows per sequence of the ubatch
+  (op param 2, rounded up), from which the sparse kernel picks its tile shape;
+  it is part of the graph reuse key.
+- llama_kv_cells tracks used cells and per-sequence positions without full
+  scans, and removes a whole sequence (a finished request) in one walk over
+  its position set, with the same cell states and head as removing it cell by
+  cell.
+
+Upstream: not planned in this form.
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8805a29c83d370b0207ab9ae3ec1e75cc2e6b738..2dc4e8f82b8e03e17f592a0e58849f3ed758417f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -26,11 +26,24 @@
+ 
+ // dedup helpers
+ 
++// Entries of the per-sequence cell lists: every sequence lists its cells, so shared cells count once per sequence.
++static int64_t kq_cell_list_size(const llama_kv_cache_context * mctx, uint32_t n_kv, const llama_cparams & cparams) {
++    const int64_t need = std::max<int64_t>(n_kv + 64*(int64_t) cparams.n_seq_max, (int64_t) mctx->get_n_seq_cells());
++    return GGML_PAD(need, 65536);
++}
++
++// Query rows per sequence of a ubatch, rounded up: the sparse flash-attention path picks its tile shape from it (op
++// param 2 of the metadata mask, part of the graph reuse key).
++static int32_t kq_mask_rows_per_seq(const llama_ubatch & ubatch) {
++    return ubatch.n_seqs_unq > 0 ? (int32_t) ((ubatch.n_tokens + ubatch.n_seqs_unq - 1)/ubatch.n_seqs_unq) : 0;
++}
++
+ static ggml_tensor * build_attn_inp_kq_mask(
+         ggml_context * ctx,
+         const llama_kv_cache_context * mctx,
+         const llama_ubatch & ubatch,
+-        const llama_cparams & cparams) {
++        const llama_cparams & cparams,
++        ggml_tensor ** metadata = nullptr) {
+     const auto n_kv     = mctx->get_n_kv();
+     const auto n_tokens = ubatch.n_tokens;
+     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+@@ -38,6 +51,38 @@ static ggml_tensor * build_attn_inp_kq_mask(
+     // flash attention requires an f16 mask
+     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
++    if (metadata && cparams.serving.batched && cparams.kv_unified && cparams.causal_attn) {
++        auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
++        // with per-sequence cell lists the membership words are never read: a 1-cell placeholder (the full tensor was a
++        // ~21 MB host->device input copy per pass)
++        const bool lists = cparams.flash_attn;
++        auto * seq = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, lists ? 1 : n_kv, (cparams.n_seq_max + 31)/32);
++        auto * query = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_tokens);
++        ggml_set_input(pos);
++        ggml_set_input(seq);
++        ggml_set_input(query);
++        metadata[0] = pos; metadata[1] = seq; metadata[2] = query;
++        ggml_tensor * res = nullptr;
++        if (lists) {
++            // no dense mask: flash attention selects cells from per-sequence lists
++            auto * off = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, cparams.n_seq_max + 1);
++            // a cell shared by several sequences (copied prompt prefix) is listed once per sequence: sized by the cell
++            // references, padded so that growth rebuilds the graph rarely
++            auto * cells = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kq_cell_list_size(mctx, n_kv, cparams));
++            ggml_set_input(off);
++            ggml_set_input(cells);
++            metadata[3] = off; metadata[4] = cells;
++            res = ggml_build_kq_mask_meta(ctx, pos, seq, query, off, cells, type);
++        } else {
++            res = ggml_build_kq_mask(ctx, pos, seq, query, type);
++        }
++        // per-sequence KV bound for the sparse flash-attention path (part of the graph reuse key)
++        res->op_params[0] = GGML_PAD(std::max<uint32_t>(1, mctx->get_n_kv_seq_max()), 512);
++        res->op_params[2] = kq_mask_rows_per_seq(ubatch);
++        ggml_set_name(res, "attn_gpu_kq_mask");
++        return res;
++    }
++
+     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+     ggml_set_input(res);
+     ggml_set_name(res, "attn_inp_kq_mask");
+@@ -56,6 +101,13 @@ static bool can_reuse_kq_mask(
+ 
+     bool res = true;
+ 
++    if (kq_mask->op == GGML_OP_BUILD_KQ_MASK && kq_mask->op_params[0] > 0) {
++        res &= mctx->get_n_kv_seq_max() <= (uint32_t) kq_mask->op_params[0];
++        res &= kq_mask->op_params[2] == kq_mask_rows_per_seq(ubatch);
++        if (kq_mask->src[4]) {
++            res &= (int64_t) mctx->get_n_seq_cells() <= kq_mask->src[4]->ne[0];
++        }
++    }
+     res &= (kq_mask->ne[0] == n_kv);
+     res &= (kq_mask->ne[1] == n_tokens/n_stream);
+     res &= (kq_mask->ne[2] == 1);
+@@ -482,7 +534,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+     // the mask is left unallocated when the graph only stores K/V without attending
+     // (e.g. DFlash's KV-injection pass)
+     if (self_kq_mask && self_kq_mask->buffer) {
+-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn, mask_metadata);
+     }
+ 
+     if (self_k_rot && self_k_rot->buffer) {
+@@ -1107,7 +1159,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+ 
+-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
++    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn, inp_attn->mask_metadata);
+ 
+     if (inp_attn->self_k_rot) {
+         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+@@ -2686,6 +2738,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
++        if (kq_mask && kq_mask->op == GGML_OP_BUILD_KQ_MASK && kq_mask->op_params[1] == 1) {
++            // flash attention reads the metadata-only mask's sources: make them sources so they stay allocated
++            for (int i = 0; i < 5; ++i) cur->src[5 + i] = kq_mask->src[i];
++        }
++        if (kq_mask && kq_mask->op == GGML_OP_BUILD_KQ_MASK && kq_mask->op_params[0] > 0) {
++            n_kv_max = kq_mask->op_params[0];
++        }
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
+@@ -2871,7 +2930,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, inp->mask_metadata);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index ed9b1cb3a70ae3af0ce0b73c5d4087a67ad48835..bf2ef32d99c62e6b849e1cbc8d6c815ac01b8ce1 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -353,6 +353,9 @@ public:
+     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+ 
++    // Retain original host inputs: scheduler rewrites operation src pointers
++    // to device copies after graph allocation.
++    ggml_tensor * mask_metadata[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 32a6fb4303f7fe7626a1b0d713e6b93cf846eac8..2c022b106d1e39d60d2663ea08e143b500e26476 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -402,15 +402,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+         uint32_t new_head = cells.size();
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
+-            if (!cells.pos_in(i, p0, p1)) {
+-                continue;
+-            }
+-
+-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+-                if (new_head == cells.size()) {
+-                    new_head = i;
+-                }
++        const auto & positions = cells.seq_positions(seq_id);
++        if (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
++            new_head = cells.seq_rm_all(seq_id);  // the whole sequence (a finished request)
++        }
++        auto it = positions.lower_bound({p0, 0});
++        while (it != positions.end() && it->first < p1) {
++            const uint32_t i = (it++)->second; // seq_rm erases the previous iterator
++            if (cells.seq_rm(i, seq_id)) {
++                new_head = std::min(new_head, i);
+             }
+         }
+ 
+@@ -478,13 +478,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+             p1 = std::numeric_limits<llama_pos>::max();
+         }
+ 
+-        for (uint32_t i = 0; i < cells.size(); ++i) {
+-            if (!cells.pos_in(i, p0, p1)) {
+-                continue;
+-            }
+-
+-            if (cells.seq_has(i, seq_id_src)) {
+-                cells.seq_add(i, seq_id_dst);
++        const auto & positions = cells.seq_positions(seq_id_src);
++        for (auto it = positions.lower_bound({p0, 0}); it != positions.end() && it->first < p1; ++it) {
++            if (!cells.seq_has(it->second, seq_id_dst)) {
++                cells.seq_add(it->second, seq_id_dst);
+             }
+         }
+ 
+@@ -775,6 +772,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+         // remember the position that we found
+         res.push_back(sinfo_new);
+ 
++        // A single ubatch needs no trial placement: nothing after it searches the cells, so the backup, apply and
++        // restore of ~n_tokens cells are skipped.
++        if (ubatches.size() == 1) {
++            return res;
++        }
++
+         // store the old state of the cells in the recovery stack
+         {
+             state_t state = { sinfo_new, v_heads, {} };
+@@ -1041,7 +1044,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+                 //                always insert in the cell with minimum pos
+                 bool can_use = cells.is_empty(idx);
+ 
+-                if (!can_use && cells.seq_count(idx) == 1) {
++                // without SWA an occupied cell is never reusable: skip the per-cell sequence lookups
++                if (!can_use && swa_type != LLAMA_SWA_TYPE_NONE && cells.seq_count(idx) == 1) {
+                     const llama_pos pos_cell = cells.pos_get(idx);
+ 
+                     // (disabled) causal mask
+@@ -1247,6 +1251,30 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+     return v_cells[seq_to_stream[seq_id]];
+ }
+ 
++uint32_t llama_kv_cache::get_n_kv_seq_max() const {
++    uint32_t n = 0;
++    for (uint32_t seq = 0; seq < seq_to_stream.size(); ++seq) {
++        n = std::max(n, (uint32_t) v_cells[seq_to_stream[seq]].seq_positions(seq).size());
++    }
++    return n;
++}
++
++uint32_t llama_kv_cache_context::get_n_kv_seq_max() const {
++    return kv->get_n_kv_seq_max();
++}
++
++uint64_t llama_kv_cache::get_n_seq_cells() const {
++    uint64_t n = 0;
++    for (uint32_t seq = 0; seq < seq_to_stream.size(); ++seq) {
++        n += v_cells[seq_to_stream[seq]].seq_positions(seq).size();
++    }
++    return n;
++}
++
++uint64_t llama_kv_cache_context::get_n_seq_cells() const {
++    return kv->get_n_seq_cells();
++}
++
+ void llama_kv_cache::set_n_kv_padding(uint32_t bucket, uint32_t reserve_cells) {
+     n_kv_bucket        = bucket;
+     n_kv_reserve_cells = reserve_cells;
+@@ -1751,9 +1779,53 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+     }
+ }
+ 
+-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
++void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, ggml_tensor * const * metadata) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
++    if (dst->op == GGML_OP_BUILD_KQ_MASK) {
++        GGML_ASSERT(metadata && metadata[0] && metadata[1] && metadata[2]);
++        GGML_ASSERT(causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && !ubatch->is_pos_2d());
++        GGML_ASSERT(n_stream == 1);
++        if (dst->op_params[0] > 0) {
++            GGML_ASSERT(get_n_kv_seq_max() <= (uint32_t) dst->op_params[0]);
++        }
++        const int64_t nk = dst->ne[0];
++        const int64_t nw = metadata[1]->ne[1];
++        auto & positions = mask_positions;
++        auto & membership = mask_membership;
++        auto & queries = mask_queries;
++        // With per-sequence cell lists the GPU needs no membership words (25 MB per call at 200k cells).
++        const bool lists = metadata[3] != nullptr;
++        positions.resize(nk);
++        queries.resize(2*n_tokens);
++        const auto & cells = v_cells[0];
++        if (lists) {
++            cells.mask_positions(nk, positions.data());
++        } else {
++            membership.resize(nk*nw);
++            cells.mask_metadata(nk, nw, positions.data(), membership.data());
++        }
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            GGML_ASSERT(ubatch->seq_id[i][0] < nw*32);
++            queries[2*i] = ubatch->pos[i];
++            queries[2*i+1] = ubatch->seq_id[i][0];
++        }
++        ggml_backend_tensor_set(metadata[0], positions.data(), 0, positions.size()*sizeof(int32_t));
++        if (!lists) {
++            ggml_backend_tensor_set(metadata[1], membership.data(), 0, membership.size()*sizeof(uint32_t));
++        }
++        ggml_backend_tensor_set(metadata[2], queries.data(), 0, queries.size()*sizeof(int32_t));
++        if (metadata[3]) {
++            const uint32_t n_seq = metadata[3]->ne[0] - 1;
++            mask_seq_off.resize(n_seq + 1);
++            mask_seq_cells.resize(metadata[4]->ne[0]);
++            cells.seq_cell_lists(nk, n_seq, mask_seq_off.data(), mask_seq_cells.data(), metadata[4]->ne[0]);
++            ggml_backend_tensor_set(metadata[3], mask_seq_off.data(), 0, mask_seq_off.size()*sizeof(int32_t));
++            ggml_backend_tensor_set(metadata[4], mask_seq_cells.data(), 0, mask_seq_off.back()*sizeof(int32_t));
++        }
++        return;
++    }
++
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const int64_t n_kv     = dst->ne[0];
+@@ -2809,8 +2881,8 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
+     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+ }
+ 
+-void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
++void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, ggml_tensor * const * metadata) const {
++    kv->set_input_kq_mask(dst, ubatch, causal_attn, metadata);
+ }
+ 
+ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9dd35c2012f46a31b9c761ba9ef24c898b6ca439..2051df83700ba53637c9d84df677c7f1466f4319 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -189,6 +189,9 @@ public:
+     //
+ 
+     uint32_t get_n_kv(const slot_info & sinfo) const;
++    uint32_t get_n_kv_seq_max() const;
++    // cells summed over sequences: a cell shared by k sequences counts k times
++    uint64_t get_n_seq_cells() const;
+ 
+     // get views of the current state of the cache
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+@@ -231,7 +234,7 @@ public:
+ 
+     void set_input_k_shift(ggml_tensor * dst) const;
+ 
+-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
++    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, ggml_tensor * const * metadata = nullptr) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
+     void set_input_k_rot(ggml_tensor * dst) const;
+@@ -313,6 +316,10 @@ private:
+     // maps from a sequence id to a stream id
+     std::vector<uint32_t> seq_to_stream;
+ 
++    // Reused host staging for GPU masks; context execution is serialized.
++    mutable std::vector<int32_t> mask_positions, mask_queries, mask_seq_off, mask_seq_cells;
++    mutable std::vector<uint32_t> mask_membership;
++
+     // pending stream copies that will be applied during the next update
+     stream_copy_info sc_info;
+ 
+@@ -398,6 +405,9 @@ public:
+     //
+ 
+     uint32_t get_n_kv() const;
++    uint32_t get_n_kv_seq_max() const;
++    // cells summed over sequences: a cell shared by k sequences counts k times
++    uint64_t get_n_seq_cells() const;
+ 
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+@@ -428,7 +438,7 @@ public:
+     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
+     void set_input_k_shift   (ggml_tensor * dst) const;
+-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
++    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, ggml_tensor * const * metadata = nullptr) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
+     void set_input_k_rot(ggml_tensor * dst) const;
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 5d567a6ed0b8efb126c4a462f0ca5cffa4af8573..a943dc9b30041ddadc1b0edd38236c113b55c96a 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -3,6 +3,7 @@
+ #include "llama.h"
+ #include "llama-cparams.h"
+ 
++#include <algorithm>
+ #include <bitset>
+ #include <cassert>
+ #include <cstring>
+@@ -38,6 +39,13 @@ public:
+     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+ 
+     void reset() {
++        std::fill(seq_words.begin(), seq_words.end(), 0);
++        std::fill(seq_n.begin(), seq_n.end(), 0);
++        std::fill(seq_x.begin(), seq_x.end(), 0);
++        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
++            seq_list[s].clear();
++            seq_list_dirty[s] = false;
++        }
+         for (uint32_t i = 0; i < pos.size(); ++i) {
+             pos[i]   = -1;
+             ext[i].reset();
+@@ -71,6 +79,10 @@ public:
+         ext.resize(n);
+         shift.resize(n);
+         seq.resize(n);
++        used.resize(n);
++        seq_words.resize(size_t(n)*n_seq_words);
++        seq_n.resize(n);
++        seq_x.resize(n);
+ 
+         reset();
+     }
+@@ -83,19 +95,19 @@ public:
+     }
+ 
+     uint32_t get_used() const {
+-        return used.size();
++        return used.count;
+     }
+ 
+     // the index of the first cell that is used
+     // return 0 if no cells are used
+     uint32_t used_min() const {
+-        return used.empty() ? 0 : *used.begin();
++        return used.count == 0 ? 0 : used.mn;
+     }
+ 
+     // the index of the last cell that is used + 1
+     // return 0 if no cells are used
+     uint32_t used_max_p1() const {
+-        return used.empty() ? 0 : *used.rbegin() + 1;
++        return used.count == 0 ? 0 : used.mx + 1;
+     }
+ 
+     bool get_has_shift() const {
+@@ -136,6 +148,7 @@ public:
+             res.pos[j] = pos[idx];
+             res.ext[j] = ext[idx];
+             res.seq[j] = seq[idx];
++            res.mask_copy(j, *this, idx);
+ 
+             assert(shift[idx] == 0);
+         }
+@@ -155,6 +168,7 @@ public:
+             res.pos[j] = pos[idx];
+             res.ext[j] = ext[idx];
+             res.seq[j] = seq[idx];
++            res.mask_copy(j, *this, idx);
+ 
+             assert(shift[idx] == 0);
+         }
+@@ -184,6 +198,7 @@ public:
+             pos[idx] = other.pos[j];
+             ext[idx] = other.ext[j];
+             seq[idx] = other.seq[j];
++            mask_copy(idx, other, j);
+ 
+             if (pos[idx] != -1) {
+                 seq_pos_add(i + j);
+@@ -215,6 +230,7 @@ public:
+             pos[idx] = other.pos[j];
+             ext[idx] = other.ext[j];
+             seq[idx] = other.seq[j];
++            mask_copy(idx, other, j);
+ 
+             if (pos[idx] != -1) {
+                 seq_pos_add(idx);
+@@ -231,6 +247,7 @@ public:
+ 
+         seq_pos_rm(i);
+         seq[i].reset();
++        mask_clear(i);
+ 
+         pos[i] = -1;
+         ext[i].reset();
+@@ -248,6 +265,7 @@ public:
+         assert(seq_id >= 0);
+ 
+         seq[i].reset(seq_id);
++        seq_words[size_t(seq_id/32)*pos.size()+i] &= ~(uint32_t(1) << (seq_id%32));
+         seq_pos_dec(seq_id, i);
+ 
+         if (seq[i].none()) {
+@@ -263,6 +281,33 @@ public:
+         return false;
+     }
+ 
++    // remove seq_id from every cell that holds it (seq_rm on each of its cells, without updating the
++    // position set one cell at a time); returns the lowest cell that became empty, or size() if none did
++    uint32_t seq_rm_all(llama_seq_id seq_id) {
++        assert(seq_id >= 0);
++        uint32_t lowest = pos.size();
++        const size_t word = size_t(seq_id/32)*pos.size();
++        const uint32_t bit = uint32_t(1) << (seq_id%32);
++        for (const auto & [p, i] : seq_pos[seq_id]) {
++            assert(seq[i].test(seq_id) && pos[i] == p);
++            seq[i].reset(seq_id);
++            seq_words[word+i] &= ~bit;
++            seq_n[i]--;
++            seq_x[i] ^= seq_id;
++            if (seq[i].none()) {
++                pos[i] = -1;
++                ext[i].reset();
++                shift[i] = 0;
++                used.erase(i);
++                lowest = std::min(lowest, i);
++            }
++        }
++        seq_pos[seq_id].clear();
++        seq_list[seq_id].clear();
++        seq_list_dirty[seq_id] = false;
++        return lowest;
++    }
++
+     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
+     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
+         assert(i < pos.size());
+@@ -272,6 +317,8 @@ public:
+             seq[i].reset();
+ 
+             seq[i].set(seq_id);
++            mask_clear(i);
++            seq_words[size_t(seq_id/32)*pos.size()+i] = uint32_t(1) << (seq_id%32);
+             seq_pos_inc(seq_id, i);
+ 
+             return false;
+@@ -280,6 +327,7 @@ public:
+         if (seq[i].any()) {
+             seq_pos_rm(i);
+             seq[i].reset();
++            mask_clear(i);
+ 
+             pos[i] = -1;
+             ext[i].reset();
+@@ -310,6 +358,53 @@ public:
+         return seq[i];
+     }
+ 
++    // Membership planes are updated only when cells change.
++    // Cells below n of each sequence below n_seq, sorted by position: off[n_seq+1], cells[<= n].
++    void seq_cell_lists(uint32_t n, uint32_t n_seq, int32_t * off, int32_t * cells_out, int64_t cap) const {
++        // Per-sequence (pos, cell)-ordered lists kept incrementally by seq_pos_inc/dec: decode steps only append at the
++        // tail; any other change marks the list dirty and it is rebuilt here from seq_pos. Cost ~ number of entries.
++        int64_t k = 0;
++        off[0] = 0;
++        for (uint32_t s = 0; s < n_seq; ++s) {
++            auto & L = seq_list[s];
++            if (seq_list_dirty[s]) {
++                L.clear();
++                for (const auto & pi : seq_pos[s]) L.push_back((int32_t) pi.second);
++                seq_list_dirty[s] = false;
++            }
++            GGML_ASSERT(k + (int64_t) L.size() <= cap && "KV cell lists exceed their tensor (shared cells)");
++            for (const int32_t c : L) {
++                cells_out[k] = c;
++                k += (uint32_t) c < n;
++            }
++            off[s + 1] = (int32_t) k;
++        }
++#ifndef NDEBUG
++        // debug builds: the incremental lists equal a rebuild from seq_pos
++        std::vector<int32_t> off2(n_seq + 1), cells2(cap);
++        int32_t k2 = 0;
++        for (uint32_t s = 0; s < n_seq; ++s) {
++            for (const auto & [p, i] : seq_pos[s]) if (i < n) cells2[k2++] = (int32_t) i;
++            off2[s + 1] = k2;
++        }
++        assert(std::equal(off2.begin(), off2.end(), off) && "seq_cell_lists: offsets differ");
++        assert(std::equal(cells2.begin(), cells2.begin() + k2, cells_out) && "seq_cell_lists: cells differ");
++#endif
++    }
++
++    void mask_positions(uint32_t n, int32_t * positions) const {
++        assert(n <= pos.size());
++        std::copy_n(pos.data(), n, positions);
++    }
++
++    void mask_metadata(uint32_t n, uint32_t words, int32_t * positions, uint32_t * membership) const {
++        assert(n <= pos.size() && words <= (LLAMA_MAX_SEQ + 31)/32);
++        std::copy_n(pos.data(), n, positions);
++        for (uint32_t w = 0; w < words; ++w) {
++            std::copy_n(seq_words.data()+size_t(w)*pos.size(), n, membership+size_t(w)*n);
++        }
++    }
++
+     // check if the cell contains seq_id
+     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
+         assert(i < pos.size());
+@@ -318,6 +413,11 @@ public:
+         return seq[i].test(seq_id);
+     }
+ 
++    const std::set<std::pair<llama_pos, uint32_t>> & seq_positions(llama_seq_id s) const {
++        assert(s >= 0 && s < LLAMA_MAX_SEQ);
++        return seq_pos[s];
++    }
++
+     // the token of the cell of sequence seq_id at the largest position <= p
+     // when several cells share that position, the one with the highest index wins
+     // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+@@ -343,6 +443,7 @@ public:
+         assert(!seq[i].test(seq_id));
+ 
+         seq[i].set(seq_id);
++        seq_words[size_t(seq_id/32)*pos.size()+i] |= uint32_t(1) << (seq_id%32);
+         seq_pos_inc(seq_id, i);
+     }
+ 
+@@ -450,6 +551,7 @@ public:
+ 
+         if (pos[i] < 0) {
+             seq[i].reset();
++            mask_clear(i);
+             pos[i] = -1;
+             shift[i] = 0;
+ 
+@@ -485,8 +587,29 @@ public:
+ private:
+     bool has_shift = false;
+ 
+-    // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
+-    std::set<uint32_t> used;
++    // indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id): a flag per cell with count, min and
++    // max (a std::set costs a cache-missing tree walk per decode token)
++    struct used_cells {
++        std::vector<uint8_t> flag;
++        uint32_t count = 0, mn = 0, mx = 0;
++        void resize(uint32_t n) { flag.assign(n, 0); count = mn = mx = 0; }
++        void clear() { std::fill(flag.begin(), flag.end(), 0); count = mn = mx = 0; }
++        void insert(uint32_t i) {
++            if (flag[i]) return;
++            flag[i] = 1;
++            if (count++ == 0) { mn = mx = i; return; }
++            mn = std::min(mn, i);
++            mx = std::max(mx, i);
++        }
++        void erase(uint32_t i) {
++            if (!flag[i]) return;
++            flag[i] = 0;
++            if (--count == 0) { mn = mx = 0; return; }
++            if (i == mx) { while (!flag[mx]) --mx; }
++            if (i == mn) { while (!flag[mn]) ++mn; }
++        }
++    };
++    used_cells used;
+ 
+     std::vector<llama_pos> pos;
+ 
+@@ -513,6 +636,29 @@ private:
+     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
+     std::vector<seq_set_t> seq;
+ 
++    static constexpr uint32_t n_seq_words = (LLAMA_MAX_SEQ + 31)/32;
++    std::vector<uint32_t> seq_words;
++
++    // seq_pos[s] as a flat (pos, cell)-ordered list, kept by seq_pos_inc/dec (rebuilt lazily when dirty)
++    mutable std::vector<int32_t> seq_list[LLAMA_MAX_SEQ];
++    mutable bool seq_list_dirty[LLAMA_MAX_SEQ] = {};
++
++    // per cell: number of sequences, and the XOR of their ids (the owner when seq_n == 1); kept by seq_pos_inc/dec
++    std::vector<uint16_t> seq_n;
++    std::vector<int32_t>  seq_x;
++
++    void mask_clear(uint32_t i) {
++        for (uint32_t w = 0; w < n_seq_words; ++w) {
++            seq_words[size_t(w)*pos.size()+i] = 0;
++        }
++    }
++
++    void mask_copy(uint32_t i, const llama_kv_cells & other, uint32_t j) {
++        for (uint32_t w = 0; w < n_seq_words; ++w) {
++            seq_words[size_t(w)*pos.size()+i] = other.seq_words[size_t(w)*other.pos.size()+j];
++        }
++    }
++
+     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
+     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
+     // and upper_bound() on a position finds the nearest cell of the sequence in logarithmic time
+@@ -526,13 +672,32 @@ private:
+     // helper functions for updating `seq_pos`, once cell at a time:
+ 
+     void seq_pos_dec(llama_seq_id s, uint32_t i) {
++        seq_n[i]--;
++        seq_x[i] ^= s;
+         const auto n = seq_pos[s].erase({ pos[i], i });
+         assert(n == 1);
+         GGML_UNUSED(n);
++        auto & L = seq_list[s];
++        if (seq_pos[s].empty()) {
++            L.clear();
++            seq_list_dirty[s] = false;
++        } else if (!seq_list_dirty[s]) {
++            if (!L.empty() && (uint32_t) L.back() == i) L.pop_back(); else seq_list_dirty[s] = true;
++        }
+     }
+ 
+     void seq_pos_inc(llama_seq_id s, uint32_t i) {
+-        seq_pos[s].insert({ pos[i], i });
++        seq_n[i]++;
++        seq_x[i] ^= s;
++        seq_pos[s].insert(seq_pos[s].end(), { pos[i], i });  // decode appends: amortized O(1) with the end hint
++        auto & L = seq_list[s];
++        if (!seq_list_dirty[s]) {
++            if (L.empty() || pos[L.back()] < pos[i] || (pos[L.back()] == pos[i] && (uint32_t) L.back() < i)) {
++                L.push_back((int32_t) i);
++            } else {
++                seq_list_dirty[s] = true;
++            }
++        }
+     }
+ 
+     // remove cell i

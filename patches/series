@@ -22,3 +22,14 @@ ggml-cuda-per-backend-serving-options.patch
 ggml-ragged-mamba2-and-kq-mask-ops-for-packed-multi-sequence-batches.patch
 ggml-cuda-sparse-flash-attention-over-per-sequence-cell-lists.patch
 ggml-cuda-f16-scale.patch
+llama-serving-parameters-for-batched-hybrid-models.patch
+llama-ragged-recurrent-batches-with-in-place-ssm-state.patch
+llama-device-kq-masks-from-per-sequence-cell-lists.patch
+llama-batched-greedy-argmax-outputs.patch
+llama-mixed-embedding-batches-and-device-resident-mtp-drafting.patch
+llama-split-decode-into-prepare-and-launch.patch
+llama-per-sequence-token-mask-for-batched-serving.patch
+llama-first-fit-kv-cells-for-batched-serving.patch
+llama-size-the-batched-serving-output-buffers-by-what-is-read.patch
+llama-draw-the-temperature-sampled-rows-of-a-batched-step-together.patch
+llama-split-decode-for-batches-with-supplied-embedding-rows.patch

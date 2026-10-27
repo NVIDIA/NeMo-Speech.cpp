@@ -1,0 +1,238 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: split decode into prepare and launch
+
+llama_decode_prepare runs batch init, memory apply, graph build and alloc and
+the input upload while the previous decode is still on the GPU (its outputs
+stay readable); llama_decode_launch sets the token ids and computes. For
+single-ubatch token batches.
+
+Upstream: not planned.
+
+diff --git a/include/llama.h b/include/llama.h
+index 6f79582f090da11be735386ef56d34d7a18fd22c..35673332955e2ebe0f2a637c99669d8dbfd24e4b 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1022,6 +1022,12 @@ extern "C" {
+             struct llama_context * ctx,
+               struct llama_batch   batch);
+ 
++    // Split decode for overlapping host work with the previous decode's GPU time (single-ubatch token batches only):
++    // prepare does everything up to the inputs (the previous decode's outputs stay readable until launch); launch sets
++    // the token ids (batch order; NULL keeps the prepared ones) and computes. 0 on success.
++    LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch batch);
++    LLAMA_API int32_t llama_decode_launch(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
++
+     // Set the number of threads used for decoding
+     // n_threads is the number of threads used for generation (single token)
+     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f6ec63c4f6f829085a09d062be59ccf01197a6be..91a24bc957058ee4e322d1917b60fc5116fb238e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1422,6 +1422,24 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    llm_graph_result * res = process_ubatch_prepare(ubatch, gtype, mctx, ret);
++    if (!res) {
++        return nullptr;
++    }
++
++    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (status != GGML_STATUS_SUCCESS) {
++        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
++        ret = status;
++        return nullptr;
++    }
++
++    ret = GGML_STATUS_SUCCESS;
++
++    return res;
++}
++
++llm_graph_result * llama_context::process_ubatch_prepare(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -1484,13 +1502,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
+-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+-    if (status != GGML_STATUS_SUCCESS) {
+-        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+-        ret = status;
+-        return nullptr;
+-    }
+-
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+@@ -1750,7 +1761,113 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+ 
++int llama_context::decode_prepare(const llama_batch & batch_inp) {
++    GGML_ASSERT(!pend.active && "llama_decode_prepare: a prepared decode is pending");
++    GGML_ASSERT(memory && batch_inp.token && !batch_inp.embd && !batch_inp.embd_input && batch_inp.logits);
++    GGML_ASSERT(!cparams.embeddings && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
++    if (batch_inp.n_tokens == 0) {
++        return -1;
++    }
++    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
++    if (!balloc->init(batch_inp, model.vocab, memory.get(), model.hparams.n_embd_inp(), n_seq_max, false)) {
++        return -1;
++    }
++    const uint32_t n_tokens_all  = balloc->get_n_tokens();
++    const uint32_t n_outputs_all = balloc->get_n_outputs();
++    GGML_ASSERT(n_tokens_all <= cparams.n_ubatch && "llama_decode_prepare: single-ubatch batches only");
++    if (t_compute_start_us == 0) {
++        t_compute_start_us = ggml_time_us();
++    }
++    n_queued_tokens += n_tokens_all;
++    sched_reserve();
++    memory_update(false);
++    llama_memory_context_ptr mctx = memory->init_batch(*balloc, cparams.n_ubatch, false);
++    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
++        return -2;
++    }
++    const auto & ubatch = mctx->get_ubatch();
++    GGML_ASSERT(ubatch.n_tokens == n_tokens_all && "llama_decode_prepare: the batch must form one ubatch");
++    GGML_ASSERT(ubatch.token_indices == nullptr || [&]() {
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) if (ubatch.token_indices[i] != (int32_t) i) return false;
++        return true; }());
++    int32_t n_outputs_new = 0;
++    if (n_outputs_all == n_tokens_all) {
++        n_outputs_new = ubatch.n_tokens;
++    } else {
++        for (uint32_t i = 0; i < ubatch.n_tokens; i++) n_outputs_new += (int32_t) (ubatch.output[i] != 0);
++    }
++    // the previous decode's outputs stay readable until launch: n_outputs is only borrowed for the graph build
++    const int32_t n_outputs_keep = n_outputs;
++    n_outputs = n_outputs_new;
++    ggml_status status;
++    llm_graph_result * res = process_ubatch_prepare(ubatch, LLM_GRAPH_TYPE_DEFAULT, mctx.get(), status);
++    n_outputs = n_outputs_keep;
++    if (!res) {
++        return -3;
++    }
++    pend.active        = true;
++    pend.mctx          = std::move(mctx);
++    pend.res           = res;
++    pend.n_tokens_all  = n_tokens_all;
++    pend.n_outputs_all = n_outputs_all;
++    pend.n_outputs     = n_outputs_new;
++    return 0;
++}
++
++int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
++    GGML_ASSERT(pend.active && "llama_decode_launch: nothing prepared");
++    llm_graph_result * res = pend.res;
++    const auto & ubatch = pend.mctx->get_ubatch();
++    if (tokens) {
++        GGML_ASSERT(n_tokens == (int32_t) ubatch.n_tokens && res->get_inp_tokens());
++        ggml_backend_tensor_set(res->get_inp_tokens(), tokens, 0, n_tokens * sizeof(llama_token));
++    }
++    output_swaps.clear();
++    if (output_reserve(pend.n_outputs_all) < pend.n_outputs_all) {
++        pend = {};
++        return -2;
++    }
++    for (const auto & entry : sampling.samplers) {
++        llama_sampler_backend_begin(entry.second);
++    }
++    nextn_device_rows  = pend.n_tokens_all;
++    nextn_host_current = false;
++    n_outputs = pend.n_outputs;
++    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (status != GGML_STATUS_SUCCESS) {
++        pend = {};
++        return -3;
++    }
++    const int64_t n_vocab = model.vocab.n_tokens();
++    auto * t_logits = res->get_logits();
++    if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
++        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
++    }
++    extract_layer_inputs(res, 0, ubatch.n_tokens);
++    if (!sampling.samplers.empty()) {
++        copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,       0, sched.get());
++        copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     n_vocab, 0, sched.get(), &sampling.logits_count);
++        copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      n_vocab, 0, sched.get(), &sampling.probs_count);
++        copy_tensor_async_rows(res->t_candidates,     sampling.candidates, n_vocab, 0, sched.get(), &sampling.candidates_count);
++    }
++    n_outputs = pend.n_outputs_all;
++    if (n_outputs > 0) {
++        auto & out_ids = balloc->get_out_ids();
++        GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
++        bool sorted_output = true;
++        for (int64_t i = 0; i < n_outputs; ++i) {
++            output_ids[out_ids[i]] = i;
++            sorted_output &= out_ids[i] == i;
++        }
++        GGML_ASSERT(sorted_output && "llama_decode_launch: outputs must be in batch order");
++    }
++    pend = {};
++    return 0;
++}
++
+ int llama_context::decode(const llama_batch & batch_inp) {
++    GGML_ASSERT(!pend.active && "llama_decode: a prepared decode is pending (llama_decode_launch first)");
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+@@ -4448,6 +4565,14 @@ int32_t llama_encode(
+     return ret;
+ }
+ 
++int32_t llama_decode_prepare(llama_context * ctx, llama_batch batch) {
++    return ctx->decode_prepare(batch);
++}
++
++int32_t llama_decode_launch(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {
++    return ctx->decode_launch(tokens, n_tokens);
++}
++
+ int32_t llama_decode(
+         llama_context * ctx,
+           llama_batch   batch) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index ec0249a7f8d5ab9334028f3fd29a3c9ff46014b4..9af3c3da2fe1be4443aee31cad3c1eea045fd7e9 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -155,6 +155,18 @@ struct llama_context {
+     int encode(const llama_batch & batch_inp);
+     int decode(const llama_batch & batch_inp);
+ 
++    // prepare / launch split of a single-ubatch decode (llama_decode_prepare / llama_decode_launch): batch init, memory
++    // apply, graph build/alloc and inputs run while the previous decode is still on the GPU (its outputs stay readable);
++    // launch sets the token ids, reserves the outputs and computes.
++    int decode_prepare(const llama_batch & batch_inp);
++    int decode_launch(const llama_token * tokens, int32_t n_tokens);
++    bool decode_pending() const { return pend.active; }
++    llm_graph_result * process_ubatch_prepare(
++                const llama_ubatch & ubatch,
++                    llm_graph_type   gtype,
++            llama_memory_context_i * mctx,
++                       ggml_status & ret);
++
+     //
+     // state save/load
+     //
+@@ -363,6 +375,15 @@ private:
+ 
+     std::vector<swap_info> output_swaps;
+ 
++    struct pending_decode {
++        bool active = false;
++        llama_memory_context_ptr mctx;
++        llm_graph_result * res = nullptr;
++        uint32_t n_tokens_all  = 0;
++        uint32_t n_outputs_all = 0;
++        int32_t  n_outputs     = 0;
++    } pend;
++
+     ggml_backend_sched_ptr sched;
+ 
+     bool sched_need_reserve = true;

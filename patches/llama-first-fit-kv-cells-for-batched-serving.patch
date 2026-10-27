@@ -1,0 +1,27 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: first-fit KV cells for batched serving
+
+The slot search started at the cache head left by earlier allocations, so the
+same request landed on different cells depending on what ran before it, and
+attention results depend on where the cells are (the covered KV span and its
+padding change the kernel launch). With batched serving (n_kv bucket set) the
+search starts at cell 0: identical requests on the same occupancy get the same
+cells.
+
+Upstream: candidate.
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 2c022b106d1e39d60d2663ea08e143b500e26476..cc7a8410d813f15e5de480c9919bc47eb5c12b0a 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1005,7 +1005,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+         // if we have enough unused cells before the current head ->
+         //   better to start searching from the beginning of the cache, hoping to fill it
+-        if (head_cur > cells.get_used() + 2*n_tokens) {
++        // Batched serving always searches from the beginning (first fit): attention results depend on where a
++        // sequence's cells are, so placement must follow the cache's occupancy, not its allocation history.
++        if (n_kv_bucket > 0 || head_cur > cells.get_used() + 2*n_tokens) {
+             head_cur = 0;
+         }
+ 

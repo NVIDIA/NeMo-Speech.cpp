@@ -1,0 +1,186 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: size the batched serving output buffers by what is read
+
+Batched serving samples only token ids on the backend, so its pinned output
+buffer no longer holds full-vocabulary logits, probabilities and candidates for
+every possible output row (several GB with hundreds of sequences and MTP verify
+rows). The raw logits rows are reserved once a decode first returns raw logits
+to the host (an output row of a sequence without a backend sampler; chained MTP
+drafts never do), and device-resident NextN rows get a host copy only when
+they are downloaded. A batched context gives memory back when its reserved
+size drops.
+
+Upstream: not planned (batched serving path).
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4f41b6ac53101262b641b9a68c90b78b8f9e52cc..15306644fd2b55c51e119cd12cfa0cdbcf14d202 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1014,6 +1014,7 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
+ void llama_context::set_embeddings_nextn_device(bool value) {
+     GGML_ASSERT(!value || (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked));
+     use_nextn_device = value;
++    if (cparams.serving.batched) output_reserve(cparams.n_outputs_max);
+ }
+ 
+ ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backend) {
+@@ -1024,6 +1025,10 @@ ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backen
+ 
+ void llama_context::download_embeddings_nextn() {
+     if (use_nextn_device && nextn_device && !nextn_host_current) {
++        if (!embd_nextn.has_data()) {
++            embd_nextn_host.resize((size_t) model.hparams.n_embd_out() * cparams.n_batch);
++            embd_nextn = {embd_nextn_host.data(), embd_nextn_host.size()};
++        }
+         ggml_backend_tensor_get_async(nextn_device_backend, nextn_device, embd_nextn.data,
+                 0, size_t(nextn_device_rows)*nextn_device->nb[1]);
+         ggml_backend_synchronize(nextn_device_backend);
+@@ -1761,6 +1766,24 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+ 
++void llama_context::note_raw_logits() {
++    if (raw_logits_reserved || !cparams.serving.batched || (cparams.mtp_tok && cparams.mtp_tok_out >= 0)) {
++        return;
++    }
++    const llama_batch & batch = balloc->get_batch();
++    for (int32_t i = 0; i < batch.n_tokens && !raw_logits_reserved; ++i) {
++        if (!batch.logits[i]) {
++            continue;
++        }
++        for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
++            if (sampling.samplers.find(batch.seq_id[i][s]) == sampling.samplers.end()) {
++                raw_logits_reserved = true;
++                break;
++            }
++        }
++    }
++}
++
+ int llama_context::decode_prepare(const llama_batch & batch_inp) {
+     GGML_ASSERT(!pend.active && "llama_decode_prepare: a prepared decode is pending");
+     GGML_ASSERT(memory && batch_inp.token && !batch_inp.embd && !batch_inp.embd_input && batch_inp.logits);
+@@ -1775,6 +1798,7 @@ int llama_context::decode_prepare(const llama_batch & batch_inp) {
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+     GGML_ASSERT(n_tokens_all <= cparams.n_ubatch && "llama_decode_prepare: single-ubatch batches only");
++    note_raw_logits();  // launch reserves the outputs
+     if (t_compute_start_us == 0) {
+         t_compute_start_us = ggml_time_us();
+     }
+@@ -2016,6 +2040,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         break;
+     }
+ 
++    note_raw_logits();
++
+     // reserve output buffer
+     if (output_reserve(n_outputs_all) < n_outputs_all) {
+         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+@@ -2183,14 +2209,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+ 
+-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
++            if ((embd_nextn.data || use_nextn_device) && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                 GGML_ASSERT(backend_h != nullptr);
+ 
+                 const uint32_t n_embd  = hparams.n_embd_out();
+-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
++                float * embd_nextn_out = embd_nextn.data ? embd_nextn.data + offset*n_embd : nullptr;
+ 
+-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
++                GGML_ASSERT(use_nextn_device || (offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                 if (use_nextn_device) {
+                     GGML_ASSERT(!masked);
+                     if (!nextn_device) {
+@@ -2315,9 +2341,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+     const auto n_embd     = hparams.n_embd;
+     const auto n_embd_out = hparams.n_embd_out();
+ 
+-    bool has_logits     = true;
++    // batched serving: raw logits once a decode reads them (note_raw_logits); device-resident NextN rows have no
++    // host buffer until they are downloaded
++    bool has_logits     = !cparams.serving.batched || raw_logits_reserved;
+     bool has_embd       = cparams.embeddings;
+-    bool has_embd_nextn = cparams.embeddings_nextn;
++    bool has_embd_nextn = cparams.embeddings_nextn && !use_nextn_device;
+ 
+     // TODO: hacky enc-dec support
+     if (model.arch == LLM_ARCH_T5) {
+@@ -2345,11 +2373,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+         }
+     }
+ 
+-    // Allocate backend sampling output buffers if there are backend samplers configured.
+-    const bool has_sampling = !sampling.samplers.empty();
++    // Allocate backend sampling output buffers if there are backend samplers configured. Batched serving samples
++    // only token ids on the backend (build_sampling), so it needs no logits, probs or candidates rows.
++    const bool has_sampling   = !sampling.samplers.empty();
++    const bool sampled_only   = cparams.serving.batched;
+     if (has_sampling) {
+-        backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
+-        backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
++        backend_float_count = sampled_only ? 0 : 2 * n_vocab * n_outputs_max;           // logits + probs
++        backend_token_count = sampled_only ? n_outputs_max : (1 + n_vocab) * n_outputs_max;  // sampled + candidates
+     }
+ 
+     if (output_ids.empty()) {
+@@ -2364,7 +2394,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+ 
+     // alloc only when more than the current capacity is required
+     // TODO: also consider shrinking the buffer
+-    if (!buf_output || prev_size < new_size) {
++    // (batched serving always reserves its configured maximum, so a smaller size means the outputs changed, e.g.
++    // NextN rows moved to the device: give the pinned memory back)
++    if (!buf_output || prev_size < new_size || (cparams.serving.batched && new_size < prev_size)) {
+         if (buf_output) {
+ #ifndef NDEBUG
+             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
+@@ -2421,16 +2453,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+     }
+ 
+     if (has_sampling) {
+-        sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
++        const size_t rows = sampled_only ? 0 : (size_t) n_vocab*n_outputs_max;
++        sampling.logits = rows ? buffer_view<float>{(float *) (base + offset), rows} : buffer_view<float>{nullptr, 0};
+         offset += sampling.logits.size * sizeof(float);
+ 
+-        sampling.probs = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
++        sampling.probs = rows ? buffer_view<float>{(float *) (base + offset), rows} : buffer_view<float>{nullptr, 0};
+         offset += sampling.probs.size * sizeof(float);
+ 
+         sampling.sampled = {(llama_token *) (base + offset), (size_t)n_outputs_max};
+         offset += sampling.sampled.size * sizeof(llama_token);
+ 
+-        sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
++        sampling.candidates = rows ? buffer_view<llama_token>{(llama_token *) (base + offset), rows}
++                                   : buffer_view<llama_token>{nullptr, 0};
+         offset += sampling.candidates.size * sizeof(llama_token);
+ 
+         // The count vectors keep track of the actual number of logits/probs/candidates
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 270b557a2d496b352f4c9301112a175490086a5a..8d3966d560838fdd9db53071eb7f658d6b88d70e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -254,6 +254,11 @@ private:
+     // map the output row index `i` to batch index
+     int64_t output_resolve_row(int32_t i) const;
+ 
++    // Batched serving reserves the raw logits only once a decode returns them to the host: an output row of a
++    // sequence without a backend sampler, outside chained MTP drafting (balloc holds the decode's batch).
++    bool raw_logits_reserved = false;
++    void note_raw_logits();
++
+     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
+     // from backend into host-side embd_layer_inp buffers
+     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+@@ -328,6 +333,7 @@ private:
+     // populated only when cparams.embeddings_nextn is enabled and the model graph
+     // sets llm_graph_result::t_h_nextn
+     buffer_view<float> embd_nextn = {nullptr, 0};
++    std::vector<float> embd_nextn_host;  // host copy of the device rows, made only when they are downloaded
+     bool use_nextn_device = false;
+     bool nextn_host_current = false;
+     uint32_t nextn_device_rows = 0;

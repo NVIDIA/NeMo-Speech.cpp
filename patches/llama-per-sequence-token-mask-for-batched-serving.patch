@@ -1,0 +1,264 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: per-sequence token mask for batched serving
+
+Serving can ban a token set (llama_set_token_mask) for chosen sequences
+(llama_set_seq_token_mask). The batched sampling path adds -inf to the
+banned logits of those sequences' rows before the greedy argmax and before
+backend sampler chains: a broadcast add when every output row is armed, a
+per-row gather when only some are, nothing when none are.
+
+Upstream: candidate.
+
+diff --git a/include/llama.h b/include/llama.h
+index 35673332955e2ebe0f2a637c99669d8dbfd24e4b..64cafd06be99a8db3f6354325cb3c4bc7ca4aa12 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1371,6 +1371,12 @@ extern "C" {
+     // note: prefer initializing the context with llama_context_params.samplers when possible
+     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+ 
++    // [serving] Token mask for batched serving: tokens with banned[i] != 0 are never sampled for sequences armed with
++    // llama_set_seq_token_mask (the greedy argmax and backend sampler chains see their logits at -inf). n_vocab
++    // entries; banned == nullptr clears the mask.
++    LLAMA_API void llama_set_token_mask(struct llama_context * ctx, const uint8_t * banned, int32_t n_vocab);
++    LLAMA_API void llama_set_seq_token_mask(struct llama_context * ctx, llama_seq_id seq_id, bool armed);
++
+     // mirror of llama_sampler_i:
+     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
+     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 91a24bc957058ee4e322d1917b60fc5116fb238e..4f41b6ac53101262b641b9a68c90b78b8f9e52cc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2764,6 +2764,8 @@ llm_graph_params llama_context::graph_params(
+         /*.mctx        =*/ mctx,
+         /*.cross       =*/ &cross,
+         /*.samplers    =*/ sampling.samplers,
++        /*.token_mask  =*/ &token_mask,
++        /*.token_mask_mode =*/ token_mask.mode(ubatch),
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
+@@ -4243,6 +4245,32 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
+     return ctx->set_sampler(seq_id, smpl);
+ }
+ 
++void llama_context::set_token_mask(const uint8_t * banned, int32_t n_vocab) {
++    token_mask.bias.clear();
++    if (banned) {
++        token_mask.bias.resize(n_vocab);
++        for (int32_t i = 0; i < n_vocab; ++i) {
++            token_mask.bias[i] = banned[i] ? -INFINITY : 0.0f;
++        }
++    }
++    token_mask.seq_armed.assign(cparams.n_seq_max, 0);
++}
++
++void llama_context::set_seq_token_mask(llama_seq_id seq_id, bool armed) {
++    if (seq_id < 0 || (size_t) seq_id >= token_mask.seq_armed.size()) {
++        return;
++    }
++    token_mask.seq_armed[seq_id] = armed ? 1 : 0;
++}
++
++void llama_set_token_mask(llama_context * ctx, const uint8_t * banned, int32_t n_vocab) {
++    ctx->set_token_mask(banned, n_vocab);
++}
++
++void llama_set_seq_token_mask(llama_context * ctx, llama_seq_id seq_id, bool armed) {
++    ctx->set_seq_token_mask(seq_id, armed);
++}
++
+ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 9af3c3da2fe1be4443aee31cad3c1eea045fd7e9..270b557a2d496b352f4c9301112a175490086a5a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -277,6 +277,9 @@ public:
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
++    void set_token_mask(const uint8_t * banned, int32_t n_vocab);
++    void set_seq_token_mask(llama_seq_id seq_id, bool armed);
++
+ private:
+     llm_graph_result * get_gf_res_prev();
+ 
+@@ -356,6 +359,8 @@ private:
+ 
+     sampling_info sampling;
+ 
++    llama_token_mask token_mask;
++
+     // sequence embeddings output (map of [n_embd] vectors)
+     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
+     std::map<llama_seq_id, std::vector<float>> embd_seq;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9aec0443bb7 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <cassert>
+ #include <cmath>
++#include <algorithm>
+ #include <cstring>
+ #include <numeric>
+ #include <sstream>
+@@ -1399,6 +1400,26 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+     return res;
+ }
+ 
++void llm_graph_input_token_mask::set_input(const llama_ubatch * ubatch) {
++    const int64_t n_vocab = table->ne[0];
++    GGML_ASSERT((int64_t) mask->bias.size() == n_vocab);
++    if (!rows) {  // every row armed: the bias alone, broadcast over the rows
++        ggml_backend_tensor_set(table, mask->bias.data(), 0, ggml_nbytes(table));
++        return;
++    }
++    std::vector<float> host(2*n_vocab, 0.0f);
++    std::copy(mask->bias.begin(), mask->bias.end(), host.begin() + n_vocab);
++    ggml_backend_tensor_set(table, host.data(), 0, ggml_nbytes(table));
++    std::vector<int32_t> sel(rows->ne[0], 0);
++    int64_t r = 0;
++    for (uint32_t i = 0; i < ubatch->n_tokens && r < rows->ne[0]; ++i) {
++        if (!ubatch->output[i]) continue;
++        const llama_seq_id s = ubatch->seq_id[i][0];
++        sel[r++] = s >= 0 && (size_t) s < mask->seq_armed.size() && mask->seq_armed[s] ? 1 : 0;
++    }
++    ggml_backend_tensor_set(rows, sel.data(), 0, ggml_nbytes(rows));
++}
++
+ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
+     // set the inputs only for the active samplers in the current ubatch
+     std::unordered_set<llama_seq_id> active_samplers;
+@@ -1622,6 +1643,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     mctx             (params.mctx),
+     cross            (params.cross),
+     samplers         (params.samplers),
++    token_mask       (params.token_mask),
++    token_mask_mode  (params.token_mask_mode),
+     cb_func          (params.cb),
+     res              (params.res),
+     ctx0             (res->get_ctx()),
+@@ -4000,6 +4023,27 @@ void llm_graph_context::build_sampling() const {
+     // sampler graphs or full-vocabulary D2H transfers. Only sequences with another sampler (temperature
+     // sampling) get their own sampler graph, on their rows only.
+     if (n_rows > 0 && cparams.serving.batched) {
++        // Rows of armed sequences get the banned-token bias (-inf) before any token is chosen; the others add
++        // zeros. In place: the raw logits are not read back when samplers run on the backend.
++        ggml_tensor * logits = res->t_logits;
++        if (token_mask_mode != 0 && token_mask && !token_mask->bias.empty()) {
++            auto inp = std::make_unique<llm_graph_input_token_mask>(token_mask);
++            ggml_tensor * bias = nullptr;
++            if (token_mask_mode == 2) {
++                inp->table = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, logits->ne[0], 1);
++                ggml_set_input(inp->table);
++                bias = inp->table;
++            } else {
++                inp->table = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, logits->ne[0], 2);
++                ggml_set_input(inp->table);
++                inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
++                ggml_set_input(inp->rows);
++                bias = ggml_get_rows(ctx0, inp->table, inp->rows);
++            }
++            logits = ggml_add_inplace(ctx0, logits, bias);
++            ggml_set_name(logits, "token_mask_logits");
++            res->add_input(std::move(inp));
++        }
+         auto is_greedy = [](llama_sampler * sampler) {
+             if (std::strcmp(llama_sampler_name(sampler), "chain") == 0) {
+                 if (llama_sampler_chain_n(sampler) != 1) return false;
+@@ -4009,7 +4053,7 @@ void llm_graph_context::build_sampling() const {
+             if (name[0] == '+') ++name;
+             return std::strcmp(name, "greedy") == 0;
+         };
+-        auto * ids = ggml_argmax(ctx0, res->t_logits);
++        auto * ids = ggml_argmax(ctx0, logits);
+         ggml_set_name(ids, "batched_greedy_argmax");
+         ggml_set_output(ids);
+         ggml_build_forward_expand(gf, ids);
+@@ -4030,7 +4074,7 @@ void llm_graph_context::build_sampling() const {
+                 sampler->iface->backend_reset(sampler);
+             }
+             for (uint32_t row : rows) {
+-                ggml_tensor * logits_row = ggml_view_1d(ctx0, res->t_logits, res->t_logits->ne[0], row*res->t_logits->nb[1]);
++                ggml_tensor * logits_row = ggml_view_1d(ctx0, logits, logits->ne[0], row*logits->nb[1]);
+                 llama_sampler_data data = { logits_row, nullptr, nullptr, nullptr };
+                 sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+                 if (data.sampled != nullptr) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index fc175e92abb4d5f998879256b30ed61e00a4e3f7..590555c8a72c0283de5a2a5315c2fb159ddb7049 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -760,6 +760,39 @@ public:
+     const llama_memory_hybrid_iswa_context * mctx;
+ };
+ 
++// Banned-token bias of the batched serving path and the sequences it applies to.
++struct llama_token_mask {
++    std::vector<float>   bias;       // n_vocab: 0, or -inf for a banned token; empty = no mask
++    std::vector<uint8_t> seq_armed;  // per sequence id
++
++    // graph topology for a ubatch: 0 = no output row is armed, 1 = some are, 2 = all are
++    int mode(const llama_ubatch & ubatch) const {
++        if (bias.empty() || !ubatch.output) return 0;
++        bool any = false, all = true;
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++            if (!ubatch.output[i]) continue;
++            const llama_seq_id s = ubatch.seq_id[i][0];
++            const bool armed = s >= 0 && (size_t) s < seq_armed.size() && seq_armed[s];
++            any |= armed;
++            all &= armed;
++        }
++        return !any ? 0 : all ? 2 : 1;
++    }
++};
++
++// Per output row: which bias row (0 = none, 1 = the mask) its logits get.
++class llm_graph_input_token_mask : public llm_graph_input_i {
++public:
++    explicit llm_graph_input_token_mask(const llama_token_mask * mask) : mask(mask) {}
++    virtual ~llm_graph_input_token_mask() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    const llama_token_mask * mask;
++    ggml_tensor * table = nullptr;  // F32 [n_vocab, 1] (all rows armed: the bias) or [n_vocab, 2] (zeros, bias)
++    ggml_tensor * rows  = nullptr;  // I32 [n_rows], the table row of each output row (mixed rows only)
++};
++
+ class llm_graph_input_sampling : public llm_graph_input_i {
+ public:
+     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
+@@ -806,6 +839,8 @@ struct llm_graph_params {
+     const llama_cross            * cross;
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
++    const llama_token_mask * token_mask;
++    int token_mask_mode;  // graph topology: llama_token_mask::mode of this ubatch
+ 
+     static bool samplers_equal(
+           const std::map<llama_seq_id, llama_sampler *> & lhs,
+@@ -871,6 +906,10 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        if (token_mask_mode != other.token_mask_mode) {
++            return false;
++        }
++
+         if (samplers.size() > 0) {
+             if (!ubatch.data || !other.ubatch.data) {
+                 return false;
+@@ -1047,6 +1086,8 @@ struct llm_graph_context {
+     const llama_cross            * cross;
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
++    const llama_token_mask * token_mask;
++    int token_mask_mode;
+ 
+     const llm_graph_cb & cb_func;
+ 
