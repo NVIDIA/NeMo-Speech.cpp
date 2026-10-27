@@ -193,8 +193,9 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
             };
         // An empty transcript without timestamps gets one more decode of the same audio (its
         // encoder output) with the fallback prompt (same budget, sampling and script guard); usage
-        // adds up.
-        if (!request.timestamps)
+        // adds up. The fallback prompt asks for a transcription, so translations and custom
+        // instructions keep their empty result.
+        if (!request.timestamps && sl.task == "transcribe" && !plan.from_client)
             request.fallback_prompt = std::string(policy::kFallbackPrompt);
         auto raw = submit(std::move(request), opts.cancelled);
         if (raw.cancelled)
@@ -514,19 +515,27 @@ to_asr_result(
     if (!opts.needs_word_timings() || aligned.empty()) {
         alt.transcript = decoded_text();
     } else {
-        // Normalize each contiguous speaker turn independently so ITN cannot
-        // merge words across speakers. Timings use an integer millisecond grid.
+        // The text keeps the decoder's order (word_index): the aligned words are sorted by time,
+        // which reorders overlapping speakers. Each contiguous speaker turn is normalized on its
+        // own so ITN cannot merge words across speakers; `words` ends up in time order again.
+        // Timings use an integer millisecond grid.
+        std::vector<const asr::SpeechLmWord*> ordered;
+        ordered.reserve(aligned.size());
+        for (const auto& w : aligned) ordered.push_back(&w);
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto* a, const auto* b) {
+            return a->word_index < b->word_index;
+        });
         size_t begin = 0;
-        while (begin < aligned.size()) {
+        while (begin < ordered.size()) {
             size_t end = begin + 1;
-            const int speaker = aligned[begin].speaker;
-            while (end < aligned.size() &&
-                   (!opts.enable_speaker_diarization || aligned[end].speaker == speaker))
+            const int speaker = ordered[begin]->speaker;
+            while (end < ordered.size() &&
+                   (!opts.enable_speaker_diarization || ordered[end]->speaker == speaker))
                 ++end;
             std::string text;
             std::vector<asr::WordTiming> words;
             for (size_t i = begin; i < end; ++i) {
-                const auto& w = aligned[i];
+                const auto& w = *ordered[i];
                 if (!text.empty() && !w.joins_previous)
                     text += ' ';
                 text += w.display.empty() ? w.word : w.display;
@@ -543,9 +552,9 @@ to_asr_result(
                 const auto& w = words[k];
                 asr::Word out;
                 out.word = w.word;
-                if (same_words && w.word == aligned[begin + k].word) {  // not masked
-                    out.display = aligned[begin + k].display;
-                    out.joins_previous = aligned[begin + k].joins_previous;
+                if (same_words && w.word == ordered[begin + k]->word) {  // not masked
+                    out.display = ordered[begin + k]->display;
+                    out.joins_previous = ordered[begin + k]->joins_previous;
                 }
                 out.start_time = static_cast<int32_t>(w.start_frame);
                 out.end_time = static_cast<int32_t>(w.end_frame);
@@ -555,6 +564,11 @@ to_asr_result(
             }
             begin = end;
         }
+        std::stable_sort(
+            alt.words.begin(), alt.words.end(), [](const asr::Word& a, const asr::Word& b) {
+                return a.start_time != b.start_time ? a.start_time < b.start_time
+                                                    : a.end_time < b.end_time;
+            });
         // Some speakers' words could not be aligned: the transcript keeps them (the decoded text);
         // `words` has the aligned ones.
         if (raw.details->unaligned_words > 0)

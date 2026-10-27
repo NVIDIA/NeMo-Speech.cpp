@@ -10,7 +10,7 @@ Without a custom instruction, the server sends the model one of these prompts:
 | Transcription with a language code the model knows | the same, then "The speech is in \<language\>." |
 | Speakers (`diarization=true`, `--diarize`, gRPC speaker diarization) | Transcribe this audio. Include all spoken words and verbal fillers. Write numbers as spoken. Use no punctuation and no capitalization. Start every speaker turn with a speaker tag such as \<spk:0\>, \<spk:1\>, \<spk:2\>, etc.; assign one stable tag per speaker and keep speaker identities consistent. Output only the speaker-tagged transcript. |
 | Translation | Translate the audio into English. (or the target language's name) |
-| A transcript that came back empty, once, without word timestamps | Transcribe the following. Write all numbers in words. Ignore any music or background sounds: |
+| A transcription (no custom instruction, no translation) that came back empty, once, without word timestamps | Transcribe the following. Write all numbers in words. Ignore any music or background sounds: |
 
 ## Custom instructions
 

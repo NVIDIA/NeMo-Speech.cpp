@@ -196,6 +196,27 @@ main() {
         check(
             diar.words[1].start_time < diar.words[0].end_time && diar.language_codes.empty(),
             "overlap or auto language lost");
+        // overlapping speakers: the aligned words come sorted by time ("yes" starts inside "good
+        // morning"); the text keeps the decoder's order, the words stay in time order
+        raw.text = "<spk:0> good morning <spk:1> yes";
+        raw.details = aligned({{"good", 0, .1, .4}, {"yes", 1, .3, .5}, {"morning", 0, .45, .9}});
+        raw.details->words[0].word_index = 0;
+        raw.details->words[1].word_index = 2;
+        raw.details->words[2].word_index = 1;
+        for (bool speakers : {true, false}) {
+            opts.enable_speaker_diarization = speakers;
+            result = speechlm::to_asr_result(raw, opts, "auto", fake->pp);
+            const auto& overlap = result.alternatives.at(0);
+            check(
+                overlap.transcript == "good morning yes" && overlap.words.size() == 3,
+                "timestamps reordered the transcript");
+            check(
+                overlap.words[0].word == "good" && overlap.words[1].word == "yes" &&
+                    overlap.words[2].word == "morning",
+                "words are not in time order");
+        }
+        opts.enable_speaker_diarization = true;
+        raw.text = "<spk:0> one <spk:2> two <spk:0> three";
         // spk:2 without a legal alignment: its word stays in the transcript, not in the words
         raw.details = aligned({{"one", 0, .1, .7}, {"three", 0, 1., 1.5}});
         raw.details->unaligned_words = 1;
