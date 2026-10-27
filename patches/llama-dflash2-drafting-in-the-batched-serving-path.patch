@@ -1,0 +1,771 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: DFlash2 drafting in the batched serving path
+
+DFlash2 drafts a block of tokens per sequence from the target's hidden features. In the batched serving path (both
+contexts with llama_serving_params.batched) a drafting step no longer round-trips through the host:
+
+- every target decode writes the residual stream at the inputs of the configured layers into one device tensor
+  (llama_set_layer_features_device; BF16 [n_layers*n_embd, n_batch], row = batch index), which the drafter's injection
+  pass reads in place; GPU events (llama_record_event) order the two contexts, and the target's next pass waits for
+  the injection on the GPU;
+- the drafter decodes every drafting sequence's block [last id, n_draft masks] in one ubatch with a non-causal mask
+  (a query sees its whole sequence up to the block's last position);
+- the drafts are walked on the device: the target's LM head on the n_draft rows after each block's anchor in row
+  chunks, top-k candidates (DFLASH_CONV and the small-k top-k from the previous patches), the selector's edge scores
+  and the greedy left-to-right walk; llama_get_draft_ids returns n_draft ids per sequence after one wait.
+
+Rejected verify rows are removed by the caller (llama_memory_seq_rm), so they never reach a draft.
+
+Upstream: not planned in this form (batched serving path).
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b197dbb794a4945cb2542e4fb9c8cf9afb49ae7d..a6019897344f0426e82e3a158130b848badc6841 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -948,6 +948,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
+     uint32_t        target_layer_ids_n = 0;
+ 
++    // Batched serving (both contexts have llama_serving_params.batched, DFlash2): the target writes its features to a
++    // device tensor that the drafter's injection pass reads in place, GPU events order the two contexts, and the
++    // selector walk runs on the device, so a step reads back n_draft ids per sequence after one wait.
++    bool device = false;
++    ggml_tensor * features = nullptr;
++    ggml_backend_t features_backend = nullptr;
++    ggml_backend_event_t ev_target = nullptr;  // recorded after a target pass: its features are written
++    ggml_backend_event_t ev_inject = nullptr;  // recorded after an injection: the target may overwrite the features
++    float dummy_embd = 0.0f;                   // an injection batch's host embd pointer (never read)
++
+     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
+             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
+         : common_speculative_impl(type, n_seq, params.draft.n_max)
+@@ -1014,8 +1024,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         }
+         this->n_max = this->params.n_max;
+ 
++        device = is_dflash2 && !is_dspark && llama_get_serving_params(ctx_tgt).batched &&
++                 llama_get_serving_params(ctx_dft).batched;
++
+         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+-        batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
++        batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), device ? 0 : n_embd_enc, n_seq);
++        if (device) {
++            free(batch_inject.token);
++            batch_inject.token = nullptr;
++            batch_inject.embd  = &dummy_embd;
++            llama_set_layer_features_device(ctx_tgt, target_layer_ids, (int32_t) target_layer_ids_n);
++            features = llama_get_layer_features_device(ctx_tgt, &features_backend);
++            GGML_ASSERT(features && features_backend);
++            ev_target = ggml_backend_event_new(ggml_backend_get_device(features_backend));
++            ev_inject = ggml_backend_event_new(ggml_backend_get_device(features_backend));
++            GGML_ASSERT(ev_target && ev_inject);
++            llama_set_causal_attn(ctx_dft, causal_attn);
++            LOG_INF("%s: device-resident DFlash2 (batched serving)\n", __func__);
++            return;
++        }
+ 
+         // embd batches on an M-RoPE draft need 4 position rows per token
+         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+@@ -1061,6 +1088,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+     ~common_speculative_impl_draft_dflash() override {
+         auto * ctx_dft = this->params.ctx_dft;
++        if (device) {
++            llama_synchronize(ctx_dft);
++            llama_synchronize(this->params.ctx_tgt);
++            llama_set_input_wait_event(this->params.ctx_tgt, nullptr);
++            llama_set_input_wait_event(ctx_dft, nullptr);
++            llama_set_layer_features_device(this->params.ctx_tgt, nullptr, 0);
++            ggml_backend_event_free(ev_target);
++            ggml_backend_event_free(ev_inject);
++            batch_inject.embd = nullptr;
++        }
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+                 continue;
+@@ -1111,6 +1148,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+         const int32_t n_tokens = batch_in.n_tokens;
+ 
++        if (device) {
++            return process_device(batch_in);
++        }
++
+         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
+         std::vector<int32_t> i_batch_beg(n_seq, -1);
+         std::vector<int32_t> i_batch_end(n_seq, -1);
+@@ -1186,9 +1227,80 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         return true;
+     }
+ 
++    // every row of the target pass, in its order (feature row = batch index), at the target's positions; rejected
++    // verify rows are removed by the caller (llama_memory_seq_rm), so they never reach a draft
++    bool process_device(const llama_batch & batch_in) {
++        auto * ctx_tgt = this->params.ctx_tgt;
++        auto * ctx_dft = this->params.ctx_dft;
++        const int32_t n_tokens = batch_in.n_tokens;
++        GGML_ASSERT(n_tokens <= (int32_t) llama_n_ubatch(ctx_dft) && n_tokens <= features->ne[1]);
++        batch_inject.n_tokens = n_tokens;
++        for (int32_t i = 0; i < n_tokens; ++i) {
++            GGML_ASSERT(batch_in.n_seq_id[i] == 1);
++            batch_inject.pos[i]       = batch_in.pos[i];
++            batch_inject.n_seq_id[i]  = 1;
++            batch_inject.seq_id[i][0] = batch_in.seq_id[i][0];
++            batch_inject.logits[i]    = false;
++        }
++        batch_inject.embd_device = features;
++        llama_record_event(ctx_tgt, ev_target);
++        llama_set_input_wait_event(ctx_dft, ev_target);
++        const int32_t rc = llama_decode(ctx_dft, batch_inject);
++        batch_inject.embd_device = nullptr;
++        // the target's next pass rewrites the features: it waits for this injection on the GPU
++        llama_record_event(ctx_dft, ev_inject);
++        llama_set_input_wait_event(ctx_tgt, ev_inject);
++        if (rc != 0) {
++            LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, (int) rc, (int) n_tokens);
++            return false;
++        }
++        return true;
++    }
++
++    // one decode of every drafting sequence's block [id_last, mask x n_draft]; the ids come back after one wait
++    void draft_device(common_speculative_draft_params_vec & dparams) {
++        auto * ctx_dft = params.ctx_dft;
++        common_batch_clear(batch);
++        const int32_t n_draft = params.n_max;
++        std::vector<llama_seq_id> rows;
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            const auto & dp = dparams[seq_id];
++            if (!dp.drafting) {
++                continue;
++            }
++            for (int32_t i = 0; i <= n_draft; ++i) {
++                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, dp.pos0 + i, { seq_id }, false);
++            }
++            rows.push_back(seq_id);
++        }
++        if (rows.empty() || n_draft <= 0) {
++            return;
++        }
++        GGML_ASSERT(batch.n_tokens <= (int32_t) llama_n_ubatch(ctx_dft) && "DFlash blocks must fit one micro-batch");
++        const int ret = llama_decode(ctx_dft, batch);
++        if (ret != 0) {
++            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
++            return;
++        }
++        int32_t nd = 0, nb = 0;
++        const float * ids = llama_get_draft_ids(ctx_dft, &nd, &nb);
++        GGML_ASSERT(ids && nd == n_draft && nb == (int32_t) rows.size());
++        for (size_t r = 0; r < rows.size(); ++r) {
++            auto & result = *dparams[rows[r]].result;
++            for (int32_t j = 0; j < nd; ++j) {
++                result.push_back((llama_token) ids[r*nd + j]);
++            }
++        }
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
++        if (device) {
++            draft_device(dparams);
++            return;
++        }
++
+         common_batch_clear(batch);
+ 
+         // build one batch holding every drafting sequence's noise block into a single decode)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f058b0010d3651e55c4167cfcb9f05b84156be01..93631c1097fbeedc6b89c39c7261759a1b88a07f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1017,6 +1017,63 @@ void llama_context::set_embeddings_nextn_device(bool value) {
+     if (cparams.serving.batched) output_reserve(cparams.n_outputs_max);
+ }
+ 
++void llama_context::set_layer_features_device(const int32_t * layers, int32_t n) {
++    cparams.layer_features = nullptr;
++    cparams.layer_features_ids.clear();
++    buf_layer_features.reset();
++    ctx_layer_features.reset();
++    layer_features_backend = nullptr;
++    sched_need_reserve = true;
++    if (!layers || n <= 0) {
++        return;
++    }
++    for (const auto & b : backends) {
++        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            layer_features_backend = b.get();
++            break;
++        }
++    }
++    GGML_ASSERT(layer_features_backend && "layer features need a GPU backend");
++    for (int32_t k = 0; k < n; ++k) {
++        GGML_ASSERT(layers[k] >= 0 && (uint32_t) layers[k] <= model.hparams.n_layer());
++    }
++    ctx_layer_features.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
++    ggml_tensor * t = ggml_new_tensor_2d(ctx_layer_features.get(), GGML_TYPE_BF16, (int64_t) n*model.hparams.n_embd,
++                                         cparams.n_batch);
++    ggml_set_name(t, "layer_features");
++    buf_layer_features.reset(ggml_backend_alloc_ctx_tensors(ctx_layer_features.get(), layer_features_backend));
++    GGML_ASSERT(buf_layer_features);
++    cparams.layer_features = t;
++    cparams.layer_features_ids.assign(layers, layers + n);
++}
++
++ggml_tensor * llama_context::get_layer_features_device(ggml_backend_t * backend) const {
++    *backend = layer_features_backend;
++    return cparams.layer_features;
++}
++
++void llama_context::record_event(ggml_backend_event_t ev) {
++    for (const auto & b : backends) {
++        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            ggml_backend_event_record(ev, b.get());
++            return;
++        }
++    }
++    GGML_ABORT("record_event needs a GPU backend");
++}
++
++const float * llama_context::get_draft_ids(int32_t * n_draft, int32_t * n_blocks) {
++    if (draft_ids_n == 0) {
++        return nullptr;
++    }
++    draft_ids.resize((size_t) draft_ids_n*draft_ids_blocks);
++    ggml_backend_tensor_get_async(draft_ids_backend, draft_ids_tensor, draft_ids.data(), 0, draft_ids.size()*sizeof(float));
++    ggml_backend_synchronize(draft_ids_backend);
++    *n_draft = draft_ids_n;
++    *n_blocks = draft_ids_blocks;
++    return draft_ids.data();
++}
++
+ ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backend) {
+     GGML_ASSERT(use_nextn_device && nextn_device);
+     *backend = nextn_device_backend;
+@@ -1955,6 +2012,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+ 
+ int llama_context::decode(const llama_batch & batch_inp) {
+     GGML_ASSERT(!pend.active && "llama_decode: a prepared decode is pending (llama_decode_launch first)");
++    draft_ids_n = draft_ids_blocks = 0;
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+@@ -2267,6 +2325,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         extract_nextn(ubatch, t_h_nextn, n_outputs, n_outputs_prev, n_tokens_prev);
+ 
++        if (ggml_tensor * t = res->t_draft_ids) {
++            // DFlash2 device walk: [n_draft, n_blocks] ids, read by get_draft_ids (a copy to pageable memory here would
++            // block until the graph is done); valid until the next decode, which a single-ubatch draft guarantees
++            GGML_ASSERT(draft_ids_n == 0 && "DFlash2 drafts must fit one ubatch");
++            draft_ids_backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++            draft_ids_tensor  = t;
++            draft_ids_n       = t->ne[0];
++            draft_ids_blocks  = t->ne[1];
++        }
++
+         if (has_samplers) {
+             const auto stride = n_vocab;
+ 
+@@ -4242,6 +4310,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
+     ctx->set_input_wait_event(ev);
+ }
+ 
++void llama_set_layer_features_device(llama_context * ctx, const int32_t * layers, int32_t n) {
++    ctx->set_layer_features_device(layers, n);
++}
++
++ggml_tensor * llama_get_layer_features_device(llama_context * ctx, ggml_backend_t * backend) {
++    return ctx->get_layer_features_device(backend);
++}
++
++void llama_record_event(llama_context * ctx, ggml_backend_event_t ev) {
++    ctx->record_event(ev);
++}
++
++const float * llama_get_draft_ids(llama_context * ctx, int32_t * n_draft, int32_t * n_blocks) {
++    return ctx->get_draft_ids(n_draft, n_blocks);
++}
++
+ void llama_set_mtp_chain(llama_context * ctx, ggml_tensor * tok, int64_t tok_in, int64_t tok_out, ggml_tensor * h_in,
+                          ggml_tensor * h_out) {
+     ctx->set_mtp_chain(tok, tok_in, tok_out, h_in, h_out);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index aeb8f5cf9a7bf976835385d44c120e2adc4645ec..53efc6741ec2f1069b0dccf60200620b817be388 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -100,6 +100,11 @@ struct llama_context {
+     }
+     void download_embeddings_nextn();
+ 
++    void set_layer_features_device(const int32_t * layers, int32_t n);
++    ggml_tensor * get_layer_features_device(ggml_backend_t * backend) const;
++    void record_event(ggml_backend_event_t ev);
++    const float * get_draft_ids(int32_t * n_draft, int32_t * n_blocks);
++
+     float * get_embeddings_layer_inp(uint32_t lid);
+ 
+     llama_token * get_sampled_tokens() const;
+@@ -338,6 +343,15 @@ private:
+     buffer_view<float> embd_nextn = {nullptr, 0};
+     std::vector<float> embd_nextn_host;  // host copy of the device rows, made only when they are downloaded
+     bool use_nextn_device = false;
++
++    // DFlash target features (cparams.layer_features) and DFlash2 device-walk drafts of the last decode
++    ggml_context_ptr ctx_layer_features;
++    ggml_backend_buffer_ptr buf_layer_features;
++    ggml_backend_t layer_features_backend = nullptr;
++    std::vector<float> draft_ids;
++    int32_t draft_ids_n = 0, draft_ids_blocks = 0;
++    ggml_backend_t draft_ids_backend = nullptr;
++    ggml_tensor * draft_ids_tensor = nullptr;
+     bool nextn_host_current = false;
+     uint32_t nextn_device_rows = 0;
+     ggml_context_ptr ctx_nextn_device;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index d1599fd379ca2e6e20e99e518bdfe897d6a64ed3..95c59c3512206aa60231289af60ca67c59dc8637 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -44,6 +44,11 @@ struct llama_cparams {
+     struct ggml_tensor * mtp_h_in  = nullptr; // F32 [n_embd, >= n_tokens] input hidden rows (nullptr: from the batch)
+     struct ggml_tensor * mtp_h_out = nullptr; // F32 [n_embd, >= n_outputs] output hidden rows
+ 
++    // DFlash target features (llama_set_layer_features_device): every decode writes the residual stream at the inputs
++    // of these layers into layer_features (BF16 [n_ids*n_embd, n_batch], layer k at columns k*n_embd), row = batch index
++    struct ggml_tensor * layer_features = nullptr;
++    std::vector<int32_t> layer_features_ids;
++
+     llama_serving_params serving = {};  // high-throughput hybrid serving (llama.h)
+ 
+     bool causal_attn;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 92eefeb4ff19f1ed1ed95ea5a506a29f73fdb318..4c662dfd8e1435ebf289f42327ffacbfea064a59 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -105,6 +105,19 @@ LLAMA_API void llama_set_input_wait_event(struct llama_context * ctx, ggml_backe
+ LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, struct ggml_tensor * tok, int64_t tok_in, int64_t tok_out,
+                                    struct ggml_tensor * h_in, struct ggml_tensor * h_out);
+ 
++// DFlash target features: every decode writes the residual stream at the inputs of `layers` (n of them, in that order)
++// to a device tensor BF16 [n*n_embd, n_batch], row = index in the decoded batch. layers = nullptr turns it off. The
++// tensor is overwritten by the next decode; get returns it and the backend whose stream writes it.
++LLAMA_API void llama_set_layer_features_device(struct llama_context * ctx, const int32_t * layers, int32_t n);
++LLAMA_API struct ggml_tensor * llama_get_layer_features_device(struct llama_context * ctx, ggml_backend_t * backend);
++
++// Records ev on the context's GPU stream, after the work queued so far.
++LLAMA_API void llama_record_event(struct llama_context * ctx, ggml_backend_event_t ev);
++
++// DFlash2 drafts of the last decode (selector walk on the device): n_blocks rows of n_draft token ids, stored as
++// floats, block order = batch order. Waits for the decode. nullptr if the last decode drafted nothing.
++LLAMA_API const float * llama_get_draft_ids(struct llama_context * ctx, int32_t * n_draft, int32_t * n_blocks);
++
+ // Device output is unmasked and remains valid until the next decode.
+ LLAMA_API void llama_set_embeddings_nextn_device(struct llama_context * ctx, bool value);
+ LLAMA_API ggml_tensor * llama_get_embeddings_nextn_device(struct llama_context * ctx, ggml_backend_t * backend);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf..ebdc27c31d38d8ba57b042fafd0caaf8dbc283de 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -53,7 +53,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
+     // flash attention requires an f16 mask
+     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
+-    if (metadata && cparams.serving.batched && cparams.kv_unified && cparams.causal_attn) {
++    // non-causal (DFlash blocks): each query sees its whole sequence (set_input_kq_mask raises its position)
++    if (metadata && cparams.serving.batched && cparams.kv_unified) {
+         auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+         // with per-sequence cell lists the membership words are never read: a 1-cell placeholder (the full tensor was a
+         // ~21 MB host->device input copy per pass)
+@@ -1485,6 +1486,7 @@ void llm_graph_result::reset() {
+     t_embd        = nullptr;
+     t_embd_pooled = nullptr;
+     t_h_nextn     = nullptr;
++    t_draft_ids   = nullptr;
+ 
+     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
+     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+@@ -1531,6 +1533,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
+     if (t_h_nextn != nullptr) {
+         ggml_set_output(t_h_nextn);
+     }
++    if (t_draft_ids != nullptr) {
++        ggml_set_output(t_draft_ids);
++    }
+     {
+         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
+         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
+@@ -2622,6 +2627,53 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     return cur;
+ }
+ 
++void llm_graph_input_feature_rows::set_input(const llama_ubatch * ubatch) {
++    std::vector<int32_t> r(ubatch->n_tokens);
++    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++        r[i] = ubatch->token_indices ? ubatch->token_indices[i] : (int32_t) i;
++    }
++    ggml_backend_tensor_set(rows, r.data(), 0, r.size()*sizeof(int32_t));
++}
++
++bool llm_graph_input_feature_rows::can_reuse(const llm_graph_params & params) {
++    return params.cparams.layer_features == dst && rows->ne[0] == params.ubatch.n_tokens;
++}
++
++bool llm_graph_context::wants_layer_feature(int il) const {
++    if (!cparams.layer_features) {
++        return false;
++    }
++    for (const int32_t id : cparams.layer_features_ids) {
++        if (id == il) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void llm_graph_context::build_layer_feature(int il, ggml_tensor * cur) {
++    ggml_tensor * dst = cparams.layer_features;
++    if (!dst) {
++        return;
++    }
++    for (size_t k = 0; k < cparams.layer_features_ids.size(); ++k) {
++        if (cparams.layer_features_ids[k] != il) {
++            continue;
++        }
++        GGML_ASSERT(cur->ne[0] == n_embd && cur->ne[1] == n_tokens && cur->type == GGML_TYPE_F32);
++        if (!inp_feature_rows) {
++            auto inp = std::make_unique<llm_graph_input_feature_rows>(dst);
++            inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++            ggml_set_input(inp->rows);
++            inp_feature_rows = inp->rows;
++            res->add_input(std::move(inp));
++        }
++        ggml_tensor * view = ggml_view_2d(ctx0, dst, n_embd, dst->ne[1], dst->nb[1], k*n_embd*ggml_element_size(dst));
++        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, view, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur),
++                                                    inp_feature_rows));
++    }
++}
++
+ ggml_tensor * llm_graph_context::build_inp_pos() const {
+     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 0dfc2a6d4e82e6f60339567303a85e4ce61d3b4c..161d49bc99982c9e3bd5e5cceca0c1be5160bf73 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -160,6 +160,21 @@ public:
+     const int64_t n_embd = 0;
+ };
+ 
++// DFlash target features: the batch index of each ubatch row (where the row's features go in cparams.layer_features)
++class llm_graph_input_feature_rows : public llm_graph_input_i {
++public:
++    llm_graph_input_feature_rows(const ggml_tensor * dst) : dst(dst) {}
++    virtual ~llm_graph_input_feature_rows() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * rows = nullptr; // I32 [n_tokens]
++
++    const ggml_tensor * dst;
++};
++
+ class llm_graph_input_pos : public llm_graph_input_i {
+ public:
+     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
+@@ -1009,6 +1024,7 @@ public:
+     ggml_tensor * t_embd        = nullptr;
+     ggml_tensor * t_embd_pooled = nullptr;
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
++    ggml_tensor * t_draft_ids   = nullptr; // DFlash2 device walk: [n_draft, n_blocks] token ids (F32)
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+@@ -1238,6 +1254,13 @@ struct llm_graph_context {
+ 
+     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+     ggml_tensor * build_inp_pos() const;
++
++    // DFlash target features (cparams.layer_features): cur is the residual stream at the input of layer il; written
++    // to the layer's column block at each row's batch index, right where it is produced
++    bool wants_layer_feature(int il) const;
++    void build_layer_feature(int il, ggml_tensor * cur);
++    ggml_tensor * inp_feature_rows = nullptr;
++
+     ggml_tensor * build_inp_attn_scale() const;
+     ggml_tensor * build_inp_out_ids() const;
+     ggml_tensor * build_inp_mean() const;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index cc7a8410d813f15e5de480c9919bc47eb5c12b0a..4ad4eefcb0ca1c60bee0be5e4a04ec0c92047309 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1786,7 +1786,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+ 
+     if (dst->op == GGML_OP_BUILD_KQ_MASK) {
+         GGML_ASSERT(metadata && metadata[0] && metadata[1] && metadata[2]);
+-        GGML_ASSERT(causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && !ubatch->is_pos_2d());
++        GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && !ubatch->is_pos_2d());
+         GGML_ASSERT(n_stream == 1);
+         if (dst->op_params[0] > 0) {
+             GGML_ASSERT(get_n_kv_seq_max() <= (uint32_t) dst->op_params[0]);
+@@ -1812,6 +1812,18 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+             queries[2*i] = ubatch->pos[i];
+             queries[2*i+1] = ubatch->seq_id[i][0];
+         }
++        if (!causal_attn) {
++            // non-causal: a query sees every cell of its sequence up to the sequence's last position in the ubatch
++            // (DFlash: the context plus the whole draft block)
++            std::unordered_map<int32_t, int32_t> last;
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                auto it = last.emplace(queries[2*i+1], queries[2*i]).first;
++                it->second = std::max(it->second, queries[2*i]);
++            }
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                queries[2*i] = last[queries[2*i+1]];
++            }
++        }
+         ggml_backend_tensor_set(metadata[0], positions.data(), 0, positions.size()*sizeof(int32_t));
+         if (!lists) {
+             ggml_backend_tensor_set(metadata[1], membership.data(), 0, membership.size()*sizeof(uint32_t));
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 9b56ac9eca53fd8ee9d1237f170a067aa36f063a..aad4f4675626d8dd519b14874492f2e04b5a027b 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -424,6 +424,19 @@ static ggml_tensor * build_dflash2_conv(
+ 
+     const int64_t block_size = n_tokens / n_blocks;
+     ggml_context * ctx0 = g.ctx0;
++
++    if (g.cparams.serving.batched) {
++        // one fused kernel (CUDA): this side's per-token coefficients [n_groups, kernel, n_tokens] of the dynamic
++        // projection and this side's base kernel [hidden, kernel]
++        if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
++            hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
++        }
++        GGML_ASSERT(dynamic->ne[0] == 2*kernel_size*n_groups && dynamic->nb[0] == sizeof(float));
++        ggml_tensor * coef = ggml_view_3d(ctx0, dynamic, n_groups, kernel_size, n_tokens, n_groups*sizeof(float),
++                dynamic->nb[1], side*kernel_size*n_groups*sizeof(float));
++        ggml_tensor * base_side = ggml_view_2d(ctx0, base, hidden_size, kernel_size, base->nb[1], side*base->nb[2]);
++        return ggml_dflash_conv(ctx0, hidden, coef, base_side, (int) block_size);
++    }
+     // ggml_cont copies even when the tensor is already contiguous
+     if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
+         hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+@@ -566,6 +579,112 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
+     ggml_build_forward_expand(g.gf, packed);
+ }
+ 
++// Batched serving: target features read in place from llama_get_layer_features_device's tensor (rows in batch order)
++class llm_graph_input_dflash_features : public llm_graph_input_i {
++public:
++    llm_graph_input_dflash_features(const ggml_tensor * src, int64_t row0) : src(src), row0(row0) {}
++    void set_input(const llama_ubatch * /*ubatch*/) override {}
++    bool can_reuse(const llm_graph_params & params) override {
++        const auto & ub = params.ubatch;
++        return ub.embd_device == src && (ub.token_indices ? ub.token_indices[0] : 0) == row0;
++    }
++    const ggml_tensor * src;
++    const int64_t row0;
++};
++
++// DFlash2 drafts on the device (batched serving): the target's LM head on the n_draft rows after each block's anchor,
++// top-k candidates, the selector's edge scores and the greedy left-to-right walk, so a step reads back n_draft ids
++// per sequence instead of a lattice row per block position. h: [n_embd, n_draft*n_blocks], block-major.
++static ggml_tensor * build_dflash2_device_walk(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
++        ggml_tensor * h, ggml_tensor * output, ggml_tensor * output_s, int64_t n_draft, int64_t n_blocks,
++        int64_t block_stride) {
++    ggml_context * ctx0 = g.ctx0;
++    const auto & hparams = g.hparams;
++    const int64_t top_k  = hparams.dflash_selector_top_k;
++    const int64_t rank   = hparams.dflash_selector_rank;
++    const int64_t n_rows = n_draft*n_blocks;
++    const int64_t n_vocab = output->ne[1];
++
++    // LM head + top-k in row chunks: a chunk's logits are dead once its candidates and unary scores are taken
++    constexpr int64_t chunk = 1024;
++    ggml_tensor * cand  = nullptr;  // I32 [top_k, n_rows]
++    ggml_tensor * unary = nullptr;  // F32 [top_k, n_rows]
++    for (int64_t r0 = 0; r0 < n_rows; r0 += chunk) {
++        const int64_t nr = std::min(chunk, n_rows - r0);
++        ggml_tensor * hr = ggml_view_2d(ctx0, h, h->ne[0], nr, h->nb[1], r0*h->nb[1]);
++        ggml_tensor * logits = g.build_lora_mm(output, hr, output_s);
++        if (hparams.f_logit_scale != 0.0f) {
++            logits = ggml_scale(ctx0, logits, hparams.f_logit_scale);
++        }
++        if (hparams.f_final_logit_softcapping > 0.0f) {
++            logits = ggml_scale(ctx0, logits, 1.0f / hparams.f_final_logit_softcapping);
++            logits = ggml_tanh(ctx0, logits);
++            logits = ggml_scale(ctx0, logits, hparams.f_final_logit_softcapping);
++        }
++        ggml_tensor * c = ggml_top_k(ctx0, logits, top_k);
++        ggml_tensor * u = ggml_reshape_2d(ctx0,
++                ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, n_vocab, nr), c), top_k, nr);
++        cand  = cand  ? ggml_concat(ctx0, cand,  c, 1) : c;
++        unary = unary ? ggml_concat(ctx0, unary, u, 1) : u;
++    }
++    ggml_tensor * gate = g.build_lora_mm(model.dflash_selector_hidden, h);  // [rank, n_rows]
++
++    ggml_tensor * cand_blk  = ggml_reshape_3d(ctx0, cand,  top_k, n_draft, n_blocks);
++    ggml_tensor * unary_blk = ggml_reshape_3d(ctx0, unary, top_k, n_draft, n_blocks);
++    ggml_tensor * gate_blk  = ggml_reshape_3d(ctx0, gate,  rank,  n_draft, n_blocks);
++
++    // scores of draft positions [beg, beg + n_pos) (0 = the first draft) given n_pred predecessor ids per position:
++    // [top_k (candidate), n_pred, n_pos, n_blocks] = unary + (predecessor (.) gate) . successor
++    auto score_run = [&](int64_t beg, int64_t n_pos, ggml_tensor * pred_ids) {
++        ggml_tensor * cand_run = ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks,
++                cand_blk->nb[1], cand_blk->nb[2], beg*cand_blk->nb[1]));
++        ggml_tensor * unary_run = ggml_cont(ctx0, ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks,
++                unary_blk->nb[1], unary_blk->nb[2], beg*unary_blk->nb[1]));
++        ggml_tensor * gate_run = ggml_cont(ctx0, ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks,
++                gate_blk->nb[1], gate_blk->nb[2], beg*gate_blk->nb[1]));
++        const int64_t n_pred = pred_ids->ne[0] / (n_pos*n_blocks);
++        ggml_tensor * successor = ggml_reshape_4d(ctx0,
++                ggml_get_rows(ctx0, model.dflash_selector_next, ggml_reshape_1d(ctx0, cand_run, top_k*n_pos*n_blocks)),
++                rank, top_k, n_pos, n_blocks);
++        ggml_tensor * predecessor = ggml_reshape_4d(ctx0,
++                ggml_get_rows(ctx0, model.dflash_selector_prev, pred_ids), rank, n_pred, n_pos, n_blocks);
++        ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
++        ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
++        ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
++        ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
++        return ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
++    };
++
++    // the first draft follows the anchor (the block's first token): one predecessor
++    ggml_tensor * anchor_ids = ggml_cont_1d(ctx0,
++            ggml_view_2d(ctx0, tokens, 1, n_blocks, block_stride*tokens->nb[0], 0), n_blocks);
++    ggml_tensor * first = ggml_reshape_2d(ctx0, score_run(0, 1, anchor_ids), top_k, n_blocks);
++    ggml_tensor * rest = nullptr;
++    if (n_draft > 1) {
++        ggml_tensor * prev_ids = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k,
++                n_draft - 1, n_blocks, cand_blk->nb[1], cand_blk->nb[2], 0)), top_k*(n_draft - 1)*n_blocks);
++        rest = score_run(1, n_draft - 1, prev_ids);  // [top_k, top_k, n_draft - 1, n_blocks]
++    }
++
++    // the walk: candidate index p_j = argmax over the scores given p_{j-1}; the id is candidate p_j of position j
++    ggml_tensor * cand_f = ggml_cast(ctx0, cand_blk, GGML_TYPE_F32);
++    ggml_tensor * ids = nullptr;
++    ggml_tensor * p = ggml_argmax(ctx0, first);  // I32 [n_blocks]
++    for (int64_t j = 0; j < n_draft; ++j) {
++        if (j > 0) {
++            ggml_tensor * s = ggml_view_3d(ctx0, rest, top_k, top_k, n_blocks, rest->nb[1], rest->nb[3],
++                    (j - 1)*rest->nb[2]);
++            ggml_tensor * row = ggml_get_rows(ctx0, s, ggml_reshape_2d(ctx0, p, 1, n_blocks));
++            p = ggml_argmax(ctx0, ggml_reshape_2d(ctx0, row, top_k, n_blocks));
++        }
++        ggml_tensor * cj = ggml_view_3d(ctx0, cand_f, 1, top_k, n_blocks, cand_f->nb[0], cand_f->nb[2],
++                j*cand_f->nb[1]);
++        ggml_tensor * id = ggml_get_rows(ctx0, cj, ggml_reshape_2d(ctx0, p, 1, n_blocks));  // [1, 1, n_blocks]
++        ids = ids ? ggml_concat(ctx0, ids, id, 0) : id;
++    }
++    return ggml_reshape_2d(ctx0, ids, n_draft, n_blocks);
++}
++
+ // DFlash decoder, dual-mode by batch type:
+ //   * embd batch  -> fused target features: project + inject K/V into the cache.
+ //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
+@@ -607,16 +726,32 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+ 
+     // KV cache injection
+     if (ubatch.embd) {
+-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
++        ggml_tensor * inp_target = nullptr;
++        if (ubatch.embd_device) {
++            // the target's features on the device (llama_get_layer_features_device), this ubatch's rows in batch order
++            ggml_tensor * src = ubatch.embd_device;
++            GGML_ASSERT(src->ne[0] == n_embd_inp);
++            const int64_t row0 = ubatch.token_indices ? ubatch.token_indices[0] : 0;
++            for (int64_t i = 1; ubatch.token_indices && i < n_tokens; ++i) {
++                GGML_ASSERT(ubatch.token_indices[i] == row0 + i && "DFlash device features: reordered ubatch");
++            }
++            GGML_ASSERT(row0 + n_tokens <= src->ne[1]);
++            res->add_input(std::make_unique<llm_graph_input_dflash_features>(src, row0));
++            inp_target = ggml_view_2d(ctx0, src, n_embd_inp, n_tokens, src->nb[1], row0*src->nb[1]);
++            if (inp_target->type != GGML_TYPE_F32) {
++                inp_target = ggml_cast(ctx0, inp_target, GGML_TYPE_F32);
++            }
++        } else {
++            auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+ 
+-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+-        ggml_set_input(inp->embd);
++            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
++            ggml_set_input(inp->embd);
+ 
+-        ggml_tensor * inp_target = inp->embd;
++            inp_target = inp->embd;
++            res->add_input(std::move(inp));
++        }
+         cb(inp_target, "inp_target_features", -1);
+ 
+-        res->add_input(std::move(inp));
+-
+         // fuse the target features through the encoder
+         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+@@ -794,8 +929,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+     ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
+     cb(cur, "result_norm", -1);
+ 
+-    res->t_embd = cur;
+-
+     // lm_head from the target model (shared via ctx_other)
+     auto * output   = model.output;
+     auto * output_s = model.output_s;
+@@ -807,6 +940,28 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+         output_s = model_other->output_s;
+     }
+ 
++    if (cparams.serving.batched && model.dflash_selector_hidden && !model.d2t) {
++        // batched serving: drafts walked on the device; only the rows after each block's anchor reach the LM head
++        const int64_t n_blocks = ubatch.n_seqs_unq;
++        GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
++        const int64_t stride  = n_tokens / n_blocks;
++        const int64_t n_draft = std::min<int64_t>(stride, hparams.dflash_block_size) - 1;
++        if (n_draft > 0) {
++            ggml_tensor * h = ggml_view_3d(ctx0, cur, n_embd, n_draft, n_blocks, cur->nb[1], stride*cur->nb[1],
++                                           cur->nb[1]);
++            h = ggml_cont_2d(ctx0, h, n_embd, n_draft*n_blocks);
++            res->t_draft_ids = build_dflash2_device_walk(*this, model, inp_tokens, h, output, output_s, n_draft,
++                                                         n_blocks, stride);
++            cb(res->t_draft_ids, "dflash2_draft_ids", -1);
++            ggml_build_forward_expand(gf, res->t_draft_ids);
++        } else {
++            ggml_build_forward_expand(gf, cur);
++        }
++        return;
++    }
++
++    res->t_embd = cur;
++
+     cur = build_lora_mm(output, cur, output_s);
+ 
+     // DFlash2 feeds these logits to the selector, so they need the target's output
+diff --git a/src/models/nemotron-h.cpp b/src/models/nemotron-h.cpp
+index be27650b061a86d0af9e320d5ae2426812073471..76c34542f132980760e89a4ce1518f04dc623356 100644
+--- a/src/models/nemotron-h.cpp
++++ b/src/models/nemotron-h.cpp
+@@ -199,10 +199,12 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
+     auto * inp = build_inp_mem_hybrid();
+ 
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+-    const bool extract_final_inp = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
++    const bool extract_final_inp = ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) ||
++                                   wants_layer_feature(n_layer);
+ 
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = inpL;
++        build_layer_feature(il, inpL);
+ 
+         struct ggml_tensor * inpSA = inpL;
+ 
+@@ -236,6 +238,7 @@ llama_model_nemotron_h::graph::graph(const llama_model & model, const llm_graph_
+     cur = inpL;
+     if (extract_final_inp) {
+         res->t_layer_inp[n_layer] = cur;
++        build_layer_feature(n_layer, cur);
+ 
+         if (inp_out_ids && cparams.embeddings_nextn_masked) {
+             cur = ggml_get_rows(ctx0, cur, inp_out_ids);

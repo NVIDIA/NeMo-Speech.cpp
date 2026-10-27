@@ -33,3 +33,8 @@ llama-first-fit-kv-cells-for-batched-serving.patch
 llama-size-the-batched-serving-output-buffers-by-what-is-read.patch
 llama-draw-the-temperature-sampled-rows-of-a-batched-step-together.patch
 llama-split-decode-for-batches-with-supplied-embedding-rows.patch
+ggml-cuda-tensor-core-mtp-verify-scan.patch
+ggml-cuda-split-k-gemv-for-small-batches-of-thin-f32-weights-the-moe-router.patch
+ggml-dflash_conv-op-for-the-dflash2-drafter-s-dynamic-grouped-convolution.patch
+ggml-cuda-top-k-for-small-k-over-long-rows-without-cub.patch
+llama-dflash2-drafting-in-the-batched-serving-path.patch

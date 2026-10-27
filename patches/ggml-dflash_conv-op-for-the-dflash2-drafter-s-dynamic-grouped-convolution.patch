@@ -1,0 +1,217 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml: DFLASH_CONV op for the DFlash2 drafter's dynamic grouped convolution
+
+The DFlash2 drafter mixes each token with the k - 1 tokens before it inside its block of drafted positions, with
+per-token coefficients predicted by the drafter: y[h, t] = sum_j (coef[h / group, j, t] + base[h, j]) * x[h, t - j].
+Built from generic ops this is k shifted views, broadcast adds and multiplies per layer; ggml_dflash_conv does it in
+one op. The CUDA kernel runs one thread per (channel, token) with the taps unrolled for k <= 4; coef and base take any
+strides, so the drafter's projections feed it without copies. There is no CPU path (the drafter runs on CUDA only).
+
+Upstream: candidate for upstream's DFlash2 drafter, which builds this from generic ops (needs a CPU implementation and
+test-backend-ops cases).
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 3851585d3b956e9014f7d96cb60e7a9502f5367b..c13b47c54be26e5f8d04de165022121e943bbafe 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -605,6 +605,7 @@ extern "C" {
+         GGML_OP_CONV1D_FUSED,
+         GGML_OP_BUILD_KQ_MASK,
+         GGML_OP_SSM_GATE_NORM,
++        GGML_OP_DFLASH_CONV,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -2673,6 +2674,14 @@ extern "C" {
+             struct ggml_context * ctx, struct ggml_tensor * key_pos, struct ggml_tensor * key_seq,
+             struct ggml_tensor * query, struct ggml_tensor * seq_off, struct ggml_tensor * seq_cells, enum ggml_type type);
+ 
++    // DFlash2 dynamic grouped convolution over blocks of `block` consecutive tokens: a token sees itself and the k - 1
++    // tokens before it in its block, y[h, t] = sum_j (coef[h / group, j, t] + base[h, j]) * x[h, t - j].
++    // x F32 [n_embd, n_tokens]; coef F32 [n_embd / group, k, n_tokens] (strides free); base F32 [n_embd, k] (strides
++    // free). CUDA only.
++    GGML_API struct ggml_tensor * ggml_dflash_conv(
++            struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * coef,
++            struct ggml_tensor * base, int block);
++
+     // Return only scan activations and write snapshots directly to dst [state,
+     // sequence, rollback]. scan's initial states must already be gathered in
+     // sequence order and must not alias dst; input ids are then unnecessary.
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 4993b5768335aac437eba5c6754ef90a8ddd8a59..8ae262e7a76e39584c8047f6e7f894bef7168fb6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2046,6 +2046,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 GGML_ABORT("BUILD_KQ_MASK has no CPU path (CUDA-only)");
+             } break;
++        case GGML_OP_DFLASH_CONV:
++            {
++                GGML_ABORT("DFLASH_CONV has no CPU path (CUDA-only)");
++            } break;
+         case GGML_OP_SSM_GATE_NORM:
+             {
+                 GGML_ABORT("SSM_GATE_NORM has no CPU path (CUDA-only)");
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 1db9077634ea99ff4576f57b2d250d14a95e7c24..99c1d456073828d4f72d5cab17678055cdaa29dc 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -439,7 +439,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+         }
+     }
+ 
+-    if (op->op == GGML_OP_BUILD_KQ_MASK || op->op == GGML_OP_SSM_GATE_NORM) return false;
++    if (op->op == GGML_OP_BUILD_KQ_MASK || op->op == GGML_OP_SSM_GATE_NORM || op->op == GGML_OP_DFLASH_CONV) return false;
+     if ((op->op == GGML_OP_SSM_SCAN && (op->src[7] || op->src[8])) || (op->op == GGML_OP_SSM_CONV && op->src[3])) {
+         return false; // packed Mamba operators currently have a CUDA implementation
+     }
+diff --git a/ggml/src/ggml-cuda/dflash-conv.cu b/ggml/src/ggml-cuda/dflash-conv.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5fc5cd2998fd87e57816083da9900c41c62b966
+--- /dev/null
++++ b/ggml/src/ggml-cuda/dflash-conv.cu
+@@ -0,0 +1,53 @@
++#include "dflash-conv.cuh"
++
++// DFlash2 dynamic grouped convolution (ggml_dflash_conv): one thread per (channel, token), taps unrolled for k <= 4.
++template <int K>
++static __global__ void dflash_conv_f32(const float * __restrict__ x, const char * __restrict__ coef,
++        const char * __restrict__ base, float * __restrict__ y, const int64_t n_embd, const int64_t group,
++        const int block, const size_t c0, const size_t c1, const size_t c2, const size_t b0, const size_t b1, int k) {
++    const int64_t h = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    const int64_t t = blockIdx.y;
++    if (h >= n_embd) {
++        return;
++    }
++    const int pos = (int) (t % block);
++    const char * c = coef + (h/group)*c0 + t*c2;
++    const char * b = base + h*b0;
++    float acc = 0.0f;
++    const int kk = K > 0 ? K : k;
++#pragma unroll
++    for (int j = 0; j < (K > 0 ? K : 8); ++j) {
++        if (j >= kk) {
++            break;
++        }
++        if (pos >= j) {
++            const float w = *(const float *) (c + j*c1) + *(const float *) (b + j*b1);
++            acc += w*x[(t - j)*n_embd + h];
++        }
++    }
++    y[t*n_embd + h] = acc;
++}
++
++void ggml_cuda_op_dflash_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * coef = dst->src[1];
++    const ggml_tensor * base = dst->src[2];
++    const int block = ggml_get_op_params_i32(dst, 0);
++    const int k = (int) coef->ne[1];
++    GGML_ASSERT(k >= 1 && k <= 8);
++    const int64_t n_embd = x->ne[0], n_tokens = x->ne[1];
++    const int64_t group = n_embd / coef->ne[0];
++    GGML_ASSERT(n_tokens <= 65535 && "DFLASH_CONV: grid y limit");
++    const dim3 grid((n_embd + 255)/256, n_tokens);
++    auto launch = [&](auto kernel) {
++        kernel<<<grid, 256, 0, ctx.stream()>>>((const float *) x->data, (const char *) coef->data,
++            (const char *) base->data, (float *) dst->data, n_embd, group, block, coef->nb[0], coef->nb[1],
++            coef->nb[2], base->nb[0], base->nb[1], k);
++    };
++    if (k == 2) {
++        launch(dflash_conv_f32<2>);
++    } else {
++        launch(dflash_conv_f32<0>);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/dflash-conv.cuh b/ggml/src/ggml-cuda/dflash-conv.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a7620630606f5b94132bfe00762f53e631a20c6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/dflash-conv.cuh
+@@ -0,0 +1,3 @@
++#include "common.cuh"
++
++void ggml_cuda_op_dflash_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ec34785affefd64cd9bc4e48248b4ab204a4bef5..e89e664e7fc2e53b71f73cc63ea65a7a12c8f993 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -57,6 +57,7 @@
+ #include "ggml-cuda/sum.cuh"
+ #include "ggml-cuda/sumrows.cuh"
+ #include "ggml-cuda/top-k.cuh"
++#include "ggml-cuda/dflash-conv.cuh"
+ #include "ggml-cuda/mean.cuh"
+ #include "ggml-cuda/tsembd.cuh"
+ #include "ggml-cuda/topk-moe.cuh"
+@@ -2457,6 +2458,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_MEAN:
+             ggml_cuda_op_mean(ctx, dst);
+             break;
++        case GGML_OP_DFLASH_CONV:
++            ggml_cuda_op_dflash_conv(ctx, dst);
++            break;
+         case GGML_OP_BUILD_KQ_MASK:
+             ggml_cuda_op_build_kq_mask(ctx, dst);
+             break;
+@@ -6215,6 +6219,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         }
+         case GGML_OP_BUILD_KQ_MASK:
+             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
++        case GGML_OP_DFLASH_CONV:
++            return true;
+         case GGML_OP_SSM_GATE_NORM:
+             return op->type == GGML_TYPE_F32;
+         case GGML_OP_SSM_CONV: {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 37147363bb03b4438fc8d739d50d7fcedbcba72a..a2c11d254728236205cec60d2092d9849e43a7fc 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1104,9 +1104,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "CONV1D_FUSED",
+     "BUILD_KQ_MASK",
+     "SSM_GATE_NORM",
++    "DFLASH_CONV",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1224,9 +1225,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "conv1d_fused(x,w)",
+     "build_kq_mask(pos,seq,query)",
+     "ssm_gate_norm(y,x,D,z,w)",
++    "dflash_conv(x,coef,base)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5965,6 +5967,22 @@ struct ggml_tensor * ggml_build_kq_mask(
+     return r;
+ }
+ 
++struct ggml_tensor * ggml_dflash_conv(
++        struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * coef,
++        struct ggml_tensor * base, int block) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && coef->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && x->ne[2] == 1 && x->ne[3] == 1 && block > 0 && x->ne[1] % block == 0);
++    GGML_ASSERT(coef->ne[2] == x->ne[1] && coef->ne[0] > 0 && x->ne[0] % coef->ne[0] == 0 && coef->ne[3] == 1);
++    GGML_ASSERT(base->ne[0] == x->ne[0] && base->ne[1] == coef->ne[1] && base->ne[2] == 1 && base->ne[3] == 1);
++    struct ggml_tensor * r = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, x->ne);
++    r->op = GGML_OP_DFLASH_CONV;
++    r->src[0] = x;
++    r->src[1] = coef;
++    r->src[2] = base;
++    ggml_set_op_params_i32(r, 0, block);
++    return r;
++}
++
+ struct ggml_tensor * ggml_build_kq_mask_meta(
+         struct ggml_context * ctx, struct ggml_tensor * key_pos, struct ggml_tensor * key_seq,
+         struct ggml_tensor * query, struct ggml_tensor * seq_off, struct ggml_tensor * seq_cells, enum ggml_type type) {

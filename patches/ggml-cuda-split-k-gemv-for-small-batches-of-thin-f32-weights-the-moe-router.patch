@@ -1,0 +1,145 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: split-K GEMV for small batches of thin F32 weights (the MoE router)
+
+The MoE router (F32, 2688 x 128) ran mul_mat_f at decode batch sizes, a grid
+of 4 blocks. Matmuls of 1 to 15 rows over contiguous F32 weights of at most
+1024 outputs now run an exact F32 GEMV with one block per output row whose 8
+warps split K (coalesced float4 loads of W and x) and add their partial sums
+in shared memory. The summation order differs from mul_mat_f, so near-tie
+expert choices can change.
+
+Upstream: candidate (as an F32 path of mul_mat_vec_f; needs test-backend-ops
+cases).
+
+diff --git a/ggml/src/ggml-cuda/gemv-thin-f32.cu b/ggml/src/ggml-cuda/gemv-thin-f32.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c69e7f52539d35737da0dc310978f945c716a8d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/gemv-thin-f32.cu
+@@ -0,0 +1,85 @@
++#include "gemv-thin-f32.cuh"
++
++// y[c][n] = sum_k W[n][k] * x[c][k], c < T: one block per row n, its THIN_WARPS warps each take every THIN_WARPS-th run
++// of 256 k (lanes 8 consecutive values: two float4 of W and of each x column, all coalesced), then the warp sums are
++// added in shared memory.
++static constexpr int THIN_WARPS = 8;
++static constexpr int THIN_MAX_ROWS = 16;  // batches of 1 to 15 rows
++
++template <int NC>
++static __global__ void __launch_bounds__(THIN_WARPS * WARP_SIZE)
++thin_f32_gemv_kernel(const float * __restrict__ w, const float * __restrict__ x, int64_t ldx, float * __restrict__ y,
++                     int64_t ldy, int64_t K, int T) {
++    __shared__ float part[THIN_WARPS][NC];
++    const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
++    const int64_t row = blockIdx.x;
++    float acc[NC] = {};
++    for (int64_t k = (int64_t) (warp * WARP_SIZE + lane) * 8; k < K; k += (int64_t) THIN_WARPS * WARP_SIZE * 8) {
++        const float4 wa = __ldg(reinterpret_cast<const float4 *>(w + row*K + k));
++        const float4 wb = __ldg(reinterpret_cast<const float4 *>(w + row*K + k) + 1);
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++            if (c < T) {
++                const float4 a = __ldg(reinterpret_cast<const float4 *>(x + c*ldx + k));
++                const float4 b = __ldg(reinterpret_cast<const float4 *>(x + c*ldx + k) + 1);
++                acc[c] += wa.x*a.x + wa.y*a.y + wa.z*a.z + wa.w*a.w + wb.x*b.x + wb.y*b.y + wb.z*b.z + wb.w*b.w;
++            }
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++        const float v = warp_reduce_sum(acc[c]);
++        if (lane == 0) {
++            part[warp][c] = v;
++        }
++    }
++    __syncthreads();
++    if (threadIdx.x < T) {
++        float s = 0.0f;
++#pragma unroll
++        for (int q = 0; q < THIN_WARPS; ++q) {
++            s += part[q][threadIdx.x];
++        }
++        y[threadIdx.x*ldy + row] = s;
++    }
++}
++
++bool ggml_cuda_thin_f32_gemv_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
++                                       const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (!ctx.serving.fused) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++        src0->ne[0] % 8 != 0 || src0->ne[1] > 1024) {
++        return false;
++    }
++    const int64_t T = src1->ne[1];
++    if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        T < 1 || T >= THIN_MAX_ROWS || src1->nb[1] % 16 != 0 || ((uintptr_t) src1->data % 16) != 0) {
++        return false;
++    }
++    return dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float) && dst->ne[1] == T && dst->ne[2] == 1 &&
++           dst->ne[3] == 1;
++}
++
++void ggml_cuda_thin_f32_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                             ggml_tensor * dst) {
++    const int64_t K = src0->ne[0], N = src0->ne[1];
++    const int T = (int) src1->ne[1];
++    const float * w = (const float *) src0->data;
++    const float * x = (const float *) src1->data;
++    float * y = (float *) dst->data;
++    const int64_t ldx = src1->nb[1] / sizeof(float), ldy = dst->nb[1] / sizeof(float);
++    cudaStream_t stream = ctx.stream();
++    const dim3 grid((unsigned) N), block(THIN_WARPS * WARP_SIZE);
++    if (T <= 1) {
++        thin_f32_gemv_kernel<1><<<grid, block, 0, stream>>>(w, x, ldx, y, ldy, K, T);
++    } else if (T <= 4) {
++        thin_f32_gemv_kernel<4><<<grid, block, 0, stream>>>(w, x, ldx, y, ldy, K, T);
++    } else if (T <= 8) {
++        thin_f32_gemv_kernel<8><<<grid, block, 0, stream>>>(w, x, ldx, y, ldy, K, T);
++    } else {
++        thin_f32_gemv_kernel<16><<<grid, block, 0, stream>>>(w, x, ldx, y, ldy, K, T);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/gemv-thin-f32.cuh b/ggml/src/ggml-cuda/gemv-thin-f32.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ddca5296b2ee84e4162b0cbe0790346a997c793
+--- /dev/null
++++ b/ggml/src/ggml-cuda/gemv-thin-f32.cuh
+@@ -0,0 +1,10 @@
++#pragma once
++#include "common.cuh"
++
++// Small batches (1 to 15 rows) of thin F32 weights (at most 1024 outputs, e.g. the MoE router): an exact F32 GEMV, one
++// block per output row with its warps splitting K, in place of mul_mat_f (whose grid is a handful of blocks there).
++// Backends with serving.fused only.
++bool ggml_cuda_thin_f32_gemv_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
++                                       const ggml_tensor * src1, const ggml_tensor * dst);
++void ggml_cuda_thin_f32_gemv(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                             ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 83f430f1ca777b53d8bafed8e24477259f96d473..ec34785affefd64cd9bc4e48248b4ab204a4bef5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9,6 +9,7 @@
+ #include "ggml-cuda/arange.cuh"
+ #include "ggml-cuda/argmax.cuh"
+ #include "ggml-cuda/ssm-gate-norm.cuh"
++#include "ggml-cuda/gemv-thin-f32.cuh"
+ #include "ggml-cuda/argsort.cuh"
+ #include "ggml-cuda/binbcast.cuh"
+ #include "ggml-cuda/clamp.cuh"
+@@ -1936,6 +1937,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_skinny_q8(ctx, src0, src1, dst);
+         return;
+     }
++    // Small batches of thin F32 weights (the MoE router): split-K GEMV instead of mul_mat_f's few blocks.
++    if (!bad_padding_clear && ggml_cuda_thin_f32_gemv_supported(ctx, src0, src1, dst)) {
++        ggml_cuda_thin_f32_gemv(ctx, src0, src1, dst);
++        return;
++    }
++
+     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)

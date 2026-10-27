@@ -1,0 +1,299 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: tensor-core MTP verify scan
+
+The MTP verify step of the ReplaySSM scan computed C_i.h0 and C_i.B_k as FP32
+dot products with warp reductions, reading the committed B and x cache rows
+from global memory inside them: instruction-bound on the CUDA cores.
+ssm_replay_verify_tc replaces it: it stages only the C rows of the tokens and
+the B and x rows of the window in shared memory, four values per load, and
+computes both products as F16 mma.sync with F32 accumulation (the checkpoint
+and the cache rows are F16 already). The tensor-core kernel needs SM80 or
+newer.
+
+Upstream: not planned (Nemotron-H MTP verify path).
+
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index ff53ebbe6155aa12f7a901f93f5673aab0f8a65c..e10763dcfd320ffaf37dbd8304ad0e28ec953dc6 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -951,7 +951,6 @@ static __global__ void __launch_bounds__(128) ssm_replay_fold(
+     }
+     __syncthreads();
+     const float total = s_tot;
+-    // all of this warp's checkpoint rows are loaded up front (independent loads in flight)
+     constexpr int RPW = P / 4;
+ #pragma unroll
+     for (int r = 0; r < RPW; ++r) {
+@@ -972,16 +971,38 @@ static __global__ void __launch_bounds__(128) ssm_replay_fold(
+     if (tid == 0) pos[h] = __float2half((float) -adv);
+ }
+ 
++// The verify step on tensor cores: its two dot-product phases are F16 mma.sync with F32 accumulation (C and the new B
++// rounded to F16, which the cache stores anyway): C_i.h0 (64 state rows x 128 x the tokens) and C_i.B_k (the tokens x
++// 128 x the window entries).
++// Ampere tensor cores (mma.sync m16n8k16); serving runs these kernels on SM80 and newer only.
++namespace ssm_tc {
++static __device__ __forceinline__ void mma16816(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++                                                uint32_t b0, uint32_t b1) {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#else
++    GGML_UNUSED_VARS(d, a0, a1, a2, a3, b0, b1);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++static __device__ __forceinline__ uint32_t lds32(const half * p) { return *(const uint32_t *) p; }
++}
++
+ template <int L, int MAXT>
+-static __global__ void __launch_bounds__(128) ssm_replay_verify(
++static __global__ void __launch_bounds__(128) ssm_replay_verify_tc(
+         half * __restrict__ rows, const int64_t row_stride, const int64_t S,
+         const float * __restrict__ x, const int64_t x_tok, const float * __restrict__ dt, const int64_t dt_tok,
+         const float * __restrict__ A, const int64_t A_h, const float * __restrict__ B, const int64_t B_tok,
+         const float * __restrict__ C, const int64_t C_tok, const int32_t * __restrict__ offsets,
+         float * __restrict__ y, const int H, const int G, const int32_t * __restrict__ ids, const int n_seq) {
+-    constexpr int P = 64, N = 128;
++    using namespace ssm_tc;
++    constexpr int P = 64, N = 128, LD = N + 8;  // F16 rows padded by 16 bytes: conflict-free fragment loads
++    constexpr int MT = MAXT <= 8 ? 8 : 16;      // token columns of C.h0 (n-tiles of 8)
++    static_assert(L <= 16 && MAXT <= 16, "the C.B product covers 16 tokens and 16 window entries");
+     const int seq = blockIdx.x, h = blockIdx.y, g = h / (H / G);
+-    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE;
++    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE, gr = lane / 4, qc = lane % 4;
+     const int64_t t0 = offsets[seq];
+     const int seg = min((int) (offsets[seq + 1] - t0), MAXT);
+     const int rid = ids[seq], wid = ids[n_seq + seq], adv = ids[2 * n_seq + seq];
+@@ -993,92 +1014,146 @@ static __global__ void __launch_bounds__(128) ssm_replay_verify(
+     half * bc = xc + (int64_t) L * H * P;
+     const float a = A[h * A_h];
+ 
+-    // ~5 KB of shared memory at MAXT = 4 (occupancy: the kernel is a state-streaming one)
+-    __shared__ float s_C[MAXT][N], s_Bn[MAXT][N], s_ch[MAXT][P];
+-    __shared__ float s_dt[L], s_cum[L], s_coef[MAXT][L], s_dtn[MAXT], s_tot[MAXT];
++    __shared__ __align__(16) half s_C[16][LD];  // C_i, rows past seg zero
++    __shared__ __align__(16) half s_B[16][LD];  // B_k of the window [0, E): cache entries, then new; past E zero
++    __shared__ __align__(16) float s_xk[L][P];
++    __shared__ float s_ch[MT][P];
++    __shared__ float s_dt[L], s_cum[L], s_coef[16][16], s_dtn[MAXT], s_tot[MAXT];
+     __shared__ int s_j;
+ 
+     if (tid == 0) {
+-        const int j = rid == wid ? (int) __half2float(pos[h]) + adv : 0;  // a fresh cell (read row != write row) starts empty
++        const int j = rid == wid ? (int) __half2float(pos[h]) + adv : 0;  // a fresh cell starts empty
+         s_j = min(max(j, 0), L);
+     }
+     __syncthreads();
+-    int j = s_j;
+-
+-    if (rid != wid) {
+-        // fresh cell: zero checkpoint (the cache entries are unused at j = 0)
++    const int j = s_j;
++    if (rid != wid) {  // fresh cell: zero checkpoint
+         for (int e = tid; e < P * N; e += blockDim.x) h0[e] = __float2half(0.0f);
+         __syncthreads();
+     }
+-
+-    for (int i = 0; i < seg; ++i) {
+-        s_C[i][tid]  = C[(t0 + i) * C_tok + g * N + tid];
+-        s_Bn[i][tid] = B[(t0 + i) * B_tok + g * N + tid];
++    const int E = j + seg;
++    // C rows of the tokens and B rows of the window (cache entries, then the new ones). Rows past seg (C) and past E (B)
++    // only reach results that are not used, so they are not staged. 4 values per load when the rows are 16-byte aligned.
++    const bool vec4 = (((uintptr_t) C | (uintptr_t) B) % 16 == 0) && C_tok % 4 == 0 && B_tok % 4 == 0 &&
++                      ((uintptr_t) bc % 8 == 0) && (G * N) % 4 == 0;
++    if (vec4) {
++        for (int e = tid; e < 16 * (N / 4); e += blockDim.x) {
++            const int i = e / (N / 4), n = 4 * (e % (N / 4));
++            if (i < seg) {
++                const float4 c = *(const float4 *) (C + (t0 + i) * C_tok + g * N + n);
++                *(half2 *) &s_C[i][n] = __floats2half2_rn(c.x, c.y);
++                *(half2 *) &s_C[i][n + 2] = __floats2half2_rn(c.z, c.w);
++            }
++            if (i < j) {
++                *(uint2 *) &s_B[i][n] = *(const uint2 *) (bc + (int64_t) i * G * N + g * N + n);
++            } else if (i < E) {
++                const float4 b = *(const float4 *) (B + (t0 + i - j) * B_tok + g * N + n);
++                *(half2 *) &s_B[i][n] = __floats2half2_rn(b.x, b.y);
++                *(half2 *) &s_B[i][n + 2] = __floats2half2_rn(b.z, b.w);
++            }
++        }
++    } else {
++        for (int e = tid; e < 16 * N; e += blockDim.x) {
++            const int i = e / N, n = e % N;
++            if (i < seg) s_C[i][n] = __float2half(C[(t0 + i) * C_tok + g * N + n]);
++            if (i < j) s_B[i][n] = bc[(int64_t) i * G * N + g * N + n];
++            else if (i < E) s_B[i][n] = __float2half(B[(t0 + i - j) * B_tok + g * N + n]);
++        }
++    }
++    if (vec4 && (uintptr_t) x % 16 == 0 && x_tok % 4 == 0 && (uintptr_t) xc % 8 == 0) {
++        for (int e = tid; e < E * (P / 4); e += blockDim.x) {
++            const int k = e / (P / 4), p = 4 * (e % (P / 4));
++            float4 v;
++            if (k < j) {
++                const uint2 u = *(const uint2 *) (xc + (int64_t) k * H * P + h * P + p);
++                const float2 a = __half22float2(*(const half2 *) &u.x), b = __half22float2(*(const half2 *) &u.y);
++                v = make_float4(a.x, a.y, b.x, b.y);
++            } else {
++                v = *(const float4 *) (x + (t0 + k - j) * x_tok + h * P + p);
++            }
++            *(float4 *) &s_xk[k][p] = v;
++        }
++    } else {
++        for (int e = tid; e < E * P; e += blockDim.x) {
++            const int k = e / P, p = e % P;
++            s_xk[k][p] = k < j ? __half2float(xc[(int64_t) k * H * P + h * P + p]) : x[(t0 + k - j) * x_tok + h * P + p];
++        }
+     }
+     if (tid < seg) {
+         const float d = dt[(t0 + tid) * dt_tok + h];
+         s_dtn[tid] = d <= 20.0f ? log1pf(expf(d)) : d;
+     }
+     __syncthreads();
+-    // dt over the window [0, j + seg): committed entries from the cache, then the new tokens
+-    const int E = j + seg;
+-    if (tid < j) s_dt[tid] = dtc[tid * H + h];
+-    else if (tid < E) s_dt[tid] = s_dtn[tid - j];
++    if (tid < j)
++        s_dt[tid] = dtc[tid * H + h];
++    else if (tid < E)
++        s_dt[tid] = s_dtn[tid - j];
+     __syncthreads();
+     if (tid == 0) {
+         float c = 0.0f;
+-        for (int k = 0; k < E; ++k) { c += s_dt[k] * a; s_cum[k] = c; }
+-    }
+-    // coef[i][k] = exp(cum[e]-cum[k]) dt_k (C_i.B_k) for k <= e = j + i (one warp per pair for the dot product)
+-    for (int pr = warp; pr < seg * E; pr += 4) {
+-        const int i = pr / E, k = pr % E;
+-        float acc = 0.0f;
+-        if (k <= j + i) {
+-            for (int n = lane; n < N; n += WARP_SIZE) {
+-                const float bkv = k < j ? __half2float(bc[(int64_t) k * G * N + g * N + n]) : s_Bn[k - j][n];
+-                acc += bkv * s_C[i][n];
+-            }
+-            acc = warp_reduce_sum(acc);
++        for (int k = 0; k < E; ++k) {
++            c += s_dt[k] * a;
++            s_cum[k] = c;
+         }
+-        __syncwarp();
+-        if (lane == 0) s_coef[i][k] = acc;  // C.B for now, scaled below
+-    }
+-    __syncthreads();
+-    for (int t = tid; t < seg * E; t += blockDim.x) {  // seg * E exceeds the block from MAXT 9 (E <= L)
+-        const int i = t / E, k = t % E;
+-        s_coef[i][k] = k <= j + i ? expf(s_cum[j + i] - s_cum[k]) * s_dt[k] * s_coef[i][k] : 0.0f;
+     }
+-    if (tid < seg) s_tot[tid] = expf(s_cum[j + tid]);
+ 
+-    // C_i . h0 (16 lanes per state row, two rows per warp per iteration): the checkpoint is read once for all tokens
+-    const int l16 = lane & 15;
+-#pragma unroll 2
+-    for (int it = 0; it < P / 8; ++it) {
+-        const int p = warp * (P / 4) + it * 2 + (lane >> 4);
+-        float hv[8];
+-        const uint4 v = ((const uint4 *) (h0 + (int64_t) p * N))[l16];
+-        const half2 * hh = (const half2 *) &v;
++    // C_i.B_k: warps 0 and 1 take window entries [8w, 8w + 8) (16 tokens x 8 entries x 128)
++    if (warp < 2 && 8 * warp < E) {
++        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++        const int kb = 8 * warp + gr;
+ #pragma unroll
+-        for (int q = 0; q < 4; ++q) { const float2 f = __half22float2(hh[q]); hv[2*q] = f.x; hv[2*q+1] = f.y; }
++        for (int ks = 0; ks < N / 16; ++ks) {
++            const int n0 = 16 * ks + 2 * qc;
++            mma16816(d, lds32(&s_C[gr][n0]), lds32(&s_C[gr + 8][n0]), lds32(&s_C[gr][n0 + 8]),
++                     lds32(&s_C[gr + 8][n0 + 8]), lds32(&s_B[kb][n0]), lds32(&s_B[kb][n0 + 8]));
++        }
++        const int k0 = 8 * warp + 2 * qc;
++        s_coef[gr][k0] = d[0];
++        s_coef[gr][k0 + 1] = d[1];
++        s_coef[gr + 8][k0] = d[2];
++        s_coef[gr + 8][k0 + 1] = d[3];
++    }
++    // C_i.h0: warp w takes state rows [16w, 16w + 16) (16 rows x MT tokens x 128); the checkpoint is read once
++    {
++        const int p0 = 16 * warp;
++        float d[MT / 8][4] = {};
+ #pragma unroll
+-        for (int i = 0; i < MAXT; ++i) {
+-            float acc = 0.0f;
+-            if (i < seg) {
++        for (int ks = 0; ks < N / 16; ++ks) {
++            const int n0 = 16 * ks + 2 * qc;
++            uint32_t a0, a1, a2, a3;
++            const half * r0 = h0 + (int64_t) (p0 + gr) * N;
++            a0 = lds32(r0 + n0);
++            a1 = lds32(r0 + 8 * N + n0);
++            a2 = lds32(r0 + n0 + 8);
++            a3 = lds32(r0 + 8 * N + n0 + 8);
+ #pragma unroll
+-                for (int q = 0; q < 8; ++q) acc += hv[q] * s_C[i][l16 * 8 + q];
+-            }
++            for (int nt = 0; nt < MT / 8; ++nt)
++                mma16816(d[nt], a0, a1, a2, a3, lds32(&s_C[8 * nt + gr][n0]), lds32(&s_C[8 * nt + gr][n0 + 8]));
++        }
+ #pragma unroll
+-            for (int off = 8; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, off);
+-            if (l16 == 0 && i < seg) s_ch[i][p] = acc;
++        for (int nt = 0; nt < MT / 8; ++nt) {
++            const int i0 = 8 * nt + 2 * qc;
++            s_ch[i0][p0 + gr] = d[nt][0];
++            s_ch[i0 + 1][p0 + gr] = d[nt][1];
++            s_ch[i0][p0 + gr + 8] = d[nt][2];
++            s_ch[i0 + 1][p0 + gr + 8] = d[nt][3];
+         }
+     }
+     __syncthreads();
++    // coef[i][k] = exp(cum[j+i] - cum[k]) dt_k (C_i.B_k) for k <= j + i
++    for (int t = tid; t < seg * E; t += blockDim.x) {
++        const int i = t / E, k = t % E;
++        s_coef[i][k] = k <= j + i ? expf(s_cum[j + i] - s_cum[k]) * s_dt[k] * s_coef[i][k] : 0.0f;
++    }
++    if (tid < seg)
++        s_tot[tid] = expf(s_cum[j + tid]);
++    __syncthreads();
+     if (tid < P) {
+         float yx[MAXT];
+ #pragma unroll
+         for (int i = 0; i < MAXT; ++i) yx[i] = 0.0f;
+         for (int k = 0; k < E; ++k) {
+-            const float xk = k < j ? __half2float(xc[(int64_t) k * H * P + h * P + tid]) : x[(t0 + k - j) * x_tok + h * P + tid];
++            const float xk = s_xk[k][tid];
+ #pragma unroll
+             for (int i = 0; i < MAXT; ++i) yx[i] += i < seg ? s_coef[i][k] * xk : 0.0f;
+         }
+@@ -1086,13 +1161,15 @@ static __global__ void __launch_bounds__(128) ssm_replay_verify(
+         for (int i = 0; i < MAXT; ++i) {
+             if (i < seg) {
+                 y[(t0 + i) * H * P + h * P + tid] = s_tot[i] * s_ch[i][tid] + yx[i];
+-                xc[(int64_t) (j + i) * H * P + h * P + tid] = __float2half(x[(t0 + i) * x_tok + h * P + tid]);
++                xc[(int64_t) (j + i) * H * P + h * P + tid] = __float2half(s_xk[j + i][tid]);
+             }
+         }
+     }
+-    for (int i = 0; i < seg; ++i) bc[(int64_t) (j + i) * G * N + g * N + tid] = __float2half(s_Bn[i][tid]);
+-    if (tid < seg) dtc[(j + tid) * H + h] = s_dtn[tid];
+-    if (tid == 0) pos[h] = __float2half((float) j);  // the new entries stay uncommitted until the next call's adv
++    for (int i = 0; i < seg; ++i) bc[(int64_t) (j + i) * G * N + g * N + tid] = s_B[j + i][tid];
++    if (tid < seg)
++        dtc[(j + tid) * H + h] = s_dtn[tid];
++    if (tid == 0)
++        pos[h] = __float2half((float) j);  // the new entries stay uncommitted until the next call adv
+ }
+ 
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -1156,8 +1233,8 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         const dim3 grid((unsigned) n_s, (unsigned) nh);
+         ssm_replay_fold<L><<<grid, 128, 0, stream>>>((half *) sdst->data, (int64_t) (sdst->nb[1] / sizeof(half)), nc*nr*nh, src3_d,
+             (int64_t) (src3->nb[1] / sizeof(float)), (const int32_t *) dst->src[7]->data, (int) nh, (int) ng, src6_d, (int) n_s, maxt);
+-        auto * kern = maxt <= 4 ? ssm_replay_verify<L, 4> : maxt <= 8 ? ssm_replay_verify<L, 8>
+-                    : maxt <= 12 ? ssm_replay_verify<L, 12> : ssm_replay_verify<L, L>;
++        auto * kern = maxt <= 4 ? ssm_replay_verify_tc<L, 4> : maxt <= 8 ? ssm_replay_verify_tc<L, 8>
++                    : maxt <= 12 ? ssm_replay_verify_tc<L, 12> : ssm_replay_verify_tc<L, L>;
+         kern<<<grid, 128, 0, stream>>>((half *) sdst->data, (int64_t) (sdst->nb[1] / sizeof(half)),
+             nc*nr*nh, src1_d, (int64_t) (src1->nb[2] / sizeof(float)), src2_d, (int64_t) (src2->nb[1] / sizeof(float)),
+             src3_d, (int64_t) (src3->nb[1] / sizeof(float)), src4_d, (int64_t) (src4->nb[2] / sizeof(float)),

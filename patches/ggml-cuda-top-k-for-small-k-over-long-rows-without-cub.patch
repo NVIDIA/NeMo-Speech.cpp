@@ -1,0 +1,158 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: top-k for small k over long rows without CUB
+
+The DFlash2 drafter takes the 16 best candidates of each drafted row over the full 131,072-entry vocabulary. Without
+CUB the CUDA top-k only accepts rows of up to 1024 columns, and CUB's top-k is one launch per row. For k of 8, 16 or 32
+over rows of at least 1024 columns (a multiple of 4, 16-byte aligned), one block per row now keeps each thread's k
+largest values sorted in registers from coalesced float4 loads, then emits the row's top k in descending order through
+k rounds of a block-wide argmax over the threads' list heads (ties: lower column first). Other shapes keep the existing
+paths.
+
+Upstream: candidate (needs test-backend-ops top-k cases with long rows).
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e89e664e7fc2e53b71f73cc63ea65a7a12c8f993..b0bac6d9e6287bacdf67da6653cf3dae7d4e4edf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6270,7 +6270,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+ #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+             return true;
+ #else
+-            return op->src[0]->ne[0] <= 1024;
++            return op->src[0]->ne[0] <= 1024 || ggml_cuda_top_k_small_rows_supported(op);
+ #endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+         case GGML_OP_ARGSORT:
+ #ifndef GGML_CUDA_USE_CUB
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index c7a0c831788df8547ffd86c8a68e6d53aff61130..f61a41a0eaedbe313741cbcbffcacbac5c8dbaee 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -210,6 +210,107 @@ static void top_k_radix_cuda(
+ 
+ #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+ 
++// Small k over long rows (DFlash2 candidates: 16 of 131072 logits per drafted row), one block per row: each thread
++// keeps its K largest values sorted in registers, then K rounds of a block-wide argmax over the threads' list heads
++// emit the row's top K in descending order (ties: lower column first). CUB's top-k is one launch per row.
++template <int K>
++static __global__ void top_k_small_rows(const float * __restrict__ src, int * __restrict__ dst, const int ncols) {
++    const float4 * x = reinterpret_cast<const float4 *>(src + (int64_t) blockIdx.x*ncols);
++    float v[K];
++    int   c[K];
++#pragma unroll
++    for (int i = 0; i < K; ++i) {
++        v[i] = -INFINITY;
++        c[i] = INT_MAX;
++    }
++    auto insert = [&](float val, int col) {
++        if (!(val > v[K - 1])) {
++            return;
++        }
++#pragma unroll
++        for (int i = 0; i < K; ++i) {
++            if (val > v[i]) {
++                const float tv = v[i];
++                const int   tc = c[i];
++                v[i] = val;
++                c[i] = col;
++                val  = tv;
++                col  = tc;
++            }
++        }
++    };
++    for (int j = threadIdx.x; j < ncols/4; j += blockDim.x) {
++        const float4 q = x[j];
++        insert(q.x, 4*j + 0);
++        insert(q.y, 4*j + 1);
++        insert(q.z, 4*j + 2);
++        insert(q.w, 4*j + 3);
++    }
++
++    __shared__ float s_v[32];
++    __shared__ int   s_c[32];
++    __shared__ int   s_win;
++    const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE, n_warps = blockDim.x / WARP_SIZE;
++    for (int r = 0; r < K; ++r) {
++        float bv = v[0];
++        int   bc = c[0];
++#pragma unroll
++        for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
++            const float ov = __shfl_xor_sync(0xffffffff, bv, o);
++            const int   oc = __shfl_xor_sync(0xffffffff, bc, o);
++            if (ov > bv || (ov == bv && oc < bc)) {
++                bv = ov;
++                bc = oc;
++            }
++        }
++        if (lane == 0) {
++            s_v[warp] = bv;
++            s_c[warp] = bc;
++        }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            for (int w = 1; w < n_warps; ++w) {
++                if (s_v[w] > bv || (s_v[w] == bv && s_c[w] < bc)) {
++                    bv = s_v[w];
++                    bc = s_c[w];
++                }
++            }
++            s_win = bc;
++            dst[(int64_t) blockIdx.x*K + r] = bc == INT_MAX ? 0 : bc;
++        }
++        __syncthreads();
++        if (c[0] == s_win && s_win != INT_MAX) {
++#pragma unroll
++            for (int i = 0; i < K - 1; ++i) {
++                v[i] = v[i + 1];
++                c[i] = c[i + 1];
++            }
++            v[K - 1] = -INFINITY;
++            c[K - 1] = INT_MAX;
++        }
++    }
++}
++
++static bool top_k_small_rows_launch(const float * src, int * dst, int64_t ncols, int64_t nrows, int64_t k,
++                                    cudaStream_t stream) {
++    if (ncols < 1024 || ncols % 4 != 0 || (uintptr_t) src % 16 != 0 || nrows > INT_MAX) {
++        return false;
++    }
++    switch (k) {
++        case 8:  top_k_small_rows<8> <<<nrows, 256, 0, stream>>>(src, dst, (int) ncols); break;
++        case 16: top_k_small_rows<16><<<nrows, 256, 0, stream>>>(src, dst, (int) ncols); break;
++        case 32: top_k_small_rows<32><<<nrows, 256, 0, stream>>>(src, dst, (int) ncols); break;
++        default: return false;
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
++bool ggml_cuda_top_k_small_rows_supported(const ggml_tensor * op) {
++    const int64_t k = op->ne[0];
++    return op->src[0]->ne[0] >= 1024 && op->src[0]->ne[0] % 4 == 0 && (k == 8 || k == 16 || k == 32);
++}
++
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0   = dst->src[0];
+     const float *       src0_d = (const float *) src0->data;
+@@ -225,6 +326,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t    nrows = ggml_nrows(src0);
+     const int64_t    k     = dst->ne[0];
+     ggml_cuda_pool & pool  = ctx.pool();
++    if (top_k_small_rows_launch(src0_d, dst_d, ncols, nrows, k, stream)) {
++        return;
++    }
+ #ifdef CUB_TOP_K_AVAILABLE
+     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
+     // https://github.com/NVIDIA/cccl/issues/6391
+diff --git a/ggml/src/ggml-cuda/top-k.cuh b/ggml/src/ggml-cuda/top-k.cuh
+index f4d8f61e5b3f14a823641883750f764c4b785024..22b3ff83fb7ffa0362703ec2993e979be5f58ec4 100644
+--- a/ggml/src/ggml-cuda/top-k.cuh
++++ b/ggml/src/ggml-cuda/top-k.cuh
+@@ -1,3 +1,6 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// k of 8, 16 or 32 over rows of at least 1024 values: one block per row, no CUB
++bool ggml_cuda_top_k_small_rows_supported(const ggml_tensor * op);
