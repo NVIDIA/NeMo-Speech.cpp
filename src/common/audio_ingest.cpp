@@ -321,7 +321,7 @@ decode_any(
         case detail::Kind::RiffWave:
         case detail::Kind::Rifx:
         case detail::Kind::Rf64:
-            decoded = detail::decode_wav_family(data, size, pcm);
+            decoded = detail::decode_wav_family(data, size, options, pcm);
             if (!decoded) {
                 const int tag = detail::wav_format_tag(data, size);
                 if (tag >= 0) {

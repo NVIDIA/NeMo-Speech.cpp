@@ -8,7 +8,7 @@
 - **Language.** The model does not detect the language. A language code (`-l`, HTTP `language`, Riva
   `language_code`) adds "The speech is in <language>." to the default instruction; a custom instruction is used as
   written, so include the language there if it matters. Responses report the requested language.
-- **Length.** One request takes from 32 ms up to one hour of audio.
+- **Length.** One request takes from 20 ms (320 samples at 16 kHz) up to one hour of audio.
 - **Silence.** Near-digital silence (peak below -60 dBFS, RMS below -90 dBFS) returns an empty transcript.
   Recorded silence or noise above that level is transcribed like speech and can produce invented text.
 - **Custom instructions.** `POST /v1/chat/completions` and the CLI's `--instruction` take an instruction with the

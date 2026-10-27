@@ -23,8 +23,8 @@ struct PcmFloat {
     bool wav_pcm16 = false;
     // FLAC and MP3: `interleaved` holds the channel mean (mix_down) of each frame.
     bool mixed = false;
-    // FLAC and MP3: decoding stopped at frame_cap; total_frames is the stream's length when its
-    // header gives one (0 otherwise).
+    // Decoding stopped at frame_cap (FLAC, MP3) or did not start (WAV); total_frames is the
+    // stream's length when its header gives one (0 otherwise).
     bool over_limit = false;
     uint64_t total_frames = 0;
     std::string decoder;
@@ -49,8 +49,10 @@ Kind probe_kind(const uint8_t* data, size_t size);
 
 // WAV family reader (RIFF/RIFX/RF64) with the integer-to-float scaling of audio_ingest.h: PCM
 // 8/16/24/32-bit, IEEE float 32/64, A-law, mu-law, WAVE_FORMAT_EXTENSIBLE with those. False when it
-// does not handle the input.
-bool decode_wav_family(const uint8_t* data, size_t size, PcmFloat& out);
+// does not handle the input. A stream of frame_cap(options, rate) frames or more is not decoded
+// (over_limit, with total_frames).
+bool decode_wav_family(
+    const uint8_t* data, size_t size, const IngestOptions& options, PcmFloat& out);
 // The WAV format tag (resolved through WAVE_FORMAT_EXTENSIBLE), or -1 when the header cannot be
 // parsed.
 int wav_format_tag(const uint8_t* data, size_t size);

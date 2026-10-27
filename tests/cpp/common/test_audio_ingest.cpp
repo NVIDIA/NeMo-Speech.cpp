@@ -443,6 +443,15 @@ compressed_limit_tests() {
         audio::IngestOptions::local_file().max_duration_seconds == 0 &&
             audio::IngestOptions::local_file().max_samples == static_cast<size_t>(-1),
         "local files have no length limit");
+    // The WAV family (here 8-bit PCM at 8 kHz) is rejected from its header, before decoding;
+    // local files decode it whole.
+    const std::string u8wav = wav_with_format(1, 8, 1, 8000, std::string(2 * 8000, '\x80'));
+    o = decode(u8wav, second);
+    check(
+        !o.ok && o.limit && o.status == 400 && o.message == "audio is 2.0 s, the limit is 1 s",
+        "an 8-bit WAV over the limit is rejected before decoding");
+    o = decode(u8wav, audio::IngestOptions::local_file());
+    check(o.ok && o.audio.samples.size() == 2 * 16000, "a local 8-bit WAV decodes whole");
 }
 
 void

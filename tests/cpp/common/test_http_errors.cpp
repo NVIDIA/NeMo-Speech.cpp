@@ -29,6 +29,13 @@ expect(E error, int status, const std::string& type, const std::string& code) {
 int
 main() {
     expect(std::invalid_argument("bad"), 400, "invalid_request_error", "invalid_argument");
+    // audio errors keep their status: undecodable audio is 422, audio over the limits 400
+    expect(
+        nemo_speech::audio::AudioError(422, "unsupported audio format"), 422,
+        "invalid_request_error", "invalid_argument");
+    expect(
+        nemo_speech::audio::AudioLimitError("audio is 2.0 s, the limit is 1 s"), 400,
+        "invalid_request_error", "invalid_argument");
 #if defined(NEMO_SPEECH_REGISTRY_ASR)
     expect(
         nemo_speech::asr::ResourceExhausted("full"), 429, "rate_limit_error", "resource_exhausted");

@@ -40,6 +40,7 @@
 #include "audio_ingest.h"
 #include "base64.h"
 #include "errors.h"
+#include "subtitles.h"
 #endif
 
 namespace nemo_speech::http::chat {
@@ -901,39 +902,11 @@ trim_end(std::string_view s) {
     return s.substr(0, end);
 }
 
-// Extended grapheme clusters (UAX #29) for cue line lengths, approximated for English text:
-// combining marks, variation selectors, emoji modifiers, ZWJ sequences, regional-indicator pairs
-// and CR LF join the preceding cluster.
+// Cue line lengths in extended grapheme clusters (UAX #29), as the other subtitle path counts them
+// (subtitles.h).
 size_t
 grapheme_count(std::string_view s) {
-    const auto extends = [](uint32_t cp) {
-        return (cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x0483 && cp <= 0x0489) ||
-               (cp >= 0x0591 && cp <= 0x05C7) || (cp >= 0x0610 && cp <= 0x061A) ||
-               (cp >= 0x064B && cp <= 0x065F) || cp == 0x0670 || (cp >= 0x0900 && cp <= 0x0903) ||
-               (cp >= 0x093A && cp <= 0x094F) || (cp >= 0x0951 && cp <= 0x0957) ||
-               (cp >= 0x0962 && cp <= 0x0963) || cp == 0x0E31 || (cp >= 0x0E34 && cp <= 0x0E3A) ||
-               (cp >= 0x0E47 && cp <= 0x0E4E) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
-               (cp >= 0x1DC0 && cp <= 0x1DFF) || cp == 0x200C || cp == 0x200D ||
-               (cp >= 0x20D0 && cp <= 0x20FF) || (cp >= 0x3099 && cp <= 0x309A) ||
-               (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xFE20 && cp <= 0xFE2F) ||
-               (cp >= 0x1F3FB && cp <= 0x1F3FF) || (cp >= 0xE0020 && cp <= 0xE007F) ||
-               (cp >= 0xE0100 && cp <= 0xE01EF);
-    };
-    size_t count = 0;
-    uint32_t previous = 0;
-    bool open_regional_pair = false;
-    for (size_t i = 0; i < s.size();) {
-        const uint32_t cp = next_code_point(s, i);
-        const bool regional = cp >= 0x1F1E6 && cp <= 0x1F1FF;
-        const bool joins =
-            count > 0 && (extends(cp) || previous == 0x200D || (previous == '\r' && cp == '\n') ||
-                          (regional && open_regional_pair));
-        if (!joins)
-            ++count;
-        open_regional_pair = regional && !(joins && open_regional_pair);
-        previous = cp;
-    }
-    return count;
+    return subtitle::grapheme_count(std::string(s));
 }
 
 // ------------------------------------------------------------------------------------------------

@@ -63,7 +63,8 @@ requests, so keep `http.threads` above the number of clients.
 
 | Error | HTTP | gRPC | CLI exit |
 |---|---|---|---|
-| invalid request (bad field, unsupported audio, too long) | 400 | `INVALID_ARGUMENT` | 2 |
+| invalid request (bad field, malformed audio header, audio too long) | 400 | `INVALID_ARGUMENT` | 2 |
+| audio that cannot be decoded (unsupported format) | 422 | `INVALID_ARGUMENT` | 2 |
 | queue full | 429 | `RESOURCE_EXHAUSTED` | 1 |
 | server shutting down | 503 | `UNAVAILABLE` | 1 |
 | anything else | 500 | `INTERNAL` | 1 |

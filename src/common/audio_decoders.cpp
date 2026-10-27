@@ -146,7 +146,7 @@ wav_format_tag(const uint8_t* d, size_t n) {
 }
 
 bool
-decode_wav_family(const uint8_t* d, size_t n, PcmFloat& out) {
+decode_wav_family(const uint8_t* d, size_t n, const IngestOptions& options, PcmFloat& out) {
     WavLayout w;
     if (!parse_wav_layout(d, n, w))
         return false;
@@ -168,6 +168,11 @@ decode_wav_family(const uint8_t* d, size_t n, PcmFloat& out) {
     out.sample_rate = static_cast<int>(f.rate);
     out.wav_pcm16 = !w.rf64 && !f.extensible && pcm && width == 2;
     out.decoder = "wav";
+    if (frames >= frame_cap(options, f.rate)) {  // over the limits: nothing is decoded
+        out.over_limit = true;
+        out.total_frames = frames;
+        return true;
+    }
     out.interleaved.resize(frames * f.channels);
     float* dst = out.interleaved.data();
     for (size_t fr = 0; fr < frames; ++fr) {
