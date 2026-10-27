@@ -20,6 +20,11 @@ add_executable(test_subtitles
 target_link_libraries(test_subtitles PRIVATE nemo_speech_common)
 add_test(NAME subtitles COMMAND test_subtitles)
 
+add_executable(test_audio_ingest
+    ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_audio_ingest.cpp)
+target_link_libraries(test_audio_ingest PRIVATE nemo_speech_common)
+add_test(NAME audio_ingest COMMAND test_audio_ingest)
+
 if(TARGET nemo_speech_http_server)
     add_executable(test_http_server_config
         ${CMAKE_SOURCE_DIR}/tests/cpp/common/test_http_server_config.cpp)

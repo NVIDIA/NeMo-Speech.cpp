@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace nemo_speech::audio {
@@ -40,13 +41,16 @@ class AudioResampler {
     uint64_t rate_gcd_ = 1;
     size_t phase_count_ = 1;
     bool exact_phase_table_ = true;
-    std::vector<float> coefficients_;
+    std::shared_ptr<const std::vector<float>> coefficients_;  // per rate pair, shared
     std::vector<float> input_;
     uint64_t input_start_ = 0;
     uint64_t total_input_ = 0;
     uint64_t next_output_ = 0;
     uint64_t source_index_ = 0;
     uint64_t source_remainder_ = 0;
+    // Per output sample the source position advances by step_whole_ samples plus step_rem_ /
+    // output_rate_ (no division per sample).
+    uint64_t step_whole_ = 0, step_rem_ = 0;
     bool finished_ = false;
 };
 

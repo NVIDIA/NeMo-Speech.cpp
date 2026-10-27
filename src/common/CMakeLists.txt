@@ -8,7 +8,10 @@
 # (parameter_parser.cpp), so there is no external YAML dependency.
 add_library(nemo_speech_common STATIC
     audio_decoder.cpp
+    audio_decoders.cpp
     audio_file.cpp
+    audio_ingest.cpp
+    audio_miniaudio.cpp
     audio_resampler.cpp
     json.cpp
     parameter_parser.cpp
@@ -20,6 +23,9 @@ add_library(nemo_speech_common STATIC
 target_include_directories(nemo_speech_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 set_target_properties(nemo_speech_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Audio ingest (audio_ingest.h): FLAC and MP3 come from miniaudio's dr_flac / dr_mp3, vendored by llama.cpp.
+target_include_directories(nemo_speech_common PRIVATE "${NEMO_SPEECH_LLAMA_CPP_DIR}/vendor/miniaudio")
 
 # Shared WFST grammar runtime for ASR ITN and TTS TN. Keep this separate from
 # nemo_speech_common so builds that do not request text normalization retain

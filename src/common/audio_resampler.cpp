@@ -6,8 +6,11 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 
 namespace nemo_speech::audio {
 namespace {
@@ -57,6 +60,66 @@ rounded_output_count(uint64_t input_count, int input_rate, int output_rate) {
 #endif
 }
 
+// Windowed-sinc coefficients (phase_count x kTaps) for one rate pair.
+std::vector<float>
+filter_coefficients(int input_rate, int output_rate, size_t phase_count) {
+    std::vector<float> coefficients(phase_count * kTaps);
+    const long double rate_ratio =
+        static_cast<long double>(output_rate) / static_cast<long double>(input_rate);
+    const long double cutoff = rate_ratio < 1.0L ? rate_ratio * 0.94L : 1.0L;
+    for (size_t phase = 0; phase < phase_count; ++phase) {
+        const long double fraction =
+            static_cast<long double>(phase) / static_cast<long double>(phase_count);
+        std::array<long double, kTaps> weights{};
+        long double weight_sum = 0.0L;
+        for (size_t tap = 0; tap < kTaps; ++tap) {
+            const int64_t offset = static_cast<int64_t>(tap) - static_cast<int64_t>(kHalfTaps) + 1;
+            const long double distance = fraction - static_cast<long double>(offset);
+            long double weight = 0.0L;
+            if (std::abs(distance) < static_cast<long double>(kHalfTaps)) {
+                const long double window =
+                    0.5L + 0.5L * std::cos(kPi * distance / static_cast<long double>(kHalfTaps));
+                weight = cutoff * sinc(cutoff * distance) * window;
+            }
+            weights[tap] = weight;
+            weight_sum += weight;
+        }
+        if (std::abs(weight_sum) < 1.0e-12L)
+            continue;
+        for (size_t tap = 0; tap < kTaps; ++tap)
+            coefficients[phase * kTaps + tap] = static_cast<float>(weights[tap] / weight_sum);
+    }
+    return coefficients;
+}
+
+// Tables of the most recently used rate pairs: building one evaluates up to kMaxPhases x kTaps
+// long-double sines and cosines, more than resampling a short clip costs.
+std::shared_ptr<const std::vector<float>>
+shared_coefficients(int input_rate, int output_rate, size_t phase_count) {
+    constexpr size_t kCachedPairs = 16;
+    static std::mutex mutex;
+    static std::vector<std::pair<std::pair<int, int>, std::shared_ptr<const std::vector<float>>>>
+        cache;  // most recent last
+    const auto key = std::make_pair(input_rate, output_rate);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < cache.size(); ++i)
+            if (cache[i].first == key) {
+                auto entry = cache[i];
+                cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(i));
+                cache.push_back(entry);
+                return entry.second;
+            }
+    }
+    auto table = std::make_shared<const std::vector<float>>(
+        filter_coefficients(input_rate, output_rate, phase_count));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (cache.size() >= kCachedPairs)
+        cache.erase(cache.begin());
+    cache.emplace_back(key, table);
+    return table;
+}
+
 }  // namespace
 
 bool
@@ -76,33 +139,9 @@ AudioResampler::AudioResampler(int input_rate, int output_rate)
     exact_phase_table_ = exact_phase_count <= kMaxPhases;
     phase_count_ = static_cast<size_t>(
         exact_phase_table_ ? exact_phase_count : static_cast<uint64_t>(kMaxPhases));
-    coefficients_.resize(phase_count_ * kTaps);
-
-    const long double rate_ratio =
-        static_cast<long double>(output_rate_) / static_cast<long double>(input_rate_);
-    const long double cutoff = rate_ratio < 1.0L ? rate_ratio * 0.94L : 1.0L;
-    for (size_t phase = 0; phase < phase_count_; ++phase) {
-        const long double fraction =
-            static_cast<long double>(phase) / static_cast<long double>(phase_count_);
-        std::array<long double, kTaps> weights{};
-        long double weight_sum = 0.0L;
-        for (size_t tap = 0; tap < kTaps; ++tap) {
-            const int64_t offset = static_cast<int64_t>(tap) - static_cast<int64_t>(kHalfTaps) + 1;
-            const long double distance = fraction - static_cast<long double>(offset);
-            long double weight = 0.0L;
-            if (std::abs(distance) < static_cast<long double>(kHalfTaps)) {
-                const long double window =
-                    0.5L + 0.5L * std::cos(kPi * distance / static_cast<long double>(kHalfTaps));
-                weight = cutoff * sinc(cutoff * distance) * window;
-            }
-            weights[tap] = weight;
-            weight_sum += weight;
-        }
-        if (std::abs(weight_sum) < 1.0e-12L)
-            continue;
-        for (size_t tap = 0; tap < kTaps; ++tap)
-            coefficients_[phase * kTaps + tap] = static_cast<float>(weights[tap] / weight_sum);
-    }
+    coefficients_ = shared_coefficients(input_rate_, output_rate_, phase_count_);
+    step_whole_ = static_cast<uint64_t>(input_rate_) / static_cast<uint64_t>(output_rate_);
+    step_rem_ = static_cast<uint64_t>(input_rate_) % static_cast<uint64_t>(output_rate_);
 }
 
 void
@@ -164,19 +203,33 @@ AudioResampler::emit_available(bool final, std::vector<float>* output) {
 float
 AudioResampler::filtered_sample(uint64_t center, size_t phase) const {
     const int64_t first = static_cast<int64_t>(center) - static_cast<int64_t>(kHalfTaps) + 1;
-    const float* coefficients = coefficients_.data() + phase * kTaps;
-    double weighted = 0.0;
-    for (size_t tap = 0; tap < kTaps; ++tap)
-        weighted += static_cast<double>(input_sample(first + static_cast<int64_t>(tap))) *
-                    coefficients[tap];
-    return static_cast<float>(weighted);
+    const float* coefficients = coefficients_->data() + phase * kTaps;
+    // Four interleaved partial sums (vectorizable); taps inside the input read it directly, the
+    // first and last samples are clamped at the edges.
+    std::array<double, 4> weighted{};
+    if (first >= static_cast<int64_t>(input_start_) &&
+        first + static_cast<int64_t>(kTaps) <= static_cast<int64_t>(total_input_)) {
+        const float* x = input_.data() + (static_cast<uint64_t>(first) - input_start_);
+        for (size_t tap = 0; tap < kTaps; tap += 4)
+            for (size_t lane = 0; lane < 4; ++lane)
+                weighted[lane] += static_cast<double>(x[tap + lane]) * coefficients[tap + lane];
+    } else {
+        for (size_t tap = 0; tap < kTaps; ++tap)
+            weighted[tap % 4] +=
+                static_cast<double>(input_sample(first + static_cast<int64_t>(tap))) *
+                coefficients[tap];
+    }
+    return static_cast<float>((weighted[0] + weighted[1]) + (weighted[2] + weighted[3]));
 }
 
 void
 AudioResampler::advance_source_position() {
-    source_remainder_ += static_cast<uint64_t>(input_rate_);
-    source_index_ += source_remainder_ / static_cast<uint64_t>(output_rate_);
-    source_remainder_ %= static_cast<uint64_t>(output_rate_);
+    source_index_ += step_whole_;
+    source_remainder_ += step_rem_;
+    if (source_remainder_ >= static_cast<uint64_t>(output_rate_)) {
+        source_remainder_ -= static_cast<uint64_t>(output_rate_);
+        ++source_index_;
+    }
 }
 
 size_t

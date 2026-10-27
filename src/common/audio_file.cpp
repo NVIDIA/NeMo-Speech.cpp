@@ -12,6 +12,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "audio_ingest.h"
+
 namespace nemo_speech::audio {
 namespace {
 
@@ -128,6 +130,36 @@ is_wav_path(const std::string& path) {
 
 AudioFile
 load_wav_file(const std::string& path) {
+    DecodedAudio decoded = decode_file(path, IngestOptions::local_file());
+    AudioFile output;
+    output.samples = std::move(decoded.samples);
+    output.sample_rate = 16000;
+    output.source_channels = decoded.channels;
+    return output;
+}
+
+AudioFile
+load_wav_memory(
+    const void* data, size_t size, const std::string& source_name, const IngestOptions& options) {
+    try {
+        DecodedAudio decoded = decode_any(data, size, source_name, options);
+        AudioFile output;
+        output.samples = std::move(decoded.samples);
+        output.sample_rate = 16000;
+        output.source_channels = decoded.channels;
+        return output;
+    }
+    catch (const AudioLimitError& e) {
+        throw AudioLimitError(source_name + ": " + e.what());
+    }
+    catch (const AudioError& e) {
+        throw AudioError(e.http_status(), source_name + ": " + e.what());
+    }
+}
+
+// WAV at the file's native rate (see audio_file.h).
+AudioFile
+load_wav_native(const std::string& path) {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input)
         throw file_error(path, "cannot open audio file");
@@ -143,11 +175,6 @@ load_wav_file(const std::string& path) {
         throw file_error(path, "could not read the complete file");
 
     return parse_wav(bytes.data(), bytes.size(), path);
-}
-
-AudioFile
-load_wav_memory(const void* data, size_t size, const std::string& source_name) {
-    return parse_wav(static_cast<const uint8_t*>(data), size, source_name);
 }
 
 std::string

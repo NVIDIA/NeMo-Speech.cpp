@@ -148,14 +148,16 @@ applicable agreement is installed with the archive under
   0.11.25 at commit `9634bedb5b5a2ca38c1ee7108a9358a4e233f14d`, vendored by
   the pinned llama.cpp checkout
 - Path: `llama.cpp/vendor/miniaudio/miniaudio.h`
-- Copyright 2025 David Reid
+- Copyright 2026 David Reid
 - License: Public Domain (Unlicense) or MIT No Attribution (MIT-0); upstream
   text is reproduced at
   [`third_party/miniaudio/LICENSE`](third_party/miniaudio/LICENSE)
 
 The command-line microphone capture layer compiles miniaudio directly into
-`nemo-speech`. Release archives install its license under
-`share/licenses/nemo-speech/third_party/miniaudio/`.
+`nemo-speech`, and the audio ingest (`src/common/audio_miniaudio.cpp`) compiles
+its embedded dr_flac and dr_mp3 decoders into every build, with all miniaudio
+symbols internal to that translation unit. Release archives install its license
+under `share/licenses/nemo-speech/third_party/miniaudio/`.
 
 ### SentencePiece
 

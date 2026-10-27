@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "audio_ingest.h"
 #include "audio_resampler.h"
 
 namespace nemo_speech::audio {
@@ -33,12 +34,16 @@ tag_is(const uint8_t* bytes, const char* tag) {
 
 }  // namespace
 
-Pcm16StreamDecoder::Pcm16StreamDecoder(int configured_sample_rate)
-    : configured_sample_rate_(configured_sample_rate), sample_rate_(configured_sample_rate) {
+Pcm16StreamDecoder::Pcm16StreamDecoder(
+    int configured_sample_rate, StreamEncoding encoding, int channels)
+    : configured_sample_rate_(configured_sample_rate), sample_rate_(configured_sample_rate),
+      encoding_(encoding), channels_(channels) {
     if (configured_sample_rate_ != 0 && !supported_input_sample_rate(configured_sample_rate_)) {
         throw std::invalid_argument(
             "sample rate must be between 8000 and 96000 Hz, or 0 (WAV/model rate)");
     }
+    if (channels_ < 1 || channels_ > 255)
+        throw std::invalid_argument("channel count must be between 1 and 255");
 }
 
 void
@@ -134,12 +139,18 @@ Pcm16StreamDecoder::parse_header(std::vector<float>* output) {
             const uint16_t channels = read_u16(format + 2);
             const uint32_t rate = read_u32(format + 4);
             const uint16_t bits = read_u16(format + 14);
-            if (codec != 1)
-                throw std::invalid_argument("WAV codec is not PCM");
-            if (channels != 1)
-                throw std::invalid_argument("WAV audio must be mono");
-            if (bits != 16)
-                throw std::invalid_argument("WAV audio must use signed 16-bit PCM");
+            if (codec == 1 && bits == 16)
+                encoding_ = StreamEncoding::Pcm16;
+            else if (codec == 7 && bits == 8)
+                encoding_ = StreamEncoding::Mulaw;
+            else if (codec == 6 && bits == 8)
+                encoding_ = StreamEncoding::Alaw;
+            else
+                throw std::invalid_argument(
+                    "streamed WAV audio must be signed 16-bit PCM, mu-law or A-law");
+            if (channels < 1 || channels > 255)
+                throw std::invalid_argument("WAV channel count must be between 1 and 255");
+            channels_ = channels;
             if (rate > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
                 !supported_input_sample_rate(static_cast<int>(rate))) {
                 throw std::invalid_argument("WAV sample rate must be between 8000 and 96000 Hz");
@@ -167,24 +178,41 @@ Pcm16StreamDecoder::decode_wav_payload(
 
 void
 Pcm16StreamDecoder::decode_pcm(const uint8_t* bytes, size_t size, std::vector<float>* output) {
-    output->reserve(output->size() + (size + (have_carry_ ? 1u : 0u)) / 2);
+    const size_t sample_bytes = encoding_ == StreamEncoding::Pcm16 ? 2 : 1;
+    const size_t frame_bytes = sample_bytes * static_cast<size_t>(channels_);
+    auto emit = [&](const uint8_t* frame) {
+        int64_t sum = 0;
+        for (int c = 0; c < channels_; ++c) {
+            const uint8_t* s = frame + static_cast<size_t>(c) * sample_bytes;
+            int16_t value;
+            if (encoding_ == StreamEncoding::Pcm16)
+                value = static_cast<int16_t>(read_u16(s));
+            else if (encoding_ == StreamEncoding::Mulaw)
+                value = decode_mulaw(s[0]);
+            else
+                value = decode_alaw(s[0]);
+            sum += value;
+        }
+        const auto mono = static_cast<int16_t>(sum / channels_);
+        output->push_back(static_cast<float>(mono) * kPcm16Scale);
+    };
+    output->reserve(output->size() + (size + pending_.size()) / frame_bytes);
     size_t offset = 0;
-    if (have_carry_ && size != 0) {
-        const uint16_t bits =
-            static_cast<uint16_t>(carry_) | (static_cast<uint16_t>(bytes[0]) << 8);
-        output->push_back(static_cast<float>(static_cast<int16_t>(bits)) * kPcm16Scale);
-        have_carry_ = false;
-        offset = 1;
+    if (!pending_.empty()) {
+        const size_t need = std::min(frame_bytes - pending_.size(), size);
+        pending_.insert(pending_.end(), bytes, bytes + need);
+        offset = need;
+        if (pending_.size() < frame_bytes)
+            return;
+        emit(pending_.data());
+        pending_.clear();
     }
-    while (offset + 1 < size) {
-        const uint16_t bits = read_u16(bytes + offset);
-        output->push_back(static_cast<float>(static_cast<int16_t>(bits)) * kPcm16Scale);
-        offset += 2;
+    while (offset + frame_bytes <= size) {
+        emit(bytes + offset);
+        offset += frame_bytes;
     }
-    if (offset < size) {
-        carry_ = bytes[offset];
-        have_carry_ = true;
-    }
+    if (offset < size)
+        pending_.assign(bytes + offset, bytes + size);
 }
 
 void
@@ -203,8 +231,12 @@ Pcm16StreamDecoder::finish(std::vector<float>* output) {
     }
     if (mode_ == Mode::Wav && wav_data_remaining_ != 0)
         throw std::invalid_argument("truncated WAV data chunk");
-    if (have_carry_)
-        throw std::invalid_argument("signed 16-bit PCM stream has an odd byte count");
+    if (!pending_.empty()) {
+        throw std::invalid_argument(
+            channels_ == 1 && encoding_ == StreamEncoding::Pcm16
+                ? "signed 16-bit PCM stream has an odd byte count"
+                : "PCM stream ends inside a sample frame");
+    }
     finished_ = true;
 }
 

@@ -154,17 +154,53 @@ main() {
     }
     check(mismatch_rejected, "WAV/configured sample-rate mismatch is rejected");
 
-    bool stereo_rejected = false;
-    try {
-        const std::string stereo = make_wav(expected, 16000, 2);
+    {
+        // Multi-channel WAV is downmixed by the integer mean (truncation toward zero), split
+        // anywhere.
+        const std::vector<int16_t> interleaved = {100, 300, -1, -2, 32767, 32767, -32768, -32768};
+        const std::string stereo = make_wav(interleaved, 16000, 2);
         Pcm16StreamDecoder decoder;
         decoded.clear();
-        decoder.process(stereo, &decoded);
+        for (size_t offset = 0; offset < stereo.size(); offset += 3)
+            decoder.process(std::string_view(stereo).substr(offset, 3), &decoded);
+        decoder.finish(&decoded);
+        check(
+            decoder.channels() == 2 && matches(decoded, {200, -1, 32767, -32768}),
+            "stereo WAV is downmixed by the integer mean");
     }
-    catch (const std::invalid_argument&) {
-        stereo_rejected = true;
+    {
+        // Headerless G.711 and multi-channel raw PCM.
+        const std::string mulaw("\xff\x00\x7f\x80", 4);
+        Pcm16StreamDecoder ulaw(8000, nemo_speech::audio::StreamEncoding::Mulaw);
+        decoded.clear();
+        ulaw.process(mulaw, &decoded);
+        ulaw.finish(&decoded);
+        check(matches(decoded, {0, -32124, 0, 32124}), "raw mu-law decodes with the ITU table");
+        const std::string alaw("\xd5\x55", 2);
+        Pcm16StreamDecoder a(8000, nemo_speech::audio::StreamEncoding::Alaw);
+        decoded.clear();
+        a.process(alaw, &decoded);
+        a.finish(&decoded);
+        check(matches(decoded, {8, -8}), "raw A-law decodes with the ITU table");
+        std::string raw3;
+        append_pcm(raw3, {3, 4, 5, -3, -4, -6});
+        Pcm16StreamDecoder three(16000, nemo_speech::audio::StreamEncoding::Pcm16, 3);
+        decoded.clear();
+        for (char byte : raw3) three.process(reinterpret_cast<const uint8_t*>(&byte), 1, &decoded);
+        three.finish(&decoded);
+        check(matches(decoded, {4, -4}), "raw three-channel PCM is downmixed across chunk splits");
+        bool partial_rejected = false;
+        try {
+            Pcm16StreamDecoder two(16000, nemo_speech::audio::StreamEncoding::Pcm16, 2);
+            decoded.clear();
+            two.process(std::string(6, '\1'), &decoded);
+            two.finish(&decoded);
+        }
+        catch (const std::invalid_argument&) {
+            partial_rejected = true;
+        }
+        check(partial_rejected, "a partial multi-channel frame is rejected at finish");
     }
-    check(stereo_rejected, "non-mono WAV is rejected");
 
     bool odd_rejected = false;
     try {

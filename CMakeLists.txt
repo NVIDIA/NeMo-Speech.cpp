@@ -438,10 +438,9 @@ if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
 endif()
 install(FILES llama.cpp/LICENSE
     DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/ggml")
-if(NEMO_SPEECH_BUILD_ASR AND NEMO_SPEECH_BUILD_CLI AND NEMO_SPEECH_BUILD_MIC_CAPTURE)
-    install(FILES third_party/miniaudio/LICENSE
-        DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/miniaudio")
-endif()
+# miniaudio (dr_flac / dr_mp3) is compiled into every build (audio_ingest).
+install(FILES third_party/miniaudio/LICENSE
+    DESTINATION "${NEMO_SPEECH_THIRD_PARTY_LICENSE_DIR}/miniaudio")
 if(TARGET nemo_speech_cublas_shim)
     install(TARGETS nemo_speech_cublas_shim
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
