@@ -98,7 +98,7 @@ HTTP listener settings use the same precedence:
 | `--tls-key` / `http.tls-key` | none | TLS private-key path |
 | `--cors-origin` / `http.cors-origin` | none | allowed browser origin |
 | `--no-ui` / `http.playground` | playground on | disable the embedded playground |
-| `--threads` / `http.threads` | `4` | bounded worker pool |
+| `--threads` / `http.threads` | `4` | bounded worker pool; with a SALM model, `asr.salm.max_sequences + 8` |
 | `--max-upload-mb` / `http.max-upload-mb` | `512` | request-body limit |
 | `--read-timeout` / `http.read-timeout` | `30` | socket read timeout in seconds |
 | `--write-timeout` / `http.write-timeout` | `30` | socket write timeout in seconds |
@@ -157,14 +157,18 @@ nemo-speech health --url http://127.0.0.1:8080/ready
 ## HTTP endpoints
 
 Full request/response field reference: **[HTTP API reference](api.md)**.
+A command-line client built on the `openai` SDK covers these routes: **[clients/transcription](../clients/transcription/README.md)**.
 
 - `GET /`, `GET /health`, `GET /ready`, and `GET /version`
 - `GET /v1/models` - loaded model inventory (OpenAI SDK-compatible, with
   capability metadata)
 - `POST /v1/audio/transcriptions` - speech-to-text (OpenAI-compatible subset)
+- `POST /v1/chat/completions` - speech-LLM transcription with a custom instruction (SALM models;
+  one user message with an `input_audio` part)
 - `POST /v1/audio/speech` - text-to-speech (OpenAI-compatible subset)
 - `POST /v1/translations` - text translation
-- `POST /v1/audio/translations` - speech translation (ASR -> NMT)
+- `POST /v1/audio/translations` - speech translation (ASR -> NMT; without NMT a speech-LLM model
+  translates the speech itself)
 - `POST /v1/audio/speech/translations` - speech-to-speech translation (extension)
 - `POST /v1/audio/diarizations` - speaker segments (`/v1/diarizations` alias)
 - WebSocket `/v1/audio/transcriptions/realtime` - live PCM16 transcription
@@ -174,6 +178,13 @@ Full request/response field reference: **[HTTP API reference](api.md)**.
 OpenAI SDK compatibility is limited to model listing and the documented
 transcription and speech subsets. The translation and diarization routes are
 project extensions.
+
+With a SALM model, `POST /v1/chat/completions` takes the audio as an `input_audio` part of one
+user message (an optional `text` part is the instruction) and returns the transcript as the
+assistant message, with the structured result (language, words, speakers) in a top-level
+`transcription` object; see the [API reference](api.md#post-v1chatcompletions).
+Its limits are `http.chat.max-request-bytes` (JSON body, default 256 MiB) and
+`http.chat.max-audio-seconds` (default 3600); `http.chat.model-name` adds another accepted `model` id.
 
 The transcription socket accepts binary little-endian PCM16 frames; an
 optional `session.update` JSON event before the first frame sets session

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-add_library(nemo_speech_http_server STATIC http_server.cpp)
+add_library(nemo_speech_http_server STATIC http_server.cpp chat_api.cpp)
 if(NEMO_SPEECH_BUILD_S2S)
     target_sources(nemo_speech_http_server PRIVATE s2s_realtime.cpp)
 endif()

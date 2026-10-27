@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+#include "chat_api.h"
+
 namespace nemo_speech {
 class EngineRegistry;
 namespace http {
@@ -31,6 +33,8 @@ struct ServerConfig {
     int realtime_s2s_max_session_seconds = 300;
     size_t realtime_s2s_max_pending_function_responses = 64;
     bool realtime_s2s_output_text_events = false;
+    // Chat API limits (http.chat.*).
+    chat::ApiConfig chat;
 };
 
 class Server {

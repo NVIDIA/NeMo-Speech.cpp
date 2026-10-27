@@ -18,8 +18,10 @@ const client = new OpenAI({
   apiKey: process.env.NEMO_SPEECH_API_KEY ?? "local",
 });
 
+// The loaded transcription model's id: the server refuses any other `model`.
+const models = await client.models.list();
 const transcript = await client.audio.transcriptions.create({
-  model: "default",
+  model: models.data.find((model) => model.capability === "transcription").id,
   file: createReadStream(audioPath),
   response_format: "verbose_json",
 });
