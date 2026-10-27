@@ -1,25 +1,39 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-// Riva NMT protocol adapter. Translation and speech composition live in core.
+// Riva NMT protocol adapter. Translation and speech composition live in core. Without an NMT model
+// (or an NMT build) a speech-LLM recognizer that translates serves StreamingTranslateSpeechToText.
 #pragma once
 
 #include <grpcpp/grpcpp.h>
 
 #include <memory>
+#include <string>
 
+#include "recognizer.h"
 #include "riva/proto/riva_nmt.grpc.pb.h"
+#if defined(NEMO_SPEECH_BUILD_NMT)
 #include "speech_translator.h"
 #include "translator.h"
+#endif
 
 namespace nr_nmt = nvidia::riva::nmt;
 
 namespace nemo_speech {
+#if !defined(NEMO_SPEECH_BUILD_NMT)
+namespace nmt {
+class Translator;
+}
+namespace speech {
+class SpeechTranslator;
+}
+#endif
 
 class GrpcNmtService final : public nr_nmt::RivaTranslation::Service {
    public:
     GrpcNmtService(
         std::shared_ptr<nmt::Translator> translator,
-        std::shared_ptr<speech::SpeechTranslator> speech_translator = nullptr);
+        std::shared_ptr<speech::SpeechTranslator> speech_translator = nullptr,
+        std::shared_ptr<asr::Recognizer> speech_llm = nullptr);
     ~GrpcNmtService() override;
 
     grpc::Status TranslateText(
@@ -43,8 +57,17 @@ class GrpcNmtService final : public nr_nmt::RivaTranslation::Service {
             nr_nmt::StreamingTranslateSpeechToSpeechRequest>* stream) override;
 
    private:
+    // StreamingTranslateSpeechToText by speech_llm_: the whole stream, then one final result.
+    grpc::Status translate_with_speech_llm(
+        grpc::ServerContext* ctx,
+        grpc::ServerReaderWriter<
+            nr_nmt::StreamingTranslateSpeechToTextResponse,
+            nr_nmt::StreamingTranslateSpeechToTextRequest>* stream,
+        const nr_nmt::StreamingTranslateSpeechToTextConfig& config, const std::string& request_id);
+
     std::shared_ptr<nmt::Translator> translator_;
     std::shared_ptr<speech::SpeechTranslator> speech_translator_;
+    std::shared_ptr<asr::Recognizer> speech_llm_;  // translates when there is no NMT
 };
 
 }  // namespace nemo_speech

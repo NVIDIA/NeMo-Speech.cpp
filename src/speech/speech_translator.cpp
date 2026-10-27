@@ -5,11 +5,16 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "langpairs.h"
 
 namespace nemo_speech::speech {
 namespace {
+
+// Complete-audio backends buffer a stream until an endpoint or finish. The bound matches the
+// longest single request the speech-LLM backend serves; gRPC streams have no upload limit.
+constexpr double kMaxBufferedSeconds = 3600.0;
 
 std::string
 resolve_source_language(
@@ -51,7 +56,7 @@ translate_text(
         resolve_source_language(recognizer, requested_source, detected_languages);
     if (source.empty())
         throw std::invalid_argument(
-            "the source language could not be detected; provide source_language");
+            "the source language could not be detected; specify the source language");
     const auto output = translator.translate({transcript}, source, requested_target);
     SpeechTranslationResult result;
     result.transcript = transcript;
@@ -122,6 +127,34 @@ struct SpeechTranslationStream::Impl {
 #endif
     }
 
+    // Complete-audio backends: recognize what is buffered as one utterance.
+    void recognize_buffered() {
+        if (buffered.empty())
+            return;
+        const auto result = recognizer->recognize(
+            buffered.data(), buffered.size(), options.recognition,
+            options.recognition.language_code, buffered_rate);
+        buffered.clear();
+        emit_final(result);
+    }
+
+    void buffer(const float* samples, size_t count, int sample_rate) {
+        if (count == 0)
+            return;
+        if (!samples)
+            throw std::invalid_argument("speech translation audio is null");
+        const int rate = sample_rate > 0 ? sample_rate : recognizer->sample_rate();
+        if (buffered_rate != 0 && rate != buffered_rate)
+            throw std::invalid_argument("the input sample rate cannot change within a stream");
+        buffered_rate = rate;
+        if (static_cast<double>(buffered.size() + count) > kMaxBufferedSeconds * rate)
+            throw std::invalid_argument(
+                "speech translation audio exceeds " +
+                std::to_string(static_cast<int>(kMaxBufferedSeconds)) +
+                " s without an endpoint for this complete-audio recognizer");
+        buffered.insert(buffered.end(), samples, samples + count);
+    }
+
     void drain_finals() {
         auto result = recognition_stream->next();
         while (result && result->is_final && !cancelled) {
@@ -136,7 +169,10 @@ struct SpeechTranslationStream::Impl {
     std::shared_ptr<tts::Synthesizer> synthesizer;
     SpeechTranslationOptions options;
     SpeechTranslationCallbacks callbacks;
+    // Null for complete-audio backends, which recognize the buffered audio instead.
     std::unique_ptr<asr::RecognitionStream> recognition_stream;
+    std::vector<float> buffered;
+    int buffered_rate = 0;
     bool cancelled = false;
     bool finished = false;
 };
@@ -152,6 +188,10 @@ SpeechTranslationStream::push(const float* samples, size_t count, int sample_rat
         throw std::logic_error("cannot push audio after speech translation finish");
     if (impl_->cancelled)
         return;
+    if (!impl_->recognition_stream) {
+        impl_->buffer(samples, count, sample_rate);
+        return;
+    }
     impl_->recognition_stream->push(samples, count, sample_rate);
     impl_->drain_finals();
 }
@@ -162,6 +202,10 @@ SpeechTranslationStream::force_endpoint() {
         throw std::logic_error("cannot force an endpoint after speech translation finish");
     if (impl_->cancelled)
         return;
+    if (!impl_->recognition_stream) {
+        impl_->recognize_buffered();
+        return;
+    }
     impl_->recognition_stream->force_endpoint();
     impl_->drain_finals();
 }
@@ -173,6 +217,10 @@ SpeechTranslationStream::finish() {
     impl_->finished = true;
     if (impl_->cancelled)
         return;
+    if (!impl_->recognition_stream) {
+        impl_->recognize_buffered();
+        return;
+    }
     impl_->emit_final(impl_->recognition_stream->finish());
 }
 
@@ -223,8 +271,12 @@ SpeechTranslator::streaming_translate(
     }
     if (options.synthesize_speech && !can_synthesize())
         throw std::invalid_argument("speech synthesis requested without a TTS synthesizer");
-    const std::string language = options.recognition.language_code;
-    auto recognition = recognizer_->streaming_recognize(options.recognition, language);
+    // Backends without streaming (speech-LLM, offline-only transducers) recognize complete audio.
+    std::unique_ptr<asr::RecognitionStream> recognition;
+    if (recognizer_->supports_streaming()) {
+        const std::string language = options.recognition.language_code;
+        recognition = recognizer_->streaming_recognize(options.recognition, language);
+    }
     auto impl = std::make_unique<SpeechTranslationStream::Impl>(
         recognizer_, translator_, synthesizer_, std::move(options), std::move(callbacks),
         std::move(recognition));

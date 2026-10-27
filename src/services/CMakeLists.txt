@@ -18,12 +18,17 @@ if(NEMO_SPEECH_BUILD_TTS)
     )
 endif()
 
-if(NEMO_SPEECH_BUILD_NMT)
+# The Riva translation service: NMT text translation and speech cascades, and speech-to-text
+# translation by a speech-LLM recognizer, which needs no NMT build.
+if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_SPEECHLM)
     add_library(nemo_speech_grpc_nmt STATIC grpc_nmt.cc)
     target_include_directories(nemo_speech_grpc_nmt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(nemo_speech_grpc_nmt PUBLIC
-        nemo_speech_nmt
-        nemo_speech_speech
+        nemo_speech_asr
         riva_proto
     )
+    if(NEMO_SPEECH_BUILD_NMT)
+        target_link_libraries(nemo_speech_grpc_nmt PUBLIC nemo_speech_nmt nemo_speech_speech)
+        target_compile_definitions(nemo_speech_grpc_nmt PUBLIC NEMO_SPEECH_BUILD_NMT=1)
+    endif()
 endif()

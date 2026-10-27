@@ -20,6 +20,7 @@
 #include <thread>
 #include <utility>
 
+#include "engine_registry.h"
 #include "grpc_asr.h"
 #include "model_logging.h"
 #include "parameter_parser.h"
@@ -30,8 +31,10 @@
 #include "tts/magpietts/config.h"
 #include "tts/synthesizer.h"
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
 #include "grpc_nmt.h"
+#endif
+#if defined(NEMO_SPEECH_BUILD_NMT)
 #include "speech_translator.h"
 #include "translator.h"
 #endif
@@ -123,9 +126,11 @@ struct RivaServerConfig {
 };
 
 
+// A SALM encoder selects ASR on its own, so a missing LLM path reports the backend's error
+// instead of silently disabling ASR.
 bool
 asr_configured(const AsrServerConfig& cfg) {
-    return !cfg.recognizer.model.path.empty();
+    return !cfg.recognizer.model.path.empty() || !cfg.recognizer.salm.encoder_path.empty();
 }
 
 #if defined(NEMO_SPEECH_BUILD_TTS)
@@ -168,6 +173,11 @@ print_usage(const char* prog) {
               << "  --bind HOST:PORT   listen address (default 0.0.0.0:50051)\n"
               << "  --config FILE      YAML config file (applied before env and CLI)\n\n"
               << "Services are enabled automatically when their required model config is present.\n"
+              << "SALM: --asr.model.path DECODER.gguf (its encoder file next to it)\n"
+              << "      Concurrent Recognize requests are always batched continuously; of the\n"
+              << "      asr.batching.* keys only max_queue_depth applies. StreamingRecognize is\n"
+              << "      unavailable for SALM; StreamingTranslateSpeechTo* recognizes the complete\n"
+              << "      audio at the end of the stream.\n\n"
               << "Use each service's .enabled key to override automatic model detection.\n\n"
               << "Config keys (precedence: defaults < --config YAML < env < CLI):\n"
               << parser.Help() << "  Env: NEMO_SPEECH_<KEY> (dotted key uppercased, '.'->'_').\n";
@@ -338,6 +348,8 @@ main(int argc, char** argv) {
         ggml_runtime::keep_skinny_q8_weights_separate();
     }
 
+    nemo_speech::EngineRegistry engines;
+
     // Core capabilities outlive the protocol adapters.
     std::shared_ptr<nemo_speech::asr::Recognizer> recognizer;
 #if defined(NEMO_SPEECH_BUILD_TTS)
@@ -351,15 +363,14 @@ main(int argc, char** argv) {
 #if defined(NEMO_SPEECH_BUILD_TTS)
     std::unique_ptr<nemo_speech::GrpcTtsService> tts_service;
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
     std::unique_ptr<nemo_speech::GrpcNmtService> nmt_service;
 #endif
 
     if (enable_asr) {
         std::cerr << "[riva_server] loading ASR model: " << cfg.asr.recognizer.model.path << "\n";
         try {
-            recognizer =
-                std::make_shared<nemo_speech::asr::Recognizer>(std::move(cfg.asr.recognizer));
+            recognizer = engines.load_asr(std::move(cfg.asr.recognizer));
             // Force lazy graph/session setup before attaching any transport.
             std::cerr << "[riva_server] warming up ASR\n";
             recognizer->warmup();
@@ -432,9 +443,14 @@ main(int argc, char** argv) {
             std::make_unique<nemo_speech::GrpcTtsService>(synthesizer, cfg.tts.server.benchmark);
     }
 #endif
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
 #if defined(NEMO_SPEECH_BUILD_NMT)
-    if (translator) {
+    if (translator)
         nmt_service = std::make_unique<nemo_speech::GrpcNmtService>(translator, speech_translator);
+#endif
+    if (!nmt_service && recognizer && recognizer->supports_translation()) {
+        nmt_service = std::make_unique<nemo_speech::GrpcNmtService>(nullptr, nullptr, recognizer);
+        std::cerr << "[riva_server] speech-to-text translation by the speech-LLM (no NMT model)\n";
     }
 #endif
     grpc::EnableDefaultHealthCheckService(true);
@@ -449,7 +465,7 @@ main(int argc, char** argv) {
         builder.RegisterService(tts_service.get());
     }
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
     if (nmt_service) {
         builder.RegisterService(nmt_service.get());
     }
@@ -477,7 +493,7 @@ main(int argc, char** argv) {
     if (tts_service)
         add_service("TTS");
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
     if (nmt_service)
         add_service("NMT");
 #endif

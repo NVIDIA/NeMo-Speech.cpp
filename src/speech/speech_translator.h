@@ -43,6 +43,8 @@ struct SpeechTranslationCallbacks {
     std::function<bool(const SpeechTranslationResult&)> utterance_end;
 };
 
+// One translated utterance per ASR final. Recognizers that cannot stream (speech-LLM backends)
+// buffer the pushed audio and recognize it whole at force_endpoint() or finish().
 class SpeechTranslationStream {
    public:
     ~SpeechTranslationStream();

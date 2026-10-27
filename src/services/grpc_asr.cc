@@ -3,16 +3,19 @@
 // Riva-compatible gRPC ASR adapter.
 #include "grpc_asr.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <vector>
 
 #include "audio_decoder.h"
+#include "audio_ingest.h"
 #include "audio_resampler.h"
-#include "model.h"
+#include "grpc_status.h"
 #include "types.h"  // AsrRequestOptions, Result
 
 namespace nemo_speech {
@@ -41,41 +44,101 @@ dump_batch_metrics(const asr::Recognizer& recognizer, const char* label) {
                   << " full=" << m.capacity_batches << " ready_set=" << m.ready_set_batches
                   << " deadline=" << m.deadline_batches << " ready_mean=" << ready
                   << " compatible_mean=" << compatible << " wait_us=" << wait_us
-                  << " execution_us=" << execution_us << "\n";
+                  << " execution_us=" << execution_us << " cancelled=" << m.cancelled_items << "\n";
     };
-    const auto* model = recognizer.model();
-    print("frontend", model->fe().batch_metrics());
-    if (model->head_kind() == asr::HeadKind::Ctc) {
-        print("encoder", static_cast<const asr::CtcModel*>(model)->batch_metrics());
-    } else {
-        const auto* rnnt = static_cast<const asr::RnntModel*>(model);
-        print("encoder", rnnt->encoder_batch_metrics());
-        print("predictor", rnnt->predictor_batch_metrics());
-        print("joint", rnnt->joint_batch_metrics());
-    }
+    for (const auto& stage : recognizer.batch_metrics()) print(stage.first.c_str(), stage.second);
 }
 
 // Validate a RecognitionConfig against engine capabilities. Returns an empty
 // Status on success, or an INVALID_ARGUMENT with a helpful message.
+// Recognize decodes like the HTTP routes (audio_ingest.h): LINEAR_PCM and the G.711 encodings as
+// raw samples or WAV, FLAC (and WAV/MP3) by content. OGGOPUS is not decoded by this build.
+// Streaming takes raw or WAV LINEAR_PCM, MULAW and ALAW. Multi-channel audio is downmixed by the
+// integer channel mean (not Riva's "first channel only").
 grpc::Status
-validate_config(const nr_asr::RecognitionConfig& cfg) {
+validate_config(const nr_asr::RecognitionConfig& cfg, bool streaming) {
     // Riva clients commonly leave encoding unset (ENCODING_UNSPECIFIED=0) and
     // ship s16le PCM bytes. Treat unspecified as LINEAR_PCM.
-    const auto enc = cfg.encoding();
-    if (enc != nr_audio::LINEAR_PCM && enc != nr_audio::ENCODING_UNSPECIFIED) {
-        return grpc::Status(
-            grpc::StatusCode::INVALID_ARGUMENT, "Only LINEAR_PCM encoding is supported.");
+    switch (cfg.encoding()) {
+        case nr_audio::ENCODING_UNSPECIFIED:
+        case nr_audio::LINEAR_PCM:
+        case nr_audio::MULAW:
+        case nr_audio::ALAW:
+            break;
+        case nr_audio::FLAC:
+            if (streaming) {
+                return grpc::Status(
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "FLAC is accepted by Recognize; StreamingRecognize takes LINEAR_PCM, MULAW or "
+                    "ALAW.");
+            }
+            break;
+        case nr_audio::OGGOPUS:
+            return grpc::Status(
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "OGGOPUS is not supported by this build: use LINEAR_PCM, FLAC, MULAW or ALAW.");
+        default:
+            return grpc::Status(
+                grpc::StatusCode::INVALID_ARGUMENT,
+                "Unsupported encoding: use LINEAR_PCM, FLAC, MULAW or ALAW.");
     }
-    if (cfg.sample_rate_hertz() != 0 &&
-        !audio::supported_input_sample_rate(cfg.sample_rate_hertz())) {
+    if (cfg.sample_rate_hertz() < 0 ||
+        (streaming && cfg.sample_rate_hertz() != 0 &&
+         !audio::supported_input_sample_rate(cfg.sample_rate_hertz()))) {
         return grpc::Status(
             grpc::StatusCode::INVALID_ARGUMENT,
-            "sample_rate_hertz must be between 8000 and 96000, or 0 (model rate/WAV header).");
+            streaming
+                ? "sample_rate_hertz must be between 8000 and 96000, or 0 (model rate/WAV header)."
+                : "sample_rate_hertz must not be negative.");
     }
-    if (cfg.audio_channel_count() > 1) {
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Only mono audio supported.");
+    if (cfg.audio_channel_count() < 0 || cfg.audio_channel_count() > 255) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT, "audio_channel_count must be between 0 and 255.");
     }
     return grpc::Status::OK;
+}
+
+audio::StreamEncoding
+stream_encoding(const nr_asr::RecognitionConfig& cfg) {
+    switch (cfg.encoding()) {
+        case nr_audio::MULAW:
+            return audio::StreamEncoding::Mulaw;
+        case nr_audio::ALAW:
+            return audio::StreamEncoding::Alaw;
+        default:
+            return audio::StreamEncoding::Pcm16;
+    }
+}
+
+bool
+is_riff_wave(const std::string& bytes) {
+    return bytes.size() >= 12 && bytes.compare(0, 4, "RIFF") == 0 &&
+           bytes.compare(8, 4, "WAVE") == 0;
+}
+
+// A RecognizeRequest's audio as canonical 16 kHz mono samples, decoded exactly like the HTTP
+// routes: containers by content; headerless LINEAR_PCM / MULAW / ALAW with the rate and channel
+// count of their RecognitionConfig (rate 0: the model rate for PCM, 8 kHz for G.711; channels 0:
+// mono), decoded as the same samples in an uploaded WAV (integer downmix, then resampling to 16
+// kHz).
+audio::DecodedAudio
+decode_recognize_audio(
+    const nr_asr::RecognitionConfig& cfg, const std::string& bytes, int model_rate) {
+    if (bytes.empty())
+        throw std::invalid_argument("empty audio");
+    const auto enc = cfg.encoding();
+    const bool raw_pcm = enc == nr_audio::ENCODING_UNSPECIFIED || enc == nr_audio::LINEAR_PCM ||
+                         enc == nr_audio::MULAW || enc == nr_audio::ALAW;
+    if (!raw_pcm || is_riff_wave(bytes))
+        return audio::decode_any(bytes.data(), bytes.size(), "audio");
+    const auto encoding = enc == nr_audio::MULAW  ? audio::RawEncoding::Mulaw
+                          : enc == nr_audio::ALAW ? audio::RawEncoding::Alaw
+                                                  : audio::RawEncoding::Pcm16;
+    const int rate = cfg.sample_rate_hertz() > 0             ? cfg.sample_rate_hertz()
+                     : encoding == audio::RawEncoding::Pcm16 ? model_rate
+                                                             : 8000;
+    return audio::decode_raw(
+        bytes.data(), bytes.size(), encoding, rate, std::max(1, cfg.audio_channel_count()));
 }
 
 // Surface detected language(s) on the response: on
@@ -116,6 +179,9 @@ extract_options(const nr_asr::RecognitionConfig& cfg) {
             o.max_speaker_count = cfg.diarization_config().max_speaker_count();
     }
     for (const auto& sc : cfg.speech_contexts()) {
+        // A context without phrases boosts nothing; HTTP drops it the same way.
+        if (sc.phrases().empty())
+            continue;
         asr::AsrRequestOptions::Boost b;
         b.boost = sc.boost();
         for (const auto& p : sc.phrases()) b.phrases.push_back(p);
@@ -154,11 +220,13 @@ join_continuation(bool any_final, const std::string& text) {
 // proto. `continuation` adds the riva leading space that joins utterance
 // segments. When word offsets were requested the library populated alt.words
 // (with per-word language tags) and alt.language_codes; otherwise we synthesize
-// language-only WordInfo from the transcript (riva's no-offset language tagging).
+// language-only WordInfo from the transcript (riva's no-offset language tagging)
+// when `detected_languages`. Complete-audio backends echo the requested language
+// rather than detecting one, so they keep only the alternative-level code.
 void
 fill_proto_alternative(
     nr_asr::SpeechRecognitionAlternative* a, const asr::Alternative& alt, bool want_offsets,
-    bool continuation) {
+    bool continuation, bool detected_languages = true) {
     a->set_transcript(join_continuation(continuation, alt.transcript));
     a->set_confidence(alt.confidence);
     if (want_offsets) {
@@ -174,9 +242,20 @@ fill_proto_alternative(
                 wi->set_language_code(w.language_code);
         }
         for (const auto& lc : alt.language_codes) a->add_language_code(lc);
-    } else {
+    } else if (detected_languages) {
         add_detected_languages(a, alt.transcript, alt.language_codes);
+    } else {
+        for (const auto& lc : alt.language_codes) a->add_language_code(lc);
     }
+}
+
+// Client errors are returned quietly; server-side failures are also logged.
+grpc::Status
+request_failure(const std::string& operation) {
+    auto status = grpc_status_from_exception(std::current_exception());
+    if (status.error_code() == grpc::StatusCode::INTERNAL)
+        std::cerr << "[grpc_asr] " << operation << " EXCEPTION: " << status.error_message() << "\n";
+    return status;
 }
 
 template <class Fn>
@@ -185,18 +264,8 @@ guard_streaming_call(const char* operation, Fn&& fn) {
     try {
         return fn();
     }
-    catch (const std::invalid_argument& e) {
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, e.what());
-    }
-    catch (const std::exception& e) {
-        std::cerr << "[grpc_asr] StreamingRecognize " << operation << " EXCEPTION: " << e.what()
-                  << "\n";
-        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
-    }
     catch (...) {
-        std::cerr << "[grpc_asr] StreamingRecognize " << operation
-                  << " EXCEPTION: unknown (non-std)\n";
-        return grpc::Status(grpc::StatusCode::INTERNAL, "unknown internal error");
+        return request_failure(std::string("StreamingRecognize ") + operation);
     }
 }
 
@@ -220,14 +289,21 @@ class StreamingAsrSession {
             }
             const auto& config = first.streaming_config();
             const auto& recognition = config.config();
-            auto status = validate_config(recognition);
+            auto status = validate_config(recognition, /*streaming=*/true);
             if (!status.ok())
                 return status;
 
             interim_results_ = config.interim_results();
             options_ = extract_options(recognition);
             request_id_ = first.has_id() ? first.id().value() : std::string();
-            decoder_ = std::make_unique<audio::Pcm16StreamDecoder>(recognition.sample_rate_hertz());
+            // Without a configured rate the WAV header decides; headerless G.711 is then 8 kHz
+            // telephony audio and headerless PCM takes the model rate.
+            const auto encoding = stream_encoding(recognition);
+            default_rate_ =
+                encoding == audio::StreamEncoding::Pcm16 ? recognizer_->sample_rate() : 8000;
+            decoder_ = std::make_unique<audio::Pcm16StreamDecoder>(
+                recognition.sample_rate_hertz(), encoding,
+                std::max(1, recognition.audio_channel_count()));
             stream_ = recognizer_->streaming_recognize(
                 options_, recognition.language_code(), /*coordinate_ingress=*/true);
             started_ = true;
@@ -261,7 +337,7 @@ class StreamingAsrSession {
             if (audio_chunk_.empty())
                 return grpc::Status::OK;
             const int sample_rate =
-                decoder_->sample_rate() > 0 ? decoder_->sample_rate() : recognizer_->sample_rate();
+                decoder_->sample_rate() > 0 ? decoder_->sample_rate() : default_rate_;
             stream_->push(audio_chunk_.data(), audio_chunk_.size(), sample_rate);
             append_partial(drain_finals(responses), responses);
             return grpc::Status::OK;
@@ -279,8 +355,8 @@ class StreamingAsrSession {
             audio_chunk_.clear();
             decoder_->finish(&audio_chunk_);
             if (!audio_chunk_.empty()) {
-                const int sample_rate = decoder_->sample_rate() > 0 ? decoder_->sample_rate()
-                                                                    : recognizer_->sample_rate();
+                const int sample_rate =
+                    decoder_->sample_rate() > 0 ? decoder_->sample_rate() : default_rate_;
                 stream_->push(audio_chunk_.data(), audio_chunk_.size(), sample_rate);
                 (void)drain_finals(responses);
             }
@@ -360,6 +436,7 @@ class StreamingAsrSession {
     asr::Recognizer* recognizer_ = nullptr;
     std::unique_ptr<asr::RecognitionStream> stream_;
     std::unique_ptr<audio::Pcm16StreamDecoder> decoder_;
+    int default_rate_ = 0;
     asr::AsrRequestOptions options_;
     std::string request_id_;
     std::string last_emitted_transcript_;
@@ -386,29 +463,27 @@ GrpcAsrService::~GrpcAsrService() {
 
 grpc::Status
 GrpcAsrService::Recognize(
-    grpc::ServerContext* /*ctx*/, const nr_asr::RecognizeRequest* req,
+    grpc::ServerContext* ctx, const nr_asr::RecognizeRequest* req,
     nr_asr::RecognizeResponse* resp) {
     // The whole body is wrapped: any failure - validation, the PCM-decode
     // allocation, or inference - is request-fatal, never server-fatal. The
     // catch(...) backstop also turns a non-std-exception throw into a clean
     // gRPC status instead of std::terminate.
     try {
-        auto status = validate_config(req->config());
+        auto status = validate_config(req->config(), /*streaming=*/false);
         if (!status.ok())
             return status;
-        const asr::AsrRequestOptions opts = extract_options(req->config());
+        asr::AsrRequestOptions opts = extract_options(req->config());
+        // A cancelled call (client gone, deadline) drops its request (speech-LLM backends).
+        opts.cancelled = [ctx] { return ctx->IsCancelled(); };
 
-        audio::Pcm16StreamDecoder decoder(req->config().sample_rate_hertz());
-        std::vector<float> audio;
-        decoder.process(req->audio(), &audio);
-        decoder.finish(&audio);
-        if (audio.empty()) {
-            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "empty audio");
-        }
+        // Same decoders, resampler, downmix and limits as the HTTP routes (audio_ingest.h).
+        const audio::DecodedAudio decoded =
+            decode_recognize_audio(req->config(), req->audio(), recognizer_->sample_rate());
+        const std::vector<float>& audio = decoded.samples;
 
         const auto t0 = std::chrono::high_resolution_clock::now();
-        const int input_sample_rate =
-            decoder.sample_rate() > 0 ? decoder.sample_rate() : recognizer_->sample_rate();
+        const int input_sample_rate = 16000;
         const asr::Result r = recognizer_->recognize(
             audio.data(), audio.size(), opts, req->config().language_code(), input_sample_rate);
         const auto t1 = std::chrono::high_resolution_clock::now();
@@ -425,23 +500,18 @@ GrpcAsrService::Recognize(
         result->set_audio_processed(r.audio_processed);
         result->set_channel_tag(r.channel_tag);
         // All alternatives (N-best); the library already capped at max_alternatives.
+        // Only an acoustic model detects languages; offline backends report the request's.
+        const bool detected_languages = recognizer_->model() != nullptr;
         for (const auto& alt : r.alternatives) {
             fill_proto_alternative(
                 result->add_alternatives(), alt, opts.needs_word_timings(),
-                /*continuation=*/false);
+                /*continuation=*/false, detected_languages);
         }
     }
-    catch (const std::invalid_argument& e) {
-        // Client error (e.g. diarization requested without a loaded diarizer).
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, e.what());
-    }
-    catch (const std::exception& e) {
-        std::cerr << "[grpc_asr] Recognize EXCEPTION: " << e.what() << "\n";
-        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
-    }
     catch (...) {
-        std::cerr << "[grpc_asr] Recognize EXCEPTION: unknown (non-std)\n";
-        return grpc::Status(grpc::StatusCode::INTERNAL, "unknown internal error");
+        // invalid_argument (e.g. diarization without a diarizer) -> INVALID_ARGUMENT, a full
+        // queue -> RESOURCE_EXHAUSTED, shutdown -> UNAVAILABLE, anything else -> INTERNAL.
+        return request_failure("Recognize");
     }
     return grpc::Status::OK;
 }
@@ -514,8 +584,10 @@ GrpcAsrService::GetRivaSpeechRecognitionConfig(
     }
     params["language_code"] = langs;
     params["sample_rate_hertz"] = std::to_string(recognizer_->sample_rate());
-    params["streaming"] = "True";
-    params["type"] = "online";
+    params["streaming"] = recognizer_->supports_streaming() ? "True" : "False";
+    params["type"] = recognizer_->supports_streaming() ? "online" : "offline";
+    params["word_timestamps"] = recognizer_->supports_word_timestamps() ? "True" : "False";
+    params["speaker_diarization"] = recognizer_->supports_speaker_diarization() ? "True" : "False";
     return grpc::Status::OK;
 }
 
