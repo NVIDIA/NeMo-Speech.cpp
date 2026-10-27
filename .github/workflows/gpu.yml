@@ -82,6 +82,7 @@ jobs:
         run: |
           scripts/configure.sh cuda-speech \
             -DNEMO_SPEECH_BUILD_NMT=OFF \
+            -DNEMO_SPEECH_BUILD_SPEECHLM=ON \
             -DNEMO_SPEECH_BUILD_TESTS=ON \
             -DCMAKE_CUDA_ARCHITECTURES=89
 

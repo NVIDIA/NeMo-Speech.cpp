@@ -20,8 +20,8 @@
     config), so use a distinct -BuildDir for each.
 
 .PARAMETER Profile
-    Component preset: core, asr, server (core + NMT + HTTP), full, or developer
-    (full + tests, examples, and tools). Component switches add features.
+    Component preset: core, asr, server (core + NMT + speech-LLM + HTTP), full, or
+    developer (full + tests, examples, and tools). Component switches add features.
 
 .PARAMETER Grpc
     Also build the Riva-compatible riva_server. gRPC and protobuf are installed
@@ -31,6 +31,10 @@
     Also build the NMT translation component (links llama.cpp; checks out the
     llama.cpp submodule if needed). Combine with -Grpc for the gRPC TranslateText
     service. Convert the model separately - see docs/development/windows-build.md.
+
+.PARAMETER Speechlm
+    Also build speech-LLM transcription (SALM: speech encoder and
+    llama.cpp decoder; checks out the llama.cpp submodule if needed). Requires ASR.
 
 .PARAMETER Flashlight
     Build LM-fused CTC decoding with Flashlight and dynamically linked KenLM
@@ -94,6 +98,7 @@ param(
     [string]$Profile = 'core',
     [switch]$Grpc,
     [switch]$Nmt,
+    [switch]$Speechlm,
     [switch]$Flashlight,
     [switch]$TtsJa,
     [switch]$TtsZh,
@@ -134,6 +139,7 @@ $BuildAsr = $false
 $BuildDiar = $false
 $BuildTts = $false
 $BuildNmt = $false
+$BuildSpeechlm = $false
 $BuildHttp = $false
 $BuildGrpc = $false
 $BuildFlashlight = $false
@@ -148,16 +154,16 @@ switch ($Profile) {
     'asr'       { $BuildAsr = $true; $BuildDiar = $true }
     'server'    {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true
-        $BuildNmt = $true; $BuildHttp = $true
+        $BuildNmt = $true; $BuildSpeechlm = $true; $BuildHttp = $true
     }
     'full'      {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true; $BuildNmt = $true
-        $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
+        $BuildSpeechlm = $true; $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
         $BuildTtsJa = $true; $BuildTtsZh = $true
     }
     'developer' {
         $BuildAsr = $true; $BuildDiar = $true; $BuildTts = $true; $BuildNmt = $true
-        $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
+        $BuildSpeechlm = $true; $BuildHttp = $true; $BuildGrpc = $true; $BuildFlashlight = $true
         $BuildTtsJa = $true; $BuildTtsZh = $true
         $BuildTests = $true; $BuildExamples = $true; $BuildTools = $true
     }
@@ -165,6 +171,7 @@ switch ($Profile) {
 
 $BuildGrpc = $BuildGrpc -or $Grpc.IsPresent
 $BuildNmt = $BuildNmt -or $Nmt.IsPresent
+$BuildSpeechlm = $BuildSpeechlm -or $Speechlm.IsPresent
 $BuildFlashlight = $BuildFlashlight -or $Flashlight.IsPresent
 $BuildTtsJa = $BuildTtsJa -or $TtsJa.IsPresent
 $BuildTtsZh = $BuildTtsZh -or $TtsZh.IsPresent
@@ -173,6 +180,9 @@ $BuildHttpTls = $HttpTls.IsPresent
 $BuildTests = $BuildTests -or $Tests.IsPresent
 if ($BuildGrpc -and (-not $BuildAsr -or -not $BuildTts)) {
     throw 'The gRPC server currently requires both ASR and TTS. Use -Profile server, full, or developer.'
+}
+if ($BuildSpeechlm -and -not $BuildAsr) {
+    throw 'Speech-LLM transcription requires ASR. Use -Profile asr, server, full, or developer.'
 }
 if ($BuildFlashlight -and -not $BuildAsr) {
     throw 'The Flashlight decoder requires ASR. Use -Profile asr, server, full, or developer.'
@@ -221,7 +231,7 @@ if ($BuildHttpTls) { $VcpkgFeatures.Add('http-tls') }
 if ($BuildExamples) { $VcpkgFeatures.Add('examples') }
 
 Write-Host "==> nemo-speech Windows build" -ForegroundColor Cyan
-Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
+Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt speechlm=$BuildSpeechlm http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
 Write-Host "    config=$Config compiler=$Compiler host=$HostArch target=$TargetArch build=$BuildDir jobs=$Jobs cublas-shim=$($CublasShim.IsPresent)"
 Write-Host "    vcpkg=$($VcpkgFeatures -join ',') triplet=$VcpkgTriplet"
 if ($DryRun) { return }
@@ -387,6 +397,7 @@ $configureArgs = @(
     "-DNEMO_SPEECH_BUILD_DIAR=$(ConvertTo-CMakeBool $BuildDiar)",
     "-DNEMO_SPEECH_BUILD_TTS=$(ConvertTo-CMakeBool $BuildTts)",
     "-DNEMO_SPEECH_BUILD_NMT=$(ConvertTo-CMakeBool $BuildNmt)",
+    "-DNEMO_SPEECH_BUILD_SPEECHLM=$(ConvertTo-CMakeBool $BuildSpeechlm)",
     "-DNEMO_SPEECH_BUILD_HTTP=$(ConvertTo-CMakeBool $BuildHttp)",
     "-DNEMO_SPEECH_HTTP_TLS=$(ConvertTo-CMakeBool $BuildHttpTls)",
     "-DNEMO_SPEECH_BUILD_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",

@@ -221,6 +221,7 @@
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
+        "NEMO_SPEECH_BUILD_SPEECHLM": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
@@ -232,6 +233,7 @@
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
+        "NEMO_SPEECH_BUILD_SPEECHLM": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
@@ -256,6 +258,7 @@
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
+        "NEMO_SPEECH_BUILD_SPEECHLM": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
@@ -267,6 +270,7 @@
       "cacheVariables": {
         "NEMO_SPEECH_BUILD_TTS": "ON",
         "NEMO_SPEECH_BUILD_NMT": "ON",
+        "NEMO_SPEECH_BUILD_SPEECHLM": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "OFF"
       }
@@ -290,6 +294,7 @@
       "inherits": "cpu-speech",
       "displayName": "CPU developer build",
       "cacheVariables": {
+        "NEMO_SPEECH_BUILD_SPEECHLM": "ON",
         "NEMO_SPEECH_BUILD_HTTP": "ON",
         "NEMO_SPEECH_BUILD_GRPC": "ON",
         "NEMO_SPEECH_BUILD_TESTS": "ON",

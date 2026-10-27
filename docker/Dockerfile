@@ -39,6 +39,8 @@ ARG ENABLE_TESTS=OFF
 ARG ENABLE_NMT=OFF
 # Full-duplex VoiceChat via llama.cpp. Set ON to build realtime server support.
 ARG ENABLE_S2S=OFF
+# SALM speech-LLM transcription (speech encoder + llama.cpp decoder). Set OFF to leave it out.
+ARG ENABLE_SPEECHLM=ON
 # Build ggml and llama.cpp with patches/ applied (CMake applies them). Set OFF to
 # build against pristine upstream llama.cpp (stock ggml ops only).
 ARG ENABLE_GGML_PATCHES=ON
@@ -65,6 +67,7 @@ ARG ENABLE_TTS_ZH
 ARG ENABLE_TESTS
 ARG ENABLE_NMT
 ARG ENABLE_S2S
+ARG ENABLE_SPEECHLM
 ARG ENABLE_GGML_PATCHES
 ARG JOBS
 ARG CUDA_ARCH
@@ -179,6 +182,7 @@ RUN cmake -G Ninja -S /work -B /work/build \
         -DNEMO_SPEECH_TTS_WITH_ZH=${ENABLE_TTS_ZH} \
         -DNEMO_SPEECH_BUILD_NMT=${ENABLE_NMT} \
         -DNEMO_SPEECH_BUILD_S2S=${ENABLE_S2S} \
+        -DNEMO_SPEECH_BUILD_SPEECHLM=${ENABLE_SPEECHLM} \
         -DNEMO_SPEECH_BUILD_TESTS=${ENABLE_TESTS} \
         -DNEMO_SPEECH_BUILD_TOOLS=${ENABLE_TESTS} \
     && cmake --build /work/build ${JOBS:+-- -j${JOBS}}

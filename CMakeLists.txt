@@ -249,6 +249,13 @@ if(GGML_CUDA)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
+
+# nvcc's host compiler on Windows is always cl.exe, and CCCL 3.2+ (CUDA 13) rejects its traditional
+# preprocessor (https://github.com/NVIDIA/cccl/pull/6827). ggml-cuda sets this for its own sources;
+# cover the in-tree CUDA targets created below (cuBLAS shim, MagpieTTS kernels).
+if(GGML_CUDA AND WIN32)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
 if(GGML_VULKAN)
     install(TARGETS ggml-vulkan
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

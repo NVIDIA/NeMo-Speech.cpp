@@ -73,6 +73,7 @@ jobs:
         run: |
           scripts/configure.sh cpu-speech \
             -DNEMO_SPEECH_BUILD_NMT=OFF \
+            -DNEMO_SPEECH_BUILD_SPEECHLM=ON \
             -DNEMO_SPEECH_BUILD_TESTS=ON
 
       - name: Build
@@ -120,6 +121,7 @@ jobs:
         run: |
           scripts/configure.sh metal-speech \
             -DNEMO_SPEECH_BUILD_NMT=OFF \
+            -DNEMO_SPEECH_BUILD_SPEECHLM=ON \
             -DNEMO_SPEECH_BUILD_TESTS=ON
 
       - name: Build
@@ -192,7 +194,7 @@ jobs:
         id: build
         shell: pwsh
         run: |
-          scripts\windows\build.ps1 -Backend cpu -Profile core -Tests `
+          scripts\windows\build.ps1 -Backend cpu -Profile core -Speechlm -Tests `
             -BuildDir "${{ github.workspace }}\build\windows-cpu"
 
       - name: Save vcpkg binaries

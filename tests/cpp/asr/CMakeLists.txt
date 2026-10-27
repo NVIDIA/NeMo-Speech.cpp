@@ -103,7 +103,9 @@ target_link_libraries(asr_c_dlopen PRIVATE ${CMAKE_DL_LIBS})
 # repacked. The kernel exists only in the patched CUDA ggml. Skips itself (exit 77) without a GPU.
 if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     add_executable(test_skinny_q8_dispatch test_skinny_q8_dispatch.cpp)
-    target_link_libraries(test_skinny_q8_dispatch PRIVATE ggml)
+    # Links ggml directly, so runtime_ggml's PUBLIC CUDA::cuda_driver stub doesn't
+    # reach it; link the stub here to resolve libggml-cuda's libcuda.so.1 NEEDED entry.
+    target_link_libraries(test_skinny_q8_dispatch PRIVATE ggml CUDA::cuda_driver)
     add_test(NAME skinny_q8_dispatch COMMAND test_skinny_q8_dispatch)
     set_tests_properties(skinny_q8_dispatch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()

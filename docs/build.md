@@ -15,7 +15,8 @@ platform without a suitable release artifact.
   in Homebrew's package), the Abseil development package as well; and
 - any toolkit required by the selected backend.
 
-CUDA 12 and 13 are supported. Outside the Windows build driver, gRPC builds
+CUDA 12 and 13 are supported; CUDA builds with `patches/` (the default) need
+CUDA 12.8 or newer. Outside the Windows build driver, gRPC builds
 additionally need compatible gRPC, Protobuf compiler/runtime, and Abseil
 development packages from a mutually compatible package set.
 
@@ -57,8 +58,8 @@ only when selecting those features; see the platform sections below.
 ### Backend toolkits
 
 - CPU builds need no accelerator toolkit.
-- CUDA builds need a supported CUDA 12 or 13 toolkit (including `nvcc`) at
-  build time and a compatible NVIDIA driver at run time. Set
+- CUDA builds need a supported CUDA 12 or 13 toolkit (including `nvcc`; 12.8
+  or newer with `patches/`) at build time and a compatible NVIDIA driver at run time. Set
   `CMAKE_CUDA_ARCHITECTURES` when the output must run on GPUs other than the
   build host.
 - Vulkan builds need Vulkan headers and loader development files, `glslc`, and
@@ -108,7 +109,7 @@ component sets. VoiceChat also provides a focused `cuda-s2s` preset. Run
 | `cuda-s2s` | CUDA VoiceChat pipeline and realtime WebSocket server |
 | `metal-nmt` | Metal-enabled NMT build |
 | `vulkan-diar` | Vulkan standalone diarization build |
-| `<backend>-server` | ASR, diarization, NMT, TTS, HTTP API, realtime WebSocket, and playground |
+| `<backend>-server` | ASR, diarization, speech-LLM transcription, NMT, TTS, HTTP API, realtime WebSocket, and playground |
 | `cuda-full` | CUDA server plus normalization, Flashlight, and language frontends (prepare the [optional dependencies](#optional-dependencies) first) |
 | `developer` | CPU speech components plus HTTP, gRPC, examples, tests, and tools |
 
@@ -146,6 +147,7 @@ how to edit them.
 | `NEMO_SPEECH_BUILD_DIAR` | ON | Standalone and ASR-integrated diarization |
 | `NEMO_SPEECH_BUILD_TTS` | ON | TTS runtime, C ABI, and CLI |
 | `NEMO_SPEECH_BUILD_NMT` | OFF | NMT through llama.cpp |
+| `NEMO_SPEECH_BUILD_SPEECHLM` | OFF | Speech-LLM transcription through llama.cpp ([SALM](salm/README.md); needs ASR) |
 | `NEMO_SPEECH_BUILD_S2S` | OFF | VoiceChat runtime and realtime server integration |
 | `NEMO_SPEECH_BUILD_CLI` | ON | Unified `nemo-speech` executable |
 | `NEMO_SPEECH_BUILD_MIC_CAPTURE` | ON | Microphone capture in the CLI and live example |
