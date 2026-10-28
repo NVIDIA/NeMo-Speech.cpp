@@ -29,17 +29,12 @@ Start with:
 
 ## SALM (speech-LLM)
 
-- [Overview](salm/README.md) - quick start and what it does not support.
-- [Models and platforms](salm/models.md) - the model files and which builds run
-  the batched path.
+- [Guide](salm/README.md) - getting started, transcription, word timestamps and
+  speakers, your own instructions, speech translation, and streamed output.
+- [Models and platforms](salm/models.md) - the model names, files and conversion,
+  and which builds decode many requests together.
 - [Configuration](salm/configuration.md) - `asr.salm.*` keys, settings for smaller
-  GPUs, concurrency and errors.
-- [Transcripts and translation](salm/transcripts.md) - language, length, silence,
-  custom instructions, streamed output, and speech translation.
-- [Prompts](salm/prompts.md) - the prompts the server sends and example custom
-  instructions.
-- [Word timestamps and speakers](salm/timestamps-and-speakers.md) - how each
-  entrypoint requests them, and speaker turns alone.
+  and larger GPUs, concurrency and errors.
 
 ## TTS
 
