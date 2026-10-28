@@ -69,9 +69,10 @@ $VulkanSdk = @{
 $VsBootstrapper = 'https://aka.ms/vs/17/release/vs_buildtools.exe'
 
 function Get-Download([string]$Url, [string]$Path) {
-    # A transfer slower than 100 kB/s for a minute is abandoned and retried.
-    curl.exe -fsSL --retry 6 --retry-all-errors --retry-delay 20 --connect-timeout 30 `
-        --speed-limit 100000 --speed-time 60 -o $Path $Url
+    # A transfer slower than 100 kB/s for a minute, or still running after 10 minutes, is
+    # abandoned and retried (a Chocolatey download of the Vulkan SDK once hung for 45).
+    curl.exe -fsSL --retry 4 --retry-all-errors --retry-delay 20 --connect-timeout 30 `
+        --speed-limit 100000 --speed-time 60 --max-time 600 -o $Path $Url
     if ($LASTEXITCODE -ne 0) { throw "download failed ($LASTEXITCODE): $Url" }
 }
 

@@ -423,7 +423,7 @@ jobs:
       - name: Install the Vulkan SDK
         # From LunarG (pinned, SHA-256): Chocolatey's package stalled a job for hours.
         if: matrix.backend == 'vulkan'
-        timeout-minutes: 20
+        timeout-minutes: 60
         shell: pwsh
         run: scripts\windows\install-build-prerequisites.ps1 -Install vulkan
 
