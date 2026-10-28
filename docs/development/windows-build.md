@@ -104,6 +104,33 @@ Key parameters: `-Backend cuda|vulkan|cpu`,
 Binaries land in `build-<backend>[-<profile>][-<architecture>]\bin`; the default
 `core` and `auto` suffixes are omitted.
 
+### Cross-compiling CUDA for Windows on Arm
+
+An x64 machine can build the ARM64 CUDA binaries for Windows on Arm (RTX
+Spark); the build host needs no GPU. Requirements, besides the components above:
+
+- CUDA Toolkit 13.4 or newer: the x64 toolkit ships the Windows ARM64 target
+  libraries in `lib\arm64` and `bin\arm64`.
+- The Visual Studio `VC.Tools.ARM64` and `VC.Llvm.Clang` components (`clang-cl`).
+- An explicit `-CudaArch`; `native` would detect the build host's GPU.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cuda -Profile server `
+    -Architecture arm64 -CudaArch 121a-real -CublasShim `
+    -CMakeArgs '-DGGML_NATIVE=OFF','-DGGML_CPU_ARM_ARCH=armv8.6-a+fp16'
+powershell -ExecutionPolicy Bypass -File scripts\windows\package-release.ps1 `
+    -BuildDir build-cuda-server-arm64 -Backend cuda -Architecture arm64
+```
+
+The driver imports the x64-hosted ARM64 environment (`vcvarsamd64_arm64.bat`),
+compiles C/C++ with `clang-cl`, and runs `nvcc` with the ARM64-targeting `cl.exe`
+and `--use-local-env`, so that `nvcc` does not set up its own x64 environment.
+`GGML_NATIVE` is off when cross-compiling, so set the CPU baseline with
+`GGML_CPU_ARM_ARCH`; `armv8.6-a+fp16` (dotprod, i8mm, bf16, fp16) matches RTX
+Spark, and without it the CPU backend targets plain ARMv8.0. ARM64 CUDA binaries
+cannot run on the x64 build host; test them on the target. CUDA
+cross-compilation is supported only from x64 to ARM64.
+
 ## Build with raw CMake
 
 If you prefer to drive CMake yourself, run from an **x64 Native Tools** prompt

@@ -374,7 +374,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: Windows x86_64 ${{ matrix.backend }}
+    name: Windows ${{ matrix.artifact_arch }} ${{ matrix.backend }}
     needs: prepare
     if: needs.prepare.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
@@ -383,10 +383,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { backend: cpu, runner: windows-2022 }
-          - { backend: vulkan, runner: windows-2022 }
-          - backend: cuda
+          - { arch: x64, artifact_arch: x86_64, backend: cpu, runner: windows-2022 }
+          - { arch: x64, artifact_arch: x86_64, backend: vulkan, runner: windows-2022 }
+          - arch: x64
+            artifact_arch: x86_64
+            backend: cuda
             runner: ${{ vars.RELEASE_WINDOWS_CUDA_RUNNER || 'windows-2022' }}
+            cuda_arch: "75-real;80-virtual;86-real;89-real;120a-real"
+          # RTX Spark (Windows on Arm), cross-compiled on an x64 runner. Its Cortex-X925/A725
+          # cores have dotprod, i8mm, bf16 and fp16; the CPU backend does not use SVE.
+          - arch: arm64
+            artifact_arch: aarch64
+            backend: cuda
+            runner: ${{ vars.RELEASE_WINDOWS_CUDA_RUNNER || 'windows-2022' }}
+            cuda_arch: "121a-real"
+            cmake_args: "-DGGML_CPU_ARM_ARCH=armv8.6-a+fp16"
     steps:
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -437,36 +448,76 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan"
           Add-Content -Path $env:GITHUB_PATH -Value "$vulkan\Bin"
 
+      - name: Install the ARM64 C++ tools
+        # Cross-compiling needs the x64-hosted ARM64 MSVC tools and clang-cl.
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $missing = @('Microsoft.VisualStudio.Component.VC.Tools.ARM64', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang') |
+            Where-Object { -not (& $vswhere -latest -products * -requires $_ -property installationPath) }
+          if (-not $missing) { exit 0 }
+          $arguments = @('modify', '--installPath', "`"$vs`"", '--quiet', '--norestart') + ($missing | ForEach-Object { '--add', $_ })
+          $process = Start-Process "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -notin 0, 3010) { throw "Visual Studio installer failed ($($process.ExitCode))" }
+
       - name: Install the CUDA toolkit
-        if: matrix.backend == 'cuda'
+        if: matrix.backend == 'cuda' && matrix.arch == 'x64'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: "13.0.0"
           method: network
+
+      - name: Install the CUDA toolkit with Windows ARM64 targets
+        # 13.4 is the first x64 toolkit with the Windows ARM64 target libraries (lib\arm64).
+        if: matrix.backend == 'cuda' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = 'cuda_13.4.3_windows_x86_64.exe'
+          # From https://developer.download.nvidia.com/compute/cuda/13.4.3/docs/sidebar/md5sum.txt
+          $md5 = 'b37e0f7cf3f37cda02d0b0a2ef7e4fad'
+          $path = Join-Path $env:RUNNER_TEMP $installer
+          curl.exe -fsSL --retry 3 -o $path "https://developer.download.nvidia.com/compute/cuda/13.4.3/local_installers/$installer"
+          if ($LASTEXITCODE -ne 0) { throw "download failed ($LASTEXITCODE)" }
+          if ((Get-FileHash -Algorithm MD5 $path).Hash -ne $md5) { throw "$installer checksum mismatch" }
+          $process = Start-Process $path -ArgumentList '-s', '-n' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer failed ($($process.ExitCode))" }
+          $cuda = "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+          if (-not (Test-Path "$cuda\lib\arm64\cudart.lib")) { throw 'the CUDA toolkit has no Windows ARM64 target libraries' }
+          Add-Content -Path $env:GITHUB_ENV -Value "CUDA_PATH=$cuda"
+          Add-Content -Path $env:GITHUB_PATH -Value "$cuda\bin"
 
       - name: Restore vcpkg binaries
         id: vcpkg-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~\AppData\Local\vcpkg\archives
-          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
-          restore-keys: vcpkg-windows-x64-
+          key: vcpkg-windows-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
+          restore-keys: vcpkg-windows-${{ matrix.arch }}-
 
       - name: Build
         id: build
         shell: pwsh
         env:
+          ARCH: ${{ matrix.arch }}
           BACKEND: ${{ matrix.backend }}
+          CUDA_ARCH: ${{ matrix.cuda_arch }}
+          EXTRA_CMAKE_ARGS: ${{ matrix.cmake_args }}
           VERSION_METADATA: ${{ needs.prepare.outputs.version_metadata }}
         run: |
           $arguments = @{
-            Backend   = $env:BACKEND
-            Profile   = 'server'
-            BuildDir  = "${{ github.workspace }}\build\release-$env:BACKEND"
-            CMakeArgs = @('-DGGML_NATIVE=OFF', "-DNEMO_SPEECH_VERSION_METADATA=$env:VERSION_METADATA")
+            Backend      = $env:BACKEND
+            Profile      = 'server'
+            Architecture = $env:ARCH
+            BuildDir     = "${{ github.workspace }}\build\release-$env:BACKEND"
+            CMakeArgs    = @('-DGGML_NATIVE=OFF', "-DNEMO_SPEECH_VERSION_METADATA=$env:VERSION_METADATA")
           }
+          if ($env:EXTRA_CMAKE_ARGS) { $arguments.CMakeArgs += $env:EXTRA_CMAKE_ARGS -split ' ' }
           if ($env:BACKEND -eq 'cuda') {
-            $arguments.CudaArch = '75-real;80-virtual;86-real;89-real;120a-real'
+            $arguments.CudaArch = $env:CUDA_ARCH
             $arguments.CublasShim = $true
           }
           scripts\windows\build.ps1 @arguments
@@ -481,10 +532,11 @@ jobs:
       - name: Package
         shell: pwsh
         env:
+          ARCH: ${{ matrix.arch }}
           BACKEND: ${{ matrix.backend }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          scripts\windows\package-release.ps1 -BuildDir "build\release-$env:BACKEND" `
+          scripts\windows\package-release.ps1 -BuildDir "build\release-$env:BACKEND" -Architecture $env:ARCH `
             -Backend $env:BACKEND -Version $env:RELEASE_VERSION -OutputDir release-artifacts
 
       - name: Restore cached models
@@ -509,7 +561,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-windows-x86_64-${{ matrix.backend }}
+          name: release-windows-${{ matrix.artifact_arch }}-${{ matrix.backend }}
           path: release-artifacts/*
           if-no-files-found: error
 
@@ -541,13 +593,13 @@ jobs:
                       macos-aarch64-cpu macos-aarch64-metal macos-x86_64-cpu; do
             expected="$expected nemo-speech-$VERSION-$name.tar.gz"
           done
-          for name in windows-x86_64-cpu windows-x86_64-vulkan windows-x86_64-cuda; do
+          for name in windows-x86_64-cpu windows-x86_64-vulkan windows-x86_64-cuda windows-aarch64-cuda; do
             expected="$expected nemo-speech-$VERSION-$name.zip"
           done
           actual="$(cd dist && ls -- *.tar.gz *.zip | sort | tr '\n' ' ')"
           wanted="$(printf '%s\n' $expected | sort | tr '\n' ' ')"
           if [ "$actual" != "$wanted" ]; then
-            echo "::error::archive set differs from the expected 13"
+            echo "::error::archive set differs from the expected 14"
             diff <(printf '%s\n' $wanted) <(printf '%s\n' $actual) || true
             exit 1
           fi

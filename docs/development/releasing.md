@@ -10,6 +10,7 @@ download, checks them, and publishes them to GitHub Releases.
 | Linux aarch64 | `cpu`, `vulkan`, `cuda12` (Orin), `cuda13` (Thor, DGX Spark) | `docker/Dockerfile.release-linux` |
 | macOS | `aarch64-cpu`, `aarch64-metal`, `x86_64-cpu` | `macos-15`, `macos-15-intel` |
 | Windows x86_64 | `cpu`, `vulkan`, `cuda` | `scripts/windows/build.ps1` |
+| Windows aarch64 | `cuda` (RTX Spark) | `scripts/windows/build.ps1`, cross-compiled on x64 with CUDA 13.4 |
 
 Archives are named `nemo-speech-<version>-<os>-<arch>-<backend>.tar.gz`
 (`.zip` on Windows), contain a single directory of the same name, and ship
@@ -62,7 +63,9 @@ run the workflow as a dry run once copy-pr-bot mirrors them to a
 - **Smoke tests:** CPU archives run `tests/ci/model_smoke.py` on their runner.
   The x86_64 Linux and Windows CUDA archives run it on L4 GPUs; the Windows run
   blocks only tagged releases. Linux Vulkan archives only start (`--version`);
-  the aarch64 CUDA and Windows Vulkan archives are not run. On Linux and macOS
+  the aarch64 CUDA (Linux and Windows) and Windows Vulkan archives are not run.
+  The cross-compiled Windows aarch64 archive is checked to contain only ARM64
+  binaries. On Linux and macOS
   the test also synthesizes digits through TN and transcribes them back through
   ITN.
 
@@ -95,4 +98,9 @@ scripts/release/package-macos.sh --install-prefix <prefix> --backend metal --arc
 ```powershell
 # Windows, after scripts\windows\build.ps1 -Backend cpu -Profile server -CMakeArgs '-DGGML_NATIVE=OFF'
 scripts\windows\package-release.ps1 -BuildDir <build dir> -Backend cpu
+
+# Windows on Arm CUDA, cross-compiled on x64 (see docs/development/windows-build.md), after
+# scripts\windows\build.ps1 -Backend cuda -Profile server -Architecture arm64 -CudaArch 121a-real -CublasShim `
+#     -CMakeArgs '-DGGML_NATIVE=OFF','-DGGML_CPU_ARM_ARCH=armv8.6-a+fp16'
+scripts\windows\package-release.ps1 -BuildDir <build dir> -Backend cuda -Architecture arm64
 ```

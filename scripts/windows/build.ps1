@@ -80,7 +80,11 @@
     cl.exe as its CUDA host compiler regardless of this setting.
 
 .PARAMETER Architecture
-    Target architecture: auto (the host), x64, or arm64.
+    Target architecture: auto (the host), x64, or arm64. CUDA builds can
+    cross-compile from an x64 host to arm64 (Windows on Arm): this needs a CUDA
+    Toolkit with Windows ARM64 target libraries (13.4 or newer, lib\arm64), the
+    Visual Studio ARM64 C++ tools, clang-cl, and an explicit -CudaArch.
+
 .PARAMETER CMakeArgs
     Extra arguments appended to the CMake configure command, for example
     -CMakeArgs '-DGGML_NATIVE=OFF'.
@@ -89,6 +93,7 @@
     pwsh scripts\windows\build.ps1 -Backend cuda -Profile server
     pwsh scripts\windows\build.ps1 -Backend cpu -Profile full
     pwsh scripts\windows\build.ps1 -Backend vulkan -Profile developer
+    pwsh scripts\windows\build.ps1 -Backend cuda -Profile server -Architecture arm64 -CudaArch 121a-real
 #>
 [CmdletBinding()]
 param(
@@ -211,7 +216,13 @@ if ($TargetArch -eq 'arm64' -and $Compiler -eq 'msvc') {
 }
 $CrossCompiling = ($HostArch -eq 'ARM64') -ne ($TargetArch -eq 'arm64')
 if ($Backend -eq 'cuda' -and $CrossCompiling) {
-    throw 'CUDA cross-compilation is not supported by this driver; build CUDA natively on the target architecture.'
+    # The x64 CUDA Toolkit ships Windows ARM64 target libraries; no toolkit targets x64 from an ARM64 host.
+    if ($TargetArch -ne 'arm64') {
+        throw 'CUDA cross-compilation is supported only from an x64 host to arm64; build x64 CUDA on an x64 host.'
+    }
+    if ($CudaArch -eq 'native') {
+        throw 'CUDA cross-compilation needs an explicit -CudaArch (for example 121a-real for RTX Spark); native would detect the build host GPU.'
+    }
 }
 if ($CublasShim -and $Backend -ne 'cuda') {
     throw '-CublasShim requires -Backend cuda.'
@@ -277,8 +288,15 @@ if ($Compiler -eq 'clang-cl' -and -not (Get-Command clang-cl -ErrorAction Silent
     throw "clang-cl not on PATH; install LLVM (choco install llvm) or the VS 'C++ Clang tools' component."
 }
 if ($Backend -eq 'cuda') {
-    if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
+    $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+    if (-not $nvcc) {
         throw 'nvcc not found; install a supported NVIDIA CUDA Toolkit.'
+    }
+    if ($CrossCompiling) {
+        $cudaRoot = Split-Path -Parent (Split-Path -Parent $nvcc.Source)
+        if (-not (Test-Path (Join-Path $cudaRoot 'lib\arm64\cudart.lib'))) {
+            throw "The CUDA Toolkit at $cudaRoot has no Windows ARM64 target libraries (lib\arm64); cross-compiling for arm64 needs CUDA 13.4 or newer."
+        }
     }
     if ($CudaArch -eq 'native') {
         $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
@@ -428,9 +446,15 @@ if ($Compiler -eq 'clang-cl') {
     }
     if ($Backend -eq 'cuda') {
         # nvcc only supports cl.exe as its host compiler on Windows; pin it
-        # explicitly so it never inherits clang-cl.
-        $configureArgs += '-DCMAKE_CUDA_HOST_COMPILER=cl'
+        # explicitly so it never inherits clang-cl. The imported environment's
+        # cl.exe targets $TargetArch (Hostx64\arm64 when cross-compiling).
+        $configureArgs += "-DCMAKE_CUDA_HOST_COMPILER=$((Get-Command cl).Source)"
     }
+}
+if ($Backend -eq 'cuda' -and $CrossCompiling) {
+    # Without --use-local-env nvcc runs vcvars for its own host and compiles
+    # x64 host code. A -DCMAKE_CUDA_FLAGS in -CMakeArgs must keep this flag.
+    $configureArgs += '-DCMAKE_CUDA_FLAGS=--use-local-env'
 }
 if ($TargetArch -eq 'arm64') {
     # Avoid an additional OpenMP runtime DLL in ARM64 packages.

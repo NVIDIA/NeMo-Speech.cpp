@@ -17,8 +17,12 @@
     Release version, or nightly. Defaults to the one in VERSION.
 .PARAMETER OutputDir
     Destination for the archive and checksum (default: release-artifacts).
+.PARAMETER Architecture
+    Architecture the build targets: auto (the host), x64, or arm64. Set it for a
+    cross-compiled build; every packaged binary must match it.
 .EXAMPLE
     pwsh scripts\windows\package-release.ps1 -BuildDir build\release-cuda -Backend cuda
+    pwsh scripts\windows\package-release.ps1 -BuildDir build\release-cuda-arm64 -Backend cuda -Architecture arm64
 #>
 [CmdletBinding()]
 param(
@@ -28,24 +32,30 @@ param(
     [ValidateSet('cpu', 'vulkan', 'cuda')]
     [string]$Backend,
     [string]$Version,
-    [string]$OutputDir
+    [string]$OutputDir,
+    [ValidateSet('auto', 'x64', 'arm64')]
+    [string]$Architecture = 'auto'
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'release-artifacts' }
 if (-not $Version) {
-    $Version = ((Get-Content (Join-Path $RepoRoot 'VERSION')) -match '^NEMO_SPEECH_VERSION:' |
+    # @() keeps -match filtering lines: on a single-line file it would return a bool.
+    $Version = (@(Get-Content (Join-Path $RepoRoot 'VERSION')) -match '^NEMO_SPEECH_VERSION:' |
         Select-Object -First 1) -replace '^NEMO_SPEECH_VERSION:\s*', ''
 }
 if ($Version -ne 'nightly' -and $Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$') {
     throw "invalid release version '$Version'"
 }
-$arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
-    'X64' { 'x86_64' }
-    'Arm64' { 'aarch64' }
-    default { throw "unsupported architecture: $_" }
+if ($Architecture -eq 'auto') {
+    $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+        'X64' { 'x64' }
+        'Arm64' { 'arm64' }
+        default { throw "unsupported architecture: $_" }
+    }
 }
+$arch = if ($Architecture -eq 'arm64') { 'aarch64' } else { 'x86_64' }
 
 $name = "nemo-speech-$Version-windows-$arch-$Backend"
 $staging = Join-Path ([System.IO.Path]::GetTempPath()) "nemo-speech-package-$PID"
@@ -99,6 +109,17 @@ try {
     }
     if ($missing) {
         throw "the package is not self-contained:`n  $($missing -join "`n  ")"
+    }
+
+    # A cross-compiled package must not mix in host binaries. The ARM64 Visual C++
+    # runtime ships ARM64X DLLs, whose headers may report x64.
+    $machine = if ($Architecture -eq 'arm64') { '^\s*AA64 machine|\(ARM64X\)' } else { '^\s*8664 machine \(x64\)\s*$' }
+    $wrongMachine = foreach ($file in Get-ChildItem $bin -Include '*.dll', '*.exe' -Recurse) {
+        $header = Invoke-Dumpbin /headers $file.FullName | Where-Object { $_ -match 'machine \(' } | Select-Object -First 1
+        if ($header -notmatch $machine) { "$($file.Name): $($header.Trim())" }
+    }
+    if ($wrongMachine) {
+        throw "binaries that do not target ${Architecture}:`n  $($wrongMachine -join "`n  ")"
     }
 
     # The cuBLAS shim implements only the calls ggml makes; a call added by a
