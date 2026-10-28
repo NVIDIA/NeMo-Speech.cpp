@@ -271,6 +271,8 @@ $vcToolset = if ($TargetArch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC
 $vsVersionRange = if ($VsVersion) { @('-version', $VsVersion) } else { @() }
 $vsPath = & $vswhere -latest -products * @vsVersionRange -requires $vcToolset -property installationPath
 if (-not $vsPath) { throw "No VS install with the C++ toolset for $TargetArch found." }
+# vcpkg picks the newest Visual Studio on its own; its libraries must come from the same STL.
+if ($VsVersion) { $env:VCPKG_VISUAL_STUDIO_PATH = $vsPath }
 $vcvarsBat = if ($HostArch -eq 'ARM64' -and $TargetArch -eq 'x64') {
     'vcvarsarm64_x64.bat'
 } elseif ($HostArch -ne 'ARM64' -and $TargetArch -eq 'arm64') {
