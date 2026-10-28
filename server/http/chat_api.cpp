@@ -14,6 +14,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -642,6 +643,63 @@ string_struct(
 // ------------------------------------------------------------------------------------------------
 // JSON output: fixed field order, string escaping and float formatting.
 
+// Moves `digits` x 10^exponent (first digit before the point) one unit in the last digit up or
+// down, keeping the digit count.
+void
+step_last_digit(std::string& digits, int& exponent, bool up) {
+    size_t i = digits.size();
+    while (i-- > 0) {
+        if (up ? digits[i] != '9' : digits[i] != '0') {
+            digits[i] = static_cast<char>(digits[i] + (up ? 1 : -1));
+            break;
+        }
+        digits[i] = up ? '0' : '9';
+    }
+    if (up && digits[0] == '0') {  // 9.99 -> 1.00 x 10
+        digits[0] = '1';
+        ++exponent;
+    } else if (!up && digits[0] == '0') {  // 1.00 -> 9.99 / 10
+        digits.assign(digits.size(), '9');
+        --exponent;
+    }
+}
+
+// The fewest significant digits that read back as `magnitude` (finite, positive), the closest of
+// them if several do, and the decimal exponent of the first: the digits std::to_chars chooses.
+// Floating-point std::to_chars needs libstdc++ from GCC 11; the Linux release image builds with
+// GCC 9. snprintf and strtod round correctly on every supported C library.
+void
+shortest_digits(double magnitude, std::string& digits, int& exponent) {
+    char text[40];
+    for (int precision = 0; precision < 17; ++precision) {
+        std::snprintf(text, sizeof(text), "%.*e", precision, magnitude);
+        const char* e = std::strchr(text, 'e');
+        digits.assign(1, text[0]);
+        if (precision > 0)
+            digits.append(text + 2, static_cast<size_t>(e - text - 2));
+        exponent = std::atoi(e + 1);
+        const double nearest = std::strtod(text, nullptr);
+        if (nearest == magnitude)
+            break;
+        // The values that read back as `magnitude` extend further to one side at powers of two,
+        // so the next digit string on the far side can read back when the nearest does not.
+        std::string candidate = digits;
+        int candidate_exponent = exponent;
+        step_last_digit(candidate, candidate_exponent, nearest < magnitude);
+        std::string candidate_text(1, candidate[0]);
+        if (precision > 0)
+            candidate_text += text[1] + candidate.substr(1);  // text[1]: the locale's radix
+        candidate_text += "e" + std::to_string(candidate_exponent);
+        if (std::strtod(candidate_text.c_str(), nullptr) == magnitude) {
+            digits = candidate;
+            exponent = candidate_exponent;
+            break;
+        }
+    }
+    while (digits.size() > 1 && digits.back() == '0')
+        digits.pop_back();
+}
+
 // Shortest round-trip digits, decimal notation with a fractional part in [1e-5, 1e16), exponent
 // outside
 // ("1e16", "1.5e-7").
@@ -652,26 +710,22 @@ format_double(double value) {
     if (value == 0.0)
         return std::signbit(value) ? "-0.0" : "0.0";
     const double magnitude = std::fabs(value);
-    char buffer[64];
+    std::string digits;
+    int exponent = 0;
+    shortest_digits(magnitude, digits, exponent);
+    std::string text = value < 0 ? "-" : "";
     if (magnitude >= 1e16 || magnitude < 1e-5) {
-        const auto [end, ec] =
-            std::to_chars(buffer, buffer + sizeof(buffer), value, std::chars_format::scientific);
-        std::string text(buffer, end);
-        const size_t e = text.find('e');
-        std::string mantissa = text.substr(0, e);
-        std::string exponent = text.substr(e + 1);
-        bool negative = !exponent.empty() && exponent[0] == '-';
-        if (!exponent.empty() && (exponent[0] == '-' || exponent[0] == '+'))
-            exponent.erase(0, 1);
-        exponent.erase(0, std::min(exponent.find_first_not_of('0'), exponent.size() - 1));
-        return mantissa + "e" + (negative ? "-" : "") + exponent;
+        text += digits[0];
+        if (digits.size() > 1)
+            text += "." + digits.substr(1);
+        return text + "e" + std::to_string(exponent);
     }
-    const auto [end, ec] =
-        std::to_chars(buffer, buffer + sizeof(buffer), value, std::chars_format::fixed);
-    std::string text(buffer, end);
-    if (text.find('.') == std::string::npos)
-        text += ".0";
-    return text;
+    if (exponent < 0)
+        return text + "0." + std::string(static_cast<size_t>(-exponent - 1), '0') + digits;
+    const size_t integer_digits = static_cast<size_t>(exponent) + 1;
+    if (digits.size() <= integer_digits)
+        return text + digits + std::string(integer_digits - digits.size(), '0') + ".0";
+    return text + digits.substr(0, integer_digits) + "." + digits.substr(integer_digits);
 }
 
 class JsonWriter {

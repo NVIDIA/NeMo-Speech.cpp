@@ -353,6 +353,9 @@ if(NEMO_SPEECH_BUILD_NMT OR NEMO_SPEECH_BUILD_S2S OR NEMO_SPEECH_BUILD_SPEECHLM)
     set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
     set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
+    # llama-common's vendored cpp-httplib would otherwise link a host OpenSSL (Homebrew's on the
+    # macOS runners), which the release archives cannot carry. MTP never downloads anything.
+    set(LLAMA_OPENSSL        OFF CACHE BOOL "" FORCE)
     add_subdirectory("${NEMO_SPEECH_LLAMA_CPP_DIR}" "${CMAKE_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
     set_property(TARGET llama PROPERTY PUBLIC_HEADER "")
     install(TARGETS llama
