@@ -47,6 +47,10 @@
     Existing vcpkg checkout to use. By default the driver bootstraps its pinned
     version under %LOCALAPPDATA%\NeMoSpeech.
 
+.PARAMETER VsVersion
+    vswhere version range of the Visual Studio to build with when several are
+    installed, for example '[17.0,18.0)' for 2022 (default: the newest).
+
 .PARAMETER TtsJa
     Build the optional Japanese TTS tokenizer (Open JTalk, MeCab, and the NAIST
     dictionary).
@@ -118,6 +122,7 @@ param(
     [switch]$CublasShim,
     [string]$VcpkgRoot,
     [string]$VcpkgTriplet,
+    [string]$VsVersion,
     [ValidateSet('auto', 'x64', 'arm64')]
     [string]$Architecture = 'auto',
     # C/C++ compiler. 'auto' = cl on x64, clang-cl on ARM64 (ggml's ARM CPU
@@ -263,7 +268,8 @@ $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.e
 if (-not (Test-Path $vswhere)) { throw "vswhere not found; install VS 2022 Build Tools (VC++ workload)." }
 $vcToolset = if ($TargetArch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
              else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
-$vsPath = & $vswhere -latest -products * -requires $vcToolset -property installationPath
+$vsVersionRange = if ($VsVersion) { @('-version', $VsVersion) } else { @() }
+$vsPath = & $vswhere -latest -products * @vsVersionRange -requires $vcToolset -property installationPath
 if (-not $vsPath) { throw "No VS install with the C++ toolset for $TargetArch found." }
 $vcvarsBat = if ($HostArch -eq 'ARM64' -and $TargetArch -eq 'x64') {
     'vcvarsarm64_x64.bat'
