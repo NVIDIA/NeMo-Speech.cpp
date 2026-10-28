@@ -289,6 +289,7 @@ struct SalmEngine::Impl {
         double audio_seconds = 0;
         std::string error;
         bool invalid_request = false;  // error is the request's fault
+        bool speech = true;            // the speaker branch found a voice (else: no decode)
     };
 
     // One in-flight sequence.
@@ -1145,6 +1146,12 @@ struct SalmEngine::Impl {
             enc[i].frames = out.n_frames;
             enc[i].proj = std::move(out.proj);
             enc[i].proj_spans = std::move(out.proj_spans);
+            // Audio without a voice (noise, tones) makes the decoder invent a transcript: the
+            // speaker branch's activity (as for diarization, above the fusion threshold in some
+            // 80 ms frame) says whether anyone speaks.
+            enc[i].speech = std::any_of(out.spk_probs.begin(), out.spk_probs.end(), [&](float p) {
+                return p > pc.speaker_activity_threshold;
+            });
             if (evidence) {
                 auto ts = std::make_shared<TimestampInput>();
                 ts->head = utts[i].evidence;
@@ -2164,8 +2171,20 @@ struct SalmEngine::Impl {
             }
             finished_reqs.push_back(e.req);
         };
+        // A request without a voice ends at its encoder output with an empty transcript: no
+        // decode and no fallback; word timestamps report it as they do a decoded empty transcript.
+        auto finish_no_speech = [&](Encoded& e) {
+            SalmResult& r = results[e.req];
+            r.audio_tokens = e.frames;
+            r.end_of_turn = true;
+            if (e.timestamps)
+                timestamp_ready.emplace_back(e.req, std::move(e.timestamps));
+            else
+                finished_reqs.push_back(e.req);
+        };
         // An encoder call's output into the queue: new requests at the back, preempted ones (their
-        // share no longer held back from admission) at the front; diarization-only requests end.
+        // share no longer held back from admission) at the front; diarization-only and voiceless
+        // requests end.
         auto deliver = [&](std::vector<Encoded>&& encs) {
             std::vector<Encoded> again;
             size_t dropped = 0;
@@ -2181,6 +2200,8 @@ struct SalmEngine::Impl {
                     ++dropped;
                 } else if (reqs[e.req].diarization_only) {
                     finish_diarization(e);
+                } else if (it == preempted.end() && e.error.empty() && !e.speech) {
+                    finish_no_speech(e);
                 } else if (it == preempted.end()) {
                     ready.push_back(std::move(e));
                 } else {

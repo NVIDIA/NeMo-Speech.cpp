@@ -9,8 +9,10 @@
   `language_code`) adds "The speech is in <language>." to the default instruction; a custom instruction is used as
   written, so include the language there if it matters. Responses report the requested language.
 - **Length.** One request takes from 20 ms (320 samples at 16 kHz) up to one hour of audio.
-- **Silence.** Near-digital silence (peak below -60 dBFS, RMS below -90 dBFS) returns an empty transcript.
-  Recorded silence or noise above that level is transcribed like speech and can produce invented text.
+- **Silence and noise.** Audio without a voice returns an empty transcript without running the language model:
+  near-digital silence (peak below -60 dBFS, RMS below -90 dBFS), and audio such as noise or a tone in which the
+  encoder's speaker branch hears no one. Stretches without speech inside a recording, such as noise or music, can
+  still be transcribed as invented text.
 - **Custom instructions.** `POST /v1/chat/completions` and the CLI's `--instruction` take an instruction with the
   audio ("Transcribe with speaker tags", "Translate the speech into German", ...); see the
   [API reference](../api.md#post-v1chatcompletions) and [Prompts](prompts.md).
