@@ -902,13 +902,14 @@ index 2cf84f88a4b1695f74607959eae49b295906248d..63a0558dc7a83ffde0e3b53509201b4f
              for (uint64_t k = 0; k < n_embd_out; k++) {
                  std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
              }
-@@ -2625,6 +2682,14 @@ ggml_status llama_context::graph_compute(
+@@ -2625,6 +2682,15 @@ ggml_status llama_context::graph_compute(
          set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
      }
  
 +    if (input_wait_event) {
 +        for (auto & b : backends) {
-+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            const auto type = ggml_backend_dev_type(ggml_backend_get_device(b.get()));
++            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
 +                ggml_backend_event_wait(b.get(), input_wait_event);
 +            }
 +        }
@@ -917,7 +918,7 @@ index 2cf84f88a4b1695f74607959eae49b295906248d..63a0558dc7a83ffde0e3b53509201b4f
      auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-@@ -4016,6 +4081,23 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
+@@ -4016,6 +4082,23 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
      return ctx->get_cparams().serving;
  }
  

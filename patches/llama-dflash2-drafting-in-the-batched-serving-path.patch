@@ -179,7 +179,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a8c41e9c3 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1028,6 +1028,63 @@ void llama_context::set_embeddings_nextn_device(bool value) {
+@@ -1028,6 +1028,65 @@ void llama_context::set_embeddings_nextn_device(bool value) {
      if (cparams.serving.batched) output_reserve(cparams.n_outputs_max);
  }
  
@@ -194,7 +194,8 @@ index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a
 +        return;
 +    }
 +    for (const auto & b : backends) {
-+        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++        const auto type = ggml_backend_dev_type(ggml_backend_get_device(b.get()));
++        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
 +            layer_features_backend = b.get();
 +            break;
 +        }
@@ -220,7 +221,8 @@ index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a
 +
 +void llama_context::record_event(ggml_backend_event_t ev) {
 +    for (const auto & b : backends) {
-+        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++        const auto type = ggml_backend_dev_type(ggml_backend_get_device(b.get()));
++        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
 +            ggml_backend_event_record(ev, b.get());
 +            return;
 +        }
@@ -243,7 +245,7 @@ index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a
  ggml_tensor * llama_context::get_embeddings_nextn_device(ggml_backend_t * backend) {
      GGML_ASSERT(use_nextn_device && nextn_device);
      *backend = nextn_device_backend;
-@@ -1986,6 +2043,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
+@@ -1986,6 +2045,7 @@ int llama_context::decode_launch(const llama_token * tokens, int32_t n_tokens) {
  
  int llama_context::decode(const llama_batch & batch_inp) {
      GGML_ASSERT(!pend.active && "llama_decode: a prepared decode is pending (llama_decode_launch first)");
@@ -251,7 +253,7 @@ index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
      GGML_ASSERT(batch_inp.token || batch_inp.embd);
-@@ -2298,6 +2356,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -2298,6 +2358,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
          extract_nextn(ubatch, t_h_nextn, n_outputs, n_outputs_prev, n_tokens_prev);
  
@@ -268,7 +270,7 @@ index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a
          if (has_samplers) {
              const auto stride = n_vocab;
  
-@@ -4272,6 +4340,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
+@@ -4272,6 +4342,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
      ctx->set_input_wait_event(ev);
  }
  
