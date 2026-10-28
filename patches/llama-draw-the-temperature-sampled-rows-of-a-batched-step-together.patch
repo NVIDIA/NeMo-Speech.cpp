@@ -50,11 +50,11 @@ index eaaf80fea4ac64597b5122d60a919b351926f3b9..2d033a689da20c5b83667c85cdca3e3a
      return true;
  }
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 9410f850fe02cb96a8742f3961b9c9aec0443bb7..8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf 100644
+index b1bb5c7b04698fe50b71c575af5918d3e46ae908..577c2cbae3bdd6da22c696a791a480d4c03fd32f 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1420,6 +1420,12 @@ void llm_graph_input_token_mask::set_input(const llama_ubatch * ubatch) {
-     ggml_backend_tensor_set(rows, sel.data(), 0, ggml_nbytes(rows));
+@@ -1432,6 +1432,12 @@ bool llm_graph_input_token_mask::can_reuse(const llm_graph_params & params) {
+     return params.token_mask_mode == 1 && rows->ne[0] == n_out;
  }
  
 +void llm_graph_input_sampled_rows::set_input(const llama_ubatch * ubatch) {
@@ -66,7 +66,7 @@ index 9410f850fe02cb96a8742f3961b9c9aec0443bb7..8b38e86f3cd26c9a390e9f9d1b4662a5
  void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
      // set the inputs only for the active samplers in the current ubatch
      std::unordered_set<llama_seq_id> active_samplers;
-@@ -4057,10 +4063,57 @@ void llm_graph_context::build_sampling() const {
+@@ -4069,10 +4075,57 @@ void llm_graph_context::build_sampling() const {
          ggml_set_name(ids, "batched_greedy_argmax");
          ggml_set_output(ids);
          ggml_build_forward_expand(gf, ids);
@@ -125,10 +125,10 @@ index 9410f850fe02cb96a8742f3961b9c9aec0443bb7..8b38e86f3cd26c9a390e9f9d1b4662a5
                  // per-row views for the output copy (it reads view_src + view_offs), kept out of the graph: one
                  // view node per row made the node count follow the lane count, so every decode step re-planned
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 590555c8a72c0283de5a2a5315c2fb159ddb7049..0dfc2a6d4e82e6f60339567303a85e4ce61d3b4c 100644
+index f8dac3652aca83670ca6e320099f5eb89da5f798..2ae391add8fc447f62b9bf16adb9d6dd74aaa83e 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -793,6 +793,21 @@ public:
+@@ -794,6 +794,21 @@ public:
      ggml_tensor * rows  = nullptr;  // I32 [n_rows], the table row of each output row (mixed rows only)
  };
  

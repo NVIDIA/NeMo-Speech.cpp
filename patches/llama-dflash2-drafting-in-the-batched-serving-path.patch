@@ -364,7 +364,7 @@ index 92eefeb4ff19f1ed1ed95ea5a506a29f73fdb318..4c662dfd8e1435ebf289f42327ffacbf
  LLAMA_API void llama_set_embeddings_nextn_device(struct llama_context * ctx, bool value);
  LLAMA_API ggml_tensor * llama_get_embeddings_nextn_device(struct llama_context * ctx, ggml_backend_t * backend);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf..ebdc27c31d38d8ba57b042fafd0caaf8dbc283de 100644
+index 577c2cbae3bdd6da22c696a791a480d4c03fd32f..885879cfce6b79530c3d7bef33b09c1e201e3b25 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -53,7 +53,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
@@ -377,7 +377,7 @@ index 8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf..ebdc27c31d38d8ba57b042fafd0caaf8
          auto * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
          // with per-sequence cell lists the membership words are never read: a 1-cell placeholder (the full tensor was a
          // ~21 MB host->device input copy per pass)
-@@ -1485,6 +1486,7 @@ void llm_graph_result::reset() {
+@@ -1497,6 +1498,7 @@ void llm_graph_result::reset() {
      t_embd        = nullptr;
      t_embd_pooled = nullptr;
      t_h_nextn     = nullptr;
@@ -385,7 +385,7 @@ index 8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf..ebdc27c31d38d8ba57b042fafd0caaf8
  
      t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
      std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
-@@ -1531,6 +1533,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
+@@ -1543,6 +1545,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
      if (t_h_nextn != nullptr) {
          ggml_set_output(t_h_nextn);
      }
@@ -395,7 +395,7 @@ index 8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf..ebdc27c31d38d8ba57b042fafd0caaf8
      {
          const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
          for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
-@@ -2622,6 +2627,53 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+@@ -2634,6 +2639,53 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
      return cur;
  }
  
@@ -450,7 +450,7 @@ index 8b38e86f3cd26c9a390e9f9d1b4662a52b9dbbaf..ebdc27c31d38d8ba57b042fafd0caaf8
      auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 0dfc2a6d4e82e6f60339567303a85e4ce61d3b4c..161d49bc99982c9e3bd5e5cceca0c1be5160bf73 100644
+index 2ae391add8fc447f62b9bf16adb9d6dd74aaa83e..c7785eb89604d91a5dfe6798c95ad5317012ef2f 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -160,6 +160,21 @@ public:
@@ -475,7 +475,7 @@ index 0dfc2a6d4e82e6f60339567303a85e4ce61d3b4c..161d49bc99982c9e3bd5e5cceca0c1be
  class llm_graph_input_pos : public llm_graph_input_i {
  public:
      llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
-@@ -1009,6 +1024,7 @@ public:
+@@ -1010,6 +1025,7 @@ public:
      ggml_tensor * t_embd        = nullptr;
      ggml_tensor * t_embd_pooled = nullptr;
      ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -483,7 +483,7 @@ index 0dfc2a6d4e82e6f60339567303a85e4ce61d3b4c..161d49bc99982c9e3bd5e5cceca0c1be
  
      std::vector<ggml_tensor *> t_layer_inp;
  
-@@ -1238,6 +1254,13 @@ struct llm_graph_context {
+@@ -1239,6 +1255,13 @@ struct llm_graph_context {
  
      ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
      ggml_tensor * build_inp_pos() const;
@@ -530,7 +530,7 @@ index cc7a8410d813f15e5de480c9919bc47eb5c12b0a..4ad4eefcb0ca1c60bee0be5e4a04ec0c
          if (!lists) {
              ggml_backend_tensor_set(metadata[1], membership.data(), 0, membership.size()*sizeof(uint32_t));
 diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
-index 9b56ac9eca53fd8ee9d1237f170a067aa36f063a..aad4f4675626d8dd519b14874492f2e04b5a027b 100644
+index 9b56ac9eca53fd8ee9d1237f170a067aa36f063a..c3e91ad38c309f6d01d6270b4d9c70bcc5e6b085 100644
 --- a/src/models/dflash.cpp
 +++ b/src/models/dflash.cpp
 @@ -424,6 +424,19 @@ static ggml_tensor * build_dflash2_conv(
@@ -538,9 +538,9 @@ index 9b56ac9eca53fd8ee9d1237f170a067aa36f063a..aad4f4675626d8dd519b14874492f2e0
      const int64_t block_size = n_tokens / n_blocks;
      ggml_context * ctx0 = g.ctx0;
 +
-+    if (g.cparams.serving.batched) {
-+        // one fused kernel (CUDA): this side's per-token coefficients [n_groups, kernel, n_tokens] of the dynamic
-+        // projection and this side's base kernel [hidden, kernel]
++    if (g.cparams.serving.batched && kernel_size <= 8 && n_tokens <= 65535) {
++        // one fused kernel (CUDA, up to 8 taps and 65535 tokens): this side's per-token coefficients
++        // [n_groups, kernel, n_tokens] of the dynamic projection and this side's base kernel [hidden, kernel]
 +        if (!ggml_is_contiguous(hidden) || hidden->ne[1] != n_tokens) {
 +            hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
 +        }

@@ -11,10 +11,10 @@ paths.
 Upstream: candidate (needs test-backend-ops top-k cases with long rows).
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a27136420f89154576e5f341f6a1e8b7dbc83816..9491496f07dc1f50971455a929852836b9e15011 100644
+index 8fd810d1c7b2e2223bb457b161e883ed3d9290ea..c5b7df92fc623609d4fb875b47c8282f6d56775a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6270,7 +6270,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6271,7 +6271,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
              return true;
  #else

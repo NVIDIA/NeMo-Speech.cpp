@@ -96,7 +96,7 @@ index 9af3c3da2fe1be4443aee31cad3c1eea045fd7e9..270b557a2d496b352f4c9301112a1754
      // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
      std::map<llama_seq_id, std::vector<float>> embd_seq;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9aec0443bb7 100644
+index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..b1bb5c7b04698fe50b71c575af5918d3e46ae908 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -19,6 +19,7 @@
@@ -107,7 +107,7 @@ index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9ae
  #include <cstring>
  #include <numeric>
  #include <sstream>
-@@ -1399,6 +1400,26 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+@@ -1399,6 +1400,38 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
      return res;
  }
  
@@ -131,10 +131,22 @@ index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9ae
 +    ggml_backend_tensor_set(rows, sel.data(), 0, ggml_nbytes(rows));
 +}
 +
++bool llm_graph_input_token_mask::can_reuse(const llm_graph_params & params) {
++    // the table shape follows token_mask_mode, which allow_reuse compares; the row selector has one row per output
++    if (!rows) {
++        return params.token_mask_mode == 2;
++    }
++    int64_t n_out = 0;
++    for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
++        n_out += params.ubatch.output[i] != 0;
++    }
++    return params.token_mask_mode == 1 && rows->ne[0] == n_out;
++}
++
  void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
      // set the inputs only for the active samplers in the current ubatch
      std::unordered_set<llama_seq_id> active_samplers;
-@@ -1622,6 +1643,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+@@ -1622,6 +1655,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
      mctx             (params.mctx),
      cross            (params.cross),
      samplers         (params.samplers),
@@ -143,7 +155,7 @@ index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9ae
      cb_func          (params.cb),
      res              (params.res),
      ctx0             (res->get_ctx()),
-@@ -4000,6 +4023,27 @@ void llm_graph_context::build_sampling() const {
+@@ -4000,6 +4035,27 @@ void llm_graph_context::build_sampling() const {
      // sampler graphs or full-vocabulary D2H transfers. Only sequences with another sampler (temperature
      // sampling) get their own sampler graph, on their rows only.
      if (n_rows > 0 && cparams.serving.batched) {
@@ -171,7 +183,7 @@ index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9ae
          auto is_greedy = [](llama_sampler * sampler) {
              if (std::strcmp(llama_sampler_name(sampler), "chain") == 0) {
                  if (llama_sampler_chain_n(sampler) != 1) return false;
-@@ -4009,7 +4053,7 @@ void llm_graph_context::build_sampling() const {
+@@ -4009,7 +4065,7 @@ void llm_graph_context::build_sampling() const {
              if (name[0] == '+') ++name;
              return std::strcmp(name, "greedy") == 0;
          };
@@ -180,7 +192,7 @@ index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9ae
          ggml_set_name(ids, "batched_greedy_argmax");
          ggml_set_output(ids);
          ggml_build_forward_expand(gf, ids);
-@@ -4030,7 +4074,7 @@ void llm_graph_context::build_sampling() const {
+@@ -4030,7 +4086,7 @@ void llm_graph_context::build_sampling() const {
                  sampler->iface->backend_reset(sampler);
              }
              for (uint32_t row : rows) {
@@ -190,10 +202,10 @@ index 4a5a9ba419fa58696ebb0ac0b40a2f50419ae93b..9410f850fe02cb96a8742f3961b9c9ae
                  sampler->iface->backend_apply(sampler, ctx0, gf, &data);
                  if (data.sampled != nullptr) {
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index fc175e92abb4d5f998879256b30ed61e00a4e3f7..590555c8a72c0283de5a2a5315c2fb159ddb7049 100644
+index fc175e92abb4d5f998879256b30ed61e00a4e3f7..f8dac3652aca83670ca6e320099f5eb89da5f798 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -760,6 +760,39 @@ public:
+@@ -760,6 +760,40 @@ public:
      const llama_memory_hybrid_iswa_context * mctx;
  };
  
@@ -224,6 +236,7 @@ index fc175e92abb4d5f998879256b30ed61e00a4e3f7..590555c8a72c0283de5a2a5315c2fb15
 +    virtual ~llm_graph_input_token_mask() = default;
 +
 +    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
 +
 +    const llama_token_mask * mask;
 +    ggml_tensor * table = nullptr;  // F32 [n_vocab, 1] (all rows armed: the bias) or [n_vocab, 2] (zeros, bias)
@@ -233,7 +246,7 @@ index fc175e92abb4d5f998879256b30ed61e00a4e3f7..590555c8a72c0283de5a2a5315c2fb15
  class llm_graph_input_sampling : public llm_graph_input_i {
  public:
      llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
-@@ -806,6 +839,8 @@ struct llm_graph_params {
+@@ -806,6 +840,8 @@ struct llm_graph_params {
      const llama_cross            * cross;
  
      std::map<llama_seq_id, llama_sampler *> samplers;
@@ -242,7 +255,7 @@ index fc175e92abb4d5f998879256b30ed61e00a4e3f7..590555c8a72c0283de5a2a5315c2fb15
  
      static bool samplers_equal(
            const std::map<llama_seq_id, llama_sampler *> & lhs,
-@@ -871,6 +906,10 @@ struct llm_graph_params {
+@@ -871,6 +907,10 @@ struct llm_graph_params {
              return false;
          }
  
@@ -253,7 +266,7 @@ index fc175e92abb4d5f998879256b30ed61e00a4e3f7..590555c8a72c0283de5a2a5315c2fb15
          if (samplers.size() > 0) {
              if (!ubatch.data || !other.ubatch.data) {
                  return false;
-@@ -1047,6 +1086,8 @@ struct llm_graph_context {
+@@ -1047,6 +1087,8 @@ struct llm_graph_context {
      const llama_cross            * cross;
  
      std::map<llama_seq_id, llama_sampler *> samplers;

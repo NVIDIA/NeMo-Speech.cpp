@@ -134,7 +134,7 @@ index 0000000000000000000000000000000000000000..9a7620630606f5b94132bfe00762f53e
 +
 +void ggml_cuda_op_dflash_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d19dae543b4bf717545003701dae2f94716fbbdd..a27136420f89154576e5f341f6a1e8b7dbc83816 100644
+index d19dae543b4bf717545003701dae2f94716fbbdd..8fd810d1c7b2e2223bb457b161e883ed3d9290ea 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -57,6 +57,7 @@
@@ -155,12 +155,13 @@ index d19dae543b4bf717545003701dae2f94716fbbdd..a27136420f89154576e5f341f6a1e8b7
          case GGML_OP_BUILD_KQ_MASK:
              ggml_cuda_op_build_kq_mask(ctx, dst);
              break;
-@@ -6215,6 +6219,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6215,6 +6219,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
          }
          case GGML_OP_BUILD_KQ_MASK:
              return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
 +        case GGML_OP_DFLASH_CONV:
-+            return true;
++            // ggml_cuda_op_dflash_conv: up to 8 taps, one grid row per token
++            return op->src[1]->ne[1] >= 1 && op->src[1]->ne[1] <= 8 && op->ne[1] <= 65535;
          case GGML_OP_SSM_GATE_NORM:
              return op->type == GGML_TYPE_F32;
          case GGML_OP_SSM_CONV: {
