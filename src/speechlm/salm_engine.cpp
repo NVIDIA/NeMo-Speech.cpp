@@ -931,7 +931,10 @@ struct SalmEngine::Impl {
                     c.samples = c.resampled.data();
                     c.n = c.resampled.size();
                 }
-                if (c.n < static_cast<size_t>(pc.n_fft))
+                // The frontend zero-pads (NeMo's constant-mode STFT), so a clip shorter than n_fft
+                // works; the per-feature normalization's unbiased std needs two mel frames, the
+                // API's minimum (320 samples at 16 kHz).
+                if (c.n < 2 * static_cast<size_t>(hop))
                     throw std::invalid_argument("audio too short");
                 c.n_fe = (c.n + fe_bucket - 1) / fe_bucket * fe_bucket;
                 // center=True frame count
