@@ -136,8 +136,9 @@ project notice set is installed under
 - Copyright (c) NVIDIA CORPORATION & AFFILIATES
 - License: NVIDIA Software License Agreement and CUDA Supplement
 
-CUDA release archives include the redistributable CUDA runtime library. The
-applicable agreement is installed with the archive under
+CUDA release archives include the redistributable CUDA runtime library, and the
+Windows ones also cuBLAS and cuBLASLt. The applicable agreement is installed with
+the archive under
 `share/licenses/nemo-speech/nvidia/cuda-runtime/`.
 
 ## Other incorporated third-party code and data

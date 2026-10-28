@@ -100,7 +100,7 @@ scripts/release/package-macos.sh --install-prefix <prefix> --backend metal --arc
 scripts\windows\package-release.ps1 -BuildDir <build dir> -Backend cpu
 
 # Windows on Arm CUDA, cross-compiled on x64 (see docs/development/windows-build.md), after
-# scripts\windows\build.ps1 -Backend cuda -Profile server -Architecture arm64 -CudaArch 121a-real -CublasShim `
+# scripts\windows\build.ps1 -Backend cuda -Profile server -Architecture arm64 -CudaArch 121a-real `
 #     -CMakeArgs '-DGGML_NATIVE=OFF','-DGGML_CPU_ARM_ARCH=armv8.6-a+fp16'
 scripts\windows\package-release.ps1 -BuildDir <build dir> -Backend cuda -Architecture arm64
 ```

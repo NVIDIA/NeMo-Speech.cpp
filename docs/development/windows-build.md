@@ -116,7 +116,7 @@ Spark); the build host needs no GPU. Requirements, besides the components above:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cuda -Profile server `
-    -Architecture arm64 -CudaArch 121a-real -CublasShim `
+    -Architecture arm64 -CudaArch 121a-real `
     -CMakeArgs '-DGGML_NATIVE=OFF','-DGGML_CPU_ARM_ARCH=armv8.6-a+fp16'
 powershell -ExecutionPolicy Bypass -File scripts\windows\package-release.ps1 `
     -BuildDir build-cuda-server-arm64 -Backend cuda -Architecture arm64
@@ -159,7 +159,9 @@ cmake --build build-vulkan --parallel
 ### Windows-specific build behavior
 
 - **The cuBLAS shim is optional.** Pass `-CublasShim` to the build driver for an
-  app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt.
+  app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt. Without
+  it, `package-release.ps1` bundles the toolkit's cuBLAS and cuBLASLt for the target
+  architecture (the release archives do).
 - **CUDA and CPU builds apply the patches.** A Vulkan build uses stock ggml;
   pass `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the build driver does this).
 - Dependent DLLs must be next to the executable or on `PATH`. Ninja places them

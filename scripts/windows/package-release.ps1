@@ -73,10 +73,27 @@ try {
     if (Get-ChildItem -Recurse $root -Include 'riva_server.exe', 'grpc*.dll') {
         throw 'release contains Riva gRPC payload'
     }
+    # A -CublasShim build installs its cublas64_*.dll; otherwise the package carries
+    # NVIDIA's cuBLAS and cuBLASLt for the target architecture, and the CUDA EULA.
+    $cublasShim = $false
     if ($Backend -eq 'cuda') {
         if (-not (Get-ChildItem $bin -Filter 'ggml-cuda.dll')) { throw 'CUDA package is missing ggml-cuda.dll' }
-        if (-not (Get-ChildItem $bin -Filter 'cublas64_*.dll')) {
-            throw 'CUDA package is missing the cuBLAS shim; build with -CublasShim'
+        $cublasShim = [bool](Get-ChildItem $bin -Filter 'cublas64_*.dll')
+        if (-not $cublasShim) {
+            $cache = Get-Content (Join-Path $BuildDir 'CMakeCache.txt')
+            $toolkitBin = ($cache | Where-Object { $_ -match '^CUDAToolkit_BIN_DIR:PATH=(.+)$' } |
+                ForEach-Object { $Matches[1] } | Select-Object -First 1)
+            if (-not $toolkitBin) { throw 'CUDAToolkit_BIN_DIR is not in the build cache' }
+            $toolkit = Split-Path -Parent $toolkitBin
+            $cublasDir = @("$toolkit\bin\$Architecture", "$toolkit\bin") |
+                Where-Object { Get-ChildItem $_ -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue } |
+                Select-Object -First 1
+            if (-not $cublasDir) { throw "no cuBLAS DLLs for $Architecture under $toolkit\bin" }
+            Copy-Item (Join-Path $cublasDir 'cublas64_*.dll'), (Join-Path $cublasDir 'cublasLt64_*.dll') $bin
+            $eula = Join-Path $root 'share\licenses\nemo-speech\nvidia\cuda-runtime'
+            New-Item -ItemType Directory -Force -Path $eula | Out-Null
+            Copy-Item (Join-Path $toolkit 'EULA.txt') $eula
+            Write-Host "Bundled cuBLAS and cuBLASLt from $cublasDir"
         }
     }
 
@@ -124,7 +141,7 @@ try {
 
     # The cuBLAS shim implements only the calls ggml makes; a call added by a
     # llama.cpp update must be added to kernels\ before it can ship.
-    if ($Backend -eq 'cuda') {
+    if ($cublasShim) {
         $shim = (Get-ChildItem $bin -Filter 'cublas64_*.dll' | Select-Object -First 1)
         $exported = @{}
         Invoke-Dumpbin /exports $shim.FullName | ForEach-Object {

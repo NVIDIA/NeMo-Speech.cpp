@@ -480,10 +480,8 @@ jobs:
             CMakeArgs    = @('-DGGML_NATIVE=OFF', "-DNEMO_SPEECH_VERSION_METADATA=$env:VERSION_METADATA")
           }
           if ($env:EXTRA_CMAKE_ARGS) { $arguments.CMakeArgs += $env:EXTRA_CMAKE_ARGS -split ' ' }
-          if ($env:BACKEND -eq 'cuda') {
-            $arguments.CudaArch = $env:CUDA_ARCH
-            $arguments.CublasShim = $true
-          }
+          # CUDA archives carry NVIDIA's cuBLAS and cuBLASLt (package-release.ps1).
+          if ($env:BACKEND -eq 'cuda') { $arguments.CudaArch = $env:CUDA_ARCH }
           scripts\windows\build.ps1 @arguments
 
       - name: Save vcpkg binaries
