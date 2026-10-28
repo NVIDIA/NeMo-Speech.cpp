@@ -68,7 +68,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT_CHANNEL: ${{ inputs.channel }}
           RELEASE_PATHS: >-
-            ^(\.github/workflows/release\.yml|docker/Dockerfile\.release-linux|scripts/build_itn_deps\.sh|scripts/build_sentencepiece_static\.sh|scripts/release/|scripts/windows/(build|package-release)\.ps1|CMakeLists\.txt|src/(asr|common)/CMakeLists\.txt|tests/ci/model_smoke\.py)
+            ^(\.github/workflows/release\.yml|docker/Dockerfile\.release-linux|scripts/build_itn_deps\.sh|scripts/build_sentencepiece_static\.sh|scripts/release/|scripts/windows/(build|package-release|install-build-prerequisites)\.ps1|CMakeLists\.txt|src/(asr|common)/CMakeLists\.txt|tests/ci/model_smoke\.py)
         run: |
           set -euo pipefail
           declared="$(sed -n 's/^NEMO_SPEECH_VERSION:[[:space:]]*//p' VERSION)"
@@ -411,31 +411,13 @@ jobs:
 
       - name: Install build prerequisites
         # Hosted windows-2022 images have these; self-hosted VMs selected with
-        # RELEASE_WINDOWS_CUDA_RUNNER may not (see gpu.yml).
+        # RELEASE_WINDOWS_CUDA_RUNNER may not. They come from their publishers
+        # (Chocolatey's community feed rate-limits shared runner addresses), and
+        # an arm64 build also gets the ARM64 MSVC tools and clang-cl.
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $packages = @()
-          foreach ($tool in @{ cmake = 'cmake'; ninja = 'ninja' }.GetEnumerator()) {
-            if (-not (Get-Command $tool.Key -ErrorAction SilentlyContinue)) { $packages += $tool.Value }
-          }
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $hasVc = (Test-Path $vswhere) -and
-            (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-          if (-not $hasVc) { $packages += 'visualstudio2022-workload-vctools' }
-          if (-not $packages) { exit 0 }
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-            $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
-          }
-          choco install -y --no-progress @packages
-          if ($LASTEXITCODE -ne 0) { throw "choco install failed ($LASTEXITCODE)" }
-          # Later steps start with the job's original PATH; publish the new one.
-          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-          "$machine;$user" -split ';' | Where-Object { $_ } | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: scripts\windows\install-build-prerequisites.ps1 -Architecture $env:ARCH
 
       - name: Install the Vulkan SDK
         if: matrix.backend == 'vulkan'
@@ -447,21 +429,6 @@ jobs:
           if (-not $vulkan) { throw 'VULKAN_SDK was not set by the installer' }
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan"
           Add-Content -Path $env:GITHUB_PATH -Value "$vulkan\Bin"
-
-      - name: Install the ARM64 C++ tools
-        # Cross-compiling needs the x64-hosted ARM64 MSVC tools and clang-cl.
-        if: matrix.arch == 'arm64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $missing = @('Microsoft.VisualStudio.Component.VC.Tools.ARM64', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang') |
-            Where-Object { -not (& $vswhere -latest -products * -requires $_ -property installationPath) }
-          if (-not $missing) { exit 0 }
-          $arguments = @('modify', '--installPath', "`"$vs`"", '--quiet', '--norestart') + ($missing | ForEach-Object { '--add', $_ })
-          $process = Start-Process "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" -ArgumentList $arguments -Wait -PassThru
-          if ($process.ExitCode -notin 0, 3010) { throw "Visual Studio installer failed ($($process.ExitCode))" }
 
       - name: Install the CUDA toolkit
         if: matrix.backend == 'cuda' && matrix.arch == 'x64'
@@ -723,22 +690,10 @@ jobs:
           key: models-${{ hashFiles('models/index.json') }}
 
       - name: Install Python
-        # The ephemeral VM does not necessarily ship Python (see gpu.yml).
+        # The ephemeral VM does not necessarily ship Python (see gpu.yml); the
+        # smoke test needs only the standard library.
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (Get-Command python -ErrorAction SilentlyContinue) { exit 0 }
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-            $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
-          }
-          choco install -y --no-progress python
-          # Later steps start with the job's original PATH; publish the new one.
-          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-          "$machine;$user" -split ';' | Where-Object { $_ } | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+        run: scripts\windows\install-build-prerequisites.ps1 -Install python
 
       - name: Model smoke test
         shell: pwsh
