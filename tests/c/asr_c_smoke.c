@@ -10,6 +10,7 @@
  *
  * WAV must be 16 kHz mono 16-bit PCM (the test reads it as such).
  */
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,9 +48,6 @@ read_wav_f32(const char* path, size_t* n_out) {
     return out;
 }
 
-_Static_assert(NEMO_SPEECH_ASR_ERROR_RESOURCE_EXHAUSTED == 5, "status values are append-only");
-_Static_assert(NEMO_SPEECH_ASR_ERROR_UNAVAILABLE == 6, "status values are append-only");
-
 /* SALM selection through the append-only recognizer config; needs no model. */
 static int
 check_salm_config(void) {
@@ -85,6 +83,11 @@ check_salm_config(void) {
 int
 main(int argc, char** argv) {
     printf("nemo_speech_asr_version: %s\n", nemo_speech_asr_version());
+    /* Checked at run time: MSVC's default C mode has no _Static_assert. */
+    if (NEMO_SPEECH_ASR_ERROR_RESOURCE_EXHAUSTED != 5 || NEMO_SPEECH_ASR_ERROR_UNAVAILABLE != 6) {
+        fprintf(stderr, "status values are append-only\n");
+        return 1;
+    }
     if (check_salm_config() != 0)
         return 1;
     if (argc < 3) {
