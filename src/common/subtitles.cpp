@@ -374,7 +374,7 @@ std::string
 join_texts(const std::vector<TimedWord>& words, size_t begin, size_t end) {
     std::string out;
     for (size_t k = begin; k < end; ++k) {
-        if (k > begin)
+        if (k > begin && !words[k].joins_previous)
             out += ' ';
         out += words[k].text;
     }
@@ -496,29 +496,35 @@ grapheme_count(const std::string& text) {
 
 std::vector<WordCue>
 word_cues(const std::vector<TimedWord>& words) {
-    double previous_end = 0.0;
     for (size_t index = 0; index < words.size(); ++index) {
         const auto& word = words[index];
         if (blank(word.text))
             throw std::invalid_argument(
                 "word " + std::to_string(index) + " has empty display text");
         if (!std::isfinite(word.start) || !std::isfinite(word.end) || word.start < 0.0 ||
-            word.end <= word.start)
+            word.end < word.start)
             throw std::invalid_argument(
                 "word " + std::to_string(index) + " has invalid timestamps");
-        if (index > 0 && word.start < previous_end)
+        if (index > 0 && word.start < words[index - 1].start)
             throw std::invalid_argument(
-                "word " + std::to_string(index) + " overlaps the preceding word");
-        previous_end = word.end;
+                "word " + std::to_string(index) + " starts before the preceding word");
     }
+    // Another speaker's word can end after the last word of a cue.
+    const auto latest_end = [&](size_t begin, size_t end_inclusive) {
+        double end = words[begin].end;
+        for (size_t k = begin + 1; k <= end_inclusive; ++k) end = std::max(end, words[k].end);
+        return end;
+    };
     std::vector<WordCue> cues;
     size_t first = 0;
     while (first < words.size()) {
         bool have_valid = false, have_sentence = false;
         size_t last_valid = 0, last_sentence = 0;
         std::string layout;
+        double end = words[first].end;
         for (size_t candidate = first; candidate < words.size(); ++candidate) {
-            const double duration = words[candidate].end - words[first].start;
+            end = std::max(end, words[candidate].end);
+            const double duration = end - words[first].start;
             if (duration > kMaxCueSeconds)
                 break;
             if (!cue_layout(words, first, candidate, layout))
@@ -538,7 +544,7 @@ word_cues(const std::vector<TimedWord>& words) {
             cue.text = words[first].text;
         }
         cue.start = words[first].start;
-        cue.end = words[cue.last_word].end;
+        cue.end = latest_end(first, cue.last_word);
         first = cue.last_word + 1;
         cues.push_back(std::move(cue));
     }
@@ -550,39 +556,25 @@ render_word_cues(const std::vector<WordCue>& cues, const std::string& format) {
     const bool vtt = format == "vtt";
     if (!vtt && format != "srt")
         throw std::invalid_argument("subtitle format must be srt or vtt");
-    std::vector<std::pair<uint64_t, uint64_t>> times;
-    times.reserve(cues.size());
-    bool have_previous = false;
-    uint64_t previous_end = 0;
-    for (size_t index = 0; index < cues.size(); ++index) {
-        if (blank(cues[index].text))
-            throw std::invalid_argument(
-                "subtitle cue " + std::to_string(index) + " has empty text");
-        const uint64_t start = subtitle_milliseconds(cues[index].start);
-        const uint64_t end = subtitle_milliseconds(cues[index].end);
-        if (end <= start)
-            throw std::invalid_argument(
-                "subtitle cue " + std::to_string(index) + " must end strictly after its start");
-        if (have_previous && start < previous_end)
-            throw std::invalid_argument(
-                "subtitle cue " + std::to_string(index) + " overlaps the preceding cue");
-        have_previous = true, previous_end = end;
-        times.emplace_back(start, end);
-    }
     std::string body = vtt ? "WEBVTT\n\n" : "";
     for (size_t index = 0; index < cues.size(); ++index) {
         const std::string& text = cues[index].text;
+        if (blank(text))
+            throw std::invalid_argument(
+                "subtitle cue " + std::to_string(index) + " has empty text");
         if (vtt) {
-            bool empty_line = text.empty() || text.front() == '\n' || text.back() == '\n' ||
+            bool empty_line = text.front() == '\n' || text.back() == '\n' ||
                               text.find("\n\n") != std::string::npos;
             if (text.find("-->") != std::string::npos || empty_line)
                 throw std::invalid_argument("WebVTT cue text contains an invalid separator");
         } else {
             body += std::to_string(index + 1) + "\n";
         }
-        body += format_milliseconds(times[index].first, vtt ? '.' : ',');
+        const uint64_t start = subtitle_milliseconds(cues[index].start);
+        const uint64_t end = std::max(start + 1, subtitle_milliseconds(cues[index].end));
+        body += format_milliseconds(start, vtt ? '.' : ',');
         body += " --> ";
-        body += format_milliseconds(times[index].second, vtt ? '.' : ',');
+        body += format_milliseconds(end, vtt ? '.' : ',');
         body += "\n" + text + "\n\n";
     }
     return body;

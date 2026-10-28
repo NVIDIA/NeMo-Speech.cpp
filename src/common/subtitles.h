@@ -47,23 +47,26 @@ std::vector<Cue> make_cues(
 // seconds; the SRT/VTT renderers round to whole milliseconds (half away from zero).
 
 struct TimedWord {
-    std::string text;
+    std::string text;               // as shown: the running text
     double start = 0.0, end = 0.0;  // seconds
+    bool joins_previous = false;    // shown without a space before it (Chinese, Japanese, Thai)
 };
 
 struct WordCue {
     size_t first_word = 0, last_word = 0;  // inclusive positions in the word list
-    double start = 0.0, end = 0.0;         // seconds: first word's start, last word's end
+    double start = 0.0, end = 0.0;         // seconds: first word's start, its words' latest end
     std::string text;                      // one line, or two joined by '\n'
 };
 
-// Words must be ordered, non-overlapping, with finite end > start >= 0 and non-blank text;
-// otherwise throws std::invalid_argument ("word N has ..."; clients match these messages).
+// Words come in the order of their starts, as NeMo's aligner gives them: a word can have no
+// duration, and the words of different speakers overlap. Each needs non-blank text and finite
+// times with end >= start >= 0; otherwise throws std::invalid_argument ("word N has ...",
+// "word N starts before the preceding word").
 std::vector<WordCue> word_cues(const std::vector<TimedWord>& words);
 
-// format "srt" or "vtt". Throws std::invalid_argument for an unknown format, a cue whose
-// millisecond times collapse or overlap after rounding, an empty cue, or (vtt) cue text that
-// contains "-->" or an empty line.
+// format "srt" or "vtt". The cues of overlapping speakers can overlap, which both formats allow; a
+// cue that rounds to no duration ends 1 ms after its start. Throws std::invalid_argument for an
+// unknown format, an empty cue, or (vtt) cue text that contains "-->" or an empty line.
 std::string render_word_cues(const std::vector<WordCue>& cues, const std::string& format);
 
 // Extended grapheme clusters (UAX #29 rules GB1-GB13; the Unicode 15.1 Indic conjunct rule GB9c

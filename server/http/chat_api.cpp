@@ -945,45 +945,8 @@ trim(std::string_view s) {
     return s.substr(begin, end - begin);
 }
 
-std::string_view
-trim_end(std::string_view s) {
-    size_t end = 0;
-    for (size_t i = 0; i < s.size();) {
-        if (!is_white_space(next_code_point(s, i)))
-            end = i;
-    }
-    return s.substr(0, end);
-}
-
-// Cue line lengths in extended grapheme clusters (UAX #29), as the other subtitle path counts them
-// (subtitles.h).
-size_t
-grapheme_count(std::string_view s) {
-    return subtitle::grapheme_count(std::string(s));
-}
-
 // ------------------------------------------------------------------------------------------------
 // Subtitle cues.
-
-struct Cue {
-    size_t first_word = 0, last_word = 0;
-    double start = 0.0, end = 0.0;
-    std::string text;
-};
-
-constexpr double kMaxCueSeconds = 7.0;
-constexpr size_t kMaxCueLineGraphemes = 42;
-constexpr double kMinSentenceBreakSeconds = 0.833;
-
-bool
-ends_sentence(std::string_view word) {
-    const auto text = trim_end(word);
-    if (text.empty())
-        return false;
-    if (text.back() == '.' || text.back() == '!' || text.back() == '?')
-        return true;
-    return text.size() >= 3 && text.substr(text.size() - 3) == "\xE2\x80\xA6";  // U+2026
-}
 
 // A word as subtitles show it: its running text (SpeechLmWord::display) when set.
 std::string_view
@@ -991,87 +954,14 @@ shown(const asr::SpeechLmWord& word) {
     return word.display.empty() ? std::string_view(word.word) : std::string_view(word.display);
 }
 
-std::optional<std::string>
-cue_layout(const std::vector<asr::SpeechLmWord>& words, size_t first, size_t last) {
-    std::vector<std::string_view> display;
-    for (size_t i = first; i <= last; ++i) display.push_back(shown(words[i]));
-    const auto join = [&](size_t a, size_t b) {
-        std::string line;
-        for (size_t i = a; i < b; ++i) {
-            if (i > a && !words[first + i].joins_previous)
-                line += ' ';
-            line += display[i];
-        }
-        return line;
-    };
-    std::string single = join(0, display.size());
-    if (grapheme_count(single) <= kMaxCueLineGraphemes)
-        return single;
-    // Two lines: prefer a split after a sentence end, then the most balanced pair (remaining ties
-    // by line text).
-    std::optional<std::tuple<size_t, size_t, std::string, std::string>> best;
-    for (size_t split = 1; split < display.size(); ++split) {
-        std::string first_line = join(0, split), second_line = join(split, display.size());
-        const size_t first_length = grapheme_count(first_line),
-                     second_length = grapheme_count(second_line);
-        if (first_length > kMaxCueLineGraphemes || second_length > kMaxCueLineGraphemes)
-            continue;
-        const size_t balance = first_length > second_length ? first_length - second_length
-                                                            : second_length - first_length;
-        auto candidate = std::make_tuple(
-            static_cast<size_t>(ends_sentence(display[split - 1])), SIZE_MAX - balance,
-            std::move(first_line), std::move(second_line));
-        if (!best || candidate > *best)
-            best = std::move(candidate);
-    }
-    if (!best)
-        return std::nullopt;
-    return std::get<2>(*best) + "\n" + std::get<3>(*best);
-}
-
-std::vector<Cue>
+// The cues of the aligned words (subtitles.h), which come in the order of their starts.
+std::vector<subtitle::WordCue>
 build_cues(const std::vector<asr::SpeechLmWord>& words) {
-    // Words come in the order of their starts; NeMo's aligner can give a word no duration, and the
-    // words of different speakers overlap.
-    for (size_t i = 0; i < words.size(); ++i) {
-        const auto& word = words[i];
-        if (trim(word.word).empty())
-            throw std::runtime_error("word " + std::to_string(i) + " has empty display text");
-        if (!std::isfinite(word.start) || !std::isfinite(word.end) || word.start < 0.0 ||
-            word.end < word.start)
-            throw std::runtime_error("word " + std::to_string(i) + " has invalid timestamps");
-        if (i > 0 && word.start < words[i - 1].start)
-            throw std::runtime_error(
-                "word " + std::to_string(i) + " starts before the preceding word");
-    }
-    const auto latest_end = [&](size_t first, size_t last) {
-        double end = words[first].end;
-        for (size_t i = first + 1; i <= last; ++i) end = std::max(end, words[i].end);
-        return end;
-    };
-    std::vector<Cue> cues;
-    size_t first = 0;
-    while (first < words.size()) {
-        std::optional<size_t> last_valid, last_sentence;
-        for (size_t candidate = first; candidate < words.size(); ++candidate) {
-            const double duration = latest_end(first, candidate) - words[first].start;
-            if (duration > kMaxCueSeconds || !cue_layout(words, first, candidate))
-                break;
-            last_valid = candidate;
-            if (duration >= kMinSentenceBreakSeconds && ends_sentence(shown(words[candidate])))
-                last_sentence = candidate;
-        }
-        // One word that cannot meet the bounds becomes its own oversized cue.
-        size_t last = first;
-        std::string text(shown(words[first]));
-        if (auto chosen = last_sentence ? last_sentence : last_valid) {
-            last = *chosen;
-            text = *cue_layout(words, first, last);
-        }
-        cues.push_back({first, last, words[first].start, latest_end(first, last), std::move(text)});
-        first = last + 1;
-    }
-    return cues;
+    std::vector<subtitle::TimedWord> timed;
+    timed.reserve(words.size());
+    for (const auto& word : words)
+        timed.push_back({std::string(shown(word)), word.start, word.end, word.joins_previous});
+    return subtitle::word_cues(timed);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1502,41 +1392,12 @@ write_word(JsonWriter& json, const asr::SpeechLmWord& word) {
     json.end_object();
 }
 
-// SRT or WebVTT text of the subtitle cues (transcription.subtitles), times rounded to whole
-// milliseconds (half away from zero). The cues of overlapping speakers can overlap, which both
-// formats allow; a cue that rounds to no duration ends 1 ms after its start.
-std::string
-subtitle_text(const std::vector<Cue>& cues, const std::string& format) {
-    const bool vtt = format == "vtt";
-    const auto timecode = [vtt](int64_t ms) {
-        char out[40];
-        std::snprintf(
-            out, sizeof out, "%02lld:%02lld:%02lld%c%03lld", static_cast<long long>(ms / 3600000),
-            static_cast<long long>(ms / 60000 % 60), static_cast<long long>(ms / 1000 % 60),
-            vtt ? '.' : ',', static_cast<long long>(ms % 1000));
-        return std::string(out);
-    };
-    std::string text = vtt ? "WEBVTT\n\n" : "";
-    for (size_t i = 0; i < cues.size(); ++i) {
-        const Cue& cue = cues[i];
-        if (vtt && (cue.text.find("-->") != std::string::npos ||
-                    cue.text.find("\n\n") != std::string::npos))
-            throw std::runtime_error("WebVTT cue text contains an invalid separator");
-        const int64_t start = std::llround(cue.start * 1000.0);
-        const int64_t end = std::max<int64_t>(start + 1, std::llround(cue.end * 1000.0));
-        if (!vtt)
-            text += std::to_string(i + 1) + "\n";
-        text += timecode(start) + " --> " + timecode(end) + "\n" + cue.text + "\n\n";
-    }
-    return text;
-}
-
 // The `transcription` object of a completion: the verbose_json fields of /v1/audio/transcriptions
 // (task, language, duration, text, words, segments) plus the alignment and speaker details.
 void
 write_payload(
     JsonWriter& json, const ValidatedRequest& request, const asr::SpeechLmDetails& details,
-    const std::vector<Cue>& cues, const std::string* subtitles = nullptr) {
+    const std::vector<subtitle::WordCue>& cues, const std::string* subtitles = nullptr) {
     const bool aligned = details.alignment_status == "aligned";
     json.begin_object();
     json.key("schema_version").string("1");
@@ -1645,7 +1506,7 @@ backend_error(const std::exception_ptr& failure) {
 // request's facts) and the subtitle cues of an aligned transcript.
 struct Completion {
     asr::SpeechLmDetails details;
-    std::vector<Cue> cues;
+    std::vector<subtitle::WordCue> cues;
 };
 
 Completion
@@ -2183,7 +2044,7 @@ Api::post(const HeaderLookup& headers, const BodyReader& read_body, const Client
                                                          : details->failure_reason) +
                         "), so no subtitles can be rendered",
                     "subtitle_format"};
-            subtitles = subtitle_text(out.cues, *request.subtitle_format);
+            subtitles = subtitle::render_word_cues(out.cues, *request.subtitle_format);
         }
 
         const std::string id = s.backend.request_id();

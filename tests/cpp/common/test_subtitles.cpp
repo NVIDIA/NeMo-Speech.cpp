@@ -291,6 +291,38 @@ test_word_cues_render_rounding_and_hours() {
 }
 
 void
+test_word_cues_overlap_and_joined_text() {
+    using nemo_speech::subtitle::render_word_cues;
+    using nemo_speech::subtitle::word_cues;
+    // NeMo's aligner: the words of two speakers overlap and a word can have no duration; the cue
+    // ends at its words' latest end.
+    const auto cues = word_cues(
+        {{"Hello", 0.40, 0.90},
+         {"Yes.", 0.60, 1.00},
+         {"there.", 0.95, 0.95},
+         {"Fine.", 1.10, 1.50}});
+    require(
+        cues.size() == 1 && cues[0].last_word == 3 && cues[0].end == 1.5 &&
+            cues[0].text == "Hello Yes. there. Fine.",
+        "overlapping and zero-length words");
+    // A cue inside another (two speakers) renders as it is; one that rounds to no duration ends
+    // 1 ms after its start.
+    const auto nested = word_cues({{"Hello", 0.4, 9.0}, {"Yes.", 1.0, 1.0005}});
+    require(
+        render_word_cues(nested, "srt") ==
+            "1\n00:00:00,400 --> 00:00:09,000\nHello\n\n2\n00:00:01,000 --> 00:00:01,001\nYes.\n\n",
+        "overlapping cues and a 1 ms minimum");
+    // Running text of Chinese, Japanese and Thai characters joins without a space.
+    const auto joined = word_cues(
+        {{"\xe4\xbd\xa0", 0.0, 0.2},
+         {"\xe5\xa5\xbd\xe3\x80\x82", 0.2, 0.4, true},
+         {"OK.", 0.5, 0.9}});
+    require(
+        joined.size() == 1 && joined[0].text == "\xe4\xbd\xa0\xe5\xa5\xbd\xe3\x80\x82 OK.",
+        "joined running text");
+}
+
+void
 test_word_cues_rejections() {
     using nemo_speech::subtitle::render_word_cues;
     using nemo_speech::subtitle::word_cues;
@@ -300,17 +332,13 @@ test_word_cues_rejections() {
             "word 1 has empty display text"),
         "blank word");
     require(
-        throws_with([] { word_cues({{"a", 0.5, 0.5}}); }, "word 0 has invalid timestamps"),
-        "zero-length word");
+        throws_with([] { word_cues({{"a", 0.5, 0.4}}); }, "word 0 has invalid timestamps"),
+        "word ending before its start");
     require(
         throws_with(
-            [] { word_cues({{"a", 0.0, 0.6}, {"b", 0.5, 1.0}}); },
-            "word 1 overlaps the preceding word"),
-        "overlapping words");
-    const auto brief = word_cues({{"brief", 0.0004, 0.00049}});
-    require(
-        throws_with([&] { render_word_cues(brief, "srt"); }, "must end strictly after its start"),
-        "cue collapsing after rounding");
+            [] { word_cues({{"a", 0.5, 0.6}, {"b", 0.4, 1.0}}); },
+            "word 1 starts before the preceding word"),
+        "words out of order");
     const auto unsafe = word_cues({{"unsafe --> cue", 0.0, 0.5}});
     require(
         throws_with(
@@ -320,7 +348,7 @@ test_word_cues_rejections() {
     require(
         render_word_cues(unsafe, "srt").find("unsafe --> cue") != std::string::npos,
         "srt keeps the text");
-    require(throws_with([&] { render_word_cues(brief, "txt"); }, "srt or vtt"), "unknown format");
+    require(throws_with([&] { render_word_cues(unsafe, "txt"); }, "srt or vtt"), "unknown format");
 }
 
 void
@@ -390,6 +418,7 @@ main() {
     test_word_cues_sentence_break_and_duration();
     test_word_cues_oversized_word();
     test_word_cues_render_rounding_and_hours();
+    test_word_cues_overlap_and_joined_text();
     test_word_cues_rejections();
     test_grapheme_counts_match_icu();
     std::cout << "subtitle tests passed\n";
