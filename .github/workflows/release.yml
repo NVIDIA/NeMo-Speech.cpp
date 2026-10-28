@@ -414,21 +414,18 @@ jobs:
         # RELEASE_WINDOWS_CUDA_RUNNER may not. They come from their publishers
         # (Chocolatey's community feed rate-limits shared runner addresses), and
         # an arm64 build also gets the ARM64 MSVC tools and clang-cl.
+        timeout-minutes: 45
         shell: pwsh
         env:
           ARCH: ${{ matrix.arch }}
         run: scripts\windows\install-build-prerequisites.ps1 -Architecture $env:ARCH
 
       - name: Install the Vulkan SDK
+        # From LunarG (pinned, SHA-256): Chocolatey's package stalled a job for hours.
         if: matrix.backend == 'vulkan'
+        timeout-minutes: 20
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          choco install -y --no-progress vulkan-sdk
-          $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
-          if (-not $vulkan) { throw 'VULKAN_SDK was not set by the installer' }
-          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan"
-          Add-Content -Path $env:GITHUB_PATH -Value "$vulkan\Bin"
+        run: scripts\windows\install-build-prerequisites.ps1 -Install vulkan
 
       - name: Install the CUDA toolkit
         if: matrix.backend == 'cuda' && matrix.arch == 'x64'

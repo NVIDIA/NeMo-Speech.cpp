@@ -5,13 +5,14 @@
     Install the Windows build prerequisites that a bare machine lacks.
 .DESCRIPTION
     Installs only what is missing, from the publishers' own servers: CMake and Ninja
-    from their GitHub releases and the Python embeddable package from python.org, each
-    checked against a pinned SHA-256, and the Visual Studio 2022 Build Tools (C++
-    workload) with Microsoft's bootstrapper, whose signature is checked. Downloads are
-    retried, rate limits (HTTP 429) included. Under GitHub Actions the new tool
-    directories are added to GITHUB_PATH for later steps.
+    from their GitHub releases, the Python embeddable package from python.org and the
+    Vulkan SDK from LunarG, each checked against a pinned SHA-256, and the Visual Studio
+    2022 Build Tools (C++ workload) with Microsoft's bootstrapper, whose signature is
+    checked. Downloads are retried, rate limits (HTTP 429) and stalls included. Under
+    GitHub Actions the new tool directories are added to GITHUB_PATH (and VULKAN_SDK to
+    GITHUB_ENV) for later steps.
 .PARAMETER Install
-    What to provide: cmake, ninja, msvc, python (default: cmake, ninja, msvc).
+    What to provide: cmake, ninja, msvc, python, vulkan (default: cmake, ninja, msvc).
 .PARAMETER Architecture
     Target architecture of the build: x64, or arm64, which also needs the ARM64 MSVC
     tools (nvcc's host compiler) and clang-cl.
@@ -24,10 +25,11 @@
 .EXAMPLE
     pwsh scripts\windows\install-build-prerequisites.ps1 -Architecture arm64
     pwsh scripts\windows\install-build-prerequisites.ps1 -Install python
+    pwsh scripts\windows\install-build-prerequisites.ps1 -Install vulkan
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('cmake', 'ninja', 'msvc', 'python')]
+    [ValidateSet('cmake', 'ninja', 'msvc', 'python', 'vulkan')]
     [string[]]$Install = @('cmake', 'ninja', 'msvc'),
     [ValidateSet('x64', 'arm64')]
     [string]$Architecture = 'x64',
@@ -59,11 +61,23 @@ $Archives = @{
         Bin    = '.'
     }
 }
+$VulkanSdk = @{
+    Version = '1.4.363.0'
+    Url     = 'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkansdk-windows-X64-1.4.363.0.exe'
+    Sha256  = '94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141'
+}
 $VsBootstrapper = 'https://aka.ms/vs/17/release/vs_buildtools.exe'
 
 function Get-Download([string]$Url, [string]$Path) {
-    curl.exe -fsSL --retry 6 --retry-all-errors --retry-delay 20 -o $Path $Url
+    # A transfer slower than 100 kB/s for a minute is abandoned and retried.
+    curl.exe -fsSL --retry 6 --retry-all-errors --retry-delay 20 --connect-timeout 30 `
+        --speed-limit 100000 --speed-time 60 -o $Path $Url
     if ($LASTEXITCODE -ne 0) { throw "download failed ($LASTEXITCODE): $Url" }
+}
+
+function Assert-Sha256([string]$Path, [string]$Expected, [string]$Name) {
+    $digest = (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLowerInvariant()
+    if ($digest -ne $Expected) { throw "$Name checksum mismatch: got $digest" }
 }
 
 function Add-ToolPath([string]$Directory) {
@@ -79,8 +93,7 @@ function Install-Archive([string]$Name) {
         Write-Host "==> $Name from $($archive.Url)"
         $zip = Join-Path ([IO.Path]::GetTempPath()) "$Name-$PID.zip"
         Get-Download $archive.Url $zip
-        $digest = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-        if ($digest -ne $archive.Sha256) { throw "$Name checksum mismatch: got $digest" }
+        Assert-Sha256 $zip $archive.Sha256 $Name
         if (Test-Path $root) { Remove-Item -Recurse -Force $root }
         Expand-Archive -Path $zip -DestinationPath $root
         Remove-Item $zip
@@ -141,4 +154,27 @@ if ($Install -contains 'msvc') {
         if (-not $vs) { throw "Visual Studio still lacks $($components -join ', ')" }
         Write-Host "==> Visual Studio: $vs"
     }
+}
+
+if ($Install -contains 'vulkan') {
+    $sdk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+    if (-not ($sdk -and (Test-Path (Join-Path $sdk 'Bin\glslc.exe')))) {
+        Write-Host "==> Vulkan SDK $($VulkanSdk.Version) from $($VulkanSdk.Url)"
+        $installer = Join-Path ([IO.Path]::GetTempPath()) "vulkansdk-$PID.exe"
+        Get-Download $VulkanSdk.Url $installer
+        Assert-Sha256 $installer $VulkanSdk.Sha256 'Vulkan SDK'
+        # LunarG's unattended install; it sets the machine VULKAN_SDK.
+        $root = Join-Path $env:SystemDrive "VulkanSDK\$($VulkanSdk.Version)"
+        $arguments = @('--root', "`"$root`"", '--accept-licenses', '--default-answer',
+                       '--confirm-command', 'install')
+        $process = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "the Vulkan SDK installer failed ($($process.ExitCode))" }
+        Remove-Item $installer
+        $sdk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+        if (-not $sdk) { throw 'VULKAN_SDK was not set by the installer' }
+    }
+    Write-Host "==> Vulkan SDK: $sdk"
+    $env:VULKAN_SDK = $sdk
+    if ($env:GITHUB_ENV) { Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk" }
+    Add-ToolPath (Join-Path $sdk 'Bin')
 }
