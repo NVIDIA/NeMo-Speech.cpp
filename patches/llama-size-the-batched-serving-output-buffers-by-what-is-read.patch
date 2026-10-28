@@ -13,7 +13,7 @@ size drops.
 Upstream: not planned (batched serving path).
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 81f077dc2a2dd5962847915d4fa25ba8a453b061..eaaf80fea4ac64597b5122d60a919b351926f3b9 100644
+index 4bb50af80bcdb5edc8bc016975dde56ac1b8f3bc..f1529a7ddcbac13bf37cd120ee551f7da14a9f0b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1025,6 +1025,7 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {

@@ -28,7 +28,7 @@ index 066db99858d6d91bd6d66bb1316a67d6f07c5288..8dd80e0187a02fff196b1c6826031d19
      // n_threads is the number of threads used for generation (single token)
      // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 77e3d00cab0df305aa2f4319f280ff4a8c41e9c3..123ad58cae665e9db2f5e7208be2a6c13a6492e5 100644
+index 4f8702e34b9275cd817840cfbca3b383ba4b3656..26f9be761c1f0d06dafa48175975fb0a1ef6e390 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,8 @@
@@ -40,7 +40,7 @@ index 77e3d00cab0df305aa2f4319f280ff4a8c41e9c3..123ad58cae665e9db2f5e7208be2a6c1
  #include "llama-mmap.h"
  #include "llama-model.h"
  #include "llama-ext.h"
-@@ -2915,6 +2917,7 @@ llm_graph_params llama_context::graph_params(
+@@ -2917,6 +2919,7 @@ llm_graph_params llama_context::graph_params(
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
@@ -48,7 +48,7 @@ index 77e3d00cab0df305aa2f4319f280ff4a8c41e9c3..123ad58cae665e9db2f5e7208be2a6c1
      };
  }
  
-@@ -4336,6 +4339,21 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
+@@ -4339,6 +4342,21 @@ llama_serving_params llama_get_serving_params(const llama_context * ctx) {
      return ctx->get_cparams().serving;
  }
  

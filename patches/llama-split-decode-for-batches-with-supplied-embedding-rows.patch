@@ -28,7 +28,7 @@ index 5e8167a427ecc1fc26c2f4ade2fc187fe5ea95bd..066db99858d6d91bd6d66bb1316a67d6
      // the token ids (batch order; NULL keeps the prepared ones) and computes. 0 on success.
      LLAMA_API int32_t llama_decode_prepare(struct llama_context * ctx, struct llama_batch batch);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2d033a689da20c5b83667c85cdca3e3a2fe9623c..7d0f9919d465f6fdcf70da0536bc401d299d0b94 100644
+index 89dbcc87f7a0c8004f75c9b5b1032206a6478a80..d74017bb70a99f36852444933ac0cafc6403e80a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1800,6 +1800,59 @@ void llama_context::note_raw_logits() {

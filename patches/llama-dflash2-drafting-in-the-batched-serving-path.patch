@@ -176,7 +176,7 @@ index b197dbb794a4945cb2542e4fb9c8cf9afb49ae7d..a6019897344f0426e82e3a158130b848
  
          // build one batch holding every drafting sequence's noise block into a single decode)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a8c41e9c3 100644
+index d74017bb70a99f36852444933ac0cafc6403e80a..4f8702e34b9275cd817840cfbca3b383ba4b3656 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1028,6 +1028,65 @@ void llama_context::set_embeddings_nextn_device(bool value) {
@@ -270,7 +270,7 @@ index 7d0f9919d465f6fdcf70da0536bc401d299d0b94..77e3d00cab0df305aa2f4319f280ff4a
          if (has_samplers) {
              const auto stride = n_vocab;
  
-@@ -4272,6 +4342,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
+@@ -4273,6 +4343,22 @@ void llama_set_input_wait_event(llama_context * ctx, ggml_backend_event_t ev) {
      ctx->set_input_wait_event(ev);
  }
  

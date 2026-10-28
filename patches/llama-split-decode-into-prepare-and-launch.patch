@@ -26,7 +26,7 @@ index 93215ebf12fd71b31f85db1635b51554d4e10841..c54678069f588c07f14adfc4a1bc5615
      // n_threads is the number of threads used for generation (single token)
      // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 63a0558dc7a83ffde0e3b53509201b4f298737f2..6ddc0329f9fa9d8fb42ae971aa6a99860f73c35f 100644
+index 4eec4eb7a6cf045e82fd1b60282551e936797a5b..a76fac0bd4be628c2742fba760eb8243546fa2f9 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1433,6 +1433,24 @@ bool llama_context::set_adapter_cvec(
@@ -202,7 +202,7 @@ index 63a0558dc7a83ffde0e3b53509201b4f298737f2..6ddc0329f9fa9d8fb42ae971aa6a9986
      // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
      // so accept either present rather than requiring exactly one.
      GGML_ASSERT(batch_inp.token || batch_inp.embd);
-@@ -4458,6 +4595,14 @@ int32_t llama_encode(
+@@ -4459,6 +4596,14 @@ int32_t llama_encode(
      return ret;
  }
  

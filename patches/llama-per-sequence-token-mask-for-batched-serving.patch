@@ -27,7 +27,7 @@ index c54678069f588c07f14adfc4a1bc56152e7aca9e..5e8167a427ecc1fc26c2f4ade2fc187f
      LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
      LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 6ddc0329f9fa9d8fb42ae971aa6a99860f73c35f..81f077dc2a2dd5962847915d4fa25ba8a453b061 100644
+index a76fac0bd4be628c2742fba760eb8243546fa2f9..4bb50af80bcdb5edc8bc016975dde56ac1b8f3bc 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -2794,6 +2794,8 @@ llm_graph_params llama_context::graph_params(
@@ -39,7 +39,7 @@ index 6ddc0329f9fa9d8fb42ae971aa6a99860f73c35f..81f077dc2a2dd5962847915d4fa25ba8
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -4273,6 +4275,32 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
+@@ -4274,6 +4276,32 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
      return ctx->set_sampler(seq_id, smpl);
  }
  

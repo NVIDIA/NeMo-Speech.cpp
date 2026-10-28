@@ -16,7 +16,7 @@ demand.
 Upstream: not planned (batched serving path).
 
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index eaaf80fea4ac64597b5122d60a919b351926f3b9..2d033a689da20c5b83667c85cdca3e3a2fe9623c 100644
+index f1529a7ddcbac13bf37cd120ee551f7da14a9f0b..89dbcc87f7a0c8004f75c9b5b1032206a6478a80 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1347,6 +1347,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {

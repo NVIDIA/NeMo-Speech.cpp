@@ -787,7 +787,7 @@ index c1d953cf8a9cfb46f20ad5a5919a531b062d08db..7d41dd43f806f982763c770602d429c0
  
      // sanitize and auto-gen missing data in the input batch
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2cf84f88a4b1695f74607959eae49b295906248d..63a0558dc7a83ffde0e3b53509201b4f298737f2 100644
+index 2cf84f88a4b1695f74607959eae49b295906248d..4eec4eb7a6cf045e82fd1b60282551e936797a5b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1022,13 +1022,35 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
