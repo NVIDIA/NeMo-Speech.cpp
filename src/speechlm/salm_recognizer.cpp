@@ -258,6 +258,7 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
                 }
                 SalmRequest r{"warmup", audio[i].data(), audio[i].size(), rate};
                 r.max_new_tokens = 4;
+                r.decode_without_voice = true;  // the noise clips must reach the decoder
                 jobs.push_back(Job{std::move(r), Clock::now(), {}, {}});
                 queue_.push_back(&jobs.back());
             }

@@ -2172,11 +2172,9 @@ struct SalmEngine::Impl {
             finished_reqs.push_back(e.req);
         };
         // A request without a voice ends at its encoder output with an empty transcript: no
-        // decode and no fallback; word timestamps report it as they do a decoded empty transcript.
+        // decode, no fallback and no token counts (no usage, as for near-silent audio); word
+        // timestamps report it as they do a decoded empty transcript.
         auto finish_no_speech = [&](Encoded& e) {
-            SalmResult& r = results[e.req];
-            r.audio_tokens = e.frames;
-            r.end_of_turn = true;
             if (e.timestamps)
                 timestamp_ready.emplace_back(e.req, std::move(e.timestamps));
             else
@@ -2200,7 +2198,9 @@ struct SalmEngine::Impl {
                     ++dropped;
                 } else if (reqs[e.req].diarization_only) {
                     finish_diarization(e);
-                } else if (it == preempted.end() && e.error.empty() && !e.speech) {
+                } else if (
+                    it == preempted.end() && e.error.empty() && !e.speech &&
+                    !reqs[e.req].decode_without_voice) {
                     finish_no_speech(e);
                 } else if (it == preempted.end()) {
                     ready.push_back(std::move(e));
@@ -2492,7 +2492,9 @@ struct SalmEngine::Impl {
             }
             if (active.empty() && ready.empty() && waiting.empty() && aheads.empty() && !pend_now &&
                 reencode.empty()) {
-                if (aligning) {  // only word timestamps in flight: keep taking new work meanwhile
+                // only word timestamps in flight (also queued ones, such as a voiceless request's):
+                // keep taking new work meanwhile
+                if (aligning || !timestamp_ready.empty()) {
                     take(cfg.max_sequences, /*block=*/false);
                     if (waiting.empty())
                         harvest_timestamps(std::chrono::milliseconds(1));

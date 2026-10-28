@@ -88,6 +88,8 @@ struct SalmRequest {
     // Speaker turns alone (with `timestamps`): the request ends at its encoder output, with the
     // 10 ms diarization segments in SalmResult::details and no prefill, decode or transcript.
     bool diarization_only = false;
+    // Decoded even when the speaker branch hears no voice (warmup, whose clips are noise).
+    bool decode_without_voice = false;
     float temperature = 0;         // below 1e-5: greedy; else sampled at this temperature
     std::optional<uint64_t> seed;  // sampling seed (same seed, same transcript); absent: random
     bool latin_script =
