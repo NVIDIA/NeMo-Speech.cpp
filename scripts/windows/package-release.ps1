@@ -129,8 +129,9 @@ try {
     }
 
     # A cross-compiled package must not mix in host binaries. The ARM64 Visual C++
-    # runtime ships ARM64X DLLs, whose headers may report x64.
-    $machine = if ($Architecture -eq 'arm64') { '^\s*AA64 machine|\(ARM64X\)' } else { '^\s*8664 machine \(x64\)\s*$' }
+    # runtime's DLLs are ARM64X, which report AA64 (vcruntime140_1.dll, which reports
+    # x64, is for x64 code and is not installed).
+    $machine = if ($Architecture -eq 'arm64') { '^\s*AA64 machine' } else { '^\s*8664 machine \(x64\)\s*$' }
     $wrongMachine = foreach ($file in Get-ChildItem $bin -Include '*.dll', '*.exe' -Recurse) {
         $header = Invoke-Dumpbin /headers $file.FullName | Where-Object { $_ -match 'machine \(' } | Select-Object -First 1
         if ($header -notmatch $machine) { "$($file.Name): $($header.Trim())" }

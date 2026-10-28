@@ -45,7 +45,14 @@ if(WIN32)
     if(NOT DEFINED GGML_OPENMP OR GGML_OPENMP)
         set(CMAKE_INSTALL_OPENMP_LIBRARIES TRUE)
     endif()
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
     include(InstallRequiredSystemLibraries)
+    # The ARM64 runtime's vcruntime140_1.dll is x64 code (for emulated and ARM64EC
+    # processes); ARM64 binaries do not import it.
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+        list(FILTER CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS EXCLUDE REGEX "/vcruntime[0-9]+_1\\.dll$")
+    endif()
+    install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 set(NEMO_SPEECH_LICENSE_INSTALL_DIR
     "${CMAKE_INSTALL_DATADIR}/licenses/nemo-speech")
