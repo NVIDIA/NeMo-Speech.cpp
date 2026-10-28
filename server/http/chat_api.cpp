@@ -696,8 +696,7 @@ shortest_digits(double magnitude, std::string& digits, int& exponent) {
             break;
         }
     }
-    while (digits.size() > 1 && digits.back() == '0')
-        digits.pop_back();
+    while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
 }
 
 // Shortest round-trip digits, decimal notation with a fractional part in [1e-5, 1e16), exponent
@@ -2088,6 +2087,14 @@ Api::post(const HeaderLookup& headers, const BodyReader& read_body, const Client
                 options.speechlm.instructions = custom;
             }
         }
+        // Other models decode greedily from a fixed task; they would ignore both. A seed stays
+        // accepted: a greedy decode gives the same transcript for every seed.
+        const bool speech_llm =
+            s.backend.supports_instructions && s.backend.supports_instructions();
+        if (!speech_llm && !options.speechlm.instructions.empty())
+            throw bad_request("an instruction needs a speech-LLM model", "messages");
+        if (!speech_llm && request.temperature && *request.temperature > 0)
+            throw bad_request("a temperature above 0 needs a speech-LLM model", "temperature");
         // Without a timestamp model, timestamp requests are refused with 422.
         if (request.word_timestamps &&
             !(s.backend.supports_timestamps && s.backend.supports_timestamps()))
@@ -2237,6 +2244,14 @@ install(httplib::Server& server, EngineRegistry& engines, const ApiConfig& confi
     backend.supports_timestamps = [&engines] {
         try {
             return engines.asr()->supports_word_timestamps();
+        }
+        catch (const std::exception&) {
+            return false;
+        }
+    };
+    backend.supports_instructions = [&engines] {
+        try {
+            return engines.asr()->supports_instructions();
         }
         catch (const std::exception&) {
             return false;

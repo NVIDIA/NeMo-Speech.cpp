@@ -94,6 +94,9 @@ class OfflineRecognitionBackend {
     // Speech translation (AsrRequestOptions::speechlm.task = "translate") and its target languages.
     virtual bool supports_translation() const { return false; }
     virtual std::vector<std::string> translation_languages() const { return {}; }
+    // Client instructions and sampled decoding (AsrRequestOptions::speechlm instructions,
+    // temperature and seed).
+    virtual bool supports_instructions() const { return false; }
     virtual std::vector<std::string> supported_languages() const = 0;
     virtual BatchMetrics batch_metrics() const = 0;
 };
@@ -227,6 +230,8 @@ class Recognizer {
     bool supports_word_timestamps() const;
     bool supports_speaker_diarization() const;
     bool supports_translation() const;
+    // A complete-audio backend that takes client instructions and sampled decoding (a speech-LLM).
+    bool supports_instructions() const;
     // A complete-audio backend that diarizes without transcribing (the speech-LLM's encoder);
     // diarize() throws without one.
     bool supports_offline_diarization() const;

@@ -79,8 +79,10 @@ struct Backend {
     std::function<asr::Result(const float*, size_t, int, const asr::AsrRequestOptions&)> recognize;
     std::function<bool()> ready;                // models loaded and warm
     std::function<bool()> supports_timestamps;  // a CTC timestamp model is loaded
-    std::function<std::string()> request_id;    // default "asr_<pid>_<millis>_<counter>"
-    std::function<uint64_t()> unix_seconds;     // default the wall clock
+    // A speech-LLM is loaded: instructions and temperature apply (other models decode greedily).
+    std::function<bool()> supports_instructions;
+    std::function<std::string()> request_id;  // default "asr_<pid>_<millis>_<counter>"
+    std::function<uint64_t()> unix_seconds;   // default the wall clock
     // The `model` accepted: the recognizer's id, which GET /v1/models lists.
     std::function<std::string()> model_alias;
 };

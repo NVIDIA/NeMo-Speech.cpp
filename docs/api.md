@@ -73,8 +73,9 @@ transcript keep the text as written. `confidence` is 0 for SALM models.
 
 ## POST /v1/chat/completions
 
-Speech-LLM (SALM) transcription in the OpenAI Chat Completions shape (JSON body). Served when a SALM model is
-loaded. The audio and an optional instruction travel as one user message:
+Speech-LLM (SALM) transcription in the OpenAI Chat Completions shape (JSON body). Other ASR models transcribe
+through it too, greedily: they refuse an instruction and a `temperature` above 0 with a 400. The audio and an
+optional instruction travel as one user message:
 
 | Field | Type | Default | Description |
 |---|---|---|---|

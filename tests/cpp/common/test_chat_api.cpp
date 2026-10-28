@@ -170,6 +170,7 @@ fixture() {
 struct Fake {
     asr::SpeechLmDetails details = fixture();
     bool timestamps = true;
+    bool instructions = true;            // a speech-LLM
     std::function<void()> on_recognize;  // throw or block
     std::vector<std::string> pieces;     // reported through on_text, then
     std::function<void()> after_text;    // throw
@@ -198,6 +199,7 @@ backend(Fake& fake) {
     };
     b.ready = [] { return true; };
     b.supports_timestamps = [&fake] { return fake.timestamps; };
+    b.supports_instructions = [&fake] { return fake.instructions; };
     b.model_alias = [] { return kModel; };
     b.request_id = [] { return std::string("abc"); };
     b.unix_seconds = [] { return uint64_t{1790000000}; };
@@ -787,6 +789,19 @@ test_audio_and_backend_errors() {
     EXPECT_ERROR(
         post(api, chat_body(kWords)), 422, "timestamp_unavailable",
         "word timestamps are unavailable", "");
+    fake.timestamps = true;
+    // Other models refuse what they would ignore; a seed and greedy decoding stay accepted.
+    fake.instructions = false;
+    EXPECT_ERROR(
+        post(api, chat_body("", with_text("Translate the speech into English."))), 400,
+        "invalid_request", "an instruction needs a speech-LLM model", "messages");
+    EXPECT_ERROR(
+        post(api, chat_body(R"("temperature":0.5)")), 400, "invalid_request",
+        "a temperature above 0 needs a speech-LLM model", "temperature");
+    CHECK(
+        post(api, chat_body(R"("temperature":0,"seed":7)")).response.status == 200 &&
+            post(api, chat_body("", with_text("  "))).response.status == 200,
+        "greedy, seeded and blank-instruction requests");
 }
 
 void

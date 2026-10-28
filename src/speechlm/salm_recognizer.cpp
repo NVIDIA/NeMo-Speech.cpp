@@ -322,6 +322,7 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
         return raw.details ? raw.details->diarization : std::vector<asr::SpeechLmSegment>{};
     }
     bool supports_translation() const override { return true; }
+    bool supports_instructions() const override { return true; }
     std::vector<std::string> translation_languages() const override {
         std::vector<std::string> codes;
         for (const auto& entry : policy::language_names()) codes.emplace_back(entry.first);

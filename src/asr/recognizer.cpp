@@ -796,6 +796,11 @@ Recognizer::supports_translation() const {
     return offline_backend_ && offline_backend_->supports_translation();
 }
 
+bool
+Recognizer::supports_instructions() const {
+    return offline_backend_ && offline_backend_->supports_instructions();
+}
+
 std::vector<std::string>
 Recognizer::translation_languages() const {
     return offline_backend_ ? offline_backend_->translation_languages()
