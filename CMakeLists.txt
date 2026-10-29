@@ -190,10 +190,10 @@ if(NEMO_SPEECH_BUILD_DIAR AND NOT NEMO_SPEECH_BUILD_ASR)
         "without the transcribe CLI/API surface")
 endif()
 
-# Drop-in cuBLAS shim (native GEMM, no cuBLASLt). Release builds can substitute
-# it for real cuBLAS to reduce their runtime closure.
-# Disabled by default for source builds, which link the CUDA toolkit's cuBLAS.
-# Portable builds enable the shim explicitly.
+# Drop-in cuBLAS shim (native GEMM, no cuBLASLt). A build can substitute it for
+# real cuBLAS to reduce its runtime closure.
+# Disabled by default: source builds link the CUDA toolkit's cuBLAS, and the
+# release archives and container ship NVIDIA's cuBLAS and cuBLASLt.
 # It is only built when GGML_CUDA is also ON (see the target below), and is a
 # no-op for Metal, Vulkan, and CPU builds.
 option(NEMO_SPEECH_CUBLAS_SHIM     "Build the in-tree drop-in cuBLAS shim (native GEMM, no cuBLASLt)" OFF)
