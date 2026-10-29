@@ -83,6 +83,15 @@ struct EncoderConfig {
         return emitted_frames > 0 ? 1 + (emitted_frames - 1) * subsampling_factor : 0;
     }
 
+    // Centre of encoder frame f's subsampling receptive field, in mel frames
+    // relative to f*sub. Every k=3/stride-2 stage pads (2, 1) when causal and
+    // (1, 1) otherwise, so causal frame f sees mel [f*sub - 2*(sub-1), f*sub]
+    // and is centred sub-1 mel frames before f*sub; symmetric frames are
+    // centred on f*sub.
+    int frame_center_mel_offset() const {
+        return conv_context == ConvContext::Causal ? 1 - subsampling_factor : 0;
+    }
+
     // Offline attention limits are independent of the streaming cache context.
     // -1 means unlimited; finite values preserve a model's trained attention window.
     int offline_left_ctx = -1;

@@ -11,6 +11,8 @@ target_link_libraries(test_rnnt_streaming PRIVATE nemo_speech_asr)
 
 add_executable(test_cache_stream_geometry test_cache_stream_geometry.cpp)
 target_link_libraries(test_cache_stream_geometry PRIVATE nemo_speech_asr)
+target_compile_definitions(test_cache_stream_geometry PRIVATE
+    NEMO_SPEECH_TEST_FILES_DIR="${CMAKE_SOURCE_DIR}/test_files")
 # Keep this separate from TEST_ASR_MODEL, which can also point to a CTC model.
 add_test(NAME cache_stream_geometry
     COMMAND test_cache_stream_geometry $ENV{NEMO_SPEECH_TEST_CACHE_AWARE_RNNT_MODEL})

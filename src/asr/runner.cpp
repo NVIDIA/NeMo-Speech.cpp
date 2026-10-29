@@ -117,6 +117,15 @@ fire_eou(
         head->reset_utterance();
 }
 
+// Bound the top hypothesis and every N-best alternative at the source, before
+// ITN, subtitles and speaker attribution read them.
+void
+bound_update_words(StreamingUpdate& update, int64_t frame_limit) {
+    bound_word_frames(update.words, frame_limit);
+    for (auto& hypothesis : update.extra_alternatives)
+        bound_word_frames(hypothesis.words, frame_limit);
+}
+
 // Shared VAD/endpointer wiring for both runner ctors. The Silero VAD is built
 // when feature masking or VAD-driven endpointing needs it; one inference per
 // step feeds both. The endpointer is built unconditionally: cfg.enable gates
@@ -279,8 +288,14 @@ BufferedStreamRunner::step() {
     // reset_utterance cleared the decoder's buffer.
     if (!update.is_final && opts_.needs_word_timings())
         update.words = head_->word_timings();
+    bound_update_words(update, real_frame_limit());
     trim_buffers();
     return update;
+}
+
+int64_t
+BufferedStreamRunner::real_frame_limit() const {
+    return real_encoder_frames(total_mel_frames_produced_, model_->subsampling_factor());
 }
 
 // Advance the VAD speech scan over newly-decoded mel frames up to decoded_mel,
@@ -403,6 +418,7 @@ BufferedStreamRunner::finalize() {
             update, head_.get(), opts_.needs_word_timings(), transcript_,
             static_cast<float>(audio_base_ + audio_buf_.size()) / static_cast<float>(sample_rate_),
             opts_.max_alternatives);
+        bound_update_words(update, real_frame_limit());
         return update;
     }
 
@@ -441,6 +457,7 @@ BufferedStreamRunner::finalize() {
     fill_final_update(
         update, head_.get(), opts_.needs_word_timings(), transcript_,
         static_cast<float>(audio_end) / static_cast<float>(sample_rate_), opts_.max_alternatives);
+    bound_update_words(update, real_frame_limit());
     return update;
 }
 
@@ -696,6 +713,7 @@ OfflineRunner::finalize() {
         static_cast<float>(audio_.size()) / static_cast<float>(model_->sample_rate());
     if (audio_.empty())
         return update;
+    const size_t real_samples = audio_.size();
     pad_audio_to_bucket_();
 
     // Audio past the positional-encoding budget is split at quiet points and
@@ -706,6 +724,17 @@ OfflineRunner::finalize() {
     std::unique_ptr<Decoder> owned_decoder;
     Decoder* decoder = nullptr;
     std::vector<int> tokens;
+    // Encoder frames past the real audio (bucket padding and the final
+    // centered frame) can still emit; bound words to the real frames.
+    int64_t frame_limit = 0;
+    const auto note_real_frames = [&](size_t off, size_t len, int64_t frame_offset) {
+        if (off >= real_samples)
+            return;
+        const auto mel =
+            static_cast<int64_t>(std::min(len, real_samples - off)) / model_->fe().hop_length();
+        frame_limit = frame_offset +
+                      real_encoder_frames(std::max<int64_t>(1, mel), model_->subsampling_factor());
+    };
     if (model_->head_kind() == HeadKind::Ctc) {
         auto* ctc = static_cast<CtcModel*>(model_);
         decoder = ctc_decoder_.get();
@@ -721,12 +750,14 @@ OfflineRunner::finalize() {
                 ctc->infer_ctc_greedy(audio_.data() + off, len, best_ids, best_probs, T);
                 seg_tokens =
                     greedy->step_compact(best_ids.data(), best_probs.data(), T, frame_offset);
+                note_real_frames(off, len, frame_offset);
                 frame_offset += T;
             } else {
                 std::vector<float> log_probs;
                 int T = 0, C = 0;
                 ctc->infer_ctc(audio_.data() + off, len, log_probs, T, C);
                 seg_tokens = decoder->step(log_probs.data(), C, T, frame_offset);
+                note_real_frames(off, len, frame_offset);
                 frame_offset += T;
             }
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
@@ -745,6 +776,7 @@ OfflineRunner::finalize() {
             transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
             auto seg_tokens =
                 decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+            note_real_frames(off, len, frame_offset);
             frame_offset += T;
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
         }
@@ -769,6 +801,7 @@ OfflineRunner::finalize() {
     update.confidence = decoder->confidence();
     if (opts_.max_alternatives > 1)
         update.extra_alternatives = decoder->additional_hypotheses(opts_.max_alternatives);
+    bound_update_words(update, frame_limit);
     return update;
 }
 
@@ -1031,8 +1064,13 @@ CacheStreamRunner::step() {
     // per-utterance buffers are already cleared.
     if (!update.is_final)
         update.transcript_so_far = transcript_;
+    // Decoded progress, like the buffered runner's emit cursor: the decoded
+    // mel frontier (the endpointer's clock), not audio queued for lookahead.
+    const auto decoded_samples = std::min<int64_t>(
+        enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_) * model_->fe().hop_length(),
+        static_cast<int64_t>(audio_end));
     update.audio_processed_sec =
-        static_cast<float>(audio_end) / static_cast<float>(model_->fe_config().sample_rate);
+        static_cast<float>(decoded_samples) / static_cast<float>(model_->fe_config().sample_rate);
     // A pending force_eou() must fire even on a chunk-less step.
     if (!update.is_final)
         poll_endpoint(update, /*after_chunk=*/false);
@@ -1040,8 +1078,14 @@ CacheStreamRunner::step() {
         update.words = head_->word_timings();
     if (head_)
         update.late_punctuation = head_->take_late_punctuation();
+    bound_update_words(update, real_frame_limit());
     trim_buffers();
     return update;
+}
+
+int64_t
+CacheStreamRunner::real_frame_limit() const {
+    return real_encoder_frames(total_mel_frames_produced_, enc_cfg_.subsampling_factor);
 }
 
 bool
@@ -1133,6 +1177,7 @@ CacheStreamRunner::finalize() {
             static_cast<float>(audio_base_ + audio_buf_.size()) /
                 static_cast<float>(model_->fe_config().sample_rate),
             opts_.max_alternatives);
+        bound_update_words(update, real_frame_limit());
         return update;
     }
     finalizing_ = true;
@@ -1168,6 +1213,8 @@ CacheStreamRunner::finalize() {
         // Tail flush: pad enough zero mel for the final real frame to
         // see a full right-context window AND for the RNNT predictor
         // to get at least one all-zero enc frame to commit pending tail tokens.
+        // Real speech can surface only in these frames (late emission), so
+        // they are decoded; their words are bounded to real_frame_limit().
         const size_t flush_pad_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
         mel_buf_.resize(mel_buf_.size() + flush_pad_frames * static_cast<size_t>(n_mels), 0.0f);
         const size_t before = all_tokens_.size();
@@ -1195,6 +1242,7 @@ CacheStreamRunner::finalize() {
         opts_.max_alternatives);
     if (head_)
         update.late_punctuation += head_->take_late_punctuation(/*end_of_stream=*/true);
+    bound_update_words(update, real_frame_limit());
     return update;
 }
 

@@ -222,6 +222,22 @@ together. For Riva-compatible gRPC clients,
 a `runtime_config["force_eou"] = "true"` message finalizes the current utterance
 once the audio received so far is decoded.
 
+## Word timestamps and progress
+
+Word `start_time` and `end_time` are decoder emission positions on the encoder
+frame grid (80 ms for the shipped models), as in NeMo, not a forced alignment.
+They always lie within the input: `0 <= start_time <= end_time <= duration`, in
+milliseconds of the input at its original sample rate. At end of stream the
+cache-aware RNNT runner decodes zero padding to flush the last tokens; words
+emitted there keep their text and are placed on the last encoder frame of real
+audio. ITN can split one spoken word into several written words, which may then
+have zero-length spans.
+
+`audio_processed` is decoded progress in seconds: the audio covered by the
+output so far, excluding audio buffered as lookahead. Buffered CTC and
+cache-aware RNNT streaming report it the same way, and the end-of-stream result
+reports the whole input duration.
+
 ## Postprocessing: profanity, ITN, PnC
 
 Postprocessing runs on the final transcript in this order: **profanity → ITN →

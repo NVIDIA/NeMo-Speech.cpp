@@ -69,8 +69,9 @@ struct AsrRequestOptions {
 
 struct Word {  // proto: WordInfo
     std::string word;
-    int32_t start_time = 0;  // ms from audio start (proto WordInfo.start_time)
-    int32_t end_time = 0;    // ms from audio start (proto WordInfo.end_time)
+    // ms from audio start (proto WordInfo.start/end_time); within the input.
+    int32_t start_time = 0;
+    int32_t end_time = 0;
     float confidence = 0.0f;
     std::string language_code;  // empty unless language detection tagged it
     // proto WordInfo.speaker_tag: 1-based speaker id, set only when
@@ -138,8 +139,10 @@ struct Result {  // proto: Streaming/SpeechRecognitionResult
     std::vector<Alternative> alternatives;
     bool is_final = true;
     float stability = 0.0f;
-    int32_t channel_tag = 1;       // mono channel
-    float audio_processed = 0.0f;  // seconds (proto audio_processed)
+    int32_t channel_tag = 1;  // mono channel
+    // Decoded progress in seconds (proto audio_processed), excluding buffered
+    // lookahead; the input duration on the end-of-stream result.
+    float audio_processed = 0.0f;
     // Streaming only: sentence punctuation emitted after the previous final's
     // endpoint. Append it to that final; it is not part of this result's text.
     std::string late_punctuation;

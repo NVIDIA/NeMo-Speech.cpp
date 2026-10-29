@@ -3,6 +3,7 @@
 // Converts encoder chunks into tokens and owns per-stream decoder state.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -111,6 +112,27 @@ struct Hypothesis {
     float confidence = 1.0f;
     std::vector<WordTiming> words;  // empty unless word offsets were requested
 };
+
+// Encoder frames whose emission position, mel frame f * sub, is one of the M
+// real mel frames: (M - 1) / sub + 1. A causal encoder frame f ends at that
+// mel frame, so these frames have seen only real audio.
+inline int64_t
+real_encoder_frames(int64_t mel_frames, int subsampling_factor) {
+    return mel_frames > 0 ? (mel_frames - 1) / subsampling_factor + 1 : 0;
+}
+
+// Word times are emission frames, and runners flush the decoder through
+// synthetic zero frames past the end of the audio. Tokens emitted there keep
+// their text and move onto the last real frame; order and end > start hold.
+inline void
+bound_word_frames(std::vector<WordTiming>& words, int64_t frame_limit) {
+    if (frame_limit <= 0)
+        return;
+    for (auto& word : words) {
+        word.start_frame = std::clamp<int64_t>(word.start_frame, 0, frame_limit - 1);
+        word.end_frame = std::clamp<int64_t>(word.end_frame, word.start_frame + 1, frame_limit);
+    }
+}
 
 // SentencePiece word-boundary marker U+2581 ('▁') = 0xE2 0x96 0x81. A piece
 // starting with it begins a new word (what detokenize_sentencepiece splits on).

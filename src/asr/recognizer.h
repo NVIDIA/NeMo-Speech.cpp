@@ -4,7 +4,9 @@
 // thread-safe; each RecognitionStream is driven by one caller thread.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -165,15 +167,26 @@ class RecognitionStream {
 
    private:
     Result build_result_(const StreamingUpdate& u, bool is_final) const;
+    // Input pushed so far, in whole milliseconds at the original sample rate.
+    int64_t input_ms_() const;
+    // Frame span -> milliseconds, never past the end of the input.
+    void set_word_time_(Word& word, const WordTiming& timing) const;
     // Extends diarization to cover all words in a final result.
     void flush_diar_deficit_(const StreamingUpdate& u);
+    // Diarizer clock (seconds) of a word time reported on the ASR frame clock.
+    double diar_time_(double asr_sec) const { return std::max(0.0, asr_sec + diar_shift_sec_); }
+    int word_speaker_(int32_t start_ms, int32_t end_ms) const;
 
     Recognizer* recognizer_;
     std::unique_ptr<AsrRunner> runner_;
     // Optional sidecar over the same model-rate audio as ASR.
     std::unique_ptr<DiarStream> diar_;
+    // Word times are f * ms_per_enc_frame(); a causal encoder frame is centred
+    // earlier than that, diarizer frames are centred on their own clock.
+    double diar_shift_sec_ = 0.0;
     AsrRequestOptions opts_;
     int input_sample_rate_ = 0;
+    uint64_t input_samples_ = 0;  // pushed so far, at input_sample_rate_
     std::unique_ptr<audio::AudioResampler> resampler_;
     std::vector<float> resampled_audio_;
     bool resampler_flushed_ = false;
@@ -240,6 +253,9 @@ class Recognizer {
     const std::string& model_name() const { return model_name_; }
     std::vector<std::string> supported_languages() const;
     double ms_per_enc_frame() const;
+    // Receptive-field centre of encoder frame f relative to f *
+    // ms_per_enc_frame() (see AsrModel::enc_frame_center_offset_ms).
+    double enc_frame_center_offset_ms() const;
     const RecognizerConfig& config() const { return cfg_; }
 
    private:

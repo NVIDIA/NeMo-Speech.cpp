@@ -10,7 +10,6 @@
 #endif
 #include <cstdio>
 #include <filesystem>
-#include <iomanip>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -50,6 +49,8 @@ struct Transcript {
     float audio_seconds = 0.0f;
     std::vector<std::string> languages;
     std::vector<nemo_speech::subtitle::Word> words;
+    // False when a speech-LLM could not align every word: `text` has words `words` lacks.
+    bool words_cover_text = true;
 };
 
 enum class OutputFormat { Text, Json, Srt, Vtt };
@@ -290,6 +291,8 @@ append_late_punctuation(Transcript& transcript, const std::string& punctuation) 
 void
 append_result(Transcript& transcript, const asr::Result& result) {
     append_late_punctuation(transcript, result.late_punctuation);
+    if (result.speechlm && result.speechlm->unaligned_words > 0)
+        transcript.words_cover_text = false;
     if (result.alternatives.empty())
         return;
     const auto& alternative = result.alternatives.front();
@@ -531,21 +534,6 @@ transcribe_live(asr::Recognizer& recognizer, const Options& options) {
 }
 #endif
 
-std::string
-timestamp(int milliseconds, bool vtt) {
-    milliseconds = std::max(0, milliseconds);
-    const int hours = milliseconds / 3600000;
-    milliseconds %= 3600000;
-    const int minutes = milliseconds / 60000;
-    milliseconds %= 60000;
-    const int seconds = milliseconds / 1000;
-    milliseconds %= 1000;
-    std::ostringstream output;
-    output << std::setfill('0') << std::setw(2) << hours << ':' << std::setw(2) << minutes << ':'
-           << std::setw(2) << seconds << (vtt ? '.' : ',') << std::setw(3) << milliseconds;
-    return output.str();
-}
-
 float
 json_number(float value) {
     return std::isfinite(value) ? value : 0.0f;
@@ -555,7 +543,16 @@ std::string
 render(const Transcript& t, OutputFormat format, const fs::path& source) {
     std::ostringstream output;
     if (format == OutputFormat::Text) {
-        output << t.text << '\n';
+        // A diarized transcript reads as speaker turns; a translation has no speaker words, and
+        // turns built from partially aligned words would drop the rest of the transcript.
+        const bool translated = !t.source_text.empty() || !t.target_language.empty();
+        const bool diarized = std::any_of(
+            t.words.begin(), t.words.end(), [](const auto& word) { return word.speaker > 0; });
+        if (diarized && !translated && t.words_cover_text)
+            output << nemo_speech::subtitle::render_speaker_turns(
+                nemo_speech::subtitle::make_speaker_turns(t.words));
+        else
+            output << t.text << '\n';
     } else if (format == OutputFormat::Json) {
         output << "{\n  \"file\": \"" << json_escape(source.string()) << "\",\n"
                << "  \"text\": \"" << json_escape(t.text) << "\",\n"
@@ -580,18 +577,10 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
         }
         output << (t.words.empty() ? "" : "\n  ") << "]\n}\n";
     } else {
-        const bool vtt = format == OutputFormat::Vtt;
-        if (vtt)
-            output << "WEBVTT\n\n";
-        const auto cues = nemo_speech::subtitle::make_cues(
-            t.words, t.text, static_cast<int>(t.audio_seconds * 1000));
-        for (size_t i = 0; i < cues.size(); ++i) {
-            if (!vtt)
-                output << i + 1 << '\n';
-            output << timestamp(cues[i].start_ms, vtt) << " --> "
-                   << timestamp(std::max(cues[i].start_ms + 1, cues[i].end_ms), vtt) << '\n'
-                   << cues[i].text << "\n\n";
-        }
+        output << nemo_speech::subtitle::render_cues(
+            nemo_speech::subtitle::make_cues(
+                t.words, t.text, static_cast<int>(t.audio_seconds * 1000)),
+            format == OutputFormat::Vtt);
     }
     return output.str();
 }
@@ -651,9 +640,10 @@ print_transcribe_help(const char* program) {
         "                            includes them when the model provides them\n"
         "  --vad-model PATH          Optional Silero VAD GGUF\n"
         "  --vad-masking             Mask silence features (requires --vad-model)\n"
-        "  --diarize                 Tag words with speakers (speech-LLM: needs the CTC\n"
-        "                            timestamp head, part of the encoder file)\n"
-        "  --diar-model MODEL        Tag words with a selected Sortformer diarizer\n"
+        "  --diarize                 Label speakers: per word in JSON, per turn in text,\n"
+        "                            srt and vtt (speech-LLM: needs the CTC timestamp\n"
+        "                            head, part of the encoder file)\n"
+        "  --diar-model MODEL        --diarize with a selected Sortformer diarizer\n"
         "  --itn-model-dir DIR       Inverse text normalization grammars\n"
         "  --pnc-model PATH          Punctuation/capitalization GGUF\n"
         "  --translate-to CODE       Translate: a speech-LLM translates the speech itself\n"

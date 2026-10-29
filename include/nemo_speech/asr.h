@@ -275,6 +275,8 @@ NEMO_SPEECH_ASR_API void nemo_speech_asr_stream_close(nemo_speech_asr_stream* st
 // per-result.
 
 NEMO_SPEECH_ASR_API bool nemo_speech_asr_result_is_final(const nemo_speech_asr_result* result);
+// Seconds of audio decoded so far, excluding audio buffered as lookahead; the
+// whole input duration on the end-of-stream result.
 NEMO_SPEECH_ASR_API float nemo_speech_asr_result_audio_processed(
     const nemo_speech_asr_result* result);
 // 1-based input channel this result belongs to (proto channel_tag). Mono input

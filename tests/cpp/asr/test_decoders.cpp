@@ -9,6 +9,7 @@
 //   RnntGreedyDecoder  scripted MockRnntEngine: emission sequence, blank =
 //                      frame advance, max_symbols_per_step cap, LSTM state /
 //                      prev_token preserved across reset_utterance (riva EOU).
+//   bound_word_frames  end-of-stream flush words stay on real frames.
 //
 // Usage: ./test_decoders   (no model files, no GPU)
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "fastconformer.h"
 #include "greedy_ctc_decoder.h"
 #include "rnnt_greedy_decoder.h"
 
@@ -676,6 +678,62 @@ test_rnnt_punctuation_word_timing() {
 }
 
 void
+test_rnnt_causal_startup_coordinates() {
+    // #46 shortened the first Mel chunk, not the decoder's emission-frame
+    // grid. Guard against applying the VAD frontier correction to word times,
+    // and against restarting the absolute frame offset after an EOU.
+    for (int right : {0, 3, 6, 13}) {
+        const auto cfg = make_cache_aware_config(EncoderConfig{}, right);
+        const int count = right + 1;
+        const int64_t first_mel = 1 + 8 * right;
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng);
+        dec.set_compute_timestamps(true);
+        const int blank = eng.rnnt_config().blank_id;
+        std::vector<int> last_only(count, blank);
+        last_only.back() = 0;
+        eng.rounds = {last_only, {blank}};
+        std::vector<float> frames(count * eng.rnnt_config().joint_dim, 0.0f);
+        const auto first = dec.step(frames.data(), eng.rnnt_config().joint_dim, count, 0);
+        dec.finalize();
+        const auto words = dec.word_timings();
+        check(
+            first == std::vector<int>{0} && words.size() == 1,
+            "rnnt causal startup: control must emit a timed word");
+        if (words.size() != 1)
+            continue;
+        check(
+            words[0].start_frame == right && words[0].end_frame == count,
+            "rnnt causal startup: first word keeps the emission-frame grid");
+        check(
+            cfg.cache_decoded_mel_frames(count) == first_mel &&
+                words[0].start_frame * 8 == first_mel - 1,
+            "rnnt causal startup: emission anchor and exclusive Mel frontier differ");
+        dec.reset_utterance();
+        eng.rounds = {{1}, {blank}};
+        const auto next = dec.step(frames.data(), eng.rnnt_config().joint_dim, count, count);
+        dec.finalize();
+        const auto& after_eou = dec.word_timings();
+        check(
+            next == std::vector<int>{1} && after_eou.size() == 1 &&
+                after_eou[0].start_frame == count && after_eou[0].end_frame == count + 1 &&
+                dec.last_speech_frame() == count,
+            "rnnt causal startup: EOU preserves absolute word and token-silence coordinates");
+        check(
+            cfg.cache_decoded_mel_frames(2 * count) == first_mel + 8 * count,
+            "rnnt causal startup: second chunk advances by the steady-state stride");
+        dec.reset();
+        eng.rounds = {{2}, {blank}};
+        dec.step(frames.data(), eng.rnnt_config().joint_dim, count, 0);
+        dec.finalize();
+        const auto& reset = dec.word_timings();
+        check(
+            reset.size() == 1 && reset[0].start_frame == 0 && reset[0].end_frame == 1,
+            "rnnt causal startup: only a new stream restarts word coordinates at zero");
+    }
+}
+
+void
 test_rnnt_open_word_needs_finalize() {
     // The contract CacheStreamRunner::finalize() relies on: an open trailing
     // word reaches word_timings() only after finalize(). Without the runner
@@ -767,6 +825,60 @@ test_tdt_duration_and_state_commit() {
 }
 
 void
+test_eos_flush_word_bounds() {
+    check(
+        real_encoder_frames(0, 8) == 0 && real_encoder_frames(1, 8) == 1 &&
+            real_encoder_frames(8, 8) == 1 && real_encoder_frames(9, 8) == 2 &&
+            real_encoder_frames(105, 8) == 14,
+        "bounds: real encoder frames follow (M - 1) / sub + 1");
+
+    // Four real frames, then the end-of-stream flush through zero frames.
+    // Tokens emitted in the flush keep their text and land on the last real
+    // frame; a word spanning the boundary keeps its onset.
+    MockRnntEngine eng;
+    eng.set_piece(3, "d");  // continuation piece
+    RnntGreedyDecoder dec(&eng);
+    dec.set_compute_timestamps(true);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> enc(4 * 4, 0.0f);
+    eng.rounds = {{blank, 0}, {blank, blank, 1}, {blank}};
+    dec.step(enc.data(), 4, 4, /*frame_offset=*/0);
+    eng.rounds = {{3}, {blank, blank, 2}, {blank}};
+    dec.step(enc.data(), 4, 4, /*frame_offset=*/4);
+    dec.finalize();
+    auto words = dec.word_timings();
+    check(
+        words.size() == 3 && words[1].word == "bd" && words[1].end_frame == 5 &&
+            words[2].start_frame == 6,
+        "bounds: control decodes words past the real frames");
+    bound_word_frames(words, real_encoder_frames(25, 8));
+    check(
+        words.size() == 3 && words[0].word == "a" && words[0].start_frame == 1 &&
+            words[0].end_frame == 2 && words[1].word == "bd" && words[1].start_frame == 3 &&
+            words[1].end_frame == 4 && words[2].word == "c" && words[2].start_frame == 3 &&
+            words[2].end_frame == 4,
+        "bounds: flushed words keep text and order on the last real frame");
+
+    // A TDT duration on the final frame must not reach past it either.
+    MockTdtEngine tdt_eng;
+    TdtGreedyDecoder tdt(&tdt_eng);
+    tdt.set_compute_timestamps(true);
+    const int tdt_blank = tdt_eng.rnnt_config().blank_id;
+    tdt_eng.rounds = {{tdt_blank, 1}, {tdt_blank, 1}, {0, 2}};
+    std::vector<float> frames(3 * 2, 0.0f);
+    tdt.step(frames.data(), 2, 3, /*frame_offset=*/0);
+    tdt.finalize();
+    auto tdt_words = tdt.word_timings();
+    check(
+        tdt_words.size() == 1 && tdt_words[0].start_frame == 2 && tdt_words[0].end_frame == 4,
+        "bounds: TDT control duration reaches past the last frame");
+    bound_word_frames(tdt_words, 3);
+    check(
+        tdt_words.size() == 1 && tdt_words[0].start_frame == 2 && tdt_words[0].end_frame == 3,
+        "bounds: TDT duration ends on the last real frame");
+}
+
+void
 test_tdt_zero_duration_guard() {
     MockTdtEngine eng;
     TdtGreedyDecoder dec(&eng);
@@ -818,9 +930,11 @@ main() {
     test_rnnt_endpoint_punctuation_continuity();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();
+    test_rnnt_causal_startup_coordinates();
     test_rnnt_punctuation_word_timing();
     test_rnnt_open_word_needs_finalize();
     test_tdt_duration_and_state_commit();
+    test_eos_flush_word_bounds();
     test_tdt_zero_duration_guard();
     test_tdt_duration_crosses_step_boundary();
     std::fprintf(stdout, g_fail ? "FAILED (%d)\n" : "ALL PASS\n", g_fail);

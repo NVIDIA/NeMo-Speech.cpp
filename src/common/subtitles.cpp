@@ -101,10 +101,11 @@ join_words(const std::vector<Word>& words, size_t begin, size_t end) {
     return output.str();
 }
 
+// `prefix`: characters shown before the first line (the speaker label).
 std::string
-format_lines(const std::vector<Word>& words, size_t begin, size_t end) {
+format_lines(const std::vector<Word>& words, size_t begin, size_t end, size_t prefix) {
     std::string text = join_words(words, begin, end);
-    if (end - begin <= 1 || character_count(text) <= kTargetLineCharacters)
+    if (end - begin <= 1 || prefix + character_count(text) <= kTargetLineCharacters)
         return text;
 
     size_t best_break = begin + 1;
@@ -114,7 +115,7 @@ format_lines(const std::vector<Word>& words, size_t begin, size_t end) {
     for (size_t split = begin + 1; split < end; ++split) {
         const std::string left = join_words(words, begin, split);
         const std::string right = join_words(words, split, end);
-        const size_t left_length = character_count(left);
+        const size_t left_length = prefix + character_count(left);
         const size_t right_length = character_count(right);
         const size_t overflow =
             (left_length > kTargetLineCharacters ? left_length - kTargetLineCharacters : 0) +
@@ -150,6 +151,36 @@ struct Group {
     Cue cue;
 };
 
+// Each word's speaker: untagged is 0, and punctuation shown with the previous word keeps its
+// speaker.
+std::vector<int>
+word_speakers(const std::vector<Word>& words) {
+    std::vector<int> speakers;
+    speakers.reserve(words.size());
+    for (const auto& word : words)
+        speakers.push_back(
+            !speakers.empty() && (word.joins_previous || attaches_to_previous(shown(word)))
+                ? speakers.back()
+                : std::max(0, word.speaker));
+    return speakers;
+}
+
+// What a speaker's cue shows before its text in SRT: "Speaker N: ".
+std::string
+cue_label(int speaker) {
+    return speaker > 0 ? speaker_label(speaker) + ": " : std::string();
+}
+
+std::string
+timecode(int milliseconds, bool vtt) {
+    milliseconds = std::max(0, milliseconds);
+    char result[32];
+    std::snprintf(
+        result, sizeof(result), "%02d:%02d:%02d%c%03d", milliseconds / 3600000,
+        milliseconds / 60000 % 60, milliseconds / 1000 % 60, vtt ? '.' : ',', milliseconds % 1000);
+    return result;
+}
+
 }  // namespace
 
 bool
@@ -160,14 +191,18 @@ attaches_to_previous(const std::string& text) {
     return starts_with_any(text, punctuation);
 }
 
+std::string
+speaker_label(int speaker) {
+    return speaker > 0 ? "Speaker " + std::to_string(speaker) : std::string();
+}
+
 std::vector<SpeakerTurn>
 make_speaker_turns(const std::vector<Word>& words) {
+    const auto speakers = word_speakers(words);
     std::vector<SpeakerTurn> turns;
-    for (const auto& word : words) {
-        int speaker = word.speaker;
-        // Standalone closing punctuation stays with the preceding speaker.
-        if (!turns.empty() && (word.joins_previous || attaches_to_previous(shown(word))))
-            speaker = turns.back().speaker;
+    for (size_t i = 0; i < words.size(); ++i) {
+        const auto& word = words[i];
+        const int speaker = speakers[i];
         if (turns.empty() || turns.back().speaker != speaker)
             turns.push_back({speaker, word.start_ms, word.end_ms, {}});
         if (!turns.back().text.empty() && !word.joins_previous &&
@@ -187,25 +222,48 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
         return {{0, std::max(1, audio_ms), fallback_text}};
     }
 
+    const auto speakers = word_speakers(words);
+    int timeline_end = audio_ms;
+    for (const auto& word : words) timeline_end = std::max(timeline_end, word.end_ms);
     std::vector<Group> groups;
     for (size_t begin = 0; begin < words.size();) {
+        const int speaker = speakers[begin];
+        const size_t label = character_count(cue_label(speaker));
+        // A cue closed for length keeps some display time, and the words after it get some
+        // before the audio ends; words that start together stay together.
+        const auto can_split_before = [&](size_t word) {
+            return words[word].start_ms > words[begin].start_ms &&
+                   words[word].start_ms < timeline_end;
+        };
         size_t end = begin + 1;
         size_t last_clause = begin;
         bool has_clause = false;
         for (; end <= words.size(); ++end) {
             const size_t current = end - 1;
             if (end > begin + 1) {
+                if (speakers[current] != speaker) {
+                    --end;
+                    break;
+                }
                 const bool pause =
                     words[current].start_ms - words[current - 1].end_ms > kPauseBoundaryMs;
                 const bool too_long =
                     words[current].end_ms - words[begin].start_ms > kMaximumCueDurationMs;
                 const bool too_many_characters =
-                    character_count(join_words(words, begin, end)) > kMaximumCueCharacters;
-                if (pause || too_long || too_many_characters) {
+                    label + character_count(join_words(words, begin, end)) > kMaximumCueCharacters;
+                if (pause) {
                     --end;
-                    if (!pause && has_clause)
-                        end = last_clause;
                     break;
+                }
+                if (too_long || too_many_characters) {
+                    if (has_clause && can_split_before(last_clause)) {
+                        end = last_clause;
+                        break;
+                    }
+                    if (can_split_before(current)) {
+                        end = current;
+                        break;
+                    }
                 }
             }
             if (clause_end(shown(words[current]))) {
@@ -222,16 +280,34 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
              end,
              {std::max(0, words[begin].start_ms),
               std::min(words[end - 1].end_ms, words[begin].start_ms + kMaximumCueDurationMs),
-              format_lines(words, begin, end)}});
+              format_lines(words, begin, end, label), speaker}});
         begin = end;
+    }
+
+    // A cue whose words start no later than the previous cue's (identical times across a speaker
+    // change), or that follows a delayed cue too closely, waits until the previous cue has been
+    // shown for the minimum duration.
+    std::vector<int> starts(groups.size());
+    for (size_t i = 0; i < groups.size(); ++i) {
+        starts[i] = groups[i].cue.start_ms;
+        if (i == 0)
+            continue;
+        const bool previous_delayed = starts[i - 1] > groups[i - 1].cue.start_ms;
+        if (starts[i] <= starts[i - 1] ||
+            (previous_delayed && starts[i] < starts[i - 1] + kMinimumCueDurationMs))
+            starts[i] = starts[i - 1] + kMinimumCueDurationMs;
     }
 
     std::vector<Cue> cues;
     cues.reserve(groups.size());
     for (size_t i = 0; i < groups.size(); ++i) {
         auto cue = groups[i].cue;
-        const int available_end =
-            i + 1 < groups.size() ? groups[i + 1].cue.start_ms : std::max(cue.end_ms, audio_ms);
+        const bool delayed = starts[i] > cue.start_ms;
+        cue.start_ms = starts[i];
+        int available_end = i + 1 < groups.size() ? starts[i + 1] : std::max(cue.end_ms, audio_ms);
+        // The last cue may run past the audio rather than flash when its words start at its end.
+        if (i + 1 == groups.size() && (delayed || available_end <= cue.start_ms))
+            available_end = std::max(available_end, cue.start_ms + kMinimumCueDurationMs);
         const int words_in_cue = static_cast<int>(groups[i].end - groups[i].begin);
         const int readable_ms = std::max(
             kMinimumCueDurationMs, (words_in_cue * 60000 + kWordsPerMinute - 1) / kWordsPerMinute);
@@ -244,6 +320,33 @@ make_cues(const std::vector<Word>& words, const std::string& fallback_text, int 
         cues.push_back(std::move(cue));
     }
     return cues;
+}
+
+std::string
+render_cues(const std::vector<Cue>& cues, bool vtt) {
+    std::string output = vtt ? "WEBVTT\n\n" : "";
+    for (size_t i = 0; i < cues.size(); ++i) {
+        const auto& cue = cues[i];
+        if (!vtt)
+            output += std::to_string(i + 1) + "\n";
+        output += timecode(cue.start_ms, vtt) + " --> " +
+                  timecode(std::max(cue.start_ms + 1, cue.end_ms), vtt) + "\n";
+        if (cue.speaker > 0)
+            output += vtt ? "<v " + speaker_label(cue.speaker) + ">" : cue_label(cue.speaker);
+        output += cue.text + "\n\n";
+    }
+    return output;
+}
+
+std::string
+render_speaker_turns(const std::vector<SpeakerTurn>& turns) {
+    std::string output;
+    for (const auto& turn : turns) {
+        if (!output.empty())
+            output += '\n';
+        output += cue_label(turn.speaker) + turn.text + "\n";
+    }
+    return output;
 }
 
 // ---- subtitle cues of the transcription API ----

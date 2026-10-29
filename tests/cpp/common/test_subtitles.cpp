@@ -174,6 +174,172 @@ test_speaker_turns() {
     require(turns[1].start_ms == 700 && turns[1].end_ms == 1300, "second speaker turn timing");
 }
 
+Word
+spoken(const std::string& text, int start_ms, int end_ms, int speaker) {
+    Word word;
+    word.text = text;
+    word.start_ms = start_ms;
+    word.end_ms = end_ms;
+    word.speaker = speaker;
+    return word;
+}
+
+void
+require_ordered(const std::vector<Cue>& cues, int minimum_ms, const char* message) {
+    for (size_t i = 0; i < cues.size(); ++i) {
+        require(cues[i].end_ms - cues[i].start_ms >= minimum_ms, message);
+        require(i + 1 == cues.size() || cues[i].end_ms <= cues[i + 1].start_ms, message);
+    }
+}
+
+// Without speakers, cues and their SRT text are those of the subtitles before speaker labels.
+void
+test_untagged_subtitles_are_unchanged() {
+    std::vector<Word> words;
+    int start = 0;
+    for (const char* text :
+         {"When",    "we", "arrived,", "the",    "station", "was",    "already",
+          "closed,", "so", "we",       "walked", "back",    "along",  "the",
+          "river",   "to", "the",      "old",    "town.",   "Nobody", "answered."}) {
+        words.push_back(spoken(text, start, start + 240, 0));
+        start += 320;
+    }
+    words.push_back(spoken("Later", start + 1500, start + 1800, 0));
+    require(
+        nemo_speech::subtitle::render_cues(
+            nemo_speech::subtitle::make_cues(words, "", 10000), false) ==
+            "1\n00:00:00,000 --> 00:00:02,560\nWhen we arrived,\nthe station was already "
+            "closed,\n\n"
+            "2\n00:00:02,560 --> 00:00:06,080\nso we walked back along\nthe river to the old "
+            "town.\n\n"
+            "3\n00:00:06,080 --> 00:00:06,914\nNobody answered.\n\n"
+            "4\n00:00:08,220 --> 00:00:09,054\nLater\n\n",
+        "untagged SRT matches the unlabelled layout");
+}
+
+// Issue #86: ten words of speaker 1 and two of speaker 2 fit one cue by length.
+void
+test_cue_never_spans_a_speaker_change() {
+    std::vector<Word> words;
+    int start = 57040;
+    for (const char* text :
+         {"speech", "recognition", "is", "most", "important", "as", "far", "as", "your",
+          "concerned", "this", "could"}) {
+        words.push_back(spoken(text, start, start + 250, words.size() < 10 ? 1 : 2));
+        start += 300;
+    }
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 61000);
+    require(cues.size() == 2, "a speaker change starts a cue");
+    require(cues[0].speaker == 1 && cues[1].speaker == 2, "cue speakers");
+    require(cues[1].text == "this could" && cues[1].start_ms == 60040, "second speaker's cue");
+    require_ordered(cues, 1, "speaker cues do not overlap");
+    // The label shares the first line's 37-character target.
+    const auto wrapped = lines(cues[0].text);
+    require(
+        wrapped.size() == 2 && characters("Speaker 1: " + wrapped[0]) <= 37 &&
+            wrapped[0] + " " + wrapped[1] ==
+                "speech recognition is most important as far as your concerned",
+        "labelled first line");
+}
+
+void
+test_speaker_labels_in_subtitles_and_text() {
+    using nemo_speech::subtitle::make_cues;
+    using nemo_speech::subtitle::render_cues;
+    const std::vector<Word> words{
+        spoken("Hello", 0, 400, 1), spoken("there.", 400, 900, 1), spoken("Hi.", 1000, 1400, 2),
+        spoken("um", 3000, 3200, 0)};
+    const auto cues = make_cues(words, "", 4000);
+    require(
+        render_cues(cues, false) ==
+            "1\n00:00:00,000 --> 00:00:00,900\nSpeaker 1: Hello there.\n\n"
+            "2\n00:00:01,000 --> 00:00:01,834\nSpeaker 2: Hi.\n\n"
+            "3\n00:00:03,000 --> 00:00:03,834\num\n\n",
+        "SRT speaker prefixes");
+    require(
+        render_cues(cues, true) ==
+            "WEBVTT\n\n00:00:00.000 --> 00:00:00.900\n<v Speaker 1>Hello there.\n\n"
+            "00:00:01.000 --> 00:00:01.834\n<v Speaker 2>Hi.\n\n"
+            "00:00:03.000 --> 00:00:03.834\num\n\n",
+        "WebVTT voice spans");
+    require(
+        nemo_speech::subtitle::render_speaker_turns(nemo_speech::subtitle::make_speaker_turns(
+            words)) == "Speaker 1: Hello there.\n\nSpeaker 2: Hi.\n\num\n",
+        "one paragraph per speaker turn");
+}
+
+// Untagged words (0 or a negative tag) form their own unlabelled turn and cue; punctuation stays
+// with the word before it.
+void
+test_untagged_words_between_speakers() {
+    const std::vector<Word> words{
+        spoken("so", 0, 200, 0), spoken("we", 200, 400, -1), spoken("start", 400, 700, 1),
+        spoken(".", 700, 720, 0), spoken("okay", 800, 1000, 0)};
+    const auto turns = nemo_speech::subtitle::make_speaker_turns(words);
+    require(
+        turns.size() == 3 && turns[0].speaker == 0 && turns[0].text == "so we" &&
+            turns[1].speaker == 1 && turns[1].text == "start." && turns[2].speaker == 0,
+        "untagged turns");
+    const auto cues = nemo_speech::subtitle::make_cues(words, "", 2000);
+    require(
+        cues.size() == 3 && cues[0].speaker == 0 && cues[0].text == "so we" &&
+            cues[1].speaker == 1 && cues[1].text == "start." && cues[2].text == "okay",
+        "untagged cues");
+    require_ordered(cues, 1, "untagged cues do not overlap");
+    require(
+        nemo_speech::subtitle::render_speaker_turns(turns) ==
+            "so we\n\nSpeaker 1: start.\n\nokay\n",
+        "untagged turn has no label");
+}
+
+// Words with one interval (end-of-stream times clamped to the audio) never split into flashing or
+// overlapping cues.
+void
+test_identical_word_times() {
+    using nemo_speech::subtitle::make_cues;
+    std::vector<Word> words;
+    for (int i = 0; i < 12; ++i)
+        words.push_back(spoken("abcdefghi" + std::to_string(i % 10), 560, 640, 0));
+    auto cues = make_cues(words, "", 640);
+    require(cues.size() == 1, "words at one time share a cue past the length limit");
+    require(
+        cues[0].start_ms == 560 && cues[0].end_ms == 640, "shared cue keeps the words' interval");
+    require(lines(cues[0].text).size() == 2, "shared cue has two lines");
+
+    words.push_back(spoken("later", 2000, 2300, 0));
+    cues = make_cues(words, "", 3000);
+    require(
+        cues.size() == 2 && cues[0].end_ms == 2000 && cues[1].start_ms == 2000,
+        "next word starts a cue");
+
+    // Zero-length words at the end of the audio stay with the cue before them.
+    std::vector<Word> tail;
+    for (int i = 0; i < 5; ++i)
+        tail.push_back(spoken("wordnumbr" + std::to_string(i), i * 600, i * 600 + 300, 1));
+    for (int i = 0; i < 6; ++i)
+        tail.push_back(spoken("clampedwr" + std::to_string(i), 3000, 3000, 1));
+    cues = make_cues(tail, "", 3000);
+    require(
+        cues.size() == 1 && cues[0].start_ms == 0 && cues[0].end_ms == 3000,
+        "zero-length tail joins the cue");
+
+    // Across a speaker change words cannot share a cue: a cue that only its start time places waits
+    // for the minimum display time of the one before.
+    cues = make_cues(
+        {spoken("Yes.", 560, 640, 1), spoken("No.", 560, 640, 2), spoken("Maybe.", 600, 640, 1)},
+        "", 640);
+    require(cues.size() == 3, "one cue per speaker turn");
+    require(
+        cues[0].start_ms == 560 && cues[1].start_ms == 1394 && cues[2].start_ms == 2228,
+        "delayed starts");
+    require_ordered(cues, 834, "delayed cues get the minimum duration");
+    cues = make_cues({spoken("Thanks", 0, 500, 1), spoken("bye", 1000, 1000, 2)}, "", 1000);
+    require(
+        cues.size() == 2 && cues[1].start_ms == 1000 && cues[1].end_ms == 1834,
+        "last cue at the audio end");
+    require_ordered(cues, 834, "last cue does not flash");
+}
+
 
 // ---- transcription API cue builder and renderers ----
 using nemo_speech::subtitle::TimedWord;
@@ -413,6 +579,11 @@ main() {
     test_duration_and_length_split_are_ordered();
     test_fallback_text();
     test_speaker_turns();
+    test_untagged_subtitles_are_unchanged();
+    test_cue_never_spans_a_speaker_change();
+    test_speaker_labels_in_subtitles_and_text();
+    test_untagged_words_between_speakers();
+    test_identical_word_times();
     test_word_cues_short_phrase_and_renders();
     test_word_cues_two_lines_by_graphemes();
     test_word_cues_sentence_break_and_duration();

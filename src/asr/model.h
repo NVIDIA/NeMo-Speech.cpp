@@ -66,6 +66,12 @@ class AsrModel {
         return static_cast<double>(enc_cfg_.subsampling_factor) * fe_->hop_length() * 1000.0 /
                static_cast<double>(fe_cfg_.sample_rate);
     }
+    // Centre of encoder frame f's receptive field relative to f *
+    // ms_per_enc_frame(), the clock word timings are reported on.
+    double enc_frame_center_offset_ms() const {
+        return enc_cfg_.frame_center_mel_offset() * fe_->hop_length() * 1000.0 /
+               static_cast<double>(fe_cfg_.sample_rate);
+    }
     const EncoderConfig& encoder_config() const { return enc_cfg_; }
     virtual const std::vector<std::string>& vocab() const { return vocab_; }
     const std::string& model_name() const { return model_name_; }

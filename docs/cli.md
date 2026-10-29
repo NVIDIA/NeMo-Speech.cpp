@@ -155,11 +155,18 @@ For ASR plus speaker labels without the other stages:
 
 ```bash
 nemo-speech transcribe meeting.wav --diarize --json
+nemo-speech transcribe meeting.wav --diarize --format srt --output meeting.srt
 ```
 
 V2 supports up to four speakers and V3 up to eight. Diarization enables word
 timestamps automatically and places a 1-based `speaker` value on each
-word in JSON output.
+word in JSON output. Text, SRT, and WebVTT output label speaker turns with
+the same numbers: text has one `Speaker N: ...` paragraph per turn, SRT cues
+start with `Speaker N: `, and WebVTT cues use a `<v Speaker N>` voice span.
+A cue never spans a speaker change. Words without a speaker are left
+unlabelled, and a `--translate-to` translation is not labelled. When a
+speech-LLM cannot align every word, text output keeps the whole transcript
+without labels.
 
 ## Diarize audio
 

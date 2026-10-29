@@ -224,18 +224,6 @@ uploaded_file(const httplib::Request& request) {
 
 #if defined(NEMO_SPEECH_REGISTRY_ASR)
 std::string
-timecode(int milliseconds, bool vtt) {
-    milliseconds = std::max(0, milliseconds);
-    char result[32];
-    std::snprintf(
-        result, sizeof(result), "%02d:%02d:%02d%c%03d", milliseconds / 3600000,
-        milliseconds / 60000 % 60, milliseconds / 1000 % 60, vtt ? '.' : ',', milliseconds % 1000);
-    return result;
-}
-#endif
-
-#if defined(NEMO_SPEECH_REGISTRY_ASR)
-std::string
 decode_base64(const std::string& input) {
     static constexpr int8_t invalid = -1;
     static const auto table = [] {
@@ -302,24 +290,16 @@ transcript_response(
     if (format == "text")
         return alternative.transcript + "\n";
     if (format == "srt" || format == "vtt") {
-        const bool vtt = format == "vtt";
-        int audio_ms = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
+        // Truncate: word times never pass the input, and neither may a cue.
+        int audio_ms = std::max(1, static_cast<int>(result.audio_processed * 1000));
         std::vector<subtitle::Word> words;
         words.reserve(alternative.words.size());
         for (const auto& word : alternative.words)
             words.push_back(
                 {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag,
                  word.display, word.joins_previous});
-        const auto cues = subtitle::make_cues(words, alternative.transcript, audio_ms);
-        std::string output = vtt ? "WEBVTT\n\n" : "";
-        for (size_t i = 0; i < cues.size(); ++i) {
-            if (!vtt)
-                output += std::to_string(i + 1) + "\n";
-            output += timecode(cues[i].start_ms, vtt) + " --> " +
-                      timecode(std::max(cues[i].start_ms + 1, cues[i].end_ms), vtt) + "\n";
-            output += cues[i].text + "\n\n";
-        }
-        return output;
+        return subtitle::render_cues(
+            subtitle::make_cues(words, alternative.transcript, audio_ms), format == "vtt");
     }
     Value root(Value::Object{});
     root["text"] = alternative.transcript;

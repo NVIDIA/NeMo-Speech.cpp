@@ -61,7 +61,8 @@ struct StreamingUpdate {
     bool is_final = false;
     // Mean token posterior for greedy CTC; 1.0 when the decoder has no posterior.
     float confidence = 1.0f;
-    // Seconds of audio processed.
+    // Decoded progress in seconds: audio whose output this or an earlier call
+    // returned, excluding unconsumed lookahead. finalize() reports all audio fed.
     float audio_processed_sec = 0.0f;
     // Punctuation for the previous final (Decoder::take_late_punctuation);
     // not part of this update's text.
@@ -130,6 +131,8 @@ class BufferedStreamRunner final : public AsrRunner {
 
    private:
     StreamingUpdate process_window(size_t win_start, size_t win_end, bool is_last);
+    // Encoder frames covering real audio; word spans are bounded to it.
+    int64_t real_frame_limit() const;
 
     // Poll the endpointer on the decode clock (now = emit cursor; last speech
     // = VAD bits over decoded frames, or the decoder's last_emit_frame).
@@ -280,6 +283,8 @@ class CacheStreamRunner final : public AsrRunner {
 
    private:
     int next_chunk_mel_frames() const;
+    // Encoder frames covering real mel frames, excluding the EOS flush pad.
+    int64_t real_frame_limit() const;
     void process_one_chunk();
     void upload_attn_mask();
     void zero_caches();
