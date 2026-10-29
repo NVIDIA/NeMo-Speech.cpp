@@ -226,7 +226,7 @@ once the audio received so far is decoded.
 
 Word `start_time` and `end_time` are decoder emission positions on the encoder
 frame grid (80 ms for the shipped models), as in NeMo, not a forced alignment.
-They always lie within the input: `0 <= start_time < end_time <= duration`, in
+They always lie within the input: `0 <= start_time <= end_time <= duration`, in
 milliseconds of the input at its original sample rate. At end of stream the
 cache-aware RNNT runner decodes zero padding to flush the last tokens; words
 emitted there keep their text and are placed on the last encoder frame of real

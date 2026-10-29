@@ -229,9 +229,9 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
 
         size_t offset = 0;
         for (size_t i = 0; i < remaining_output.size(); ++i) {
-            const size_t base = remaining_spoken.size() / remaining_output.size();
+            const size_t per_output = remaining_spoken.size() / remaining_output.size();
             const size_t extra = remaining_spoken.size() % remaining_output.size();
-            const size_t take = base + (i < extra ? 1 : 0);
+            const size_t take = per_output + (i < extra ? 1 : 0);
             std::vector<int> slice(
                 remaining_spoken.begin() + offset, remaining_spoken.begin() + offset + take);
             result.emplace_back(

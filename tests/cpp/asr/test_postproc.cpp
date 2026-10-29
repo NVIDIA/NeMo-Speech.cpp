@@ -211,6 +211,39 @@ main() {
             "remap: equal start frames keep the written order");
     }
     {
+        // A rewrite that merges several spoken words ("five dollars" -> "$5") after unchanged
+        // words, all on one frame, keeps its written position.
+        std::vector<WordTiming> w = {{"and", 7, 8, 1.f},  {"please", 7, 8, 1.f},
+                                     {"pay", 7, 8, 1.f},  {"me", 7, 8, 1.f},
+                                     {"five", 7, 8, 1.f}, {"dollars", 7, 8, 1.f}};
+        update_word_timings(
+            w,
+            "Token:\t0\tand\t0,3\t0,0\nToken:\t1\tplease\t4,10\t1,1\n"
+            "Token:\t2\tpay\t11,14\t2,2\nToken:\t3\tme\t15,17\t3,3\n"
+            "Token:\t4\tfive dollars\t18,30\t4,4\n"
+            "Word:\t0\tand\t0\nWord:\t1\tplease\t1\nWord:\t2\tpay\t2\nWord:\t3\tme\t3\n"
+            "Word:\t4\t$5\t4\n");
+        check(
+            w.size() == 5 && w[0].word == "and" && w[1].word == "please" && w[2].word == "pay" &&
+                w[3].word == "me" && w[4].word == "$5",
+            "remap: merged rewrite on a shared frame keeps the written order");
+    }
+    {
+        // Two merged rewrites of different spoken lengths on one frame keep their order.
+        std::vector<WordTiming> w = {{"one", 7, 8, 1.f},     {"hundred", 7, 8, 1.f},
+                                     {"twenty", 7, 8, 1.f},  {"three", 7, 8, 1.f},
+                                     {"dollars", 7, 8, 1.f}, {"five", 7, 8, 1.f},
+                                     {"euros", 7, 8, 1.f}};
+        update_word_timings(
+            w,
+            "Token:\t0\tone hundred twenty three dollars\t0,32\t0,0\n"
+            "Token:\t1\tfive euros\t33,43\t1,1\n"
+            "Word:\t0\t$123\t0\nWord:\t1\t€5\t1\n");
+        check(
+            w.size() == 2 && w[0].word == "$123" && w[1].word == "€5",
+            "remap: two merged rewrites on a shared frame keep the written order");
+    }
+    {
         // Unparseable alignment is a no-op (timings kept).
         std::vector<WordTiming> w = {{"hello", 0, 5, 1.f}};
         update_word_timings(w, "garbage not links");
