@@ -1,13 +1,17 @@
 # SALM configuration
 
-The CLI and both servers also take a YAML file (`--config salm.yaml`); flags such as `--asr.salm.max_sequences 64`
-override it. For how keys are set (YAML, environment, and CLI precedence), see
-[Server configuration](../server.md#engine-and-listener-configuration).
+SALM runs without any configuration: the defaults fit a GPU with 32 GB of memory and take recordings of up to one
+hour. Change the settings to fit a smaller GPU, to decode many more requests at once on a large one, or to turn
+speculative decoding off.
+
+Set them as flags (`--asr.salm.max_sequences 64`) or in a YAML file (`--config salm.yaml`), which the CLI and both
+servers take; flags override the file. [Server configuration](../server.md#engine-and-listener-configuration) explains
+the precedence of YAML, environment and flags.
 
 ```yaml
 asr:
   model:
-    path: salm.gguf
+    path: models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4.gguf   # the decoder GGUF
     name: salm                     # the model id reported by /v1/models
   salm:
     max_sequences: 64              # requests decoded at the same time
@@ -34,20 +38,21 @@ CPU threads are `asr.backend.threads`, as for the other models.
 
 ## GPU memory
 
-With the NVFP4 decoder the defaults fit a 32 GB GPU and hold one hour of audio per request. For other sizes, for
-example:
+Two settings decide most of the memory: `max_sequences`, how many requests decode at the same time, and the token pool
+they share (`n_ctx_per_sequence x max_sequences`), which must hold the longest request. Start from the row for your
+GPU:
 
 | GPU memory | `max_sequences` | `n_ctx_per_sequence` | Longest request | Other changes |
 |---|---|---|---|---|
-| 24 GB | 4 | 8192 | 29 minutes (`max_context: 32768`) | IQ4_NL model; `mtp_draft: 0`, `n_batch: 1024`, `encoder_max_batch: 4` |
+| 24 GB | 4 | 8192 | 29 minutes (`max_context: 32768`) | IQ4_NL decoder; `mtp_draft: 0`, `n_batch: 1024`, `encoder_max_batch: 4` |
 | 32 GB | 16 | 8192 | one hour | none (the defaults) |
 | 80 GB or more | 240 | 2048 | one hour | `n_batch: 16384`, `encoder_max_batch: 128`: many requests at once |
 | 128 GB, unified | 240 | 2048 | one hour | `n_batch: 8192`, `encoder_max_batch: 64`, `mtp_draft: 3` |
 
-The requests decoding at the same time share a pool of `n_ctx_per_sequence x max_sequences` tokens, which must hold
-the longest request: 12.5 tokens per second of audio plus up to 6 per second of transcript. The batched path grows
-each request's cells as it decodes; CPU, Vulkan, Metal and the other [upstream llama.cpp](models.md#platforms) paths
-reserve them all (prompt and whole transcript budget) when it starts, so fewer long requests decode at once there.
+A request needs 12.5 tokens per second of audio plus up to 6 per second of transcript. The batched path grows each
+request's share of the pool as it decodes; CPU, Vulkan and the other [upstream llama.cpp](models.md#platforms) paths
+reserve the whole share (prompt and transcript budget) when the request starts, so fewer long requests decode
+at once there.
 
 On those paths each slot also holds about 48 MiB of recurrent state whatever the request's length, so on a laptop or a
 small GPU lower `max_sequences` and raise `n_ctx_per_sequence` to keep the pool: for example `max_sequences: 4` and

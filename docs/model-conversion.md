@@ -73,7 +73,7 @@ experts); embeddings, the output head and the norms stay BF16/F32:
 | `--outtype` | Routed experts | Dense linears | Use |
 |---|---|---|---|
 | `nvfp4` (default) | NVFP4 | BF16 | Blackwell GPUs run the experts natively |
-| `iq4_nl` | IQ4_NL | Q8_0 | GPUs without NVFP4 (Ampere, Ada), CPU, Vulkan, Metal; the smaller file |
+| `iq4_nl` | IQ4_NL | Q8_0 | GPUs without NVFP4 (Ampere, Ada), CPU, Vulkan; the smaller file |
 
 The encoder file is the same for every `--outtype` (F16 encoder and F32 CTC head), named after the
 checkpoint, so decoders of several types share one. `--salm-encoder none` writes only the decoder, for a second

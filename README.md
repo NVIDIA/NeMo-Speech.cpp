@@ -18,6 +18,7 @@
 | Application | Supported models |
 |---|---|
 | Speech recognition | [Nemotron 3.5 ASR Streaming 0.6B](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b), [Nemotron Speech Streaming 0.6B](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b), [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), and [Parakeet CTC 1.1B](https://huggingface.co/nvidia/parakeet-ctc-1.1b) |
+| Speech-LLM transcription | [Nemotron 3.5 Transcribe 30B-A4B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B) for complete recordings, with word timestamps, speaker labels, speech translation, and custom instructions ([guide](docs/salm/README.md)) |
 | Speaker diarization | [Streaming Sortformer 4-speaker v2](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2) and [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), standalone or combined with ASR |
 | Text and speech translation | [Riva Translate 4B Instruct v2](https://huggingface.co/nvidia/Riva-Translate-4B-Instruct-v2), with composed ASR-to-NMT-to-TTS speech translation |
 | Speech synthesis | [MagpieTTS Multilingual 357M](https://huggingface.co/nvidia/magpie_tts_multilingual_357m) with [NeMo NanoCodec](https://huggingface.co/nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps) |
