@@ -26,6 +26,10 @@ test_extract_strips_tags() {
     check(extract_language_tags(text) == Codes{"fr-FR", "en-US"}, "codes in order");
     check(text == "Bonjour. Hello.", "tags removed from text");
 
+    text = "Hello<en-US>bonjour";
+    check(extract_language_tags(text) == Codes{"en-US"}, "a tag inside a word");
+    check(text == "Hello bonjour", "a tag inside a word leaves two words, as in the word list");
+
     text = "no tag";
     check(extract_language_tags(text).empty() && text == "no tag", "text without tags unchanged");
 }
@@ -110,6 +114,18 @@ test_word_languages_follow_tag_position() {
         prefix.size() == 2 && prefix[1].word == "Il" && prefix[0].language == "en-US" &&
             prefix[1].language.empty(),
         "a tag joined before a word labels only the earlier words");
+
+    const auto embedded = label_word_languages({{"Hello<en-US>bonjour", 2, 3}});
+    check(
+        embedded.size() == 2 && embedded[0].word == "Hello" && embedded[0].language == "en-US" &&
+            embedded[1].word == "bonjour" && embedded[1].language.empty() &&
+            embedded[1].start_frame == 2 && embedded[1].end_frame == 3,
+        "a tag inside a word splits it into two spans");
+    const auto several = label_word_languages({{"Yes", 0, 1}, {"<en-US>Oui.<fr-FR>", 2, 3}});
+    check(
+        several.size() == 2 && several[0].language == "en-US" && several[1].word == "Oui." &&
+            several[1].language == "fr-FR",
+        "every tag in one word labels the text before it");
 
     // RNNT can emit several tokens on one frame, and the end-of-audio bound can clamp frames.
     const auto shared =

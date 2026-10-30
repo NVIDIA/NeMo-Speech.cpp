@@ -49,7 +49,7 @@ extract_language_tags(std::string& text, std::vector<std::string>* leading) {
         found = true;
     }
     if (found) {
-        text = std::regex_replace(text, tag_re, "");
+        text = std::regex_replace(text, tag_re, " ");  // a tag can join two words
         text = std::regex_replace(text, std::regex(R"( {2,})"), " ");
         const size_t a = text.find_first_not_of(' ');
         const size_t b = text.find_last_not_of(' ');
@@ -76,22 +76,25 @@ label_word_languages(const std::vector<WordTiming>& words) {
     std::vector<WordTiming> labeled;
     labeled.reserve(words.size());
     size_t unlabeled = 0;
-    std::smatch tag;
+    // A tag token has no word boundary, so it can join the open word, with text on either side.
+    // Each piece of text is a word of its own, with the frames of the decoder word.
+    auto add_text = [&](const WordTiming& word, size_t pos, size_t count) {
+        if (count == 0)
+            return;
+        labeled.push_back(word);
+        labeled.back().word = word.word.substr(pos, count);
+    };
     for (const auto& w : words) {
-        if (!std::regex_search(w.word, tag, tag_regex())) {
-            labeled.push_back(w);
-            continue;
+        size_t pos = 0;
+        for (std::sregex_iterator it(w.word.begin(), w.word.end(), tag_regex()), end; it != end;
+             ++it) {
+            const size_t tag_pos = static_cast<size_t>(it->position(0));
+            add_text(w, pos, tag_pos - pos);
+            pos = tag_pos + static_cast<size_t>(it->length(0));
+            for (; unlabeled < labeled.size(); ++unlabeled)
+                labeled[unlabeled].language = (*it)[1].str();
         }
-        // A tag token has no word boundary, so it can join the open word. Text before it is
-        // labeled; text after it is not, like the words after a tag.
-        WordTiming word = w;
-        word.word = std::regex_replace(w.word, tag_regex(), "");
-        const bool labels_word = tag.prefix().length() > 0;
-        if (labels_word)
-            labeled.push_back(word);
-        for (; unlabeled < labeled.size(); ++unlabeled) labeled[unlabeled].language = tag[1].str();
-        if (!labels_word && !word.word.empty())
-            labeled.push_back(std::move(word));
+        add_text(w, pos, w.word.size() - pos);
     }
     return labeled;
 }
