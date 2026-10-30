@@ -98,6 +98,19 @@ test_word_languages_follow_tag_position() {
     check(late.size() == 1 && late[0].language.empty(), "a leading tag labels no word");
     check(label_word_languages({{"Hi", 0, 1}})[0].language.empty(), "no tags, no labels");
 
+    // A tag token has no word boundary, so it can join the open word.
+    const auto suffix =
+        label_word_languages({{"Oui", 0, 1}, {"Hello.<en-US>", 2, 3}, {"Go", 4, 5}});
+    check(
+        suffix.size() == 3 && suffix[1].word == "Hello." && suffix[0].language == "en-US" &&
+            suffix[1].language == "en-US" && suffix[2].language.empty(),
+        "a tag joined after a word labels it and is removed");
+    const auto prefix = label_word_languages({{"Yes", 0, 1}, {"<en-US>Il", 2, 3}});
+    check(
+        prefix.size() == 2 && prefix[1].word == "Il" && prefix[0].language == "en-US" &&
+            prefix[1].language.empty(),
+        "a tag joined before a word labels only the earlier words");
+
     // RNNT can emit several tokens on one frame, and the end-of-audio bound can clamp frames.
     const auto shared =
         label_word_languages({{"Hello.", 7, 8}, {"<en-US>", 7, 8}, {"Again", 7, 8}});

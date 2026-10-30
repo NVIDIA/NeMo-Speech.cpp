@@ -25,7 +25,8 @@ void extract_appended_language_tags(
     std::vector<std::string>& leading);
 
 // Decoder words without their language tags, in decoder order. A tag sets `language` on the
-// unlabeled words before it; the words after the last tag stay unlabeled.
+// unlabeled words before it, including a word it follows directly ("Hello<en-US>"); the words
+// after the last tag stay unlabeled.
 std::vector<WordTiming> label_word_languages(const std::vector<WordTiming>& words);
 
 }  // namespace nemo_speech::asr

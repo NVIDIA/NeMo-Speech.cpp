@@ -78,11 +78,20 @@ label_word_languages(const std::vector<WordTiming>& words) {
     size_t unlabeled = 0;
     std::smatch tag;
     for (const auto& w : words) {
-        if (!std::regex_match(w.word, tag, tag_regex())) {
+        if (!std::regex_search(w.word, tag, tag_regex())) {
             labeled.push_back(w);
             continue;
         }
+        // A tag token has no word boundary, so it can join the open word. Text before it is
+        // labeled; text after it is not, like the words after a tag.
+        WordTiming word = w;
+        word.word = std::regex_replace(w.word, tag_regex(), "");
+        const bool labels_word = tag.prefix().length() > 0;
+        if (labels_word)
+            labeled.push_back(word);
         for (; unlabeled < labeled.size(); ++unlabeled) labeled[unlabeled].language = tag[1].str();
+        if (!labels_word && !word.word.empty())
+            labeled.push_back(std::move(word));
     }
     return labeled;
 }
