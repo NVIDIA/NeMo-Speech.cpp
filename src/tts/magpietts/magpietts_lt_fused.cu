@@ -932,9 +932,9 @@ ltf_chain_setup(magpietts_lt_fused* f) {
     if (ltf_chain_tier_usable<ltf_chain_tier_large>(
             reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_large>), sms, fits)) {
         f->chain_grid = ltf_chain_tier_large::grid;
-    } else if (ltf_chain_tier_usable<ltf_chain_tier_small>(
-                   reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_small>), sms,
-                   fits)) {
+    } else if (
+        ltf_chain_tier_usable<ltf_chain_tier_small>(
+            reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_small>), sms, fits)) {
         f->chain_grid = ltf_chain_tier_small::grid;
     } else {
         return;

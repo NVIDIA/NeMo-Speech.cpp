@@ -715,8 +715,9 @@ magpietts_decoder_fused_create(
     if (ltf_chain_tier_usable<ltf_chain_tier_large>(
             reinterpret_cast<const void*>(df_kernel<ltf_chain_tier_large>), sms, fits)) {
         grid = ltf_chain_tier_large::grid;
-    } else if (ltf_chain_tier_usable<ltf_chain_tier_small>(
-                   reinterpret_cast<const void*>(df_kernel<ltf_chain_tier_small>), sms, fits)) {
+    } else if (
+        ltf_chain_tier_usable<ltf_chain_tier_small>(
+            reinterpret_cast<const void*>(df_kernel<ltf_chain_tier_small>), sms, fits)) {
         grid = ltf_chain_tier_small::grid;
     } else {
         char msg[128];
