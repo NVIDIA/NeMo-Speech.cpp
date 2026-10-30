@@ -17,6 +17,7 @@ struct Word {
     // punctuation around it), and whether it follows the previous word without a space.
     std::string display;
     bool joins_previous = false;
+    std::string language;  // detected language code; empty when unknown
 };
 
 struct Cue {

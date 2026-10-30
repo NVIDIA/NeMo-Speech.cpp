@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "gguf.h"
+#include "language_tags.h"
 #include "model.h"
 #include "silero_vad.h"
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
@@ -548,12 +549,8 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     // The prompt-conditioned multilingual model emits a "<lang>" token (e.g.
     // <en-US>). The runner strips it from the transcript text and records it in
     // detected_languages(), but the decoder's per-word list still carries it as
-    // a word - drop those entries so the language id can't leak into word time
-    // offsets. Empty for non-multilingual models (no-op).
-    std::vector<std::string> tag_words;
-    tag_words.reserve(langs.size());
-    for (const auto& l : langs) tag_words.push_back("<" + l + ">");
-
+    // a word - it labels the words before it, then is dropped so the language id
+    // can't leak into word time offsets. No-op for non-multilingual models.
     if (!is_final) {
         // Raw interim text plus decoder word timings. Speaker tags only once
         // the model-specific attribution window covers the word onset.
@@ -562,14 +559,15 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
         alt.confidence = 0.0f;
         alt.language_codes.assign(langs.begin(), langs.end());
         if (want_off) {
+            const auto spans = language_spans(u.words);
             for (const auto& w : u.words) {
-                if (std::find(tag_words.begin(), tag_words.end(), w.word) != tag_words.end())
+                if (is_language_tag(w.word))
                     continue;
                 Word ww;
                 ww.word = w.word;
                 set_word_time_(ww, w);
                 ww.confidence = w.confidence;
-                ww.language_code = lang0;
+                ww.language_code = word_language(spans, w.start_frame);
                 alt.words.push_back(std::move(ww));
             }
         }
@@ -585,10 +583,11 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     auto make_alt = [&](const std::string& transcript, float confidence,
                         const std::vector<WordTiming>& words_in, bool tag_speakers) {
         Alternative alt;
+        const auto spans = language_spans(words_in);
         std::vector<WordTiming> words;
         words.reserve(words_in.size());
         for (const auto& w : words_in)
-            if (std::find(tag_words.begin(), tag_words.end(), w.word) == tag_words.end())
+            if (!is_language_tag(w.word))
                 words.push_back(w);
         alt.transcript = recognizer_->postproc().apply(
             transcript, opts_, want_off ? &words : nullptr, postproc_language);
@@ -600,7 +599,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
                 ww.word = w.word;
                 set_word_time_(ww, w);
                 ww.confidence = w.confidence;
-                ww.language_code = lang0;
+                ww.language_code = word_language(spans, w.start_frame);
                 if (tag_speakers && diar_) {
                     // Transducer punctuation can extend a word timestamp into
                     // the next turn. Anchor attribution to the word onset and
@@ -677,6 +676,10 @@ RecognitionStream::next() {
         pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     auto u = runner_->step();
     late_punctuation_ += u.late_punctuation;
+    for (const auto& code : u.late_language_codes)
+        if (std::find(late_language_codes_.begin(), late_language_codes_.end(), code) ==
+            late_language_codes_.end())
+            late_language_codes_.push_back(code);
     if (u.is_final) {
         flush_diar_deficit_(u);
         last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
@@ -690,6 +693,7 @@ RecognitionStream::next() {
                 static_cast<int64_t>(last_start_sec / diar_->seconds_per_frame()));
         }
         result.late_punctuation = std::exchange(late_punctuation_, {});
+        result.late_language_codes = std::exchange(late_language_codes_, {});
         return result;
     }
     // Deliver an interim only when this step advanced the audio cursor (decoded
@@ -703,6 +707,7 @@ RecognitionStream::next() {
         pending_cohort_target_ = 0;
         auto result = build_result_(u, /*is_final=*/false);
         result.late_punctuation = std::exchange(late_punctuation_, {});
+        result.late_language_codes = std::exchange(late_language_codes_, {});
         return result;
     }
     pending_cohort_target_ = 0;
@@ -734,6 +739,11 @@ RecognitionStream::finish() {
         result.audio_processed =
             static_cast<float>(static_cast<double>(input_samples_) / input_sample_rate_);
     result.late_punctuation = std::exchange(late_punctuation_, {}) + u.late_punctuation;
+    result.late_language_codes = std::exchange(late_language_codes_, {});
+    for (const auto& code : u.late_language_codes)
+        if (std::find(result.late_language_codes.begin(), result.late_language_codes.end(), code) ==
+            result.late_language_codes.end())
+            result.late_language_codes.push_back(code);
     return result;
 }
 

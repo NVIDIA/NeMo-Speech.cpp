@@ -52,6 +52,10 @@ add_executable(test_decoders test_decoders.cpp)
 target_link_libraries(test_decoders PRIVATE nemo_speech_asr)
 add_test(NAME decoders COMMAND test_decoders)
 
+add_executable(test_language_tags test_language_tags.cpp)
+target_link_libraries(test_language_tags PRIVATE nemo_speech_asr)
+add_test(NAME language_tags COMMAND test_language_tags)
+
 # Do not link sentencepiece directly; it is provided by nemo_speech_asr.
 add_executable(test_oov_boost test_oov_boost.cpp)
 target_link_libraries(test_oov_boost PRIVATE nemo_speech_asr)
