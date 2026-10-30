@@ -1,9 +1,10 @@
 # cuBLAS shim and GPU kernels
 
-The minimal runtime image ships **no NVIDIA cuBLAS**. ggml-cuda's
-non-quantized GEMMs (FastConformer attention, subsampling convs, CTC head; the
-q8/RNNT weight matmuls already use ggml's quantized kernels) are served instead
-by an in-tree drop-in `libcublas`.
+The release archives and the container ship NVIDIA's cuBLAS and cuBLASLt. For a
+smaller runtime closure, a build can serve ggml-cuda's non-quantized GEMMs
+(FastConformer attention, subsampling convs, CTC head; the q8/RNNT weight
+matmuls already use ggml's quantized kernels) from an in-tree drop-in
+`libcublas` instead.
 
 ## The shim
 
@@ -12,22 +13,21 @@ GEMM/GEMV kernels, including WMMA tensor-core paths, but **no cuBLASLt**.
 Linux uses the generated symbol map from `kernels/ver_cublas.map`; Windows exports
 the same ABI from `cublas64_<major>.dll`. The target inherits
 `CMAKE_CUDA_ARCHITECTURES` when set and falls back to JIT-portable
-`compute_80` PTX for ad-hoc builds. Dropping real cuBLAS and cuBLASLt is
-the bulk of the package size. The shim is built separately from ggml.
-Prebuilt releases include Turing (SM75) code. Local Turing builds must set
-`CMAKE_CUDA_ARCHITECTURES=75` or `native`, because `compute_80` PTX cannot run
-on SM75.
+`compute_80` PTX for ad-hoc builds. Real cuBLAS and cuBLASLt are the bulk of
+a CUDA package's size. The shim is built separately from ggml. Turing builds
+must set `CMAKE_CUDA_ARCHITECTURES=75` or `native`, because `compute_80` PTX
+cannot run on SM75.
 
 It's an optional CMake target, **`NEMO_SPEECH_CUBLAS_SHIM` (default `OFF`)**,
 built when explicitly enabled with `GGML_CUDA` (a no-op for Metal, Vulkan,
 and CPU builds). Normal shared-library source builds link the CUDA toolkit's
-cuBLAS; static ggml builds may also link cuBLASLt. Portable container and
-release-archive builds enable the shim and do not require those libraries at
-run time. Linux uses a matching SONAME and symbol version; Windows uses the
-matching versioned DLL name.
+cuBLAS; static ggml builds may also link cuBLASLt. A build with the shim does
+not require those libraries at run time; the release archives and the
+container do not use it. Linux uses a matching SONAME and symbol version;
+Windows uses the matching versioned DLL name.
 
-To build and exercise the container GEMM path outside the container, enable the
-shim and put its output directory first on the loader path:
+To build and exercise the shim's GEMM path, enable it and put its output
+directory first on the loader path:
 
 ```bash
 scripts/configure.sh cuda-asr \

@@ -162,15 +162,12 @@ RUN if [ "${ENABLE_FLASHLIGHT}" = "ON" ]; then \
 
 # NCCL disabled: single-GPU inference does not use multi-GPU collectives,
 # and the linked libnccl is otherwise dead runtime weight.
-# NEMO_SPEECH_CUBLAS_SHIM=ON builds the drop-in libcublas.so.<CUDA-major>
-# (native GEMM, no cuBLASLt) as a normal build target.
 RUN cmake -G Ninja -S /work -B /work/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=${ENABLE_CUDA} \
         -DGGML_CUDA_NCCL=OFF \
         -DGGML_CUDA_GRAPHS=${ENABLE_CUDA_GRAPHS} \
         -DGGML_NATIVE=OFF \
-        -DNEMO_SPEECH_CUBLAS_SHIM=${ENABLE_CUDA} \
         -DNEMO_SPEECH_GGML_PATCHED=${ENABLE_GGML_PATCHES} \
         ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}} \
         -DNEMO_SPEECH_BUILD_GRPC=${ENABLE_GRPC} \
@@ -206,8 +203,7 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
            /work/build/bin/libggml*.so* \
            /work/build/bin/libllama*.so* \
            /work/build/bin/libnemo_speech*.so* \
-           /work/build/bin/libkenlm*.so* \
-           /work/build/bin/libcublas.so*; \
+           /work/build/bin/libkenlm*.so*; \
        do \
            if [ -e "${library}" ]; then cp -a "${library}" /out/lib/; fi; \
        done \
@@ -304,11 +300,10 @@ RUN set -eux; \
     }; \
     copy_dep() { \
         dep="$1"; \
-        # Skip the CUDA driver (toolkit-injected at run time) and real cuBLAS/
-        # cuBLASLt: the in-tree shim in /opt/nemo-speech/lib provides
-        # libcublas.so.<CUDA-major>, and nothing else needs cuBLASLt.
+        # Skip the CUDA driver (toolkit-injected at run time). The CUDA runtime,
+        # cuBLAS and cuBLASLt are copied from the toolkit like any other dependency.
         case "$dep" in \
-            */libcuda.so*|*/libcublas.so*|*/libcublasLt.so*) return 0;; \
+            */libcuda.so*) return 0;; \
         esac; \
         dest="$root${dep}"; \
         mkdir -p "$(dirname "$dest")"; \
@@ -333,9 +328,6 @@ RUN set -eux; \
             break; \
         fi; \
     done; \
-    # The cuBLAS shim (CMake target -DNEMO_SPEECH_CUBLAS_SHIM=ON, staged via
-    # /out/lib) is the only libcublas.so.<CUDA-major> in the image and is first on
-    # LD_LIBRARY_PATH; real cuBLAS/cuBLASLt were skipped by copy_dep above.
     for b in "$root"/opt/nemo-speech/bin/*; do [ -f "$b" ] && strip --strip-unneeded "$b" || true; done; \
     chmod 0755 "$root"/opt/nemo-speech/bin/*; \
     chown -R 1000:1000 "$root/home/nemo" "$root/opt/nemo-speech"

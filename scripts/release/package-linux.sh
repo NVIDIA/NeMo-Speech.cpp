@@ -28,7 +28,7 @@ Options:
 The installed project and GCC runtimes are packaged together; the project must
 be built with text normalization (-DNEMO_SPEECH_WITH_NORM=ON and the static
 dependencies from scripts/build_itn_deps.sh). CUDA archives also include
-libcudart. glibc, GPU drivers, and the Vulkan loader remain host
+libcudart, cuBLAS and cuBLASLt. glibc, GPU drivers, and the Vulkan loader remain host
 dependencies. Project binaries must find bundled libraries through DT_RPATH,
 which LD_LIBRARY_PATH cannot override.
 EOF
@@ -258,21 +258,6 @@ if [[ "$backend" == cuda ]]; then
         }
     fi
     cublas_soname="libcublas.so.${actual_cuda_major}"
-    cublas_shim="$package_root/lib/$cublas_soname"
-    [[ -f "$cublas_shim" ]] || {
-        echo "error: CUDA release does not contain the $cublas_soname shim" >&2
-        exit 1
-    }
-    actual_cublas_soname="$(readelf -d "$cublas_shim" |
-        sed -n 's/.*Library soname: \[\([^]]*\)\].*/\1/p')"
-    [[ "$actual_cublas_soname" == "$cublas_soname" ]] || {
-        echo "error: cuBLAS shim SONAME is '$actual_cublas_soname'; expected '$cublas_soname'" >&2
-        exit 1
-    }
-    readelf --version-info "$cublas_shim" | grep -Fq "$cublas_soname" || {
-        echo "error: cuBLAS shim does not export the $cublas_soname symbol version" >&2
-        exit 1
-    }
     ggml_cuda="$(find -L "$package_root/lib" -maxdepth 1 -type f \
         -name 'libggml-cuda.so.*' -print | sort -V | tail -n 1)"
     [[ -n "$ggml_cuda" ]] || {
@@ -285,25 +270,14 @@ if [[ "$backend" == cuda ]]; then
         echo "error: libggml-cuda requires '$required_cublas'; expected '$cublas_soname'" >&2
         exit 1
     }
-    # The shim implements only the cuBLAS calls ggml makes; a call added by a
-    # llama.cpp update must be added to kernels/ before it can ship.
-    imported_cublas="$work_dir/imported-cublas"
-    exported_cublas="$work_dir/exported-cublas"
-    nm -D --undefined-only "$ggml_cuda" > "$imported_cublas.raw"
-    nm -D --defined-only "$cublas_shim" > "$exported_cublas.raw"
-    awk '{ sub(/@.*/, "", $2); if ($2 ~ /^cublas/) print $2 }' "$imported_cublas.raw" |
-        sort -u > "$imported_cublas"
-    awk '{ sub(/@.*/, "", $3); print $3 }' "$exported_cublas.raw" | sort -u > "$exported_cublas"
-    [[ -s "$imported_cublas" && -s "$exported_cublas" ]] || {
-        echo "error: could not read the cuBLAS symbols of libggml-cuda or the shim" >&2
-        exit 1
-    }
-    missing_cublas="$(comm -23 "$imported_cublas" "$exported_cublas")"
-    [[ -z "$missing_cublas" ]] || {
-        echo "error: the cuBLAS shim does not export these functions libggml-cuda calls:" >&2
-        sed 's/^/  /' <<< "$missing_cublas" >&2
-        exit 1
-    }
+    # NVIDIA's cuBLAS, and the cuBLASLt it loads, ship next to libcudart.
+    for nvidia_soname in "$cublas_soname" "libcublasLt.so.${actual_cuda_major}"; do
+        [[ -e "$cuda_lib_dir/$nvidia_soname" ]] || {
+            echo "error: $nvidia_soname was not found under $cuda_lib_dir" >&2
+            exit 1
+        }
+        cp -L "$cuda_lib_dir/$nvidia_soname" "$package_root/lib/$nvidia_soname"
+    done
     cuda_license="/usr/share/doc/cuda-cudart-${cuda_version}/copyright"
     [[ -f "$cuda_license" ]] || {
         echo "error: CUDA runtime license was not found: $cuda_license" >&2
@@ -313,9 +287,19 @@ if [[ "$backend" == cuda ]]; then
         "$package_root/share/licenses/nemo-speech/nvidia/cuda-runtime/copyright"
 fi
 
+# NVIDIA's CUDA libraries ship as the toolkit provides them: not stripped, and not
+# held to the DT_RPATH rule for project binaries.
+is_nvidia_library() {
+    case "${1##*/}" in
+        libcudart.so.*|libcublas.so.*|libcublasLt.so.*) return 0 ;;
+    esac
+    return 1
+}
+
 elf_candidates="$work_dir/elf-candidates"
 find "$package_root/bin" "$package_root/lib" -type f -print0 > "$elf_candidates"
 while IFS= read -r -d '' file; do
+    is_nvidia_library "$file" && continue
     if readelf -h "$file" >/dev/null 2>&1; then
         strip --strip-unneeded "$file"
     fi
@@ -361,6 +345,7 @@ fi
 runpath_files="$work_dir/runpath-files"
 : > "$runpath_files"
 while IFS= read -r -d '' file; do
+    is_nvidia_library "$file" && continue
     readelf -h "$file" >/dev/null 2>&1 || continue
     if readelf -d "$file" 2>/dev/null | grep -q '(RUNPATH)'; then
         echo "$file" >> "$runpath_files"

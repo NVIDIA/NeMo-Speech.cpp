@@ -225,7 +225,6 @@ RUN set -eux; \
     scripts/configure.sh cuda-server \
         -DGGML_NATIVE=OFF \
         -DGGML_CUDA_NCCL=OFF \
-        -DNEMO_SPEECH_CUBLAS_SHIM=ON \
         -DNEMO_SPEECH_BUILD_GRPC=OFF \
         -DNEMO_SPEECH_WITH_GRPC=OFF \
         -DNEMO_SPEECH_WITH_NORM=ON \
