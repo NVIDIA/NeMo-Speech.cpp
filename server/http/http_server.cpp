@@ -317,6 +317,8 @@ transcript_response(
             item["confidence"] = word.confidence;
             if (word.speaker_tag > 0)
                 item["speaker"] = word.speaker_tag;
+            if (!word.language_code.empty())
+                item["language"] = word.language_code;
             words.emplace_back(std::move(item));
         }
         root["words"] = std::move(words);
@@ -1178,6 +1180,9 @@ struct Server::Impl {
                                     : "conversation.item.input_audio_transcription.delta";
                 if (result.is_final) {
                     event["transcript"] = alternative.transcript;
+                    // The model tags a language after the text, so only finals carry it.
+                    if (!alternative.language_codes.empty())
+                        event["language"] = alternative.language_codes.front();
                     partial_transcript.clear();
                 } else {
                     const bool extends_previous =
@@ -1188,6 +1193,9 @@ struct Server::Impl {
                     partial_transcript = alternative.transcript;
                 }
                 event["audio_processed"] = result.audio_processed;
+                // A tag decoded after the previous final's endpoint labels that final.
+                if (!result.late_language_codes.empty())
+                    event["previous_language"] = result.late_language_codes.front();
                 if (result.is_final && options.needs_word_timings()) {
                     Value::Array words;
                     for (const auto& word : alternative.words) {
@@ -1198,6 +1206,8 @@ struct Server::Impl {
                         item["confidence"] = word.confidence;
                         if (word.speaker_tag > 0)
                             item["speaker"] = word.speaker_tag;
+                        if (!word.language_code.empty())
+                            item["language"] = word.language_code;
                         words.emplace_back(std::move(item));
                     }
                     event["words"] = std::move(words);

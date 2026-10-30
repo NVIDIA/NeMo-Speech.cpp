@@ -199,6 +199,7 @@ class RecognitionStream {
     bool interim_words_ = false;
     // Late punctuation from steps that returned no Result; sent with the next.
     std::string late_punctuation_;
+    std::vector<std::string> late_language_codes_;
 };
 
 // A speech-LLM decoder GGUF names its encoder file (speech encoder and CTC timestamp head) in

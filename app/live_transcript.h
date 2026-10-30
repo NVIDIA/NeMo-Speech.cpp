@@ -60,6 +60,9 @@ class LiveDiarizationBuffer {
         double stable_before_seconds = std::numeric_limits<double>::infinity()) const;
     // Append late punctuation to the newest buffered final; false if empty.
     bool attach_late_punctuation(const std::string& punctuation);
+    // Apply late language tags to the newest buffered final's trailing unlabeled
+    // words; false if empty.
+    bool attach_late_languages(const std::vector<std::string>& languages);
 
    private:
     std::deque<Result> pending_;

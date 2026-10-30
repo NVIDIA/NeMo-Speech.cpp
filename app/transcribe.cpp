@@ -49,6 +49,7 @@ struct Transcript {
     float audio_seconds = 0.0f;
     std::vector<std::string> languages;
     std::vector<nemo_speech::subtitle::Word> words;
+    size_t last_final_word = 0;  // the first of the words the last final appended
     // False when a speech-LLM could not align every word: `text` has words `words` lacks.
     bool words_cover_text = true;
 };
@@ -278,6 +279,13 @@ make_request_options(const Options& options, bool word_timestamps_supported) {
     return request;
 }
 
+void
+add_language(Transcript& transcript, const std::string& language) {
+    if (std::find(transcript.languages.begin(), transcript.languages.end(), language) ==
+        transcript.languages.end())
+        transcript.languages.push_back(language);
+}
+
 // Punctuation the model emitted after an endpoint closes the previous final.
 void
 append_late_punctuation(Transcript& transcript, const std::string& punctuation) {
@@ -288,9 +296,24 @@ append_late_punctuation(Transcript& transcript, const std::string& punctuation) 
         transcript.words.back().text += punctuation;
 }
 
+// A language tag the model emitted after an endpoint labels the previous final's last words.
+void
+append_late_languages(Transcript& transcript, const std::vector<std::string>& languages) {
+    if (languages.empty() || transcript.text.empty())
+        return;
+    for (const auto& language : languages) add_language(transcript, language);
+    for (size_t i = transcript.words.size(); i > transcript.last_final_word; --i) {
+        auto& word = transcript.words[i - 1];
+        if (!word.language.empty())
+            break;
+        word.language = languages.front();
+    }
+}
+
 void
 append_result(Transcript& transcript, const asr::Result& result) {
     append_late_punctuation(transcript, result.late_punctuation);
+    append_late_languages(transcript, result.late_language_codes);
     if (result.speechlm && result.speechlm->unaligned_words > 0)
         transcript.words_cover_text = false;
     if (result.alternatives.empty())
@@ -304,10 +327,8 @@ append_result(Transcript& transcript, const asr::Result& result) {
     }
     transcript.confidence = alternative.confidence;
     transcript.audio_seconds = std::max(transcript.audio_seconds, result.audio_processed);
-    for (const auto& language : alternative.language_codes)
-        if (std::find(transcript.languages.begin(), transcript.languages.end(), language) ==
-            transcript.languages.end())
-            transcript.languages.push_back(language);
+    for (const auto& language : alternative.language_codes) add_language(transcript, language);
+    transcript.last_final_word = transcript.words.size();
     for (const auto& word : alternative.words) {
         int speaker = word.speaker_tag;
         if (!transcript.words.empty() &&
@@ -315,7 +336,7 @@ append_result(Transcript& transcript, const asr::Result& result) {
             speaker = transcript.words.back().speaker;
         transcript.words.push_back(
             {word.word, word.start_time, word.end_time, word.confidence, speaker, word.display,
-             word.joins_previous});
+             word.joins_previous, word.language_code});
     }
 }
 
@@ -342,6 +363,7 @@ transcribe_one(asr::Recognizer& recognizer, const Options& options, const fs::pa
                     append_result(transcript, *result);
                 } else {
                     append_late_punctuation(transcript, result->late_punctuation);
+                    append_late_languages(transcript, result->late_language_codes);
                     break;
                 }
             }
@@ -448,6 +470,9 @@ transcribe_live(asr::Recognizer& recognizer, const Options& options) {
     // Attach late punctuation once: to the buffered diarized final if any, else
     // to the transcript and the presenter's open turn. Printed lines stay as is.
     auto attach_late_punctuation = [&](asr::Result& result) {
+        const auto late_languages = std::exchange(result.late_language_codes, {});
+        if (!options.diarize || !diar_finals.attach_late_languages(late_languages))
+            append_late_languages(transcript, late_languages);
         auto punctuation = std::exchange(result.late_punctuation, {});
         if (punctuation.empty())
             return;
@@ -573,6 +598,8 @@ render(const Transcript& t, OutputFormat format, const fs::path& source) {
                    << ", \"confidence\": " << json_number(w.confidence);
             if (w.speaker > 0)
                 output << ", \"speaker\": " << w.speaker;
+            if (!w.language.empty())
+                output << ", \"language\": \"" << json_escape(w.language) << '"';
             output << '}';
         }
         output << (t.words.empty() ? "" : "\n  ") << "]\n}\n";
