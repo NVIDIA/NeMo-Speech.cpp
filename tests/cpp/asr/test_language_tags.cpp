@@ -28,7 +28,7 @@ test_extract_strips_tags() {
 
     text = "Hello<en-US>bonjour";
     check(extract_language_tags(text) == Codes{"en-US"}, "a tag inside a word");
-    check(text == "Hello bonjour", "a tag inside a word leaves two words, as in the word list");
+    check(text == "Hellobonjour", "a tag inside a word adds no text");
 
     text = "no tag";
     check(extract_language_tags(text).empty() && text == "no tag", "text without tags unchanged");
@@ -80,6 +80,20 @@ test_appended_tags() {
     extract_appended_language_tags(text, old_size, languages, leading);
     check(languages == Codes{"fr-FR"}, "a tag after words labels this utterance");
     check(text == "Vous États.", "appended tag removed");
+
+    // The transcript must not depend on where decoding stops.
+    for (const std::string& tail : Codes{"bonjour", " bonjour"}) {
+        Codes one_languages, one_leading, two_languages, two_leading;
+        std::string one = "Hello<en-US>" + tail;
+        extract_appended_language_tags(one, 0, one_languages, one_leading);
+        std::string two = "Hello<en-US>";
+        extract_appended_language_tags(two, 0, two_languages, two_leading);
+        const size_t split = two.size();
+        two += tail;
+        extract_appended_language_tags(two, split, two_languages, two_leading);
+        check(one == two, "one chunk and two chunks give the same text");
+        check(one_languages == two_languages, "one chunk and two chunks give the same languages");
+    }
 }
 
 void

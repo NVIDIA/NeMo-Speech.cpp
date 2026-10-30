@@ -49,7 +49,7 @@ extract_language_tags(std::string& text, std::vector<std::string>* leading) {
         found = true;
     }
     if (found) {
-        text = std::regex_replace(text, tag_re, " ");  // a tag can join two words
+        text = std::regex_replace(text, tag_re, "");
         text = std::regex_replace(text, std::regex(R"( {2,})"), " ");
         const size_t a = text.find_first_not_of(' ');
         const size_t b = text.find_last_not_of(' ');
