@@ -559,15 +559,12 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
         alt.confidence = 0.0f;
         alt.language_codes.assign(langs.begin(), langs.end());
         if (want_off) {
-            const auto spans = language_spans(u.words);
-            for (const auto& w : u.words) {
-                if (is_language_tag(w.word))
-                    continue;
+            for (const auto& w : label_word_languages(u.words)) {
                 Word ww;
                 ww.word = w.word;
                 set_word_time_(ww, w);
                 ww.confidence = w.confidence;
-                ww.language_code = word_language(spans, w.start_frame);
+                ww.language_code = w.language;
                 alt.words.push_back(std::move(ww));
             }
         }
@@ -583,12 +580,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     auto make_alt = [&](const std::string& transcript, float confidence,
                         const std::vector<WordTiming>& words_in, bool tag_speakers) {
         Alternative alt;
-        const auto spans = language_spans(words_in);
-        std::vector<WordTiming> words;
-        words.reserve(words_in.size());
-        for (const auto& w : words_in)
-            if (!is_language_tag(w.word))
-                words.push_back(w);
+        std::vector<WordTiming> words = label_word_languages(words_in);
         alt.transcript = recognizer_->postproc().apply(
             transcript, opts_, want_off ? &words : nullptr, postproc_language);
         alt.confidence = confidence;
@@ -599,7 +591,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
                 ww.word = w.word;
                 set_word_time_(ww, w);
                 ww.confidence = w.confidence;
-                ww.language_code = word_language(spans, w.start_frame);
+                ww.language_code = w.language;
                 if (tag_speakers && diar_) {
                     // Transducer punctuation can extend a word timestamp into
                     // the next turn. Anchor attribution to the word onset and

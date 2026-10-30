@@ -5,7 +5,6 @@
 // that can be after the endpoint, at the start of the next utterance.
 #pragma once
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -25,19 +24,8 @@ void extract_appended_language_tags(
     std::string& text, size_t old_size, std::vector<std::string>& languages,
     std::vector<std::string>& leading);
 
-// Whether a decoder word is a language tag.
-bool is_language_tag(const std::string& word);
-
-// A tag labels the words that start before the first word after it. Frame times survive ITN
-// merging words; the words after the last tag stay unlabeled until the next tag.
-struct LanguageSpan {
-    int64_t end_frame;  // words that start before this frame
-    std::string code;
-};
-
-std::vector<LanguageSpan> language_spans(const std::vector<WordTiming>& words);
-
-// The code of the first span that holds a word starting at `start_frame`; empty if none.
-std::string word_language(const std::vector<LanguageSpan>& spans, int64_t start_frame);
+// Decoder words without their language tags, in decoder order. A tag sets `language` on the
+// unlabeled words before it; the words after the last tag stay unlabeled.
+std::vector<WordTiming> label_word_languages(const std::vector<WordTiming>& words);
 
 }  // namespace nemo_speech::asr

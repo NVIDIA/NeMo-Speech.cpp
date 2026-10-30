@@ -202,7 +202,8 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
                 WordTiming{
                     outs[remaining_output.front()], timings[remaining_spoken.front()].start_frame,
                     timings[remaining_spoken.back()].end_frame,
-                    average_confidence(timings, remaining_spoken)});
+                    average_confidence(timings, remaining_spoken),
+                    timings[remaining_spoken.front()].language});
             continue;
         }
 
@@ -213,6 +214,7 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
             const int64_t end = timings[remaining_spoken.back()].end_frame;
             const int64_t span = end - start;
             const float confidence = average_confidence(timings, remaining_spoken);
+            const std::string& language = timings[remaining_spoken.front()].language;
             for (size_t i = 0; i < remaining_output.size(); ++i) {
                 result.emplace_back(
                     base + remaining_output[i],
@@ -222,7 +224,7 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
                                     static_cast<int64_t>(remaining_output.size()),
                         start + span * static_cast<int64_t>(i + 1) /
                                     static_cast<int64_t>(remaining_output.size()),
-                        confidence});
+                        confidence, language});
             }
             continue;
         }
@@ -238,7 +240,8 @@ update_word_timings(std::vector<WordTiming>& timings, const std::string& alignme
                 base + remaining_output[i],
                 WordTiming{
                     outs[remaining_output[i]], timings[slice.front()].start_frame,
-                    timings[slice.back()].end_frame, average_confidence(timings, slice)});
+                    timings[slice.back()].end_frame, average_confidence(timings, slice),
+                    timings[slice.front()].language});
             offset += take;
         }
     }

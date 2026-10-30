@@ -3,9 +3,8 @@
 #include "language_tags.h"
 
 #include <algorithm>
-#include <cctype>
-#include <limits>
 #include <regex>
+#include <sstream>
 #include <utility>
 
 namespace nemo_speech::asr {
@@ -22,6 +21,17 @@ add_language(std::vector<std::string>& languages, std::string code) {
     if (std::find(languages.begin(), languages.end(), code) == languages.end())
         languages.push_back(std::move(code));
 }
+
+// Punctuation is what the decoder calls punctuation; everything else is a word.
+bool
+has_word(const std::string& text) {
+    std::istringstream pieces(text);
+    std::string piece;
+    while (pieces >> piece)
+        if (!sp_is_punctuation(piece))
+            return true;
+    return false;
+}
 }  // namespace
 
 std::vector<std::string>
@@ -33,10 +43,7 @@ extract_language_tags(std::string& text, std::vector<std::string>* leading) {
     bool found = false;
     for (std::sregex_iterator it(text.begin(), text.end(), tag_re), end; it != end; ++it) {
         const size_t pos = static_cast<size_t>(it->position(0));
-        after_word = after_word ||
-                     std::any_of(text.begin() + scanned, text.begin() + pos, [](unsigned char c) {
-                         return c >= 0x80 || std::isalnum(c);
-                     });
+        after_word = after_word || has_word(text.substr(scanned, pos - scanned));
         scanned = pos + static_cast<size_t>(it->length(0));
         add_language(after_word ? langs : *leading, (*it)[1].str());
         found = true;
@@ -64,34 +71,20 @@ extract_appended_language_tags(
         add_language(languages, std::move(code));
 }
 
-bool
-is_language_tag(const std::string& word) {
-    return std::regex_match(word, tag_regex());
-}
-
-std::vector<LanguageSpan>
-language_spans(const std::vector<WordTiming>& words) {
-    std::vector<LanguageSpan> spans;
-    std::string pending;
+std::vector<WordTiming>
+label_word_languages(const std::vector<WordTiming>& words) {
+    std::vector<WordTiming> labeled;
+    labeled.reserve(words.size());
+    size_t unlabeled = 0;
+    std::smatch tag;
     for (const auto& w : words) {
-        if (is_language_tag(w.word)) {
-            if (pending.empty())
-                pending = w.word.substr(1, w.word.size() - 2);
-        } else if (!pending.empty()) {
-            spans.push_back({w.start_frame, std::exchange(pending, {})});
+        if (!std::regex_match(w.word, tag, tag_regex())) {
+            labeled.push_back(w);
+            continue;
         }
+        for (; unlabeled < labeled.size(); ++unlabeled) labeled[unlabeled].language = tag[1].str();
     }
-    if (!pending.empty())
-        spans.push_back({std::numeric_limits<int64_t>::max(), std::move(pending)});
-    return spans;
-}
-
-std::string
-word_language(const std::vector<LanguageSpan>& spans, int64_t start_frame) {
-    for (const auto& span : spans)
-        if (start_frame < span.end_frame)
-            return span.code;
-    return {};
+    return labeled;
 }
 
 }  // namespace nemo_speech::asr

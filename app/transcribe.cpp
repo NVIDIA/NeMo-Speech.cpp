@@ -470,9 +470,8 @@ transcribe_live(asr::Recognizer& recognizer, const Options& options) {
     // Attach late punctuation once: to the buffered diarized final if any, else
     // to the transcript and the presenter's open turn. Printed lines stay as is.
     auto attach_late_punctuation = [&](asr::Result& result) {
-        // A diarized final can still be buffered, outside the transcript: skip the late tag there.
         const auto late_languages = std::exchange(result.late_language_codes, {});
-        if (!options.diarize)
+        if (!options.diarize || !diar_finals.attach_late_languages(late_languages))
             append_late_languages(transcript, late_languages);
         auto punctuation = std::exchange(result.late_punctuation, {});
         if (punctuation.empty())

@@ -104,6 +104,7 @@ struct WordTiming {
     int64_t start_frame = 0;
     int64_t end_frame = 0;
     float confidence = 1.0f;
+    std::string language;  // from a language tag after the word; empty when unknown
 };
 
 // One N-best hypothesis. Times use the same encoder-frame clock as WordTiming.

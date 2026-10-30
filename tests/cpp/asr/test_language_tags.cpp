@@ -44,6 +44,16 @@ test_leading_tag_labels_previous_utterance() {
     check(leading == Codes{"en-US"}, "a tag after leading punctuation is still leading");
 
     leading.clear();
+    text = "\xE3\x80\x82 <zh-CN> \xE4\xBD\xA0";  // an ideographic full stop, then a word
+    check(extract_language_tags(text, &leading).empty(), "non-ASCII punctuation is not a word");
+    check(leading == Codes{"zh-CN"}, "a tag after non-ASCII punctuation is still leading");
+
+    leading.clear();
+    text = "\xE4\xBD\xA0 <zh-CN>";
+    check(extract_language_tags(text, &leading) == Codes{"zh-CN"}, "a non-ASCII word is a word");
+    check(leading.empty(), "no leading tag after a non-ASCII word");
+
+    leading.clear();
     text = "now. <en-US> Widely";
     check(
         extract_language_tags(text, &leading) == Codes{"en-US"},
@@ -70,20 +80,30 @@ test_appended_tags() {
 
 void
 test_word_languages_follow_tag_position() {
-    const std::vector<WordTiming> words = {
-        {"Hello.", 0, 4},  {"<en-US>", 5, 6},   {"Bonjour", 8, 10},
-        {"tout.", 11, 12}, {"<fr-FR>", 13, 14}, {"Again", 20, 22},
-    };
-    check(is_language_tag("<en-US>") && !is_language_tag("Hello."), "tag shape");
-    const auto spans = language_spans(words);
-    check(word_language(spans, 0) == "en-US", "a tag labels the words before it");
-    check(word_language(spans, 8) == "fr-FR", "the next tag labels the words since the last one");
-    check(word_language(spans, 11) == "fr-FR", "all words up to the tag");
-    check(word_language(spans, 20).empty(), "words after the last tag stay unlabeled");
+    const auto words = label_word_languages({
+        {"Hello.", 0, 4},
+        {"<en-US>", 5, 6},
+        {"Bonjour", 8, 10},
+        {"tout.", 11, 12},
+        {"<fr-FR>", 13, 14},
+        {"Again", 20, 22},
+    });
+    check(words.size() == 4, "tags are not words");
+    check(words[0].language == "en-US", "a tag labels the words before it");
+    check(words[1].language == "fr-FR", "the next tag labels the words since the last one");
+    check(words[2].language == "fr-FR", "all words up to the tag");
+    check(words[3].language.empty(), "words after the last tag stay unlabeled");
 
-    const std::vector<WordTiming> late = {{"<en-US>", 0, 1}, {"Il", 2, 3}};
-    check(word_language(language_spans(late), 2).empty(), "a leading tag labels no word");
-    check(language_spans({{"Hi", 0, 1}}).empty(), "no tags, no spans");
+    const auto late = label_word_languages({{"<en-US>", 0, 1}, {"Il", 2, 3}});
+    check(late.size() == 1 && late[0].language.empty(), "a leading tag labels no word");
+    check(label_word_languages({{"Hi", 0, 1}})[0].language.empty(), "no tags, no labels");
+
+    // RNNT can emit several tokens on one frame, and the end-of-audio bound can clamp frames.
+    const auto shared =
+        label_word_languages({{"Hello.", 7, 8}, {"<en-US>", 7, 8}, {"Again", 7, 8}});
+    check(
+        shared.size() == 2 && shared[0].language == "en-US" && shared[1].language.empty(),
+        "decoder order decides when words share a frame");
 }
 
 int
