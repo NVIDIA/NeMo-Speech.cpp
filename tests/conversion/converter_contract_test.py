@@ -57,6 +57,8 @@ from conversion.salm import checkpoint_id as salm_checkpoint_id
 from conversion.salm import decoder_keys as salm_decoder_keys
 from conversion.salm import encoder_file_name as salm_encoder_file_name
 from conversion.salm import encoder_type as salm_encoder_type
+from conversion.salm import kept_expert_layers as salm_kept_expert_layers
+from conversion.salm import q2_0_uses_top_level as salm_q2_0_uses_top_level
 from conversion.salm import stage as stage_salm
 from conversion.salm import tensor_rules as salm_tensor_rules
 from conversion.source import extract_archive
@@ -287,6 +289,7 @@ class ConverterContractTest(unittest.TestCase):
             _normalized_outtype("s2s", "q8_0")
         self.assertEqual(_normalized_outtype("salm", "auto"), "nvfp4")
         self.assertEqual(_normalized_outtype("salm", "IQ4_NL"), "iq4_nl")
+        self.assertEqual(_normalized_outtype("salm", "Q2_0"), "q2_0")
         for unsupported in ("bf16", "q4_k_m"):
             with self.assertRaises(ValueError):
                 _normalized_outtype("salm", unsupported)
@@ -304,8 +307,35 @@ class ConverterContractTest(unittest.TestCase):
                 ".=bf16",
             ],
         )
-        # dense linears: Q8_0 with IQ4_NL experts, BF16 with NVFP4 experts
-        self.assertEqual(SALM_DENSE_TYPE, {"nvfp4": "bf16", "iq4_nl": "q8_0"})
+        # q2_0: the experts of the last MoE layers stay IQ4_NL; embeddings and output head Q8_0
+        self.assertEqual(
+            salm_tensor_rules("q2_0", "q8_0", [43, 45, 47, 49, 51]),
+            [
+                r"blk\.(43|45|47|49|51)\.ffn_(up|down|gate)_exps=iq4_nl",
+                "ffn_(up|down|gate)_exps=q2_0",
+                "ssm_(in|out)=q8_0",
+                "ffn_(up|down)_shexp=q8_0",
+                "attn_(q|k|v|output)=q8_0",
+                r"^token_embd\.weight=q8_0",
+                r"^output\.weight=q8_0",
+                ".=bf16",
+            ],
+        )
+        blocks = ["mamba", "moe"] * 3 + ["attention", "moe", "mamba", "moe", "mamba", "moe"]
+        self.assertEqual(
+            salm_kept_expert_layers("q2_0", {"layers_block_type": blocks}), [3, 5, 7, 9, 11]
+        )
+        self.assertEqual(salm_kept_expert_layers("iq4_nl", {"layers_block_type": blocks}), [])
+        with self.assertRaises(RuntimeError):
+            salm_kept_expert_layers("q2_0", {})
+        # stock Q2_0 rounding never reaches code 3 (+2 x scale); the fitted scales of patches/ do
+        scale = b"\x00\x3c"
+        self.assertFalse(salm_q2_0_uses_top_level(scale + bytes([0b10_01_00_01] * 16)))
+        self.assertTrue(
+            salm_q2_0_uses_top_level(scale + bytes([0b10_01_00_01] * 15 + [0b00_00_11_00]))
+        )
+        # dense linears: Q8_0 with IQ4_NL and Q2_0 experts, BF16 with NVFP4 experts
+        self.assertEqual(SALM_DENSE_TYPE, {"nvfp4": "bf16", "iq4_nl": "q8_0", "q2_0": "q8_0"})
         # one F16 encoder file serves every profile; "none" writes the decoder alone
         self.assertEqual(salm_encoder_type("nvfp4"), "f16")
         self.assertEqual(salm_encoder_type("iq4_nl"), "f16")

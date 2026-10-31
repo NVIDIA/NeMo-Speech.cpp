@@ -1,0 +1,60 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml: fit Q2_0 block scales to the weights and the importance matrix
+
+quantize_q2_0 rounded every row with quantize_row_q2_0_ref, which takes the
+block scale from the largest magnitude, so a block uses three of its four
+levels, and it ignored the importance matrix. Each 64-weight block now gets
+the scale make_qx_quants finds for the levels -2..1 (stored as -1..2 with the
+sign of d flipped), with each weight's error weighted by its importance (1
+without an importance matrix) times sqrt(sigma2 + x^2), as the other
+small-block types do. On SALM's routed experts the relative squared error
+falls from 0.52 to 0.13, and a decoder with Q2_0 experts no longer falls into
+repetition loops. quantize_row_q2_0_ref (copies into Q2_0 tensors, tests) is
+unchanged.
+
+Upstream: candidate (needs perplexity and KLD numbers on text models).
+
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 55db802c0aeb5fd85de9ed77b4c5fe3dd84b5bd1..b800feb04146957999fc6a02335fab2bf98b25f8 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -2110,15 +2110,34 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+     return nrow * row_size;
+ }
+ 
+-size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+-    if (!quant_weights) {
+-        quantize_row_q2_0_ref(src, dst, (int64_t)nrow*n_per_row);
+-        return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
++static void quantize_row_q2_0_impl(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
++    float weight[QK2_0];
++    int8_t L[QK2_0];
++
++    float sum_x2 = 0;
++    for (int j = 0; j < n_per_row; ++j) sum_x2 += x[j]*x[j];
++    float sigma2 = sum_x2/n_per_row;
++
++    const int64_t nb = n_per_row/QK2_0;
++    for (int ib = 0; ib < nb; ++ib) {
++        const float * xb = x + QK2_0 * ib;
++        const float * qw = quant_weights ? quant_weights + QK2_0 * ib : NULL;
++        for (int j = 0; j < QK2_0; ++j) weight[j] = (qw ? qw[j] : 1.0f) * sqrtf(sigma2 + xb[j]*xb[j]);
++        // levels -2..1 times d, while q2_0 stores -1..2 times d: flip the sign of d and of the codes
++        float d = make_qx_quants(QK2_0, 2, xb, L, 1, weight);
++        y[ib].d = GGML_FP32_TO_FP16(-d);
++        memset(y[ib].qs, 0, sizeof(y[ib].qs));
++        for (int j = 0; j < QK2_0; ++j) {
++            y[ib].qs[j/4] |= (uint8_t)(3 - L[j]) << ((j%4)*2);
++        }
+     }
++}
++
++size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+     size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+     char * qrow = (char *)dst;
+     for (int64_t row = 0; row < nrow; ++row) {
+-        quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
++        quantize_row_q2_0_impl(src, (block_q2_0*)qrow, n_per_row, quant_weights);
+         src += n_per_row;
+         qrow += row_size;
+     }
