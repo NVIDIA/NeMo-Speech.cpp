@@ -33,6 +33,11 @@ Prebuilt Linux archives require glibc 2.31 or newer (Ubuntu 20.04 or equivalent)
 
 Prebuilt CPU archives require no GPU toolkit. Linux CUDA archives include the
 required user-space CUDA libraries but still need a compatible NVIDIA driver.
+The x86_64 CUDA archives (Linux and Windows) are built with CUDA 12 and need
+NVIDIA driver 525 or newer; the CUDA 13 archives (`cuda13` on Linux aarch64,
+Windows aarch64) need driver 580 or newer. With an older driver the installer
+selects the Vulkan archive instead, and `nemo-speech doctor` reports the
+driver's CUDA version next to the build's.
 Vulkan archives use the host's Vulkan loader and vendor driver. The Linux
 x86_64 CUDA archive supports Turing-class GPUs (compute capability 7.5,
 including RTX 20-series) and newer. On an older GPU, select `--backend cpu` or

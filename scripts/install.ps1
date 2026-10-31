@@ -138,6 +138,17 @@ if ($Backend -eq "auto") {
         $gpu = & $smi.Source --query-gpu=name --format=csv,noheader 2>$null
         if ($LASTEXITCODE -eq 0 -and $gpu) {
             $Backend = "cuda"
+            # The x86_64 CUDA archive (CUDA 12) needs driver 525 or newer, the aarch64 one (CUDA 13) 580.
+            $minimumDriver = if ($arch -eq 'aarch64') { 580 } else { 525 }
+            $driver = & $smi.Source --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1
+            if ($driver -match '^\s*(\d+)\.' -and [int]$Matches[1] -lt $minimumDriver) {
+                if ($arch -eq 'x86_64') {
+                    $Backend = "vulkan"
+                    Write-Host "NVIDIA driver $driver is older than the CUDA archive needs ($minimumDriver or newer); selecting the Vulkan backend. Update the driver to use CUDA."
+                } else {
+                    Write-Host "NVIDIA driver $driver is older than the CUDA archive needs ($minimumDriver or newer); update the driver."
+                }
+            }
         } else {
             Write-Host 'nvidia-smi is present but the NVIDIA driver is not working; selecting the CPU backend.'
         }

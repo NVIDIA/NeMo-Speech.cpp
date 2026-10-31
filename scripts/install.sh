@@ -119,6 +119,22 @@ if [ "$backend" = auto ]; then
         backend=metal
     elif command -v nvidia-smi >/dev/null 2>&1; then
         backend=cuda
+        # the x86_64 CUDA archive (CUDA 12) needs driver 525 or newer
+        if [ "$os" = linux ] && [ "$arch" = x86_64 ]; then
+            driver_version=$(nvidia-smi --query-gpu=driver_version \
+                --format=csv,noheader 2>/dev/null | sed -n '1p' || true)
+            driver_major=${driver_version%%.*}
+            case "$driver_major" in
+                ''|*[!0-9]*) ;;
+                *)
+                    if [ "$driver_major" -lt 525 ]; then
+                        echo "NVIDIA driver $driver_version is older than the CUDA archive needs (525 or newer);" \
+                            "selecting the Vulkan backend. Update the driver to use CUDA."
+                        backend=vulkan
+                    fi
+                    ;;
+            esac
+        fi
     elif [ "$os" = linux ] && [ "$arch" = aarch64 ]; then
         case "$device_model" in
             *jetson*|*thor*|*dgx*spark*|*gb10*) backend=cuda ;;
