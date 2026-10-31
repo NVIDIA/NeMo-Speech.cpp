@@ -235,15 +235,19 @@ command_doctor(int argc, char** argv) {
         result["model_download"] = std::move(model_download);
         Value::Array runtime_warnings;
 #if defined(NEMO_SPEECH_CLI_CUDA)
-        // A CUDA build runs on drivers of its CUDA major version or newer (525 for CUDA 12, 580 for
-        // CUDA 13).
+        // Drivers of the build's CUDA major version or newer run it (minor version compatibility)
         const int cuda_build = NEMO_SPEECH_CLI_CUDA_VERSION;
         const int cuda_driver = cuda_driver_version();
         Value cuda(Value::Object{});
         cuda["build"] = cuda_version_string(cuda_build);
         cuda["driver"] = cuda_driver ? Value(cuda_version_string(cuda_driver)) : Value(nullptr);
         result["cuda"] = std::move(cuda);
-        const std::string minimum_driver = cuda_build / 1000 >= 13 ? "580" : "525";
+#if defined(_WIN32)
+        const std::string minimum_driver_12 = "528.33";
+#else
+        const std::string minimum_driver_12 = "525.60.13";
+#endif
+        const std::string minimum_driver = cuda_build / 1000 >= 13 ? "580" : minimum_driver_12;
         if (cuda_driver == 0)
             runtime_warnings.emplace_back(
                 "no NVIDIA driver was found; the CUDA backend needs driver " + minimum_driver +
