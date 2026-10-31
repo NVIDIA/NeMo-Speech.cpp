@@ -678,6 +678,44 @@ class ConverterContractTest(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     find_quantizer(llama_cpp, profile="q2_0")
 
+    def test_q2_0_quantizer_is_rebuilt_from_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            llama_cpp = root / "llama.cpp"
+            llama_cpp.mkdir()
+            (llama_cpp / "CMakeLists.txt").touch()
+            (llama_cpp / "convert_hf_to_gguf.py").touch()
+            materialize = root / "cmake" / "llama_cpp.cmake"
+            materialize.parent.mkdir()
+            materialize.touch()
+            built = default_quantizer_path(llama_cpp)
+            built.parent.mkdir(parents=True)
+            built.touch(mode=0o755)
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 0)
+
+            def fake_which(name):
+                return f"/usr/bin/{name}" if name in {"cmake", "ninja"} else None
+
+            with mock.patch(
+                "conversion.s2s_components.voicechat_source.shutil.which",
+                side_effect=fake_which,
+            ), mock.patch(
+                "conversion.s2s_components.voicechat_source.subprocess.run",
+                side_effect=fake_run,
+            ):
+                # an existing managed quantizer is rebuilt from the current patches/
+                self.assertEqual(ensure_quantizer(llama_cpp, profile="q2_0", repo_root=root), built)
+                self.assertTrue(any("--build" in command for command in commands))
+                other = root / "other-llama.cpp"
+                other.mkdir()
+                (other / "convert_hf_to_gguf.py").touch()
+                with self.assertRaisesRegex(RuntimeError, "patches/"):
+                    ensure_quantizer(other, profile="q2_0", repo_root=root)
+
     def test_pinned_llama_checkout_is_initialized_automatically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -83,8 +83,8 @@ checkpoint, so decoders of several types share one. `--salm-encoder none` writes
 The conversion stages the checkpoint's decoder for llama.cpp's NemotronH converter (the pinned `llama.cpp`
 submodule), writes a BF16 intermediate next to the output (the size of the BF16 decoder) and then quantizes it
 with the patched `llama-quantize`, built once on first use like the S2S converter's. `--dry-run` checks the tensor
-mapping without writing. `q2_0` needs the Q2_0 scale fitting in `patches/`: the converter checks its output and
-stops when the `llama-quantize` it found rounds Q2_0 the stock way.
+mapping without writing. `q2_0` needs the Q2_0 scale fitting in `patches/`: the converter builds `llama-quantize`
+for it from this repository's patched `llama.cpp` (not a `--llama-cpp` checkout) and checks its output.
 
 ### DFlash2 draft model
 
