@@ -53,7 +53,7 @@ engine_config(const asr::RecognizerConfig& c) {
     constexpr int kMaxMtpDraft = 15;
     if (s.max_sequences < 1 || s.n_ctx_per_sequence < 1 || s.max_context < 1 || s.n_batch < 1 ||
         s.encoder_max_batch < 1 || s.encoder_ahead_seconds < 0 || s.max_new_tokens < 1 ||
-        s.mtp_draft < 0 || s.mtp_draft > kMaxMtpDraft)
+        s.mtp_draft < 0 || s.mtp_draft > kMaxMtpDraft || s.n_cpu_moe < 0)
         throw std::invalid_argument("invalid SALM scheduling configuration");
     SalmConfig out;
     out.encoder_path = s.encoder_path;
@@ -75,6 +75,8 @@ engine_config(const asr::RecognizerConfig& c) {
     out.max_new_tokens = s.max_new_tokens;
     out.mtp_draft = s.mtp_draft;
     out.dflash_path = s.dflash_path;
+    out.n_cpu_moe = s.n_cpu_moe;
+    out.batched = s.batched;
     return out;
 }
 

@@ -156,13 +156,19 @@ typedef struct nemo_speech_asr_batching_config {
 // continuously (of the batching config only max_queue_depth applies), and keeps
 // the model's own punctuation and casing. Requires a library built with
 // NEMO_SPEECH_BUILD_SPEECHLM; otherwise creation returns INVALID_ARGUMENT. A
-// zeroed struct sets mtp_draft = 0 (MTP off); start from
-// nemo_speech_asr_salm_config_default() to keep every library default.
+// zeroed struct sets mtp_draft = 0 (MTP off) and batched = 0 (the upstream llama.cpp path);
+// start from nemo_speech_asr_salm_config_default() to keep every library default.
 typedef struct nemo_speech_asr_salm_config {
     size_t size;
     const char* encoder_path;  // encoder GGUF; NULL/"" = the encoder file the decoder names
     int32_t max_sequences;     // concurrent decode slots; <= 0 = default
     int32_t mtp_draft;         // speculative draft tokens; 0 disables MTP; < 0 = default
+    // Decoder blocks whose MoE expert weights stay in system RAM (llama.cpp's --n-cpu-moe), for
+    // GPUs smaller than the decoder; decoding is slower and without MTP. <= 0 = all on the GPU.
+    int32_t n_cpu_moe;
+    // 1: the batched CUDA path where available; 0: the upstream llama.cpp path (less GPU memory,
+    // no MTP); < 0 = default (1).
+    int32_t batched;
 } nemo_speech_asr_salm_config;
 
 typedef struct nemo_speech_asr_recognizer_config {

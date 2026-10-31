@@ -12,8 +12,11 @@ linears (attention, Mamba in/out, shared experts) by `profile`:
 
     nvfp4   routed experts NVFP4, dense linears BF16 (default; Blackwell runs the experts natively)
     iq4_nl  routed experts IQ4_NL, dense linears Q8_0 (other GPUs, CPU, Vulkan, Metal; sized for 24 GB GPUs)
+    q2_0    routed experts Q2_0 except those of the last Q2_KEPT_MOE_LAYERS MoE layers (IQ4_NL), dense linears,
+            embeddings and the output head Q8_0 (the smallest decoder, for smaller GPUs)
 
-Embeddings, the output head and the norms stay BF16/F32.
+Otherwise embeddings, the output head and the norms stay BF16/F32. Q2_0 needs the scale fitting of patches/: stock
+llama.cpp rounds every block to three of its four levels, so the converter checks its output for the fourth.
 
 The speech encoder (conversion/pee.py) is F16 ("none" writes the decoder alone, for a second profile of a checkpoint
 whose encoder file exists) and the CTC timestamp head (conversion/ctc_timestamp.py) comes from the checkpoint when it
@@ -31,11 +34,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .s2s_components.voicechat_source import ensure_llama_checkout, ensure_quantizer
+from .s2s_components.voicechat_source import (
+    default_quantizer_path,
+    ensure_llama_checkout,
+    ensure_quantizer,
+)
 
 DEFAULT_PROFILE = "nvfp4"
-PROFILES = ("nvfp4", "iq4_nl")
-DENSE_TYPE = {"nvfp4": "bf16", "iq4_nl": "q8_0"}  # the dense linears of each profile
+PROFILES = ("nvfp4", "iq4_nl", "q2_0")
+DENSE_TYPE = {
+    "nvfp4": "bf16",
+    "iq4_nl": "q8_0",
+    "q2_0": "q8_0",
+}  # the dense linears of each profile
+Q2_KEPT_MOE_LAYERS = 5  # q2_0: the last MoE layers whose routed experts stay IQ4_NL
+Q2_0_BLOCK_BYTES = 18  # FP16 scale and 64 2-bit codes
 ENCODER_TYPES = ("f16", "none")
 DEFAULT_ENCODER = "f16"
 ENCODER_FILE_KEY = "nemo_speech.speech_model"  # the encoder file the decoder names
@@ -61,6 +74,16 @@ def backbone_config(source: Path) -> dict:
     if isinstance(config.get("llm_config"), dict):
         return config["llm_config"]
     raise RuntimeError(f"{source}: no llm_backbone/config.json and no llm_config in config.json")
+
+
+def kept_expert_layers(profile: str, config: dict) -> list[int]:
+    """The decoder blocks whose routed experts stay IQ4_NL: for q2_0 the last MoE layers of the main stack."""
+    if profile != "q2_0":
+        return []
+    moe = [i for i, kind in enumerate(config.get("layers_block_type") or []) if kind == "moe"]
+    if not moe:
+        raise RuntimeError("the backbone config lists no MoE layers (layers_block_type)")
+    return moe[-Q2_KEPT_MOE_LAYERS:]
 
 
 def stage(source: Path, staging: Path, weights: bool = True) -> None:
@@ -186,7 +209,15 @@ def convert(
     if dry_run:  # tensor mapping checked, nothing written
         shutil.rmtree(work, ignore_errors=True)
         return
-    quantize_decoder(bf16, outfile, profile, quantize, dense)
+    quantize_decoder(
+        bf16,
+        outfile,
+        profile,
+        quantize,
+        dense,
+        kept_expert_layers(profile, backbone_config(source)),
+        llama,
+    )
     shutil.rmtree(work, ignore_errors=True)
     if speech:
         print(f"[convert-salm] {outfile.name} and its encoder file {speech.name}")
@@ -239,33 +270,94 @@ def encoder_type(profile: str, encoder: str | None = None) -> str:
     return (encoder or DEFAULT_ENCODER).lower()
 
 
-def tensor_rules(profile: str, dense: str = "bf16") -> list[str]:
+def tensor_rules(
+    profile: str, dense: str = "bf16", kept_layers: list[int] | None = None
+) -> list[str]:
     """llama-quantize --tensor-type rules: they apply over a quantized base type and the first match wins, so the
     expert and dense rules come first and a catch-all keeps everything else BF16 (the base type is never used).
+    `kept_layers`: blocks whose routed experts stay IQ4_NL (kept_expert_layers).
     """
-    rules = [f"{EXPERT_TENSORS}={profile}"]
+    rules = []
+    if kept_layers:
+        rules.append(rf"blk\.({'|'.join(str(i) for i in kept_layers)})\.{EXPERT_TENSORS}=iq4_nl")
+    rules.append(f"{EXPERT_TENSORS}={profile}")
     if dense != "bf16":
         rules.extend(f"{pattern}={dense}" for pattern in DENSE_TENSORS)
+    if profile == "q2_0":
+        rules += [r"^token_embd\.weight=q8_0", r"^output\.weight=q8_0"]
     return rules + [".=bf16"]
 
 
+def q2_0_uses_top_level(blocks: bytes) -> bool:
+    """Whether Q2_0 blocks use code 3 (+2 x scale). Stock llama.cpp's rounding takes the scale from the block's
+    largest magnitude and never reaches it; the fitted scales of patches/ do."""
+    import numpy as np
+
+    raw = np.frombuffer(blocks, dtype=np.uint8)
+    codes = raw[: raw.size - raw.size % Q2_0_BLOCK_BYTES].reshape(-1, Q2_0_BLOCK_BYTES)[:, 2:]
+    shifts = np.array([0, 2, 4, 6], dtype=np.uint8)
+    return bool((((codes[:, :, None] >> shifts) & 3) == 3).any())
+
+
+def check_q2_0_rounding(path: Path, llama_cpp: Path, quantize: Path) -> None:
+    """Fails when the first Q2_0 tensor of `path` was rounded by an unpatched llama-quantize (`quantize`). Reads it
+    in a fresh interpreter with the pinned llama.cpp's gguf-py first on the path: an installed gguf may predate Q2_0.
+    """
+    script = (
+        "import sys, gguf\n"
+        "for t in gguf.GGUFReader(sys.argv[1]).tensors:\n"
+        "    if t.tensor_type == gguf.GGMLQuantizationType.Q2_0:\n"
+        "        sys.stdout.buffer.write(t.data.reshape(-1)[: int(sys.argv[2])].tobytes())\n"
+        "        break\n"
+    )
+    env = dict(os.environ, PYTHONPATH=str(llama_cpp / "gguf-py"))
+    blocks = subprocess.run(
+        [sys.executable, "-c", script, str(path), str(Q2_0_BLOCK_BYTES * 65536)],
+        env=env,
+        check=True,
+        capture_output=True,
+    ).stdout
+    if not blocks:
+        raise RuntimeError(f"{path} has no Q2_0 tensor")
+    if not q2_0_uses_top_level(blocks):
+        managed = default_quantizer_path(llama_cpp)
+        if Path(quantize).resolve() == managed:
+            hint = f"remove {managed.parents[1]} so the converter rebuilds it from patches/"
+        else:
+            hint = (
+                "pass --llama-quantize a build of this repository's llama.cpp with patches/ applied"
+            )
+        raise RuntimeError(f"{quantize} rounded Q2_0 without the fitted scales of patches/; {hint}")
+
+
 def quantize_decoder(
-    bf16: Path, outfile: Path, profile: str, quantize: Path, dense: str = "bf16"
+    bf16: Path,
+    outfile: Path,
+    profile: str,
+    quantize: Path,
+    dense: str = "bf16",
+    kept_layers: list[int] | None = None,
+    llama_cpp: Path | None = None,
 ) -> None:
-    """A BF16 decoder GGUF with its routed experts in `profile` and its dense linears in `dense`."""
+    """A BF16 decoder GGUF with its routed experts in `profile` (IQ4_NL in `kept_layers`) and its dense linears in
+    `dense`."""
     threads = (
         len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 8
     )
     temporary = outfile.with_name(outfile.name + ".quantizing")
     print(f"[convert-salm] routed experts -> {profile.upper()}, dense linears -> {dense.upper()}")
     command = [str(quantize)]
-    for rule in tensor_rules(profile, dense):
+    for rule in tensor_rules(profile, dense, kept_layers):
         command += ["--tensor-type", rule]
     command += [str(bf16), str(temporary), "Q8_0", str(threads)]
     try:
         subprocess.run(command, check=True)
         if not temporary.is_file() or temporary.stat().st_size == 0:
             raise RuntimeError(f"llama-quantize did not produce {temporary}")
+        if profile == "q2_0":
+            check_q2_0_rounding(
+                temporary, llama_cpp or Path(__file__).resolve().parents[1] / "llama.cpp", quantize
+            )
         temporary.replace(outfile)
     finally:
         temporary.unlink(missing_ok=True)

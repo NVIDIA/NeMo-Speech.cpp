@@ -91,10 +91,11 @@ target_include_directories(nemo_speech_asr_c PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_definitions(nemo_speech_asr_c PRIVATE NEMO_SPEECH_ASR_BUILD)
+# SOVERSION 2: nemo_speech_asr_salm_config grew (n_cpu_moe, batched)
 set_target_properties(nemo_speech_asr_c PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
-    SOVERSION 1)
+    SOVERSION 2)
 if(UNIX AND NOT APPLE)
     target_link_options(nemo_speech_asr_c PRIVATE
         "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/c_api.map")

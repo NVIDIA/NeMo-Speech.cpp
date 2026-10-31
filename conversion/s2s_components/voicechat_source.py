@@ -214,14 +214,18 @@ def find_quantizer(
             )
         return resolved
 
-    candidates = [
-        llama_cpp / "build" / "bin" / "llama-quantize",
-        llama_cpp / "build-quantize" / "bin" / "llama-quantize",
-    ]
-    candidates.extend(sorted(llama_cpp.glob("build*/bin/llama-quantize")))
-    installed = shutil.which("llama-quantize")
-    if installed:
-        candidates.append(Path(installed))
+    if profile and profile.lower() == "q2_0":
+        # Q2_0 needs the scale fitting of patches/: only the converter-managed build has it
+        candidates = [default_quantizer_path(llama_cpp)]
+    else:
+        candidates = [
+            llama_cpp / "build" / "bin" / "llama-quantize",
+            llama_cpp / "build-quantize" / "bin" / "llama-quantize",
+        ]
+        candidates.extend(sorted(llama_cpp.glob("build*/bin/llama-quantize")))
+        installed = shutil.which("llama-quantize")
+        if installed:
+            candidates.append(Path(installed))
     for candidate in candidates:
         resolved = candidate.resolve()
         if (
@@ -248,15 +252,24 @@ def ensure_quantizer(
     checkout = llama_cpp.expanduser().resolve()
     if explicit is not None:
         return find_quantizer(checkout, explicit, profile=profile)
-    try:
-        return find_quantizer(checkout, profile=profile)
-    except FileNotFoundError as missing:
-        if not auto_build:
-            raise FileNotFoundError(
-                f"{missing}; automatic build is disabled, so pass --llama-quantize PATH"
-            ) from missing
-
     root = (repo_root or _project_root()).expanduser().resolve()
+    q2_0 = bool(profile) and profile.lower() == "q2_0"
+    if q2_0 and checkout != (root / "llama.cpp").resolve():
+        raise RuntimeError(
+            "q2_0 needs the Q2_0 scale fitting in patches/, which the converter applies only to this "
+            "repository's llama.cpp; omit --llama-cpp, or pass --llama-quantize built with patches/"
+        )
+    # q2_0 always goes through the build, so the managed quantizer carries the current patches/
+    # (an incremental no-op when it does)
+    if not (q2_0 and auto_build and shutil.which("cmake")):
+        try:
+            return find_quantizer(checkout, profile=profile)
+        except FileNotFoundError as missing:
+            if not auto_build:
+                raise FileNotFoundError(
+                    f"{missing}; automatic build is disabled, so pass --llama-quantize PATH"
+                ) from missing
+
     checkout = ensure_llama_checkout(checkout, root)
     cmake = shutil.which("cmake")
     if cmake is None:

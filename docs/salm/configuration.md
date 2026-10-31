@@ -33,6 +33,8 @@ asr:
 | `encoder_ahead_seconds` | 20000 | audio encoded ahead of the decoder, in seconds; it waits on the GPU (about 134 KB per second of audio) until a decode slot frees, so lower it if long requests fail with `pee: out of device memory for the encoder output`; 0 removes the limit |
 | `mtp_draft` | 7 | speculative decoding, tokens drafted per step (up to 15), with the model's MTP head; more memory; 0 turns it off |
 | `dflash_path` | none | DFlash2 draft model GGUF: drafts the `mtp_draft` tokens instead of the MTP head (batched path) |
+| `batched` | true | `false`: the upstream llama.cpp path instead of the batched CUDA path; less GPU memory, no MTP |
+| `n_cpu_moe` | 0 | MoE experts of the first N decoder blocks kept in system RAM (llama.cpp's `--n-cpu-moe`) so the decoder fits a smaller GPU; slower, best with `max_sequences: 1` |
 
 CPU threads are `asr.backend.threads`, as for the other models.
 
@@ -44,10 +46,15 @@ GPU:
 
 | GPU memory | `max_sequences` | `n_ctx_per_sequence` | Longest request | Other changes |
 |---|---|---|---|---|
+| 8 GB | 1 | 32768 | 29 minutes (`max_context: 32768`) | IQ4_NL decoder; `n_cpu_moe: 53` (every expert in system RAM), `n_batch: 512`, `encoder_max_batch: 1`, `encoder_ahead_seconds: 600` |
+| 12 GB | 1 | 32768 | 29 minutes (`max_context: 32768`) | IQ4_NL decoder; `n_cpu_moe: 40`, `n_batch: 512`, `encoder_max_batch: 1`, `encoder_ahead_seconds: 600` |
+| 16 GB | 1 | 32768 | 29 minutes (`max_context: 32768`) | IQ4_NL decoder; `n_cpu_moe: 28`, `n_batch: 512`, `encoder_max_batch: 1`, `encoder_ahead_seconds: 600` |
 | 24 GB | 4 | 8192 | 29 minutes (`max_context: 32768`) | IQ4_NL decoder; `mtp_draft: 0`, `n_batch: 1024`, `encoder_max_batch: 4` |
 | 32 GB | 16 | 8192 | one hour | none (the defaults) |
 | 80 GB or more | 240 | 2048 | one hour | `n_batch: 16384`, `encoder_max_batch: 128`: many requests at once |
 | 128 GB, unified | 240 | 2048 | one hour | `n_batch: 8192`, `encoder_max_batch: 64`, `mtp_draft: 3` |
+
+The Q2_0 decoder (`--outtype q2_0`, [Model conversion](../model-conversion.md)) fits a 16 GB GPU entirely and decodes faster: use `batched: false` instead of `n_cpu_moe`. Its transcripts drift about 4% in relative WER on average.
 
 A request needs 12.5 tokens per second of audio plus up to 6 per second of transcript. The batched path grows each
 request's share of the pool as it decodes; CPU, Vulkan and the other [upstream llama.cpp](models.md#platforms) paths

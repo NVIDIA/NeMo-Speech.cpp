@@ -180,7 +180,8 @@ constexpr size_t kEncoderAhead = 256;
 
 struct SalmEngine::Impl {
     SalmConfig cfg;
-    llama_model_tensor_buft_override embedding_overrides[2] = {};
+    std::vector<llama_model_tensor_buft_override> buft_overrides;  // null-terminated when set
+    std::vector<std::string> cpu_moe_patterns;   // the n_cpu_moe overrides' patterns, owned here
     ggml_backend_dev_t decoder_devices[2] = {};  // the decoder's GPU (null-terminated list)
     ggml_runtime::BackendManager bm;
     // Batched serving path (SALM_FAST_PATH builds on a CUDA GPU with a Nemotron-H MoE decoder):
@@ -366,8 +367,10 @@ struct SalmEngine::Impl {
     explicit Impl(SalmConfig c)
         : cfg(std::move(c)), bm(make_params(cfg)), pee(bm, cfg.encoder_path, false, cfg.ctc_path) {
 #if SALM_FAST_PATH
-        // the serving kernels need an NVIDIA GPU of compute capability 8.0 or newer
-        fast = cfg.gpu >= 0 && bm.gpu_backend_handle() != nullptr &&
+        // the serving kernels need an NVIDIA GPU of compute capability 8.0 or newer, and every
+        // decoder weight on it
+        fast = cfg.batched && cfg.gpu >= 0 && cfg.n_cpu_moe == 0 &&
+               bm.gpu_backend_handle() != nullptr &&
                ggml_backend_is_cuda(bm.gpu_backend_handle()) &&
                ggml_backend_cuda_serving_supported(bm.gpu_backend_handle());
 #endif
@@ -443,9 +446,20 @@ struct SalmEngine::Impl {
         if (fast) {  // token embeddings on the GPU (mixed text/audio rows are looked up there)
             if (!decoder_devices[0])
                 throw std::runtime_error("embedding GPU device not found");
-            embedding_overrides[0] = {
-                "token_embd\\.weight", ggml_backend_dev_buffer_type(decoder_devices[0])};
-            mp.tensor_buft_overrides = embedding_overrides;
+            buft_overrides.push_back(
+                {"token_embd\\.weight", ggml_backend_dev_buffer_type(decoder_devices[0])});
+        }
+        if (cfg.gpu >= 0 && cfg.n_cpu_moe > 0) {
+            // llm_add_n_cpu_ffn_overrides, with per-engine strings instead of a shared static list
+            cpu_moe_patterns.reserve(cfg.n_cpu_moe);
+            for (int i = 0; i < cfg.n_cpu_moe; ++i)
+                cpu_moe_patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
+            for (const auto& pattern : cpu_moe_patterns)
+                buft_overrides.push_back({pattern.c_str(), ggml_backend_cpu_buffer_type()});
+        }
+        if (!buft_overrides.empty()) {
+            buft_overrides.push_back({nullptr, nullptr});
+            mp.tensor_buft_overrides = buft_overrides.data();
         }
         model = llama_model_load_from_file(cfg.llm_path.c_str(), mp);
         if (!model)
@@ -666,9 +680,9 @@ struct SalmEngine::Impl {
     // The path the engine runs and its main settings.
     void log_configuration() const {
         std::fprintf(
-            stderr, "[salm] path=%s mtp_draft=%d%s slots=%d n_batch=%d\n",
+            stderr, "[salm] path=%s mtp_draft=%d%s slots=%d n_batch=%d n_cpu_moe=%d\n",
             fast ? "batched (patched ggml, CUDA)" : "upstream llama.cpp", cfg.mtp_draft,
-            model_dft ? " (DFlash2 drafter)" : "", cfg.max_sequences, cfg.n_batch);
+            model_dft ? " (DFlash2 drafter)" : "", cfg.max_sequences, cfg.n_batch, cfg.n_cpu_moe);
     }
 
     // The tokenized form of a user turn (kept while in use or computed, plus a bounded number of
