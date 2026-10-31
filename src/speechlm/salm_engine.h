@@ -64,6 +64,14 @@ struct SalmConfig {
     // DFlash2 drafter GGUF (block drafter reading 6 target layers); when set it drafts the
     // mtp_draft tokens per step instead of the model's MTP head.
     std::string dflash_path;
+    // MoE expert weights of the first n_cpu_moe decoder blocks stay in system RAM (llama.cpp's
+    // --n-cpu-moe), for GPUs smaller than the decoder; decoding runs on the upstream llama.cpp
+    // path (no MTP), slower than with every weight on the GPU.
+    int n_cpu_moe = 0;
+    // The batched CUDA path where available; false decodes on the upstream llama.cpp path, which
+    // needs less GPU memory (no MTP, prompt cache or device-side token embeddings) for one request
+    // at a time.
+    bool batched = true;
     int encoder_max_batch = 16;  // windows per encoder graph launch
     // Audio seconds encoded but not yet admitted (ready queue + encoder calls in flight). Their
     // projection stays on the device (n_embd floats per 80 ms frame, about 134 KB per second), so

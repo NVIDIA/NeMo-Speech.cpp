@@ -53,7 +53,7 @@ static int
 check_salm_config(void) {
     nemo_speech_asr_salm_config salm = nemo_speech_asr_salm_config_default();
     if (salm.size != sizeof(salm) || salm.encoder_path || salm.max_sequences != 0 ||
-        salm.mtp_draft >= 0) {
+        salm.mtp_draft >= 0 || salm.n_cpu_moe != 0 || salm.batched >= 0) {
         fprintf(stderr, "nemo_speech_asr_salm_config_default does not keep the defaults\n");
         return 1;
     }

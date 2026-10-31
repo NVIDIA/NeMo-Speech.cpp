@@ -195,6 +195,10 @@ to_config(const nemo_speech_asr_recognizer_config* c) {
             cfg.salm.max_sequences = s->max_sequences;
         if (HAS_FIELD(s, nemo_speech_asr_salm_config, mtp_draft) && s->mtp_draft >= 0)
             cfg.salm.mtp_draft = s->mtp_draft;
+        if (HAS_FIELD(s, nemo_speech_asr_salm_config, n_cpu_moe) && s->n_cpu_moe > 0)
+            cfg.salm.n_cpu_moe = s->n_cpu_moe;
+        if (HAS_FIELD(s, nemo_speech_asr_salm_config, batched) && s->batched >= 0)
+            cfg.salm.batched = s->batched != 0;
     }
     return cfg;
 }
@@ -298,6 +302,7 @@ nemo_speech_asr_salm_config_default(void) {
     std::memset(&c, 0, sizeof(c));
     c.size = sizeof(c);
     c.mtp_draft = -1;  // library default
+    c.batched = -1;
     return c;
 }
 

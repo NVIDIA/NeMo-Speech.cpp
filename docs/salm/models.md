@@ -11,6 +11,7 @@ run writing the decoder and, next to it, the encoder file they share. Choose the
 |---|---|
 | NVIDIA Blackwell GPU | `nvfp4` |
 | Other NVIDIA GPUs, the CPU, Vulkan | `iq4_nl` |
+| 16 GB GPUs, every weight on the GPU | `q2_0` |
 
 For example:
 
@@ -60,3 +61,7 @@ with Vulkan and decodes requests side by side without speculative decoding.
 |---|---|---|
 | CUDA with `patches/` (the default), NVIDIA GPU of compute capability 8.0 or newer | batched serving | many requests decoded together, MTP or DFlash2 speculative decoding; needs CUDA 12.8 or newer |
 | CPU, Vulkan, CUDA without `patches/` (`NEMO_SPEECH_GGML_PATCHED=OFF`) or older GPUs | upstream llama.cpp | up to 256 requests at once, no speculative decoding; IQ4_NL decoder |
+
+The default CUDA build also runs the upstream llama.cpp path with `asr.salm.batched: false`, or when
+`asr.salm.n_cpu_moe` keeps experts in system RAM: it needs less GPU memory, which suits a smaller GPU serving one
+request at a time ([GPU memory](configuration.md#gpu-memory)).
