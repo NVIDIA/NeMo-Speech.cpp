@@ -34,7 +34,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .s2s_components.voicechat_source import ensure_llama_checkout, ensure_quantizer
+from .s2s_components.voicechat_source import (
+    default_quantizer_path,
+    ensure_llama_checkout,
+    ensure_quantizer,
+)
 
 DEFAULT_PROFILE = "nvfp4"
 PROFILES = ("nvfp4", "iq4_nl", "q2_0")
@@ -295,9 +299,9 @@ def q2_0_uses_top_level(blocks: bytes) -> bool:
     return bool((((codes[:, :, None] >> shifts) & 3) == 3).any())
 
 
-def check_q2_0_rounding(path: Path, llama_cpp: Path) -> None:
-    """Fails when the first Q2_0 tensor of `path` was rounded by an unpatched llama-quantize. Reads it in a fresh
-    interpreter with the pinned llama.cpp's gguf-py first on the path: an installed gguf may predate Q2_0.
+def check_q2_0_rounding(path: Path, llama_cpp: Path, quantize: Path) -> None:
+    """Fails when the first Q2_0 tensor of `path` was rounded by an unpatched llama-quantize (`quantize`). Reads it
+    in a fresh interpreter with the pinned llama.cpp's gguf-py first on the path: an installed gguf may predate Q2_0.
     """
     script = (
         "import sys, gguf\n"
@@ -316,10 +320,14 @@ def check_q2_0_rounding(path: Path, llama_cpp: Path) -> None:
     if not blocks:
         raise RuntimeError(f"{path} has no Q2_0 tensor")
     if not q2_0_uses_top_level(blocks):
-        raise RuntimeError(
-            "llama-quantize rounded Q2_0 without the fitted scales of patches/; remove "
-            f"{llama_cpp / 'build-quantize'} so the converter rebuilds it, or pass a patched --llama-quantize"
-        )
+        managed = default_quantizer_path(llama_cpp)
+        if Path(quantize).resolve() == managed:
+            hint = f"remove {managed.parents[1]} so the converter rebuilds it from patches/"
+        else:
+            hint = (
+                "pass --llama-quantize a build of this repository's llama.cpp with patches/ applied"
+            )
+        raise RuntimeError(f"{quantize} rounded Q2_0 without the fitted scales of patches/; {hint}")
 
 
 def quantize_decoder(
@@ -348,7 +356,7 @@ def quantize_decoder(
             raise RuntimeError(f"llama-quantize did not produce {temporary}")
         if profile == "q2_0":
             check_q2_0_rounding(
-                temporary, llama_cpp or Path(__file__).resolve().parents[1] / "llama.cpp"
+                temporary, llama_cpp or Path(__file__).resolve().parents[1] / "llama.cpp", quantize
             )
         temporary.replace(outfile)
     finally:

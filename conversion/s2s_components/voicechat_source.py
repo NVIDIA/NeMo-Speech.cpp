@@ -214,14 +214,18 @@ def find_quantizer(
             )
         return resolved
 
-    candidates = [
-        llama_cpp / "build" / "bin" / "llama-quantize",
-        llama_cpp / "build-quantize" / "bin" / "llama-quantize",
-    ]
-    candidates.extend(sorted(llama_cpp.glob("build*/bin/llama-quantize")))
-    installed = shutil.which("llama-quantize")
-    if installed:
-        candidates.append(Path(installed))
+    if profile and profile.lower() == "q2_0":
+        # Q2_0 needs the scale fitting of patches/: only the converter-managed build has it
+        candidates = [default_quantizer_path(llama_cpp)]
+    else:
+        candidates = [
+            llama_cpp / "build" / "bin" / "llama-quantize",
+            llama_cpp / "build-quantize" / "bin" / "llama-quantize",
+        ]
+        candidates.extend(sorted(llama_cpp.glob("build*/bin/llama-quantize")))
+        installed = shutil.which("llama-quantize")
+        if installed:
+            candidates.append(Path(installed))
     for candidate in candidates:
         resolved = candidate.resolve()
         if (

@@ -655,6 +655,29 @@ class ConverterContractTest(unittest.TestCase):
                     quantizer,
                 )
 
+    def test_q2_0_uses_only_the_converter_managed_quantizer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            llama_cpp = Path(temporary) / "llama.cpp"
+            for build in ("build", "build-quantize"):
+                quantizer = llama_cpp / build / "bin" / "llama-quantize"
+                quantizer.parent.mkdir(parents=True)
+                quantizer.write_text("#!/bin/sh\n", encoding="utf-8")
+                quantizer.chmod(0o755)
+            with mock.patch(
+                "conversion.s2s_components.voicechat_source.shutil.which",
+                return_value=None,
+            ):
+                self.assertEqual(
+                    find_quantizer(llama_cpp, profile="q2_0"), default_quantizer_path(llama_cpp)
+                )
+                self.assertEqual(
+                    find_quantizer(llama_cpp, profile="iq4_nl"),
+                    (llama_cpp / "build" / "bin" / "llama-quantize").resolve(),
+                )
+                default_quantizer_path(llama_cpp).unlink()
+                with self.assertRaises(FileNotFoundError):
+                    find_quantizer(llama_cpp, profile="q2_0")
+
     def test_pinned_llama_checkout_is_initialized_automatically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -14,7 +14,7 @@
 #define DL_DEFAULT "nemo_speech_asr_c.dll"
 #else
 #include <dlfcn.h>
-#define DL_DEFAULT "libnemo_speech_asr_c.so.1"
+#define DL_DEFAULT "libnemo_speech_asr_c.so.2"
 #endif
 
 typedef const char* (*ver_fn)(void);

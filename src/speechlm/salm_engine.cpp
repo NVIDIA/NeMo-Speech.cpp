@@ -181,6 +181,7 @@ constexpr size_t kEncoderAhead = 256;
 struct SalmEngine::Impl {
     SalmConfig cfg;
     std::vector<llama_model_tensor_buft_override> buft_overrides;  // null-terminated when set
+    std::vector<std::string> cpu_moe_patterns;   // the n_cpu_moe overrides' patterns, owned here
     ggml_backend_dev_t decoder_devices[2] = {};  // the decoder's GPU (null-terminated list)
     ggml_runtime::BackendManager bm;
     // Batched serving path (SALM_FAST_PATH builds on a CUDA GPU with a Nemotron-H MoE decoder):
@@ -448,8 +449,14 @@ struct SalmEngine::Impl {
             buft_overrides.push_back(
                 {"token_embd\\.weight", ggml_backend_dev_buffer_type(decoder_devices[0])});
         }
-        if (cfg.gpu >= 0 && cfg.n_cpu_moe > 0)
-            llm_add_n_cpu_ffn_overrides(cfg.n_cpu_moe, LLM_FFN_EXPS_REGEX, buft_overrides);
+        if (cfg.gpu >= 0 && cfg.n_cpu_moe > 0) {
+            // llm_add_n_cpu_ffn_overrides, with per-engine strings instead of a shared static list
+            cpu_moe_patterns.reserve(cfg.n_cpu_moe);
+            for (int i = 0; i < cfg.n_cpu_moe; ++i)
+                cpu_moe_patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
+            for (const auto& pattern : cpu_moe_patterns)
+                buft_overrides.push_back({pattern.c_str(), ggml_backend_cpu_buffer_type()});
+        }
         if (!buft_overrides.empty()) {
             buft_overrides.push_back({nullptr, nullptr});
             mp.tensor_buft_overrides = buft_overrides.data();
