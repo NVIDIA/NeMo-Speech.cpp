@@ -138,6 +138,7 @@ if ($Backend -eq "auto") {
         $gpu = & $smi.Source --query-gpu=name --format=csv,noheader 2>$null
         if ($LASTEXITCODE -eq 0 -and $gpu) {
             $Backend = "cuda"
+            $autoCuda = $true
         } else {
             Write-Host 'nvidia-smi is present but the NVIDIA driver is not working; selecting the CPU backend.'
         }
@@ -178,6 +179,21 @@ if ($Version -eq "latest") {
 }
 $tag = if ($Version -eq "nightly") { "nightly" } elseif ($Version.StartsWith('v')) { $Version } else { "v$Version" }
 $releaseVersion = $Version.TrimStart('v')
+if ($autoCuda -and $releaseVersion -ne 'source') {
+    # CUDA 12 archives need driver 528.33 or newer; CUDA 13 ones (aarch64, x86_64 up to 0.3.0) need 580.
+    $cuda13 = $arch -eq 'aarch64' -or $releaseVersion -match '^0\.(2\.|3\.0($|-))'
+    $minimumDriver = if ($cuda13) { [version]'580.0' } else { [version]'528.33' }
+    $driver = "$(& $smi.Source --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1)".Trim()
+    $driverVersion = $null
+    if ([version]::TryParse($driver, [ref]$driverVersion) -and $driverVersion -lt $minimumDriver) {
+        if ($arch -eq 'x86_64') {
+            $Backend = "vulkan"
+            Write-Host "NVIDIA driver $driver is older than the CUDA archive needs ($minimumDriver or newer); selecting the Vulkan backend. Update the driver to use CUDA."
+        } else {
+            Write-Host "NVIDIA driver $driver is older than the CUDA archive needs ($minimumDriver or newer); update the driver."
+        }
+    }
+}
 $archive = "nemo-speech-$releaseVersion-windows-$arch-$Backend.zip"
 $url = "$releaseBase/download/$tag/$archive"
 $sourceRef = if ($env:NEMO_SPEECH_SOURCE_REF) {

@@ -64,7 +64,12 @@ if(NEMO_SPEECH_BUILD_GRPC)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_GRPC_SERVER_BUILT=1)
 endif()
 if(GGML_CUDA)
-    target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_CUDA=1)
+    # doctor compares the CUDA version of the driver with the toolkit's (major * 1000 + minor * 10)
+    math(EXPR _cli_cuda_version "${CUDAToolkit_VERSION_MAJOR} * 1000 + ${CUDAToolkit_VERSION_MINOR} * 10")
+    target_compile_definitions(nemo_speech_cli PRIVATE
+        NEMO_SPEECH_CLI_CUDA=1
+        NEMO_SPEECH_CLI_CUDA_VERSION=${_cli_cuda_version})
+    target_link_libraries(nemo_speech_cli PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(GGML_METAL)
     target_compile_definitions(nemo_speech_cli PRIVATE NEMO_SPEECH_CLI_METAL=1)

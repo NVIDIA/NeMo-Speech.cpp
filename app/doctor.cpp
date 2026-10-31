@@ -5,6 +5,20 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(NEMO_SPEECH_CLI_CUDA)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#endif
+
 #include "cli_util.h"
 #include "commands.h"
 #include "ggml-backend.h"
@@ -123,6 +137,35 @@ build_features() {
     return result;
 }
 
+#if defined(NEMO_SPEECH_CLI_CUDA)
+// The CUDA version the installed NVIDIA driver supports (major * 1000 + minor * 10), 0 without a
+// driver. The driver library is loaded at run time, so a missing or broken driver is reported
+// instead of failing to start.
+int
+cuda_driver_version() {
+    using get_version_fn = int (*)(int*);
+#if defined(_WIN32)
+    HMODULE library = LoadLibraryA("nvcuda.dll");
+    const auto get_version =
+        library ? reinterpret_cast<get_version_fn>(GetProcAddress(library, "cuDriverGetVersion"))
+                : nullptr;
+#else
+    void* library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    const auto get_version =
+        library ? reinterpret_cast<get_version_fn>(dlsym(library, "cuDriverGetVersion")) : nullptr;
+#endif
+    int version = 0;
+    if (!get_version || get_version(&version) != 0)
+        return 0;
+    return version;
+}
+
+std::string
+cuda_version_string(int version) {
+    return std::to_string(version / 1000) + "." + std::to_string(version % 1000 / 10);
+}
+#endif
+
 Value
 backend_devices() {
     ggml_backend_load_all();
@@ -191,6 +234,30 @@ command_doctor(int argc, char** argv) {
         model_download["executable"] = downloader.u8string();
         result["model_download"] = std::move(model_download);
         Value::Array runtime_warnings;
+#if defined(NEMO_SPEECH_CLI_CUDA)
+        // Drivers of the build's CUDA major version or newer run it (minor version compatibility)
+        const int cuda_build = NEMO_SPEECH_CLI_CUDA_VERSION;
+        const int cuda_driver = cuda_driver_version();
+        Value cuda(Value::Object{});
+        cuda["build"] = cuda_version_string(cuda_build);
+        cuda["driver"] = cuda_driver ? Value(cuda_version_string(cuda_driver)) : Value(nullptr);
+        result["cuda"] = std::move(cuda);
+#if defined(_WIN32)
+        const std::string minimum_driver_12 = "528.33";
+#else
+        const std::string minimum_driver_12 = "525.60.13";
+#endif
+        const std::string minimum_driver = cuda_build / 1000 >= 13 ? "580" : minimum_driver_12;
+        if (cuda_driver == 0)
+            runtime_warnings.emplace_back(
+                "no NVIDIA driver was found; the CUDA backend needs driver " + minimum_driver +
+                " or newer");
+        else if (cuda_driver / 1000 < cuda_build / 1000)
+            runtime_warnings.emplace_back(
+                "the NVIDIA driver supports CUDA " + cuda_version_string(cuda_driver) +
+                ", but this build needs CUDA " + std::to_string(cuda_build / 1000) + " (driver " +
+                minimum_driver + " or newer); update the driver, or use a Vulkan or CPU build");
+#endif
         if (accelerator_compiled && !accelerator_available)
             runtime_warnings.emplace_back(
                 "this build includes a GPU backend, but no compatible accelerator/driver was "
@@ -218,6 +285,10 @@ command_doctor(int argc, char** argv) {
                     std::printf(" (%.1f GiB)", total / 1073741824.0);
                 std::printf("\n");
             }
+            if (const auto* cuda = result.find("cuda"))
+                std::printf(
+                    "CUDA: build %s, driver %s\n", cuda->at("build").string().c_str(),
+                    cuda->at("driver").is_null() ? "none" : cuda->at("driver").string().c_str());
             if (downloader.empty())
                 std::printf("Model downloads: unavailable (curl not found on PATH)\n");
             else
