@@ -32,6 +32,14 @@ nemo-speech transcribe audio.wav \
   --json
 ```
 
+With `auto`, the model writes a language tag after each sentence's final
+punctuation. Results label the words before a tag with its language: JSON
+`words` get a `language` field, and `languages` lists every detected language.
+Words with no tag after them, or with a tag the model did not write, have no
+`language`. With `--stream --endpointing`, the tag can come after the endpoint;
+it then labels the previous utterance. The realtime WebSocket reports it as
+`previous_language` on the next event.
+
 When ITN is configured with a parent grammar directory (`en/`, `es/`, ...),
 the same explicit or auto-detected language code selects the grammar used for
 the final transcript. Unsupported languages remain unchanged.
