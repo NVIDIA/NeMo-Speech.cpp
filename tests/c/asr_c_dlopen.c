@@ -12,9 +12,12 @@
 #if defined(_WIN32)
 #include <windows.h>
 #define DL_DEFAULT "nemo_speech_asr_c.dll"
+#elif defined(__APPLE__)
+#include <dlfcn.h>
+#define DL_DEFAULT "libnemo_speech_asr_c.2.dylib"
 #else
 #include <dlfcn.h>
-#define DL_DEFAULT "libnemo_speech_asr_c.so.1"
+#define DL_DEFAULT "libnemo_speech_asr_c.so.2"
 #endif
 
 typedef const char* (*ver_fn)(void);

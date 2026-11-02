@@ -54,6 +54,8 @@ struct SalmBackendConfig {
     int max_new_tokens = 1024;
     int mtp_draft = 7;
     std::string dflash_path;
+    int n_cpu_moe = 0;
+    bool batched = true;
     void Register(common::ParameterParser& p) {
         p.Register(
             "encoder_path", &encoder_path,
@@ -76,6 +78,13 @@ struct SalmBackendConfig {
         p.Register(
             "dflash_path", &dflash_path,
             "SALM DFlash2 drafter GGUF: drafts mtp_draft tokens per step instead of MTP");
+        p.Register(
+            "n_cpu_moe", &n_cpu_moe,
+            "SALM decoder blocks whose MoE expert weights stay in system RAM (0 = all on the GPU)");
+        p.Register(
+            "batched", &batched,
+            "SALM batched CUDA path where available (false: the upstream llama.cpp path, less GPU "
+            "memory, no MTP)");
     }
 };
 

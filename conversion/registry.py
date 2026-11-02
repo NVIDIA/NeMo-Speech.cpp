@@ -193,7 +193,7 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
         "codec": {"f16", "f32"},
         "nmt": {"f32", "f16", "bf16", "q8_0", "auto"},
         "s2s": {"bf16", "q4_k_m", "nvfp4"},
-        "salm": {"nvfp4", "iq4_nl"},
+        "salm": {"nvfp4", "iq4_nl", "q2_0"},
         "dflash2": {"bf16", "f16", "f32"},
     }
     if value not in supported[architecture]:
