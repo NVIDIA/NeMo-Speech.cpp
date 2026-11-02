@@ -833,9 +833,10 @@ test_text_and_numbers() {
     fake.details.duration_seconds = 1e-7;
     auto sent = post(api, chat_body());
     CHECK(
-        sent.response.body.find(R"("content":"tab\there \"q\" \\ \u0001 café )"
-                                "\xEF\xBF\xBD"
-                                R"( end")") != std::string::npos,
+        sent.response.body.find(
+            R"("content":"tab\there \"q\" \\ \u0001 café )"
+            "\xEF\xBF\xBD"
+            R"( end")") != std::string::npos,
         sent.response.body);
     CHECK(sent.response.body.find(R"("duration":1e-7)") != std::string::npos, sent.response.body);
     fake.details.duration_seconds = 12345678901234567.0;
