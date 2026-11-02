@@ -414,8 +414,9 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
                 cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
                 if (stop_) {
                     for (Job* job : queue_)
-                        job->result.set_exception(std::make_exception_ptr(
-                            std::runtime_error("SALM: backend is shutting down")));
+                        job->result.set_exception(
+                            std::make_exception_ptr(
+                                std::runtime_error("SALM: backend is shutting down")));
                     queue_.clear();
                     return;
                 }
