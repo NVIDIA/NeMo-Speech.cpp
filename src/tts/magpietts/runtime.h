@@ -28,6 +28,12 @@ enum class MagpieLongformMode {
     On,
 };
 
+enum class TtsCliDevice {
+    Cpu,
+    Cuda,
+    Accelerator,
+};
+
 struct MagpieRuntimeConfig {
     std::string magpie_model;
     std::string codec_model;
@@ -60,6 +66,11 @@ struct MagpieRuntimeConfig {
     MagpieUmaMode uma_mode = MagpieUmaMode::Auto;
     MagpieLongformMode longform_mode = MagpieLongformMode::Auto;
 };
+
+// Apply the aggregate --device selection without discarding a requested
+// NanoCodec CPU override. CPU is the exception: selecting it explicitly forces
+// every TTS component onto CPU.
+void apply_tts_device_policy(MagpieRuntimeConfig& config, TtsCliDevice device);
 
 struct MagpieSynthesisOptions {
     int speaker = -1;

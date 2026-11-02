@@ -176,6 +176,11 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.use-stateful-codec` / `tts.no-stateful-codec` | - | on | fast layer-state codec |
 | `tts.codec-cpu` | - | `false` | force NanoCodec decoder onto CPU |
 
+For `nemo-speech synthesize` and `nemo-speech serve`, an explicit `--device cpu`
+places both MagpieTTS and NanoCodec on CPU. With an accelerator selected by
+`--device`, `--tts.codec-cpu` moves only NanoCodec to CPU; MagpieTTS remains on
+the selected accelerator.
+
 ### Execution
 
 | key | CLI alias | default | meaning |
