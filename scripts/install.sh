@@ -114,11 +114,43 @@ if [ "$backend" = cuda ] && [ "$os" = macos ]; then
     exit 1
 fi
 
+# 0 when dotted version $1 is older than $2
+version_older() {
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        n = split(a, x, "."); m = split(b, y, ".")
+        for (i = 1; i <= (n > m ? n : m); i++) {
+            if (x[i] + 0 < y[i] + 0) exit 0
+            if (x[i] + 0 > y[i] + 0) exit 1
+        }
+        exit 1
+    }'
+}
+
 if [ "$backend" = auto ]; then
     if [ "$os" = macos ] && [ "$arch" = aarch64 ]; then
         backend=metal
     elif command -v nvidia-smi >/dev/null 2>&1; then
         backend=cuda
+        # the x86_64 CUDA archive (CUDA 12) needs driver 525.60.13 or newer
+        if [ "$os" = linux ] && [ "$arch" = x86_64 ]; then
+            driver_version=$(nvidia-smi --query-gpu=driver_version \
+                --format=csv,noheader 2>/dev/null | sed -n '1p' || true)
+            case "$driver_version" in
+                ''|*[!0-9.]*) ;;
+                *)
+                    if version_older "$driver_version" 525.60.13; then
+                        if { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } |
+                            grep -q 'libvulkan\.so\.1'; then
+                            backend=vulkan
+                        else
+                            backend=cpu
+                        fi
+                        echo "NVIDIA driver $driver_version is older than the CUDA archive needs (525.60.13 or" \
+                            "newer); selecting the $backend backend. Update the driver to use CUDA."
+                    fi
+                    ;;
+            esac
+        fi
     elif [ "$os" = linux ] && [ "$arch" = aarch64 ]; then
         case "$device_model" in
             *jetson*|*thor*|*dgx*spark*|*gb10*) backend=cuda ;;
