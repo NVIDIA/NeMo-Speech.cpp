@@ -263,8 +263,9 @@ test_speaker_labels_in_subtitles_and_text() {
             "00:00:03.000 --> 00:00:03.834\num\n\n",
         "WebVTT voice spans");
     require(
-        nemo_speech::subtitle::render_speaker_turns(nemo_speech::subtitle::make_speaker_turns(
-            words)) == "Speaker 1: Hello there.\n\nSpeaker 2: Hi.\n\num\n",
+        nemo_speech::subtitle::render_speaker_turns(
+            nemo_speech::subtitle::make_speaker_turns(words)) ==
+            "Speaker 1: Hello there.\n\nSpeaker 2: Hi.\n\num\n",
         "one paragraph per speaker turn");
 }
 

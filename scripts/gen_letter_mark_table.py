@@ -6,6 +6,7 @@ or a mark (M*), used by the SALM script guard.
 
   python3 scripts/gen_letter_mark_table.py > src/speechlm/letter_mark_table.inc
 """
+
 import sys
 import unicodedata
 

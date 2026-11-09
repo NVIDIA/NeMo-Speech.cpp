@@ -8,6 +8,7 @@
 Emits arch="pnc": a BERT encoder + two token-classification heads (punct, capit)
 under the `pnc.*` namespace, plus the WordPiece vocab and label sets.
 """
+
 import tempfile
 from pathlib import Path
 from typing import Optional
