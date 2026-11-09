@@ -11,6 +11,7 @@ Each row is (first, last, class): class is the Grapheme_Cluster_Break value (num
 Extended_Pictographic. Rows cover every code point whose class is not Other or that is Extended_Pictographic;
 adjacent code points with the same value are merged.
 """
+
 import ctypes
 
 u = ctypes.CDLL("libicuuc.so.74")

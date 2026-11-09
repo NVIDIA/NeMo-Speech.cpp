@@ -13,6 +13,7 @@ gets its ConvTranspose1d(D, D, kernel_size=U, stride=U) as ctc.upsample, stored 
 of D inputs and U x D outputs: out[j * D + o] = b[o] + sum_i W[i, o, j] x[i] (PyTorch weight
 (in, out, U)), so the U CTC frames of an encoder frame are consecutive D-rows of one product.
 """
+
 import base64
 import json
 import sys

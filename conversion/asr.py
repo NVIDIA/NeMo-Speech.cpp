@@ -26,6 +26,7 @@ Usage:
 If `--head-type` is omitted, the head is auto-detected from the model_config.yaml
 inside the .nemo (presence of `joint` block ⇒ RNNT, `labels` only ⇒ CTC).
 """
+
 import math
 import re
 import sys

@@ -235,9 +235,10 @@ test_budget() {
 void
 test_text_and_usage() {
     expect(
-        utf8_lossy("a\xE0\x80"
-                   "b\xED\xA0\x80\xF4\x90"
-                   "c\xC3") ==
+        utf8_lossy(
+            "a\xE0\x80"
+            "b\xED\xA0\x80\xF4\x90"
+            "c\xC3") ==
             "a\xEF\xBF\xBD\xEF\xBF\xBD"
             "b\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD"
             "c\xEF\xBF\xBD",
