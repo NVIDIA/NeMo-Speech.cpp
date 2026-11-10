@@ -684,10 +684,17 @@ magpietts_decoder_fused_create(
                    reinterpret_cast<const void*>(df_kernel<ltf_chain_tier_small>), sms, fits)) {
         grid = ltf_chain_tier_small::grid;
     } else {
+        // Below the smallest tier's SM count only a larger GPU helps; above it, the model's shape
+        // or the kernel's shared memory and occupancy ruled every tier out.
+        const int min_sms = ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM;
         char msg[128];
-        snprintf(
-            msg, sizeof(msg), "fused decoder: no persistent tier fits (%d SMs, needs %d+)", sms,
-            ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM);
+        if (sms < min_sms)
+            snprintf(
+                msg, sizeof(msg), "fused decoder: needs %d+ SMs, this GPU has %d", min_sms, sms);
+        else
+            snprintf(
+                msg, sizeof(msg),
+                "fused decoder: no persistent tier fits this model on this GPU (%d SMs)", sms);
         ltf_set_error(error, error_size, msg);
         return nullptr;
     }

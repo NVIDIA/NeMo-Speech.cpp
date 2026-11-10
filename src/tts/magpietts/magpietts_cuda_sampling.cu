@@ -659,7 +659,9 @@ magpietts_cuda_sampler_sequence_launch(
         const cudaError_t inst_err = cudaGraphInstantiate(
             &sampler->sequence_exec, sampler->sequence_graph, nullptr, nullptr, 0);
         if (inst_err != cudaSuccess) {
-            // Drop the composed graph as well, so the next frame builds a new sequence.
+            // Clear the error so later launches do not report it, and drop the composed graph so
+            // the caller runs this frame on the async chain and the next frame builds a new one.
+            (void)cudaGetLastError();
             sampler->sequence_exec = nullptr;
             magpietts_cuda_sampler_sequence_reset(sampler);
             set_error(

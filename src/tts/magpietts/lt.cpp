@@ -1636,6 +1636,19 @@ sample_local_codebooks_cuda_impl(
     bool chain_ok = false;
     if (magpietts_cuda_sampler_sequence_is_ready(cuda_sampler)) {
         chain_ok = magpietts_cuda_sampler_sequence_launch(cuda_sampler, error, sizeof(error));
+        if (!chain_ok && !magpietts_cuda_sampler_sequence_is_ready(cuda_sampler)) {
+            // Re-instantiating the composed graph after an idle pause failed and dropped it: run
+            // this frame on the async chain; the next frame composes a new graph.
+            fprintf(
+                stderr, "warning: CUDA local graph unavailable; using async chain: %s\n",
+                error[0] ? error : "unknown error");
+            chain_ok = magpietts_cuda_sampler_upload_config(cuda_sampler, error, sizeof(error)) &&
+                       run_chain();
+            if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
+                magpietts_cuda_sampler_sequence_mark_warm(cuda_sampler);
+                magpietts_cuda_sampler_sequence_set_key(cuda_sampler, sequence_key);
+            }
+        }
     } else if (
         magpietts_cuda_sampler_sequence_is_warm(cuda_sampler) &&
         !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {

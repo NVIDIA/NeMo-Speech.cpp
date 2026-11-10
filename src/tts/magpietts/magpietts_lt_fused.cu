@@ -938,10 +938,15 @@ ltf_chain_setup(magpietts_lt_fused* f) {
                    fits)) {
         grid = ltf_chain_tier_small::grid;
     } else {
+        // Below the smallest tier's SM count only a larger GPU helps; above it, the model's shape
+        // or the kernel's shared memory and occupancy ruled every tier out.
+        const int min_sms = ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM;
         char msg[96];
-        snprintf(
-            msg, sizeof(msg), "no persistent tier fits (%d SMs, needs %d+)", sms,
-            ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM);
+        if (sms < min_sms)
+            snprintf(msg, sizeof(msg), "needs %d+ SMs, this GPU has %d", min_sms, sms);
+        else
+            snprintf(
+                msg, sizeof(msg), "no persistent tier fits this model on this GPU (%d SMs)", sms);
         unsupported(msg);
         return;
     }
