@@ -1426,17 +1426,9 @@ local_transformer_fused_try_create(
     // int8 dot products, in-kernel sampling), which needs Q8_0 projections. With F16 weights
     // the per-round fused kernels are slower than the ggml round graphs, so keep those.
     if (!magpietts_lt_fused_chain_supported(fused)) {
-        bool all_q8 = w.out_type == (int)GGML_TYPE_Q8_0;
-        for (int i = 0; i < w.n_layers; ++i) {
-            const magpietts_lt_fused_layer_weights& lw = w.layers[i];
-            all_q8 = all_q8 && lw.qkv_type == (int)GGML_TYPE_Q8_0 &&
-                     lw.o_type == (int)GGML_TYPE_Q8_0 && lw.ff1_type == (int)GGML_TYPE_Q8_0 &&
-                     lw.ff2_type == (int)GGML_TYPE_Q8_0;
-        }
         fprintf(
             stderr, "MagpieTTS local transformer: using ggml round graphs (%s)\n",
-            all_q8 ? "fused CUDA chain not supported on this GPU"
-                   : "the fused CUDA chain needs a q8_0 model; convert with --outtype q8_0");
+            magpietts_lt_fused_chain_unsupported_reason(fused));
         magpietts_lt_fused_free(fused);
         return;
     }

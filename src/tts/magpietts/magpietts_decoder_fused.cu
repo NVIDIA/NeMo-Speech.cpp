@@ -652,49 +652,14 @@ magpietts_decoder_fused_create(
         ltf_set_error(error, error_size, "fused decoder: unsupported embedding types");
         return nullptr;
     }
-    magpietts_decoder_fused* f = new magpietts_decoder_fused;
-    f->w = w;
-    f->cache = cache;
-    f->layer_w.assign(w.layers, w.layers + w.n_layers);
-    f->audio_emb.assign(w.audio_emb, w.audio_emb + w.n_codebooks);
-    f->layers.resize(w.n_layers);
     const int E = w.n_embd, NFF = w.n_ff, CD = w.cross_dim;
-    for (int i = 0; i < w.n_layers; ++i) {
-        const magpietts_decoder_fused_layer_weights& L = w.layers[i];
-        df_layer& d = f->layers[i];
-        bool ok = df_repack(L.qkv, L.qkv_type, 3 * E, E, f->owned, d.qkv) &&
-                  df_repack(L.o, L.o_type, E, E, f->owned, d.o) &&
-                  df_repack(L.ff1, L.ff1_type, NFF, E, f->owned, d.ff1) &&
-                  df_repack(L.ff2, L.ff2_type, E, NFF, f->owned, d.ff2) && L.norm_self && L.norm_ff;
-        if (ok && L.has_cross)
-            ok = df_repack(L.cross_q, L.cross_q_type, CD, E, f->owned, d.cq) &&
-                 df_repack(L.cross_o, L.cross_o_type, E, CD, f->owned, d.co) && L.norm_xq;
-        if (ok)
-            ok = ltf_ln_fold_constants(d.qkv, L.norm_self, 3 * E, E, f->owned, d.qkv_c) &&
-                 ltf_ln_fold_constants(d.ff1, L.norm_ff, NFF, E, f->owned, d.ff1_c);
-        if (ok && L.has_cross)
-            ok = ltf_ln_fold_constants(d.cq, L.norm_xq, CD, E, f->owned, d.cq_c);
-        if (!ok) {
-            ltf_set_error(
-                error, error_size, "fused decoder: Q8_0 projections required (repack failed)");
-            magpietts_decoder_fused_free(f);
-            return nullptr;
-        }
-        d.norm_self = L.norm_self;
-        d.norm_xq = L.norm_xq;
-        d.norm_ff = L.norm_ff;
-        d.kv_arena = cache.kv_arena[i];
-        d.flags = (L.has_cross ? 1 : 0) | (L.collect_alignment && L.has_cross ? 2 : 0) |
-                  (L.apply_prior ? 4 : 0);
-        if (L.has_cross && L.collect_alignment)
-            ++f->n_collect;
-    }
+    // Check the GPU before the weights, so a GPU that cannot run the kernel (Jetson Thor has 20
+    // SMs) reports that instead of asking for a q8_0 model that would not help.
     int device = 0, sms = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
         (void)cudaGetLastError();
         ltf_set_error(error, error_size, "fused decoder: device query failed");
-        magpietts_decoder_fused_free(f);
         return nullptr;
     }
     // Same tiling as the LT chain; the cross-attention query runs on the DF_XATTN_BLOCKS tail
@@ -724,8 +689,55 @@ magpietts_decoder_fused_create(
             msg, sizeof(msg), "fused decoder: no persistent tier fits (%d SMs, needs %d+)", sms,
             ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM);
         ltf_set_error(error, error_size, msg);
-        magpietts_decoder_fused_free(f);
         return nullptr;
+    }
+    for (int i = 0; i < w.n_layers; ++i) {
+        const magpietts_decoder_fused_layer_weights& L = w.layers[i];
+        bool q8 = L.qkv_type == LTF_TYPE_Q8_0 && L.o_type == LTF_TYPE_Q8_0 &&
+                  L.ff1_type == LTF_TYPE_Q8_0 && L.ff2_type == LTF_TYPE_Q8_0;
+        if (L.has_cross)
+            q8 = q8 && L.cross_q_type == LTF_TYPE_Q8_0 && L.cross_o_type == LTF_TYPE_Q8_0;
+        if (!q8) {
+            ltf_set_error(
+                error, error_size,
+                "fused decoder: needs a q8_0 model; convert with --outtype q8_0");
+            return nullptr;
+        }
+    }
+    magpietts_decoder_fused* f = new magpietts_decoder_fused;
+    f->w = w;
+    f->cache = cache;
+    f->layer_w.assign(w.layers, w.layers + w.n_layers);
+    f->audio_emb.assign(w.audio_emb, w.audio_emb + w.n_codebooks);
+    f->layers.resize(w.n_layers);
+    for (int i = 0; i < w.n_layers; ++i) {
+        const magpietts_decoder_fused_layer_weights& L = w.layers[i];
+        df_layer& d = f->layers[i];
+        bool ok = df_repack(L.qkv, L.qkv_type, 3 * E, E, f->owned, d.qkv) &&
+                  df_repack(L.o, L.o_type, E, E, f->owned, d.o) &&
+                  df_repack(L.ff1, L.ff1_type, NFF, E, f->owned, d.ff1) &&
+                  df_repack(L.ff2, L.ff2_type, E, NFF, f->owned, d.ff2) && L.norm_self && L.norm_ff;
+        if (ok && L.has_cross)
+            ok = df_repack(L.cross_q, L.cross_q_type, CD, E, f->owned, d.cq) &&
+                 df_repack(L.cross_o, L.cross_o_type, E, CD, f->owned, d.co) && L.norm_xq;
+        if (ok)
+            ok = ltf_ln_fold_constants(d.qkv, L.norm_self, 3 * E, E, f->owned, d.qkv_c) &&
+                 ltf_ln_fold_constants(d.ff1, L.norm_ff, NFF, E, f->owned, d.ff1_c);
+        if (ok && L.has_cross)
+            ok = ltf_ln_fold_constants(d.cq, L.norm_xq, CD, E, f->owned, d.cq_c);
+        if (!ok) {
+            ltf_set_error(error, error_size, "fused decoder: Q8_0 projection repack failed");
+            magpietts_decoder_fused_free(f);
+            return nullptr;
+        }
+        d.norm_self = L.norm_self;
+        d.norm_xq = L.norm_xq;
+        d.norm_ff = L.norm_ff;
+        d.kv_arena = cache.kv_arena[i];
+        d.flags = (L.has_cross ? 1 : 0) | (L.collect_alignment && L.has_cross ? 2 : 0) |
+                  (L.apply_prior ? 4 : 0);
+        if (L.has_cross && L.collect_alignment)
+            ++f->n_collect;
     }
     f->grid = grid;
     // scratch arena

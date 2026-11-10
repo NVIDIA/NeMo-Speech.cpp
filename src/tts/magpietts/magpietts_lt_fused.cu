@@ -58,6 +58,7 @@ struct magpietts_lt_fused {
     // persistent chain kernel (all rounds in one launch)
     unsigned int* barrier = nullptr;  // monotonic grid-barrier counter (reset before each launch)
     int chain_grid = 0;               // blocks (0 = chain unsupported)
+    char chain_reason[128] = {};      // why the chain is unsupported (empty when supported)
     bool prefetch_out = false;
     void* arena = nullptr;  // single allocation holding every scratch buffer (L2 access window)
     size_t arena_bytes = 0;
@@ -886,31 +887,28 @@ ltf_type_ok(int t) {
     return t == LTF_TYPE_F16 || t == LTF_TYPE_Q8_0;
 }
 
-// Decide whether the persistent chain kernel applies: all weights planar Q8, shapes within the
-// kernel's static limits, small vocab for the in-kernel sampler, and every block co-resident.
+// Decide whether the persistent chain kernel applies: shapes within the kernel's static limits,
+// small vocab for the in-kernel sampler, every block co-resident, and all weights planar Q8.
+// Records the reason in f->chain_reason when it does not.
 static void
 ltf_chain_setup(magpietts_lt_fused* f) {
     f->chain_grid = 0;
     const magpietts_lt_fused_weights& w = f->w;
+    auto unsupported = [f](const char* msg) {
+        snprintf(f->chain_reason, sizeof(f->chain_reason), "fused CUDA chain: %s", msg);
+    };
+    const int K = w.n_embd;
+    // Kernel limits (R=4 tiles need MB=1, ff2 tiles MB<=3) and the in-kernel sampler's vocab.
     if (w.n_layers > LTF_MAX_LAYERS || w.n_rounds > LTF_MAX_ROUNDS ||
-        w.vocab > MAGPIETTS_CUDA_SMALL_VOCAB || w.out_type != LTF_TYPE_Q8_0) {
+        w.vocab > MAGPIETTS_CUDA_SMALL_VOCAB || (K >> 5) > 32 || (w.n_ff >> 5) > 96) {
+        unsupported("unsupported shape");
         return;
     }
-    for (const ltf_layer& L : f->layers) {
-        if (L.qkv_type != LTF_TYPE_Q8_0 || L.o_type != LTF_TYPE_Q8_0 ||
-            L.ff1_type != LTF_TYPE_Q8_0 || L.ff2_type != LTF_TYPE_Q8_0)
-            return;
-    }
-    const int K = w.n_embd;
-    if ((K >> 5) > 32 || (w.n_ff >> 5) > 96)
-        return;  // R=4 tiles need MB=1, ff2 tiles MB<=3
-    for (int i = 0; i < w.n_layers; ++i)
-        if (!f->layers[i].qkv_c || !f->layers[i].ff1_c)
-            return;
     int device = 0, sms = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
         (void)cudaGetLastError();
+        unsupported("device query failed");
         return;
     }
     auto fits = [&](auto tier) {
@@ -928,17 +926,40 @@ ltf_chain_setup(magpietts_lt_fused* f) {
                w.n_ff % grid == 0 && (w.n_ff / grid) % 16 == 0 && K % grid == 0 &&
                (K / grid) % 4 == 0 && K / w.n_head == 64;
     };
-    // Without a fitting tier the per-round path runs.
+    // Check the GPU before the weight types, so a GPU that cannot run the chain (Jetson Thor has
+    // 20 SMs) reports that instead of asking for a q8_0 model that would not help. Without a
+    // fitting tier the per-round path runs.
+    int grid = 0;
     if (ltf_chain_tier_usable<ltf_chain_tier_large>(
             reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_large>), sms, fits)) {
-        f->chain_grid = ltf_chain_tier_large::grid;
+        grid = ltf_chain_tier_large::grid;
     } else if (ltf_chain_tier_usable<ltf_chain_tier_small>(
                    reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_small>), sms,
                    fits)) {
-        f->chain_grid = ltf_chain_tier_small::grid;
+        grid = ltf_chain_tier_small::grid;
     } else {
+        char msg[96];
+        snprintf(
+            msg, sizeof(msg), "no persistent tier fits (%d SMs, needs %d+)", sms,
+            ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM);
+        unsupported(msg);
         return;
     }
+    bool q8 = w.out_type == LTF_TYPE_Q8_0;
+    for (const ltf_layer& L : f->layers)
+        q8 = q8 && L.qkv_type == LTF_TYPE_Q8_0 && L.o_type == LTF_TYPE_Q8_0 &&
+             L.ff1_type == LTF_TYPE_Q8_0 && L.ff2_type == LTF_TYPE_Q8_0;
+    if (!q8) {
+        unsupported("needs a q8_0 model; convert with --outtype q8_0");
+        return;
+    }
+    for (int i = 0; i < w.n_layers; ++i) {
+        if (!f->layers[i].qkv_c || !f->layers[i].ff1_c) {
+            unsupported("missing LayerNorm fold constants");
+            return;
+        }
+    }
+    f->chain_grid = grid;
     {
         // Prefetch the output projection only if it stays comfortably L2-resident.
         int l2 = 0;
@@ -1337,6 +1358,11 @@ magpietts_lt_fused_timing_report() {
 bool
 magpietts_lt_fused_chain_supported(const magpietts_lt_fused* f) {
     return f && f->chain_grid > 0;
+}
+
+const char*
+magpietts_lt_fused_chain_unsupported_reason(const magpietts_lt_fused* f) {
+    return f ? f->chain_reason : "";
 }
 
 static bool

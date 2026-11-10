@@ -1,0 +1,99 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: re-instantiate CUDA graphs that sat idle on integrated GPUs
+
+On Jetson Thor (L4T R38.3, driver 580), replaying a cached executable after
+the GPU power-gated while it sat idle, which starts after about 1 s without
+work, can fault the compute scheduler (Xid 13
+SKEDCHECK36_DEPENDENCE_COUNTER_UNDERFLOW, "unspecified launch failure") or
+silently produce wrong results. A fresh instantiation of the same captured
+graph is unaffected; cudaGraphUpload of the stale executable is not enough.
+
+Before launching an executable that was not launched for
+GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS (default 250 ms on integrated GPUs,
+off on discrete GPUs; 0 disables), destroy it and instantiate the kept
+cudaGraph_t again. That costs about 1 ms per 200 graph nodes, only on the
+first launch after a pause, and graphs stay resident.
+
+Upstream: stays here as a workaround until the Thor driver is fixed.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b7bcc820beb85dcb695398eaa2eac0e94469871b..508ca51850fc2aa0d4df6f446d2ff93d1b66bc42 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1295,6 +1295,7 @@ struct ggml_cuda_graph {
+     bool warmup_complete = false;
+     uint64_t uid = 0;
+     int64_t last_used_time = 0;
++    int64_t last_launch_time = 0;
+     struct node_properties {
+         ggml_tensor node;
+         void *   node_src_data_ptrs[GGML_MAX_SRC];
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c5b7df92fc623609d4fb875b47c8282f6d56775a..bcaa0628eb76514feeeec8255fb49d76f1418573 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2828,6 +2828,42 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+     return res;
+ }
+ 
++// On Jetson Thor, replaying an executable after the GPU power-gated while it sat idle (power
++// gating starts after about 1 s without work) can fault the compute scheduler (Xid 13
++// SKEDCHECK36_DEPENDENCE_COUNTER_UNDERFLOW, "unspecified launch failure") or silently produce
++// wrong results. A fresh instantiation of the same captured graph is unaffected, so an executable
++// that was not launched for this long is instantiated again before its next launch.
++// GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS overrides the default (250 ms on integrated GPUs, off on
++// discrete GPUs); 0 disables it.
++static int64_t ggml_cuda_graph_reinstantiate_after_us(int device) {
++    static const int64_t env_ms = [] {
++        const char * value = getenv("GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS");
++        if (value == nullptr || value[0] == '\0') {
++            return (int64_t) -1;
++        }
++        char * end = nullptr;
++        const long long ms = std::strtoll(value, &end, 10);
++        return end == value || *end != '\0' || ms < 0 ? (int64_t) -1 : (int64_t) ms;
++    }();
++    if (env_ms >= 0) {
++        return env_ms * 1000;
++    }
++    // ggml_cuda_info().devices[].integrated is forced to false (#15034), so ask CUDA.
++    static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = [] {
++        std::array<bool, GGML_CUDA_MAX_DEVICES> out = {};
++        for (int id = 0; id < ggml_cuda_info().device_count && id < GGML_CUDA_MAX_DEVICES; ++id) {
++            int value = 0;
++            if (cudaDeviceGetAttribute(&value, cudaDevAttrIntegrated, ggml_cuda_get_physical_device(id)) == cudaSuccess) {
++                out[id] = value != 0;
++            } else {
++                (void) cudaGetLastError();
++            }
++        }
++        return out;
++    }();
++    return integrated[device] ? 250 * 1000 : 0;
++}
++
+ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+@@ -5048,12 +5084,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+     if (use_cuda_graph) {
+         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
++        const int64_t time_now = ggml_time_us();
++        const int64_t reinstantiate_after_us = ggml_cuda_graph_reinstantiate_after_us(cuda_ctx->device);
++        if (graph->instance != nullptr && reinstantiate_after_us > 0 && graph->last_launch_time != 0 &&
++                time_now - graph->last_launch_time > reinstantiate_after_us) {
++            // The executable may have outlived a GPU power-gating period: see ggml_cuda_graph_reinstantiate_after_us.
++            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
++            graph->instance = nullptr;
++        }
+         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+         }
+         if (cuda_graph_update_required) { // Update graph executable
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
++        graph->last_launch_time = time_now;
+         // Launch graph
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+ #else
