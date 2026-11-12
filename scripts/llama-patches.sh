@@ -219,7 +219,7 @@ case "${1:-}" in
     check)
         scratch_series tree "$(pin)"
         write_series "${tree}" "$(pin)" "${tree}.out"
-        if ! diff -r "${PATCHES}" "${tree}.out" --exclude='*.md'; then
+        if ! diff -r "${PATCHES}" "${tree}.out" --exclude='*.md' --exclude='.greptile'; then
             die "patches/ is not in exported form; run edit, export and commit the result"
         fi
         echo "patches/ applies to llama.cpp $(pin) and round-trips byte for byte."
@@ -242,7 +242,7 @@ case "${1:-}" in
             out="$(mktemp -d)"
             scratch_trees+=("${out}/none")
             write_series "${WORK}" "$(pin)" "${out}"
-            diff -rq "${PATCHES}" "${out}" --exclude='*.md' >/dev/null \
+            diff -rq "${PATCHES}" "${out}" --exclude='*.md' --exclude='.greptile' >/dev/null \
                 || die "${WORK} has changes that are not exported; run export, or done --force"
         fi
         llama worktree remove --force "${WORK}"

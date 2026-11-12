@@ -1426,17 +1426,9 @@ local_transformer_fused_try_create(
     // int8 dot products, in-kernel sampling), which needs Q8_0 projections. With F16 weights
     // the per-round fused kernels are slower than the ggml round graphs, so keep those.
     if (!magpietts_lt_fused_chain_supported(fused)) {
-        bool all_q8 = w.out_type == (int)GGML_TYPE_Q8_0;
-        for (int i = 0; i < w.n_layers; ++i) {
-            const magpietts_lt_fused_layer_weights& lw = w.layers[i];
-            all_q8 = all_q8 && lw.qkv_type == (int)GGML_TYPE_Q8_0 &&
-                     lw.o_type == (int)GGML_TYPE_Q8_0 && lw.ff1_type == (int)GGML_TYPE_Q8_0 &&
-                     lw.ff2_type == (int)GGML_TYPE_Q8_0;
-        }
         fprintf(
             stderr, "MagpieTTS local transformer: using ggml round graphs (%s)\n",
-            all_q8 ? "fused CUDA chain not supported on this GPU"
-                   : "the fused CUDA chain needs a q8_0 model; convert with --outtype q8_0");
+            magpietts_lt_fused_chain_unsupported_reason(fused));
         magpietts_lt_fused_free(fused);
         return;
     }
@@ -1644,6 +1636,18 @@ sample_local_codebooks_cuda_impl(
     bool chain_ok = false;
     if (magpietts_cuda_sampler_sequence_is_ready(cuda_sampler)) {
         chain_ok = magpietts_cuda_sampler_sequence_launch(cuda_sampler, error, sizeof(error));
+        if (!chain_ok && !magpietts_cuda_sampler_sequence_is_ready(cuda_sampler)) {
+            // The re-instantiation failed and removed the composed graph. Use the async chain.
+            fprintf(
+                stderr, "warning: CUDA local graph unavailable; using async chain: %s\n",
+                error[0] ? error : "unknown error");
+            chain_ok = magpietts_cuda_sampler_upload_config(cuda_sampler, error, sizeof(error)) &&
+                       run_chain();
+            if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
+                magpietts_cuda_sampler_sequence_mark_warm(cuda_sampler);
+                magpietts_cuda_sampler_sequence_set_key(cuda_sampler, sequence_key);
+            }
+        }
     } else if (
         magpietts_cuda_sampler_sequence_is_warm(cuda_sampler) &&
         !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {

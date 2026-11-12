@@ -1,0 +1,135 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml-cuda: re-instantiate CUDA graphs that sat idle on integrated GPUs
+
+On Jetson Thor (L4T R38.3, driver 580), a cached executable can fault
+(Xid 13) or give wrong results after the GPU power-gates while idle. A new
+instance of the same graph is correct.
+
+A pause longer than GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS on a device
+starts a new idle epoch. Executables from an earlier epoch are instantiated
+again before they run. Default: 250 ms on integrated GPUs, off on discrete
+GPUs. If the instantiation fails, the call runs the graph nodes directly.
+
+Upstream: stays here as a workaround until the Thor driver is fixed.
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b7bcc820beb85dcb695398eaa2eac0e94469871b..47aee26bbbb6b87ae0f357a64455bed3e4fa6e75 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1295,6 +1295,7 @@ struct ggml_cuda_graph {
+     bool warmup_complete = false;
+     uint64_t uid = 0;
+     int64_t last_used_time = 0;
++    uint64_t idle_epoch = 0; // ggml_cuda_idle_epoch() at the last launch
+     struct node_properties {
+         ggml_tensor node;
+         void *   node_src_data_ptrs[GGML_MAX_SRC];
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c5b7df92fc623609d4fb875b47c8282f6d56775a..c8ca08464f2b5d7021ca815819ff8a0047d07427 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2828,6 +2828,66 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+     return res;
+ }
+ 
++// On Jetson Thor, an executable can fault (Xid 13) or give wrong results after the GPU power-gates while idle. A new instance of the graph is correct.
++// A pause longer than this on a device starts a new idle epoch. Executables from an earlier epoch are instantiated again.
++// GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS sets it. Default: 250 ms on integrated GPUs, off on discrete GPUs.
++static int64_t ggml_cuda_graph_reinstantiate_after_us(int device) {
++    static const int64_t env_ms = [] {
++        const char * value = getenv("GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS");
++        if (value == nullptr || value[0] == '\0') {
++            return (int64_t) -1;
++        }
++        char * end = nullptr;
++        const long long ms = std::strtoll(value, &end, 10);
++        return end == value || *end != '\0' || ms < 0 ? (int64_t) -1 : (int64_t) ms;
++    }();
++    if (env_ms >= 0) {
++        return env_ms * 1000;
++    }
++    // ggml_cuda_info().devices[].integrated is forced to false (#15034), so ask CUDA.
++    static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = [] {
++        std::array<bool, GGML_CUDA_MAX_DEVICES> out = {};
++        for (int id = 0; id < ggml_cuda_info().device_count && id < GGML_CUDA_MAX_DEVICES; ++id) {
++            int value = 0;
++            if (cudaDeviceGetAttribute(&value, cudaDevAttrIntegrated, ggml_cuda_get_physical_device(id)) == cudaSuccess) {
++                out[id] = value != 0;
++            } else {
++                (void) cudaGetLastError();
++            }
++        }
++        return out;
++    }();
++    return integrated[device] ? 250 * 1000 : 0;
++}
++
++struct ggml_cuda_idle_state {
++    std::mutex            mutex;
++    int64_t               last_compute_us = 0;
++    std::atomic<uint64_t> epoch{0};
++};
++
++static ggml_cuda_idle_state ggml_cuda_idle[GGML_CUDA_MAX_DEVICES];
++
++static uint64_t ggml_cuda_idle_epoch(int device) {
++    return ggml_cuda_idle[device].epoch.load(std::memory_order_relaxed);
++}
++
++// call at the start of each graph compute: work from all backends on the device counts
++static void ggml_cuda_idle_note_compute(int device) {
++    const int64_t after_us = ggml_cuda_graph_reinstantiate_after_us(device);
++    if (after_us <= 0) {
++        return;
++    }
++    ggml_cuda_idle_state & state = ggml_cuda_idle[device];
++    const int64_t now = ggml_time_us();
++    // one step, so another compute cannot see the new time with the old epoch
++    std::lock_guard<std::mutex> lock(state.mutex);
++    if (state.last_compute_us != 0 && now - state.last_compute_us > after_us) {
++        state.epoch.fetch_add(1, std::memory_order_relaxed);
++    }
++    state.last_compute_us = std::max(state.last_compute_us, now);
++}
++
+ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+@@ -5048,12 +5108,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+     if (use_cuda_graph) {
+         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
++        const uint64_t idle_epoch = ggml_cuda_idle_epoch(cuda_ctx->device);
++        if (graph->instance != nullptr && graph->idle_epoch != idle_epoch) {
++            // the device paused after the last launch
++            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
++            graph->instance = nullptr;
++        }
+         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
++            const cudaError_t err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
++            if (err != cudaSuccess) {
++                // for example, out of memory: run this call without the graph. The next call tries again.
++                (void) cudaGetLastError();
++                graph->instance = nullptr;
++                GGML_LOG_WARN("%s: cudaGraphInstantiate failed (%s), evaluating the graph directly\n", __func__, cudaGetErrorString(err));
++                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
++                return;
++            }
+         }
+         if (cuda_graph_update_required) { // Update graph executable
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
++        graph->idle_epoch = idle_epoch;
+         // Launch graph
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+ #else
+@@ -5090,6 +5165,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_key graph_key = {};
+ 
+ #ifdef USE_CUDA_GRAPH
++    ggml_cuda_idle_note_compute(cuda_ctx->device);
++
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);

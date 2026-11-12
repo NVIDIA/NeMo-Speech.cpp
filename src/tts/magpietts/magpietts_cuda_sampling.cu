@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cub/block/block_radix_sort.cuh>
 
@@ -25,6 +28,7 @@ struct magpietts_cuda_sampler {
     cudaGraph_t sequence_graph = nullptr;
     cudaGraphExec_t sequence_exec = nullptr;
     cudaGraphNode_t sequence_tail = nullptr;
+    int64_t sequence_last_launch_us = 0;
     bool sequence_warm = false;
     bool sequence_build_active = false;
     bool sequence_disabled = false;
@@ -54,6 +58,32 @@ magpietts_cuda_device_is_uma(void) {
         return false;
     }
     return prop.integrated != 0 && prop.unifiedAddressing != 0;
+}
+
+// On Jetson Thor, a graph that ran before the GPU was idle can fault or give wrong codes. A new
+// instance of the graph is correct. Instantiate the sequence again if it did not run for
+// GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS (default 250 ms on integrated GPUs, off on discrete GPUs).
+static int64_t
+sequence_reinstantiate_after_us() {
+    static const int64_t after_us = [] {
+        const char* value = std::getenv("GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS");
+        if (value && value[0] != '\0') {
+            char* end = nullptr;
+            const long long ms = std::strtoll(value, &end, 10);
+            if (end != value && *end == '\0' && ms >= 0) {
+                return (int64_t)ms * 1000;
+            }
+        }
+        return magpietts_cuda_device_is_uma() ? (int64_t)250 * 1000 : (int64_t)0;
+    }();
+    return after_us;
+}
+
+static int64_t
+sequence_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 static void
@@ -552,6 +582,7 @@ magpietts_cuda_sampler_sequence_finish_build_and_launch(
         return false;
     }
     sampler->sequence_exec = exec;
+    sampler->sequence_last_launch_us = sequence_now_us();
     if (error && error_size > 0)
         error[0] = '\0';
     return true;
@@ -582,6 +613,7 @@ magpietts_cuda_sampler_sequence_disable(magpietts_cuda_sampler* sampler) {
         sampler->sequence_graph = nullptr;
     }
     sampler->sequence_tail = nullptr;
+    sampler->sequence_last_launch_us = 0;
     sampler->sequence_disabled = true;
 }
 
@@ -614,6 +646,26 @@ magpietts_cuda_sampler_sequence_launch(
         set_error(error, error_size, "CUDA local sequence graph is not ready");
         return false;
     }
+    const int64_t now_us = sequence_now_us();
+    const int64_t reinstantiate_after_us = sequence_reinstantiate_after_us();
+    if (reinstantiate_after_us > 0 && sampler->sequence_graph &&
+        sampler->sequence_last_launch_us != 0 &&
+        now_us - sampler->sequence_last_launch_us > reinstantiate_after_us) {
+        cudaGraphExecDestroy(sampler->sequence_exec);
+        sampler->sequence_exec = nullptr;
+        const cudaError_t inst_err = cudaGraphInstantiate(
+            &sampler->sequence_exec, sampler->sequence_graph, nullptr, nullptr, 0);
+        if (inst_err != cudaSuccess) {
+            // Clear the error. Remove the composed graph: the caller uses the async chain.
+            (void)cudaGetLastError();
+            sampler->sequence_exec = nullptr;
+            magpietts_cuda_sampler_sequence_reset(sampler);
+            set_error(
+                error, error_size, "failed to re-instantiate CUDA local sequence graph", inst_err);
+            return false;
+        }
+    }
+    sampler->sequence_last_launch_us = now_us;
     const cudaError_t err = cudaGraphLaunch(sampler->sequence_exec, sampler->stream);
     if (err != cudaSuccess) {
         set_error(error, error_size, "failed to launch CUDA local sequence graph", err);

@@ -9,6 +9,14 @@ reviews:
   # description. (high_level_summary: false would disable it entirely.)
   high_level_summary: true
   high_level_summary_in_walkthrough: true
+  # Show applied guidelines, path instructions, and any suppressed comments in the
+  # walkthrough's collapsible details block so reviewers can audit bot coverage.
+  review_details: true
+  # Keep the walkthrough to the summary and the findings.
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  suggested_labels: false
+  suggested_reviewers: false
   auto_review:
     enabled: true
     auto_incremental_review: true
@@ -17,22 +25,86 @@ reviews:
     base_branches:
       - ".*"
   path_instructions:
-    - path: "**/*.{cu,cuh,cpp,c,h,hpp}"
+    - path: "**/*.{cu,cuh,cpp,cc,c,h,hpp}"
       instructions: |
-        Prioritize correctness, performance and portability:
-        - Correctness: races, uninitialized or stale state, edge cases (empty, masked,
-          boundary sizes), numerical stability, and fallback paths that differ from the fast
-          path.
-        - Performance: regressions on hot paths, redundant work, unnecessary allocations or
-          synchronization, and caches or reuse that do not actually take effect.
-        - Portability: assumptions tied to one GPU, architecture, backend or platform; hardware
-          limits must be queried or guarded, with a working fallback.
+        Apply every section of REVIEW.md, in its priority order. Read the full enclosing
+        function, its callers and its sibling paths before you conclude. Cover each of these:
+        - Correctness: wrong results, memory errors, races, stale state, edge cases (empty or
+          short input, boundary sizes, partial chunks), numerical stability, and fallback
+          paths that differ from the fast path.
+        - State: every reader and writer of added or changed state, on fallback, error and
+          concurrent paths, and callers that use underlying handles directly.
+        - Order: checks that can reject a path run before setup with side effects, or the
+          rejected path undoes them. Sibling implementations use the same order.
+        - Failures at run time: recoverable failures fall back or return an error. They do
+          not reach CUDA_CHECK, GGML_ASSERT or GGML_ABORT. Recovery paths clear sticky
+          backend errors.
+        - Performance: regressions on hot paths (synchronization, allocations, copies, CPU
+          fallbacks, caches that do not take effect).
+        - Portability: assumptions tied to one GPU, memory model, architecture, backend, OS
+          or compiler. Hardware limits are queried, with a working fallback.
+        - Reuse: new code that duplicates an existing helper or copies a block, and code,
+          flags or options that the change makes unused. Name the helper or the copy.
+        If a change makes unchanged code run more often or in new conditions, check that code
+        and attach the finding to the changed line. Report a defect that you found. Do not ask
+        the author to verify or consider something.
     - path: "patches/**"
       instructions: |
-        Patches to the pinned llama.cpp submodule. Apply the same correctness, performance and
-        portability checks; also check that op preconditions match what the kernels support
-        and that the patch series stays consistent.
+        Files in patches/ modify llama.cpp and ggml at the pinned llama.cpp submodule commit,
+        stacked in patches/series order. Do not review hunks in isolation:
+        1. Read the full target function and struct in llama.cpp/<file>. If the submodule
+           checkout is empty, fetch
+           https://raw.githubusercontent.com/ggml-org/llama.cpp/<pin>/<file>, where <pin> is
+           the commit that `git ls-tree HEAD llama.cpp` prints. If that fails, use the context
+           lines of the patch and the earlier patches in patches/series that change the same
+           function.
+        2. Search all other patches/*.patch files for earlier/later patches touching the same
+           file, struct, or custom interop API.
+        3. Search src/, server/, and include/ for every caller (including callers that borrow
+           underlying handles directly). Report a caller that uses a patched op or API outside
+           a NEMO_SPEECH_GGML_PATCHED guard, because unpatched builds do not have it.
+        Apply the same correctness, concurrency, runtime-abort survival, op supports_op
+        precondition, and hardware fallback checks as first-party C++/CUDA code.
+    - path: "{include/nemo_speech/**,src/**/c_api.map}"
+      instructions: |
+        Public dlopen-compatible C ABI. Flag struct field reordering, unguarded struct size
+        changes, or signature changes that break binary compatibility for existing C callers.
+        The c_api.map linker scripts set which symbols the C ABI libraries export. Flag a
+        change that stops the export of a public nemo_speech_* symbol or that exports
+        internal symbols.
+    - path: "{conversion/**,convert_model.py,clients/**}"
+      instructions: |
+        Report a GGUF tensor name, shape, quantization layout or metadata key that the change
+        alters on one side only (converter or C++ loader), an input that is validated after
+        expensive work, and a CLI or client behavior that breaks on an edge case (zero or
+        falsy numeric arguments, missing optional files).
+    - path: "{CMakeLists.txt,**/CMakeLists.txt,CMakePresets.json,vcpkg.json,cmake/**,scripts/**,docker/**,.github/workflows/**}"
+      instructions: |
+        Report a step that works on one OS, architecture, shell or GPU type only. Targets are
+        Linux, macOS and Windows on x86_64 and arm64, with discrete GPUs and iGPU/UMA platforms
+        (DGX Spark, RTX Spark, Jetson, Apple Silicon). Report a new runtime dependency that the
+        prebuilt release archives do not bundle. Report a preset that sets
+        NEMO_SPEECH_GGML_PATCHED to the wrong value for its backend: ON for cpu-* and cuda-*,
+        OFF for metal-* and vulkan-*.
     - path: "{BENCHMARK.md,README.md,docs/**,app/bench*}"
       instructions: |
-        Check that measurements are sound and that documented numbers, defaults and flags match
-        the code.
+        Report a documented number, environment variable, default, API payload or CLI flag
+        that does not match the code in src/, server/ and patches/, and a benchmark that
+        compares unlike conditions.
+  # REVIEW.md says not to report formatting, so the prose and Markdown linters are off.
+  tools:
+    languagetool:
+      enabled: false
+    markdownlint:
+      enabled: false
+  pre_merge_checks:
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+
+knowledge_base:
+  # Shared review rules for CodeRabbit, Greptile, and human reviewers.
+  code_guidelines:
+    filePatterns:
+      - "REVIEW.md"

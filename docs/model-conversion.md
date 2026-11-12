@@ -73,7 +73,8 @@ experts); embeddings, the output head and the norms stay BF16/F32:
 | `--outtype` | Routed experts | Dense linears | Use |
 |---|---|---|---|
 | `nvfp4` (default) | NVFP4 | BF16 | Blackwell GPUs run the experts natively |
-| `iq4_nl` | IQ4_NL | Q8_0 | GPUs without NVFP4 (Ampere, Ada), CPU, Vulkan; the smaller file |
+| `iq4_nl` | IQ4_NL | Q8_0 | GPUs without NVFP4 (Ampere, Ada), CPU, Vulkan |
+| `q2_0` | Q2_0, IQ4_NL in the last five MoE layers | Q8_0 (also the embeddings and output head) | the smallest file, for smaller GPUs |
 
 The encoder file is the same for every `--outtype` (F16 encoder and F32 CTC head), named after the
 checkpoint, so decoders of several types share one. `--salm-encoder none` writes only the decoder, for a second
@@ -82,7 +83,8 @@ checkpoint, so decoders of several types share one. `--salm-encoder none` writes
 The conversion stages the checkpoint's decoder for llama.cpp's NemotronH converter (the pinned `llama.cpp`
 submodule), writes a BF16 intermediate next to the output (the size of the BF16 decoder) and then quantizes it
 with the patched `llama-quantize`, built once on first use like the S2S converter's. `--dry-run` checks the tensor
-mapping without writing.
+mapping without writing. `q2_0` needs the Q2_0 scale fitting in `patches/`: the converter builds `llama-quantize`
+for it from this repository's patched `llama.cpp` (not a `--llama-cpp` checkout) and checks its output.
 
 ### DFlash2 draft model
 

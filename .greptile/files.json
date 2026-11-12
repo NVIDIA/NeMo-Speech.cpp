@@ -1,0 +1,23 @@
+{
+  "files": [
+    {
+      "path": "REVIEW.md",
+      "description": "Repository review checklist: what to report, checks past the diff, correctness, runtime failures, performance, portability, reuse, patches/ and docs"
+    },
+    {
+      "path": "patches/README.md",
+      "description": "How patches/ applies to the pinned llama.cpp submodule and interacts with NEMO_SPEECH_GGML_PATCHED",
+      "scope": ["patches/**", "src/**", "server/**", "cmake/**", "scripts/llama-patches.sh"]
+    },
+    {
+      "path": "docs/development/diagnostics.md",
+      "description": "Build switches (NEMO_SPEECH_GGML_PATCHED) and runtime environment variables read by patches/ and src/",
+      "scope": ["patches/**", "src/**", "server/**", "docs/**"]
+    },
+    {
+      "path": "docs/development/releasing.md",
+      "description": "Release archive targets across Linux, macOS, and Windows (x86_64 and arm64, discrete and UMA GPUs)",
+      "scope": ["scripts/**", "docker/**", ".github/workflows/**", "CMakeLists.txt", "cmake/**"]
+    }
+  ]
+}
