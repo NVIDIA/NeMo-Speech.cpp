@@ -25,10 +25,10 @@ index b7bcc820beb85dcb695398eaa2eac0e94469871b..47aee26bbbb6b87ae0f357a64455bed3
          ggml_tensor node;
          void *   node_src_data_ptrs[GGML_MAX_SRC];
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c5b7df92fc623609d4fb875b47c8282f6d56775a..2c4f653d078dfd9d1c4d06bf8c6ec9d9e9003ad4 100644
+index c5b7df92fc623609d4fb875b47c8282f6d56775a..c8ca08464f2b5d7021ca815819ff8a0047d07427 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2828,6 +2828,65 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -2828,6 +2828,66 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
      return res;
  }
  
@@ -65,7 +65,8 @@ index c5b7df92fc623609d4fb875b47c8282f6d56775a..2c4f653d078dfd9d1c4d06bf8c6ec9d9
 +}
 +
 +struct ggml_cuda_idle_state {
-+    std::atomic<int64_t>  last_compute_us{0};
++    std::mutex            mutex;
++    int64_t               last_compute_us = 0;
 +    std::atomic<uint64_t> epoch{0};
 +};
 +
@@ -83,18 +84,18 @@ index c5b7df92fc623609d4fb875b47c8282f6d56775a..2c4f653d078dfd9d1c4d06bf8c6ec9d9
 +    }
 +    ggml_cuda_idle_state & state = ggml_cuda_idle[device];
 +    const int64_t now = ggml_time_us();
-+    int64_t prev = state.last_compute_us.load(std::memory_order_relaxed);
-+    while (prev < now && !state.last_compute_us.compare_exchange_weak(prev, now, std::memory_order_relaxed)) {
-+    }
-+    if (prev != 0 && now - prev > after_us) {
++    // one step, so another compute cannot see the new time with the old epoch
++    std::lock_guard<std::mutex> lock(state.mutex);
++    if (state.last_compute_us != 0 && now - state.last_compute_us > after_us) {
 +        state.epoch.fetch_add(1, std::memory_order_relaxed);
 +    }
++    state.last_compute_us = std::max(state.last_compute_us, now);
 +}
 +
  static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
-@@ -5048,12 +5107,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5048,12 +5108,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
      if (use_cuda_graph) {
          ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -123,7 +124,7 @@ index c5b7df92fc623609d4fb875b47c8282f6d56775a..2c4f653d078dfd9d1c4d06bf8c6ec9d9
          // Launch graph
          CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
  #else
-@@ -5090,6 +5164,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5090,6 +5165,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_cuda_graph_key graph_key = {};
  
  #ifdef USE_CUDA_GRAPH
