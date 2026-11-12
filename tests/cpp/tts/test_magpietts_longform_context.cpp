@@ -120,6 +120,39 @@ cache_is_capped() {
     return ok;
 }
 
+// The chunk prefetch copies only the newest history rows of the cache for its thread. Splicing
+// from that copy must give the same rows as splicing from the whole cache.
+bool
+tail_splices_the_same_rows() {
+    std::vector<float> cache;
+    int cache_len = 0;
+    std::vector<float> c0 = encode_window(0, 30, 0, 1);
+    tts::append_longform_history_context(cache, cache_len, c0, 30, 30, kEmbd, 2048);
+    std::vector<float> c1 = encode_window(8, 8, 30, 2);
+    tts::splice_longform_history_context(c1, 16, 8, kEmbd, cache, cache_len);
+    tts::append_longform_history_context(cache, cache_len, c1, 16, 8, kEmbd, 2048);
+
+    const std::vector<float> tail = tts::longform_history_context_tail(cache, cache_len, 20, kEmbd);
+    bool ok = expect(tail.size() == (size_t)20 * kEmbd, "tail holds the 20 newest rows");
+    std::vector<float> from_cache = encode_window(20, 25, 38, 3);
+    std::vector<float> from_tail = from_cache;
+    ok &= expect(
+        tts::splice_longform_history_context(from_cache, 45, 25, kEmbd, cache, cache_len),
+        "splice from the whole cache");
+    ok &= expect(
+        tts::splice_longform_history_context(from_tail, 45, 25, kEmbd, tail, 20),
+        "splice from the tail");
+    ok &= expect(from_cache == from_tail, "the tail splices the same rows");
+
+    ok &= expect(
+        tts::longform_history_context_tail(cache, cache_len, 100, kEmbd) == cache,
+        "a tail longer than the cache is the whole cache");
+    ok &= expect(
+        tts::longform_history_context_tail(cache, cache_len, 0, kEmbd).empty(),
+        "no history rows gives an empty tail");
+    return ok;
+}
+
 bool
 rejects_inconsistent_cache() {
     std::vector<float> cache(5 * kEmbd, 0.0f);
@@ -138,6 +171,7 @@ main() {
     ok &= short_chunk_then_long_chunk();
     ok &= matches_previous_window_cache();
     ok &= cache_is_capped();
+    ok &= tail_splices_the_same_rows();
     ok &= rejects_inconsistent_cache();
     if (!ok) {
         return 1;

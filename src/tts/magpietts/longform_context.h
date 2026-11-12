@@ -42,6 +42,19 @@ splice_longform_history_context(
     return true;
 }
 
+// The newest `rows` rows of the cache. A window splices only its history rows, so a copy of the
+// cache for another thread needs no more than these.
+inline std::vector<float>
+longform_history_context_tail(
+    const std::vector<float>& context, int context_len, int rows, int n_embd) {
+    if (rows <= 0 || context_len <= 0 || n_embd <= 0 ||
+        context.size() < (size_t)context_len * (size_t)n_embd) {
+        return {};
+    }
+    const float* end = context.data() + (size_t)context_len * (size_t)n_embd;
+    return std::vector<float>(end - (size_t)std::min(rows, context_len) * (size_t)n_embd, end);
+}
+
 // Appends a chunk's own rows to the rolling cache: the per-token context of every token
 // synthesized so far, in order, capped at max_tokens. A window's history is capped by its own
 // chunk length, so caching only the previous window falls short when a short chunk is followed by

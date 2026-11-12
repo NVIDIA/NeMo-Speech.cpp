@@ -1363,13 +1363,17 @@ stream_magpie_to_audio(
         chunk_prefetch.collect_alignment = speculative.shouldCollect(h, 0, text_len);
         chunk_prefetch.alignment.clear();
         chunk_prefetch.ok = false;
-        std::vector<float> history_context = history_text_context;
-        const int history_context_len = history_text_context_len;
+        // The window splices only its history_len newest rows, so do not copy the whole cache.
+        std::vector<float> history_context = longform_history_context_tail(
+            history_text_context, history_text_context_len, history_len, h.n_embd);
+        const int history_context_len = (int)(history_context.size() / (size_t)h.n_embd);
         const int current_len = (int)next_tokens.size();
         const int speaker = params.speaker;
         const int threads = params.threads;
-        chunk_prefetch.thread = std::thread([&, window, history_context, history_context_len,
-                                             current_len, text_len, speaker, threads]() {
+        chunk_prefetch.thread = std::thread([&, window,
+                                             history_context = std::move(history_context),
+                                             history_context_len, current_len, text_len, speaker,
+                                             threads]() {
             const ggml_nvtx::range nvtx_range("magpietts_stream_chunk_prefetch");
             MagpieStreamingWorkspace& ws = workspace;
             // pinned staging sized once for the widest window (cudaMallocHost holds the driver
