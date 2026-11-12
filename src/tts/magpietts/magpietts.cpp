@@ -28,6 +28,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml_log_filter.h"
+#include "longform_context.h"
 #include "lt.h"
 #include "nvtx_utils.h"
 #include "token_utils.h"
@@ -85,33 +86,6 @@ token_count(const std::vector<std::vector<int32_t>>& chunks) {
         total += chunk.size();
     }
     return total;
-}
-
-static bool
-splice_longform_history_context(
-    std::vector<float>& text_cond, int text_len, int current_chunk_len, int n_embd,
-    const std::vector<float>& previous_context, int previous_context_len) {
-    if (text_len < 0 || current_chunk_len < 0 || current_chunk_len > text_len || n_embd <= 0) {
-        fprintf(stderr, "invalid longform text context dimensions\n");
-        return false;
-    }
-    const int history_len = text_len - current_chunk_len;
-    if (history_len <= 0) {
-        return true;
-    }
-    if (previous_context_len < history_len ||
-        previous_context.size() < (size_t)previous_context_len * (size_t)n_embd ||
-        text_cond.size() < (size_t)text_len * (size_t)n_embd) {
-        fprintf(
-            stderr, "longform history context cache is too short: need %d token(s), have %d\n",
-            history_len, previous_context_len);
-        return false;
-    }
-
-    const float* src =
-        previous_context.data() + (size_t)(previous_context_len - history_len) * (size_t)n_embd;
-    std::copy(src, src + (size_t)history_len * (size_t)n_embd, text_cond.data());
-    return true;
 }
 
 static std::vector<std::vector<int32_t>>
@@ -1389,13 +1363,17 @@ stream_magpie_to_audio(
         chunk_prefetch.collect_alignment = speculative.shouldCollect(h, 0, text_len);
         chunk_prefetch.alignment.clear();
         chunk_prefetch.ok = false;
-        std::vector<float> history_context = history_text_context;
-        const int history_context_len = history_text_context_len;
+        // The window splices only its history_len newest rows, so do not copy the whole cache.
+        std::vector<float> history_context = longform_history_context_tail(
+            history_text_context, history_text_context_len, history_len, h.n_embd);
+        const int history_context_len = (int)(history_context.size() / (size_t)h.n_embd);
         const int current_len = (int)next_tokens.size();
         const int speaker = params.speaker;
         const int threads = params.threads;
-        chunk_prefetch.thread = std::thread([&, window, history_context, history_context_len,
-                                             current_len, text_len, speaker, threads]() {
+        chunk_prefetch.thread = std::thread([&, window,
+                                             history_context = std::move(history_context),
+                                             history_context_len, current_len, text_len, speaker,
+                                             threads]() {
             const ggml_nvtx::range nvtx_range("magpietts_stream_chunk_prefetch");
             MagpieStreamingWorkspace& ws = workspace;
             // pinned staging sized once for the widest window (cudaMallocHost holds the driver
@@ -1587,8 +1565,12 @@ stream_magpie_to_audio(
                             0, text_cond.size() * sizeof(float));
                     }
                 }
-                history_text_context = text_cond;
-                history_text_context_len = text_len;
+                // A window's history never exceeds n_ctx - 1 tokens, so n_ctx rows always suffice.
+                if (!append_longform_history_context(
+                        history_text_context, history_text_context_len, text_cond, text_len,
+                        (int)current_tokens.size(), h.n_embd, h.n_ctx)) {
+                    return cancel_worker();
+                }
             }
             metrics.encoder_ms += (double)(ggml_time_us() - encoder_start_us) / 1000.0;
 
