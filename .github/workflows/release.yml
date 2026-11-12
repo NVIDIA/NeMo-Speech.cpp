@@ -428,10 +428,11 @@ jobs:
         run: scripts\windows\install-build-prerequisites.ps1 -Install vulkan
 
       - name: Install the CUDA toolkit
+        # CUDA 12, as the Linux x86_64 archive: it runs on drivers 525 and newer, CUDA 13 needs 580.
         if: matrix.backend == 'cuda' && matrix.arch == 'x64'
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
-          cuda: "13.0.0"
+          cuda: "12.8.1"
           method: network
 
       - name: Install the CUDA toolkit with Windows ARM64 targets

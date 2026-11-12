@@ -33,6 +33,7 @@ runtime version, compiled capabilities, backend devices, and driver status.
 | Automatic model download is unavailable | `doctor --json` `model_download` field; `curl --version` | Install `curl` and ensure it is on `PATH`, or use an existing local model. |
 | Missing companion model | command error | Download the reported component and pass it explicitly or set it in YAML. |
 | GPU requested but unavailable | `doctor --json` devices | Install the matching backend build/driver or use `--device cpu`. |
+| CUDA fails to initialize (`ggml_cuda_init: failed to initialize CUDA`) | `doctor` CUDA build and driver versions | Update the NVIDIA driver to one that supports the build's CUDA version, or use the Vulkan or CPU build. |
 | Server exits before listening | server stderr | Correct the reported model/component path or compatibility error. |
 | HTTP 401 | request `Authorization` header | Send `Authorization: Bearer $NEMO_SPEECH_HTTP_API_KEY`. |
 | HTTP 413 | upload size | Raise `--max-upload-mb` intentionally or split the input. |
