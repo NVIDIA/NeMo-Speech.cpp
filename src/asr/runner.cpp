@@ -632,8 +632,18 @@ OfflineRunner::OfflineRunner(
 // cross the positional-encoding budget; the exact length is always safe.
 size_t
 OfflineRunner::max_offline_samples_() const {
+    static const int max_sec = [] {
+        if (const char* s = std::getenv("NEMO_SPEECH_MAX_OFFLINE_SEC")) {
+            const int v = std::atoi(s);
+            if (v > 0)
+                return v;
+        }
+        return 90;
+    }();
+    const size_t vram_cap =
+        static_cast<size_t>(max_sec) * static_cast<size_t>(model_->sample_rate());
     if (!exceeds_offline_position_limit(*model_, audio_.size(), model_->sample_rate()))
-        return audio_.size();
+        return std::min(audio_.size(), vram_cap);
     size_t lo = static_cast<size_t>(model_->sample_rate());
     size_t hi = audio_.size();
     while (hi - lo > static_cast<size_t>(model_->fe().hop_length())) {
@@ -643,7 +653,7 @@ OfflineRunner::max_offline_samples_() const {
         else
             lo = mid;
     }
-    return lo;
+    return std::min(lo, vram_cap);
 }
 
 // Center of the quietest 100 ms window in [target - search_span, target], so
