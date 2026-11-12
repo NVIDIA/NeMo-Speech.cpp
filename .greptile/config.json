@@ -1,0 +1,138 @@
+{
+  "effort": "plus",
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "autoReview": ["open", "push", "rebase"],
+  "instructions": "Apply every section of REVIEW.md, in its priority order. REVIEW.md also describes the project. Read past the diff: the full function, its callers, its sibling paths, and each patches/*.patch that touches the same struct or API. Report only reachable problems, with the scenario, the file and line, and the fix. If a change makes unchanged code run more often or in new conditions, check that code and anchor the comment on the changed line. Do not comment on formatting, naming, or anything that pre-commit checks.",
+  "context": {
+    "repos": ["ggml-org/llama.cpp"]
+  },
+  "rules": [
+    {
+      "id": "correctness-and-edge-cases",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py",
+        "scripts/**",
+        ".github/workflows/**"
+      ],
+      "severity": "high",
+      "rule": "Look for wrong results, crashes, memory errors, races, integer or buffer overflows, and uninitialized or stale state. Check edge cases: empty or very short input, boundary sizes, partial tiles, batches or chunks, masked or multi-sequence state, and numerical instability. Fallback paths must give results consistent with fast paths, and streaming results must not depend on chunk size unless documented."
+    },
+    {
+      "id": "cross-layer-state-and-siblings",
+      "scope": [
+        "src/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py"
+      ],
+      "severity": "high",
+      "rule": "Trace added or modified state (counters, timestamps, caches, flags, buffers, backend handles) across all readers, writers, fallback/error paths, concurrent sessions/threads sharing a physical device, and callers that borrow underlying streams, graphs, or buffers directly and bypass wrapper entrypoints. Distinguish per-request, per-backend, and device- or process-wide state, and update related shared fields atomically. Check parallel/sibling paths (paired model stages, fast path vs fallback, streaming vs offline, HTTP vs gRPC, converter vs C++ loader) for symmetric fixes."
+    },
+    {
+      "id": "preconditions-before-side-effects",
+      "scope": [
+        "src/**",
+        "server/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py",
+        "clients/**"
+      ],
+      "severity": "high",
+      "rule": "Checks that can reject a request, model, or fast path (input/upload limits, shapes, data/quantization types, hardware limits and capabilities) must run BEFORE side-effectful setup such as allocations, full-input decoding, weight repacking/conversion, file writes, or global/device-wide settings. If they run later, the rejected path must undo every side effect."
+    },
+    {
+      "id": "no-runtime-process-aborts",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**"
+      ],
+      "severity": "high",
+      "rule": "CUDA_CHECK, GGML_ASSERT, GGML_ABORT, abort, and uncaught exceptions across C/thread boundaries terminate the process. Flag any new or newly-reachable runtime path where recoverable failures (OOM including mid-run iGPU/UMA shared-memory pressure, failed runtime compilation/instantiation, bad client input, missing files) abort instead of falling back or returning an error. On recovery paths, ensure thread-local sticky backend errors (e.g. cudaGetLastError()) are cleared."
+    },
+    {
+      "id": "patch-series-and-unpatched-builds",
+      "scope": [
+        "patches/**",
+        "src/**",
+        "server/**",
+        "include/**",
+        "cmake/**",
+        "CMakeLists.txt"
+      ],
+      "severity": "high",
+      "rule": "Files in patches/ stack in patches/series order on top of the pinned llama.cpp submodule. Check interactions with other patches/*.patch touching the same ggml/llama structs or functions, verify op supports_op preconditions match kernel capabilities, and ensure -DNEMO_SPEECH_GGML_PATCHED=OFF builds (Metal/Vulkan presets) remain valid."
+    },
+    {
+      "id": "hot-path-performance",
+      "scope": [
+        "src/**",
+        "server/**",
+        "patches/**"
+      ],
+      "severity": "medium",
+      "rule": "Flag hot-path regressions: added host-device or cross-thread synchronization, per-chunk/per-step allocations, redundant conversions or repacks, extra host-device or cross-backend copies, silent CPU fallbacks, caches that fail to hit or invalidate en masse, and locks or waits that serialize previously parallel work."
+    },
+    {
+      "id": "portability-packaging-and-c-abi",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "scripts/**",
+        "docker/**",
+        ".github/workflows/**",
+        "CMakeLists.txt",
+        "**/CMakeLists.txt",
+        "cmake/**"
+      ],
+      "severity": "high",
+      "rule": "Query hardware limits and architecture features at runtime with a working fallback across discrete GPUs, iGPU/UMA platforms (DGX Spark, RTX Spark, Jetson, Apple Silicon), and CPU-only hosts on x86_64 and arm64. Keep include/nemo_speech/*.h binary-compatible for dlopen C callers, keep builds portable across GCC, Clang, Apple Clang, and MSVC, and keep Linux/macOS/Windows release archives self-contained."
+    },
+    {
+      "id": "reuse-and-maintainability",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py",
+        "scripts/**"
+      ],
+      "severity": "medium",
+      "rule": "Flag new code that duplicates an existing helper (check src/common/ and src/runtime/ggml/) or that copies a block with small edits, and name the helper or the copy. Flag a constant, default, limit or environment variable defined in more than one place, platform or backend branches spread across call sites, code, flags or options that the change makes unused, and unnamed or unexplained constants. Comment only when you can point to the code."
+    },
+    {
+      "id": "docs-and-benchmarks-sync",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "patches/**",
+        "conversion/**",
+        "scripts/**",
+        "docs/**",
+        "README.md",
+        "BENCHMARK.md"
+      ],
+      "severity": "medium",
+      "rule": "Verify benchmark methodology and ensure documented numbers, environment variables, defaults, API payloads, and CLI flags in docs/, README.md, and BENCHMARK.md match the implementation."
+    }
+  ]
+}

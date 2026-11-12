@@ -9,6 +9,9 @@ reviews:
   # description. (high_level_summary: false would disable it entirely.)
   high_level_summary: true
   high_level_summary_in_walkthrough: true
+  # Show applied guidelines, path instructions, and any suppressed comments in the
+  # walkthrough's collapsible details block so reviewers can audit bot coverage.
+  review_details: true
   auto_review:
     enabled: true
     auto_incremental_review: true
@@ -19,20 +22,65 @@ reviews:
   path_instructions:
     - path: "**/*.{cu,cuh,cpp,c,h,hpp}"
       instructions: |
-        Prioritize correctness, performance and portability:
-        - Correctness: races, uninitialized or stale state, edge cases (empty, masked,
-          boundary sizes), numerical stability, and fallback paths that differ from the fast
-          path.
-        - Performance: regressions on hot paths, redundant work, unnecessary allocations or
-          synchronization, and caches or reuse that do not actually take effect.
-        - Portability: assumptions tied to one GPU, architecture, backend or platform; hardware
-          limits must be queried or guarded, with a working fallback.
+        Apply every section of REVIEW.md, in its priority order. Read the full enclosing
+        function, its callers and its sibling paths before you conclude. Cover each of these:
+        - Correctness: wrong results, memory errors, races, stale state, edge cases (empty or
+          short input, boundary sizes, partial chunks), numerical stability, and fallback
+          paths that differ from the fast path.
+        - State: every reader and writer of added or changed state, on fallback, error and
+          concurrent paths, and callers that use underlying handles directly.
+        - Order: checks that can reject a path run before setup with side effects, or the
+          rejected path undoes them. Sibling implementations use the same order.
+        - Failures at run time: recoverable failures fall back or return an error. They do
+          not reach CUDA_CHECK, GGML_ASSERT or GGML_ABORT.
+        - Performance: regressions on hot paths (synchronization, allocations, copies, CPU
+          fallbacks, caches that do not take effect).
+        - Portability: assumptions tied to one GPU, memory model, architecture, backend, OS
+          or compiler. Hardware limits are queried, with a working fallback.
+        - Reuse: new code that duplicates an existing helper or copies a block, and code,
+          flags or options that the change makes unused. Name the helper or the copy.
+        If a change makes unchanged code run more often or in new conditions, check that code
+        and attach the finding to the changed line.
     - path: "patches/**"
       instructions: |
-        Patches to the pinned llama.cpp submodule. Apply the same correctness, performance and
-        portability checks; also check that op preconditions match what the kernels support
-        and that the patch series stays consistent.
+        Files in patches/ modify llama.cpp and ggml at the pinned llama.cpp submodule commit,
+        stacked in patches/series order. Do not review hunks in isolation:
+        1. Read the full target function and struct in llama.cpp/<file>. If the submodule
+           checkout is empty, read the file from the linked ggml-org/llama.cpp repository.
+           The pinned commit is the one that `git ls-tree HEAD llama.cpp` prints.
+        2. Search all other patches/*.patch files for earlier/later patches touching the same
+           file, struct, or custom interop API.
+        3. Search src/, server/, and include/ for every caller (including callers that borrow
+           underlying handles directly) and verify -DNEMO_SPEECH_GGML_PATCHED=OFF builds
+           remain intact.
+        Apply the same correctness, concurrency, runtime-abort survival, op supports_op
+        precondition, and hardware fallback checks as first-party C++/CUDA code.
+    - path: "include/nemo_speech/**"
+      instructions: |
+        Public dlopen-compatible C ABI. Flag struct field reordering, unguarded struct size
+        changes, or signature changes that break binary compatibility for existing C callers.
+    - path: "{conversion/**,convert_model.py,clients/**}"
+      instructions: |
+        Verify GGUF tensor names, shapes, quantization layouts, and metadata keys stay in sync
+        with C++ model loaders, validate inputs before expensive work, and preserve CLI/client
+        behavior across edge cases (e.g., zero/falsy numeric arguments, missing optional files).
+    - path: "{CMakeLists.txt,**/CMakeLists.txt,cmake/**,scripts/**,docker/**,.github/workflows/**}"
+      instructions: |
+        Verify portability across Linux, macOS, and Windows on both x86_64 and arm64, discrete
+        GPUs and iGPU/UMA platforms (DGX Spark, RTX Spark, Jetson, Apple Silicon), and keep
+        prebuilt release archives self-contained.
     - path: "{BENCHMARK.md,README.md,docs/**,app/bench*}"
       instructions: |
-        Check that measurements are sound and that documented numbers, defaults and flags match
-        the code.
+        Check that measurements are sound and that documented numbers, environment variables,
+        defaults, API payloads, and CLI flags match the code in src/, server/, and patches/.
+
+knowledge_base:
+  # Shared review rules for CodeRabbit, Greptile, and human reviewers.
+  code_guidelines:
+    filePatterns:
+      - "REVIEW.md"
+  # patches/ changes llama.cpp and ggml from this repository. The submodule can be empty in a
+  # review checkout, so the bot needs this link to see the code that a patch changes.
+  linked_repositories:
+    - repository: "ggml-org/llama.cpp"
+      instructions: "Upstream of the llama.cpp submodule. Files in patches/ change llama.cpp and ggml from this repository at a pinned commit."

@@ -55,6 +55,8 @@ index 31cd00f77816fe6f5ffdda0428289e2aa1a25f9b..40b1b496b011eb4f85c35af3d1c29d22
   work with `Co-authored-by:` lines after it.
 - `series` lists the files in apply order. A patch file that `series` does not
   list, or a listed file that does not exist, fails the build and the check.
+- `.greptile/` holds review-bot rules for this directory. It is not part of
+  the series, and the build and the check ignore it.
 
 Don't edit patch files by hand. Change the commits and run `export`: CI runs
 `scripts/llama-patches.sh check`, which fails when the files differ from what

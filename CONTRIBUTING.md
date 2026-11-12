@@ -21,8 +21,9 @@ Pull requests that don't follow these guidelines may be closed without review.
 ### Automated review
 
 The project uses AI tools too: CodeRabbit and Greptile review every pull
-request, configured in [`.coderabbit.yaml`](.coderabbit.yaml) and
-[`greptile.json`](greptile.json). Their comments are suggestions; a maintainer
+request, configured in [`.coderabbit.yaml`](.coderabbit.yaml),
+[`.greptile/`](.greptile/config.json) and [`REVIEW.md`](REVIEW.md). Their
+comments are suggestions; a maintainer
 decides what must change before merging. Fix the findings that are valid, and
 reply briefly to the ones that are not so reviewers can see why. The rules above
 apply to those replies as well.
