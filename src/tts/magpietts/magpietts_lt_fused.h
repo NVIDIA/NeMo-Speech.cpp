@@ -43,7 +43,8 @@ struct magpietts_lt_fused_weights {
     const float* const* out_b = nullptr;  // n_rounds [vocab] F32 (may contain nullptrs)
 };
 
-// Returns nullptr (with error text) when the weight layout is unsupported.
+// Returns nullptr and the error text if the weight layout is not supported or the GPU cannot run
+// the persistent chain.
 magpietts_lt_fused* magpietts_lt_fused_create(
     const magpietts_lt_fused_weights& weights, char* error, size_t error_size);
 void magpietts_lt_fused_free(magpietts_lt_fused* fused);
@@ -88,7 +89,7 @@ bool magpietts_lt_fused_sampling_supported(const magpietts_lt_fused* fused);
 // exact top-k sampling per codebook) in a single kernel launch with software grid barriers.
 // Requires planar Q8 weights for every projection and an in-kernel sampler (top_k <= 256).
 bool magpietts_lt_fused_chain_supported(const magpietts_lt_fused* fused);
-// Why the chain is unsupported (for the log); empty when it is supported.
+// The reason the chain cannot run, for the log. Empty if it can run.
 const char* magpietts_lt_fused_chain_unsupported_reason(const magpietts_lt_fused* fused);
 // Print and reset the per-phase timing of -DLTF_CHAIN_TIMING builds (no-op otherwise).
 void magpietts_lt_fused_timing_report();

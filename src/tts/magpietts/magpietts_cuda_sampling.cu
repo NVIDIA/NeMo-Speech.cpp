@@ -60,12 +60,9 @@ magpietts_cuda_device_is_uma(void) {
     return prop.integrated != 0 && prop.unifiedAddressing != 0;
 }
 
-// On Jetson Thor, replaying an executable after the GPU power-gated while it sat idle can fault the
-// compute scheduler or sample wrong codes, while a fresh instantiation of the same graph is
-// unaffected. Like ggml-cuda's CUDA graphs (patches/ggml-cuda-re-instantiate-cuda-graphs-that-sat-
-// idle-on-integrated-gpus.patch), the composed sequence is instantiated again when it was not
-// launched for GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS (default 250 ms on integrated GPUs, off on
-// discrete GPUs; 0 disables).
+// On Jetson Thor, a graph that ran before the GPU was idle can fault or give wrong codes. A new
+// instance of the graph is correct. Instantiate the sequence again if it did not run for
+// GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS (default 250 ms on integrated GPUs, off on discrete GPUs).
 static int64_t
 sequence_reinstantiate_after_us() {
     static const int64_t after_us = [] {
@@ -659,8 +656,7 @@ magpietts_cuda_sampler_sequence_launch(
         const cudaError_t inst_err = cudaGraphInstantiate(
             &sampler->sequence_exec, sampler->sequence_graph, nullptr, nullptr, 0);
         if (inst_err != cudaSuccess) {
-            // Clear the error so later launches do not report it, and drop the composed graph so
-            // the caller runs this frame on the async chain and the next frame builds a new one.
+            // Clear the error. Remove the composed graph: the caller uses the async chain.
             (void)cudaGetLastError();
             sampler->sequence_exec = nullptr;
             magpietts_cuda_sampler_sequence_reset(sampler);

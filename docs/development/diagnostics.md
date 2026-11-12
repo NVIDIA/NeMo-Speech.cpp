@@ -22,7 +22,7 @@ are deprecated spellings of `NEMO_SPEECH_BUILD_NMT` and `NEMO_SPEECH_BUILD_GRPC`
 | Variable | Default | Effect |
 |---|---|---|
 | `GGML_CUDA_GRAPH_EVICT_AFTER_MS` | `10000`; `0` once a server loads TTS, and for VoiceChat | Drop CUDA graphs idle for this long; `0` keeps them. Read when a CUDA backend is created. |
-| `GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS` | `250` on integrated GPUs, `0` on discrete GPUs | Instantiate a cached CUDA graph again before replaying it when it was not launched for this long; `0` replays it as is. Works around Jetson Thor executables that fault (Xid 13) or compute wrong results after the GPU power-gates while idle. Also applies to the MagpieTTS composed sampling graph. |
+| `GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS` | `250` on integrated GPUs, `0` on discrete GPUs | After this long without ggml work on the GPU, instantiate cached CUDA graphs again before they run. Prevents Jetson Thor faults (Xid 13) and wrong results after idle power gating. `0` turns it off. |
 | `GGML_SKINNY_Q8=0` | enabled | Disable the skinny Q8_0 GEMM for block Q8_0 weights. Planar Q8 weights always use it. |
 | `GGML_SKINNY_Q8_INPLACE=0` | in place; `0` when ASR and NMT share a process | Keep repacked skinny-Q8 weights in a separate buffer. |
 

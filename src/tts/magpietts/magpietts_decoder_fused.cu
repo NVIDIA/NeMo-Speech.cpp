@@ -653,8 +653,7 @@ magpietts_decoder_fused_create(
         return nullptr;
     }
     const int E = w.n_embd, NFF = w.n_ff, CD = w.cross_dim;
-    // Check the GPU before the weights, so a GPU that cannot run the kernel (Jetson Thor has 20
-    // SMs) reports that instead of asking for a q8_0 model that would not help.
+    // Check the GPU first. On a GPU with too few SMs, a q8_0 model does not help.
     int device = 0, sms = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
@@ -684,8 +683,7 @@ magpietts_decoder_fused_create(
                    reinterpret_cast<const void*>(df_kernel<ltf_chain_tier_small>), sms, fits)) {
         grid = ltf_chain_tier_small::grid;
     } else {
-        // Below the smallest tier's SM count only a larger GPU helps; above it, the model's shape
-        // or the kernel's shared memory and occupancy ruled every tier out.
+        // Below min_sms, only a larger GPU helps. Above it, the model shape or GPU resources fail.
         const int min_sms = ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM;
         char msg[128];
         if (sms < min_sms)

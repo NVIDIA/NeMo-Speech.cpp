@@ -58,7 +58,7 @@ struct magpietts_lt_fused {
     // persistent chain kernel (all rounds in one launch)
     unsigned int* barrier = nullptr;  // monotonic grid-barrier counter (reset before each launch)
     int chain_grid = 0;               // blocks (0 = chain unsupported)
-    char chain_reason[128] = {};      // why the chain is unsupported (empty when supported)
+    char chain_reason[128] = {};      // why the chain cannot run (empty if it can)
     bool prefetch_out = false;
     void* arena = nullptr;  // single allocation holding every scratch buffer (L2 access window)
     size_t arena_bytes = 0;
@@ -887,29 +887,25 @@ ltf_type_ok(int t) {
     return t == LTF_TYPE_F16 || t == LTF_TYPE_Q8_0;
 }
 
-// Decide whether the persistent chain kernel applies: shapes within the kernel's static limits,
-// small vocab for the in-kernel sampler, every block co-resident, and all weights planar Q8.
-// Records the reason in f->chain_reason when it does not.
-static void
-ltf_chain_setup(magpietts_lt_fused* f) {
-    f->chain_grid = 0;
-    const magpietts_lt_fused_weights& w = f->w;
-    auto unsupported = [f](const char* msg) {
-        snprintf(f->chain_reason, sizeof(f->chain_reason), "fused CUDA chain: %s", msg);
+// Returns the chain grid for this model and GPU, or 0 and the reason. Uses only the weight shapes
+// and types, so create() calls it before the repack.
+static int
+ltf_chain_select(const magpietts_lt_fused_weights& w, char* reason, size_t reason_size) {
+    auto unsupported = [&](const char* msg) {
+        snprintf(reason, reason_size, "fused CUDA chain: %s", msg);
+        return 0;
     };
     const int K = w.n_embd;
     // Kernel limits (R=4 tiles need MB=1, ff2 tiles MB<=3) and the in-kernel sampler's vocab.
     if (w.n_layers > LTF_MAX_LAYERS || w.n_rounds > LTF_MAX_ROUNDS ||
         w.vocab > MAGPIETTS_CUDA_SMALL_VOCAB || (K >> 5) > 32 || (w.n_ff >> 5) > 96) {
-        unsupported("unsupported shape");
-        return;
+        return unsupported("unsupported shape");
     }
     int device = 0, sms = 0;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
         (void)cudaGetLastError();
-        unsupported("device query failed");
-        return;
+        return unsupported("device query failed");
     }
     auto fits = [&](auto tier) {
         using Tier = decltype(tier);
@@ -926,9 +922,7 @@ ltf_chain_setup(magpietts_lt_fused* f) {
                w.n_ff % grid == 0 && (w.n_ff / grid) % 16 == 0 && K % grid == 0 &&
                (K / grid) % 4 == 0 && K / w.n_head == 64;
     };
-    // Check the GPU before the weight types, so a GPU that cannot run the chain (Jetson Thor has
-    // 20 SMs) reports that instead of asking for a q8_0 model that would not help. Without a
-    // fitting tier the per-round path runs.
+    // Check the GPU first. On a GPU with too few SMs, a q8_0 model does not help.
     int grid = 0;
     if (ltf_chain_tier_usable<ltf_chain_tier_large>(
             reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_large>), sms, fits)) {
@@ -938,8 +932,7 @@ ltf_chain_setup(magpietts_lt_fused* f) {
                    fits)) {
         grid = ltf_chain_tier_small::grid;
     } else {
-        // Below the smallest tier's SM count only a larger GPU helps; above it, the model's shape
-        // or the kernel's shared memory and occupancy ruled every tier out.
+        // Below min_sms, only a larger GPU helps. Above it, the model shape or GPU resources fail.
         const int min_sms = ltf_chain_tier_small::grid / LTF_CHAIN_BLOCKS_PER_SM;
         char msg[96];
         if (sms < min_sms)
@@ -947,22 +940,39 @@ ltf_chain_setup(magpietts_lt_fused* f) {
         else
             snprintf(
                 msg, sizeof(msg), "no persistent tier fits this model on this GPU (%d SMs)", sms);
-        unsupported(msg);
-        return;
+        return unsupported(msg);
     }
     bool q8 = w.out_type == LTF_TYPE_Q8_0;
-    for (const ltf_layer& L : f->layers)
+    for (int i = 0; i < w.n_layers; ++i) {
+        const magpietts_lt_fused_layer_weights& L = w.layers[i];
         q8 = q8 && L.qkv_type == LTF_TYPE_Q8_0 && L.o_type == LTF_TYPE_Q8_0 &&
              L.ff1_type == LTF_TYPE_Q8_0 && L.ff2_type == LTF_TYPE_Q8_0;
-    if (!q8) {
-        unsupported("needs a q8_0 model; convert with --outtype q8_0");
-        return;
     }
+    if (!q8)
+        return unsupported("needs a q8_0 model; convert with --outtype q8_0");
+    return grid;
+}
+
+// Enables the chain after the repack and sets its L2 window. Writes the reason to f->chain_reason
+// if it cannot.
+static void
+ltf_chain_setup(magpietts_lt_fused* f, int grid) {
+    f->chain_grid = 0;
+    const magpietts_lt_fused_weights& w = f->w;
+    const int K = w.n_embd;
     for (int i = 0; i < w.n_layers; ++i) {
         if (!f->layers[i].qkv_c || !f->layers[i].ff1_c) {
-            unsupported("missing LayerNorm fold constants");
+            snprintf(
+                f->chain_reason, sizeof(f->chain_reason),
+                "fused CUDA chain: missing LayerNorm fold constants");
             return;
         }
+    }
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        snprintf(f->chain_reason, sizeof(f->chain_reason), "fused CUDA chain: device query failed");
+        return;
     }
     f->chain_grid = grid;
     {
@@ -1027,6 +1037,13 @@ magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size
                 error, error_size, "fused local transformer: missing per-codebook tensors");
             return nullptr;
         }
+    }
+    // The fused path is useful only with the chain. Check it before the repack and allocations.
+    char reason[128] = {};
+    const int chain_grid = ltf_chain_select(w, reason, sizeof(reason));
+    if (chain_grid == 0) {
+        ltf_set_error(error, error_size, reason);
+        return nullptr;
     }
     magpietts_lt_fused* f = new magpietts_lt_fused;
     f->w = w;
@@ -1128,7 +1145,7 @@ magpietts_lt_fused_create(const magpietts_lt_fused_weights& w, char* error, size
         magpietts_lt_fused_free(f);
         return nullptr;
     }
-    ltf_chain_setup(f);
+    ltf_chain_setup(f, chain_grid);
     if (error && error_size)
         error[0] = '\0';
     return f;
