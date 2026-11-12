@@ -13,6 +13,8 @@
       "scope": [
         "src/**",
         "app/**",
+        "tools/**",
+        "examples/**",
         "server/**",
         "include/**",
         "patches/**",
@@ -28,6 +30,7 @@
       "id": "cross-layer-state-and-siblings",
       "scope": [
         "src/**",
+        "app/**",
         "server/**",
         "include/**",
         "patches/**",
@@ -41,6 +44,7 @@
       "id": "preconditions-before-side-effects",
       "scope": [
         "src/**",
+        "app/**",
         "server/**",
         "patches/**",
         "conversion/**",
@@ -70,10 +74,11 @@
         "server/**",
         "include/**",
         "cmake/**",
-        "CMakeLists.txt"
+        "CMakeLists.txt",
+        "CMakePresets.json"
       ],
       "severity": "high",
-      "rule": "For a patch in patches/, report a conflict with another patch that touches the same struct or function, a supports_op check that accepts a case that the kernel does not handle, and code that uses a patched op or API outside a NEMO_SPEECH_GGML_PATCHED guard."
+      "rule": "For a patch in patches/, report a conflict with another patch that touches the same struct or function, a supports_op check that accepts a case that the kernel does not handle, and code that uses a patched op or API outside a NEMO_SPEECH_GGML_PATCHED guard. Report a preset in CMakePresets.json that sets NEMO_SPEECH_GGML_PATCHED to the wrong value for its backend: ON for cpu-* and cuda-*, OFF for metal-* and vulkan-*."
     },
     {
       "id": "hot-path-performance",
@@ -90,6 +95,8 @@
       "scope": [
         "src/**",
         "app/**",
+        "tools/**",
+        "examples/**",
         "server/**",
         "include/**",
         "patches/**",
@@ -98,10 +105,12 @@
         ".github/workflows/**",
         "CMakeLists.txt",
         "**/CMakeLists.txt",
-        "cmake/**"
+        "cmake/**",
+        "CMakePresets.json",
+        "vcpkg.json"
       ],
       "severity": "high",
-      "rule": "Report a hardware limit or feature that the code assumes and does not query, a fast path with no fallback, compiler-specific code without an MSVC path, a runtime dependency that release archives do not bundle, and a change to include/nemo_speech/*.h that breaks binary compatibility."
+      "rule": "Report a hardware limit or feature that the code assumes and does not query, a fast path with no fallback, compiler-specific code without an MSVC path, and a runtime dependency that release archives do not bundle. Report a change to include/nemo_speech/*.h that breaks binary compatibility, and a change to a src/*/c_api.map linker script that stops the export of a public nemo_speech_* symbol or exports internal symbols."
     },
     {
       "id": "reuse-and-maintainability",

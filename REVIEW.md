@@ -46,9 +46,10 @@ Most missed bugs sit outside the changed hunks.
 
 - Look for assumptions tied to one GPU architecture, SM count, memory model (discrete vs. iGPU/UMA), CPU ISA (`x86_64` vs. `arm64`), backend, OS or compiler.
 - Report a hardware limit or architecture feature that the code assumes and does not query at run time, an architecture-specific instruction or kernel without a guard, and a fast path with no working fallback.
-- Unpatched builds (`-DNEMO_SPEECH_GGML_PATCHED=OFF`, the `metal-*` and `vulkan-*` presets) compile without `patches/`. Report code that uses a patched op or API outside a `NEMO_SPEECH_GGML_PATCHED` guard.
+- Unpatched builds (`-DNEMO_SPEECH_GGML_PATCHED=OFF`, the `metal-*` and `vulkan-*` presets) compile without `patches/`. Report code that uses a patched op or API outside a `NEMO_SPEECH_GGML_PATCHED` guard, and a preset in `CMakePresets.json` that sets the option to the wrong value for its backend.
 - Report a GGUF tensor name, shape, quantization layout or metadata key that the change alters in the Python converters (`conversion/`, `convert_model.py`) or in the C++ loaders, but not in both.
 - Public headers in `include/nemo_speech/*.h` define a `dlopen`-compatible C ABI. Report a reordered struct field, an unguarded struct size change, or a changed signature.
+- The `c_api.map` linker scripts in `src/` set which symbols the C ABI libraries export. Report a change that stops the export of a public `nemo_speech_*` symbol or that exports internal symbols.
 - Report compiler-specific code (extensions, attributes or builtins) without a path for GCC, Clang, Apple Clang and MSVC, and a new runtime dependency that the Linux, macOS and Windows release archives do not bundle.
 
 ## Maintainability and reuse
@@ -65,6 +66,7 @@ Give a maintainability comment only when you can point to the code: the helper t
 
 - Each `.patch` file in `patches/` modifies `llama.cpp` or `ggml` at the pinned commit of the `llama.cpp` submodule, applied in `patches/series` order. Review the patched code as compiled source code, not plain diff text.
 - Inspect the full target function and struct in `llama.cpp/`, search all other `patches/*.patch` files in `patches/series` that touch the same file, struct or API, and check every caller in `src/`, `server/` and `include/`.
+- If the `llama.cpp/` checkout is empty, fetch `https://raw.githubusercontent.com/ggml-org/llama.cpp/<pin>/<file>`, where `<pin>` is the commit that the `llama.cpp` submodule points to (`git ls-tree HEAD llama.cpp` prints it). If that fails, use the context lines of the patch and the earlier patches that change the same function.
 - Report an op whose `supports_op` or dispatch check accepts a case that the kernel does not handle.
 
 ## Docs and benchmarks
