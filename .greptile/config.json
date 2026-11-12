@@ -1,0 +1,147 @@
+{
+  "effort": "plus",
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "autoReview": ["open", "push", "rebase"],
+  "instructions": "Apply every section of REVIEW.md, in its priority order. REVIEW.md also describes the project. Read past the diff: the full function, its callers, its sibling paths, and each patches/*.patch that touches the same struct or API. Report only reachable problems, with the scenario, the file and line, and the fix. State a defect or say nothing: do not ask the author to verify or consider something. If a change makes unchanged code run more often or in new conditions, check that code and anchor the comment on the changed line. Do not comment on formatting, naming, or anything that pre-commit checks.",
+  "context": {
+    "repos": ["ggml-org/llama.cpp"]
+  },
+  "rules": [
+    {
+      "id": "correctness-and-edge-cases",
+      "scope": [
+        "src/**",
+        "app/**",
+        "tools/**",
+        "examples/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py",
+        "scripts/**",
+        ".github/workflows/**"
+      ],
+      "severity": "high",
+      "rule": "Report wrong results, crashes, memory errors, races, overflows and stale state, including on edge cases: empty or very short input, boundary sizes, partial chunks, and multi-sequence state. See 'Correctness and concurrency' in REVIEW.md."
+    },
+    {
+      "id": "cross-layer-state-and-siblings",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py"
+      ],
+      "severity": "high",
+      "rule": "When a change adds or updates state, report a path that reads, writes or borrows it and leaves it wrong: fallbacks, error paths, concurrent sessions, and callers that use underlying handles directly. Report a sibling path that keeps the bug. See 'Look past the diff' in REVIEW.md."
+    },
+    {
+      "id": "preconditions-before-side-effects",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py",
+        "clients/**"
+      ],
+      "severity": "high",
+      "rule": "Report a check that can reject a request, model or fast path and that runs after setup with side effects (allocations, decoding, weight conversion, file writes, global or device-wide settings) that the rejected path does not undo."
+    },
+    {
+      "id": "no-runtime-process-aborts",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**"
+      ],
+      "severity": "high",
+      "rule": "Report a new or newly reachable path where a recoverable failure (out of memory, failed runtime instantiation, bad client input, a missing file) reaches CUDA_CHECK, GGML_ASSERT, GGML_ABORT, abort or an uncaught exception. Report a recovery path that leaves a sticky backend error such as cudaGetLastError() set."
+    },
+    {
+      "id": "patch-series-and-unpatched-builds",
+      "scope": [
+        "patches/**",
+        "src/**",
+        "server/**",
+        "include/**",
+        "cmake/**",
+        "CMakeLists.txt",
+        "CMakePresets.json"
+      ],
+      "severity": "high",
+      "rule": "For a patch in patches/, report a conflict with another patch that touches the same struct or function, a supports_op check that accepts a case that the kernel does not handle, and code that uses a patched op or API outside a NEMO_SPEECH_GGML_PATCHED guard. Report a preset in CMakePresets.json that sets NEMO_SPEECH_GGML_PATCHED to the wrong value for its backend: ON for cpu-* and cuda-*, OFF for metal-* and vulkan-*."
+    },
+    {
+      "id": "hot-path-performance",
+      "scope": [
+        "src/**",
+        "server/**",
+        "patches/**"
+      ],
+      "severity": "medium",
+      "rule": "Report a hot-path regression: added host-device or cross-thread synchronization, allocations per chunk or step, redundant conversions or copies, a silent CPU fallback, a cache that does not hit, or a lock that serializes work that ran in parallel before."
+    },
+    {
+      "id": "portability-packaging-and-c-abi",
+      "scope": [
+        "src/**",
+        "app/**",
+        "tools/**",
+        "examples/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "scripts/**",
+        "docker/**",
+        ".github/workflows/**",
+        "CMakeLists.txt",
+        "**/CMakeLists.txt",
+        "cmake/**",
+        "CMakePresets.json",
+        "vcpkg.json"
+      ],
+      "severity": "high",
+      "rule": "Report a hardware limit or feature that the code assumes and does not query, a fast path with no fallback, compiler-specific code without an MSVC path, and a runtime dependency that release archives do not bundle. Report a change to include/nemo_speech/*.h that breaks binary compatibility, and a change to a src/*/c_api.map linker script that stops the export of a public nemo_speech_* symbol or exports internal symbols."
+    },
+    {
+      "id": "reuse-and-maintainability",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "include/**",
+        "patches/**",
+        "conversion/**",
+        "convert_model.py",
+        "scripts/**"
+      ],
+      "severity": "medium",
+      "rule": "Report new code that duplicates an existing helper (check src/common/ and src/runtime/ggml/) or copies a block, a value that the change defines in a second place, platform or backend branches spread across call sites, and code that the change makes unused. Name the helper, the copy or the unused item."
+    },
+    {
+      "id": "docs-and-benchmarks-sync",
+      "scope": [
+        "src/**",
+        "app/**",
+        "server/**",
+        "patches/**",
+        "conversion/**",
+        "scripts/**",
+        "docs/**",
+        "README.md",
+        "BENCHMARK.md"
+      ],
+      "severity": "medium",
+      "rule": "Report a documented number, environment variable, default, API payload or CLI flag that does not match the code, and a benchmark that compares unlike conditions."
+    }
+  ]
+}

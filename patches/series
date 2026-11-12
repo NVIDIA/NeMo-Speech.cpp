@@ -40,3 +40,4 @@ ggml-cuda-top-k-for-small-k-over-long-rows-without-cub.patch
 llama-dflash2-drafting-in-the-batched-serving-path.patch
 llama-mtp-verify-steps-flagged-by-the-caller.patch
 ggml-fit-q2_0-block-scales-to-the-weights-and-the-importance-matrix.patch
+ggml-cuda-re-instantiate-cuda-graphs-that-sat-idle-on-integrated-gpus.patch
