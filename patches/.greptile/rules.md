@@ -6,6 +6,6 @@ Each `.patch` file in `patches/` is a commit applied on top of the pinned `llama
 - Do not read patch hunks in isolation:
   1. Check the surrounding function and struct definitions in `llama.cpp/`.
   2. Search other `patches/*.patch` files in `patches/series` that modify the same file, struct, or custom ggml/llama API.
-  3. Check every caller in `src/`, `server/`, and `include/`. Include callers that use underlying streams, graphs, or buffers directly and bypass the normal wrapper entry points. Verify that `-DNEMO_SPEECH_GGML_PATCHED=OFF` builds still compile and work.
-- Check op `supports_op` / dispatch preconditions against kernel limits, architecture guards, and fallback paths across discrete GPUs and iGPU/UMA platforms.
+  3. Check every caller in `src/`, `server/`, and `include/`. Include callers that use underlying streams, graphs, or buffers directly and bypass the normal wrapper entry points. Report a caller that uses a patched op or API outside a `NEMO_SPEECH_GGML_PATCHED` guard, because unpatched builds do not have it.
+- Report an op whose `supports_op` or dispatch check accepts a case that the kernel does not handle, on discrete GPUs or on iGPU/UMA platforms.
 - Audit unchanged context lines whose reachability or execution frequency changes (such as process-aborting checks becoming reachable on mid-run runtime failures or OOM). Anchor any finding on the changed line in the patch that altered reachability.

@@ -12,6 +12,11 @@ reviews:
   # Show applied guidelines, path instructions, and any suppressed comments in the
   # walkthrough's collapsible details block so reviewers can audit bot coverage.
   review_details: true
+  # Keep the walkthrough to the summary and the findings.
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  suggested_labels: false
+  suggested_reviewers: false
   auto_review:
     enabled: true
     auto_incremental_review: true
@@ -40,7 +45,8 @@ reviews:
         - Reuse: new code that duplicates an existing helper or copies a block, and code,
           flags or options that the change makes unused. Name the helper or the copy.
         If a change makes unchanged code run more often or in new conditions, check that code
-        and attach the finding to the changed line.
+        and attach the finding to the changed line. Report a defect that you found. Do not ask
+        the author to verify or consider something.
     - path: "patches/**"
       instructions: |
         Files in patches/ modify llama.cpp and ggml at the pinned llama.cpp submodule commit,
@@ -51,8 +57,8 @@ reviews:
         2. Search all other patches/*.patch files for earlier/later patches touching the same
            file, struct, or custom interop API.
         3. Search src/, server/, and include/ for every caller (including callers that borrow
-           underlying handles directly) and verify -DNEMO_SPEECH_GGML_PATCHED=OFF builds
-           remain intact.
+           underlying handles directly). Report a caller that uses a patched op or API outside
+           a NEMO_SPEECH_GGML_PATCHED guard, because unpatched builds do not have it.
         Apply the same correctness, concurrency, runtime-abort survival, op supports_op
         precondition, and hardware fallback checks as first-party C++/CUDA code.
     - path: "include/nemo_speech/**"
@@ -61,18 +67,32 @@ reviews:
         changes, or signature changes that break binary compatibility for existing C callers.
     - path: "{conversion/**,convert_model.py,clients/**}"
       instructions: |
-        Verify GGUF tensor names, shapes, quantization layouts, and metadata keys stay in sync
-        with C++ model loaders, validate inputs before expensive work, and preserve CLI/client
-        behavior across edge cases (e.g., zero/falsy numeric arguments, missing optional files).
+        Report a GGUF tensor name, shape, quantization layout or metadata key that the change
+        alters on one side only (converter or C++ loader), an input that is validated after
+        expensive work, and a CLI or client behavior that breaks on an edge case (zero or
+        falsy numeric arguments, missing optional files).
     - path: "{CMakeLists.txt,**/CMakeLists.txt,cmake/**,scripts/**,docker/**,.github/workflows/**}"
       instructions: |
-        Verify portability across Linux, macOS, and Windows on both x86_64 and arm64, discrete
-        GPUs and iGPU/UMA platforms (DGX Spark, RTX Spark, Jetson, Apple Silicon), and keep
-        prebuilt release archives self-contained.
+        Report a step that works on one OS, architecture, shell or GPU type only. Targets are
+        Linux, macOS and Windows on x86_64 and arm64, with discrete GPUs and iGPU/UMA platforms
+        (DGX Spark, RTX Spark, Jetson, Apple Silicon). Report a new runtime dependency that the
+        prebuilt release archives do not bundle.
     - path: "{BENCHMARK.md,README.md,docs/**,app/bench*}"
       instructions: |
-        Check that measurements are sound and that documented numbers, environment variables,
-        defaults, API payloads, and CLI flags match the code in src/, server/, and patches/.
+        Report a documented number, environment variable, default, API payload or CLI flag
+        that does not match the code in src/, server/ and patches/, and a benchmark that
+        compares unlike conditions.
+  # REVIEW.md says not to report formatting, so the prose and Markdown linters are off.
+  tools:
+    languagetool:
+      enabled: false
+    markdownlint:
+      enabled: false
+  pre_merge_checks:
+    title:
+      mode: "off"
+    description:
+      mode: "off"
 
 knowledge_base:
   # Shared review rules for CodeRabbit, Greptile, and human reviewers.

@@ -10,6 +10,9 @@ NeMo-Speech.cpp is a C++17 speech runtime (ASR, SpeechLM, diarization, TTS, tran
 - Report only problems that the change introduces or makes reachable.
 - For each problem, name the input, configuration, backend or platform that reaches it, the concrete impact (wrong output, crash or abort, race, resource leak or waste, or latency regression), the file and line, and the fix. Do not report speculative issues without a reachable path.
 - If a change makes unchanged surrounding or called code run more often or under new runtime conditions, audit that unchanged code too and attach the comment to the changed line that altered its reachability.
+- State a defect or say nothing. Do not ask the author to verify, consider or ensure something.
+- Write one comment for each problem. If it occurs in more than one place, list the other places in the same comment.
+- Do not post praise, and do not restate what the code does.
 - Do not report formatting, naming, missing docstrings, or anything `.pre-commit-config.yaml` already checks.
 
 ## Look past the diff
@@ -42,11 +45,11 @@ Most missed bugs sit outside the changed hunks.
 ## Portability, packaging and ABI
 
 - Look for assumptions tied to one GPU architecture, SM count, memory model (discrete vs. iGPU/UMA), CPU ISA (`x86_64` vs. `arm64`), backend, OS or compiler.
-- Query hardware limits and architecture features at run time, guard architecture-specific instructions and kernels, and keep a working fallback.
-- Keep `-DNEMO_SPEECH_GGML_PATCHED=OFF` builds compiling and working (`metal-*` and `vulkan-*` presets).
-- Keep Python converters (`conversion/`, `convert_model.py`) consistent with the C++ GGUF loaders.
-- Public headers in `include/nemo_speech/*.h` define a `dlopen`-compatible C ABI: do not reorder struct fields, change struct sizes unguarded, or break existing caller signatures.
-- Code and scripts must work across GCC, Clang, Apple Clang and MSVC, and keep Linux, macOS and Windows release archives (`x86_64` and `arm64`) self-contained.
+- Report a hardware limit or architecture feature that the code assumes and does not query at run time, an architecture-specific instruction or kernel without a guard, and a fast path with no working fallback.
+- Unpatched builds (`-DNEMO_SPEECH_GGML_PATCHED=OFF`, the `metal-*` and `vulkan-*` presets) compile without `patches/`. Report code that uses a patched op or API outside a `NEMO_SPEECH_GGML_PATCHED` guard.
+- Report a GGUF tensor name, shape, quantization layout or metadata key that the change alters in the Python converters (`conversion/`, `convert_model.py`) or in the C++ loaders, but not in both.
+- Public headers in `include/nemo_speech/*.h` define a `dlopen`-compatible C ABI. Report a reordered struct field, an unguarded struct size change, or a changed signature.
+- Report compiler-specific code (extensions, attributes or builtins) without a path for GCC, Clang, Apple Clang and MSVC, and a new runtime dependency that the Linux, macOS and Windows release archives do not bundle.
 
 ## Maintainability and reuse
 
@@ -54,22 +57,18 @@ Give a maintainability comment only when you can point to the code: the helper t
 
 - Reuse before you add. Search `src/common/` and `src/runtime/ggml/` for a helper that does the same work. Report new code that duplicates one, and name the helper.
 - Report a block that the change copies with small edits. Ask for one shared function. This includes the same logic repeated across models, backends, and the HTTP and gRPC servers.
-- Keep one source of truth. A constant, default, limit, tensor name or environment variable must have one definition that all code uses.
+- Keep one source of truth. Report a constant, default, limit, tensor name or environment variable that the change defines in a second place.
 - Keep platform and backend branches in one place, behind one helper or interface. Report `#ifdef` or backend checks that the change spreads across call sites.
-- Follow the patterns of the surrounding code for error handling, logging and resource cleanup. Report a new pattern only when an existing one does the same job.
-- Remove what the change makes unused: dead code, unreachable branches, and unused parameters, flags and options. Do not leave commented-out code.
-- Give each constant a name and a reason. Report a new threshold, size or timeout that has no name or no comment that says where the value comes from.
-- Do not add options, parameters or abstraction layers that nothing uses yet.
-- A bug fix or new behavior needs a test when a test can cover it. If the change adds none, name the test that is missing.
-- Keep the change focused. Report unrelated refactors, reformatting or speculative code (see `CONTRIBUTING.md`).
+- Report what the change makes unused: dead code, unreachable branches, and unused parameters, flags and options.
 
 ## patches/
 
 - Each `.patch` file in `patches/` modifies `llama.cpp` or `ggml` at the pinned commit of the `llama.cpp` submodule, applied in `patches/series` order. Review the patched code as compiled source code, not plain diff text.
 - Inspect the full target function and struct in `llama.cpp/`, search all other `patches/*.patch` files in `patches/series` that touch the same file, struct or API, and check every caller in `src/`, `server/` and `include/`.
-- Check that op `supports_op` / dispatch preconditions match what the kernels support, and that `patches/series` stays consistent.
+- Report an op whose `supports_op` or dispatch check accepts a case that the kernel does not handle.
 
 ## Docs and benchmarks
 
-- Check that benchmark methodology and measurements are sound, and that documented numbers, environment variables, defaults, API payloads and CLI flags match the code.
+- Report a documented number, environment variable, default, API payload or CLI flag that does not match the code.
+- Report a benchmark that compares unlike conditions, such as different inputs, warm-up or hardware.
 - If a change alters a default, flag, API or runtime behavior, report documentation in `docs/`, `README.md` or `BENCHMARK.md` that no longer matches it.

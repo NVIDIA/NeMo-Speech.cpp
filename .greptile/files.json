@@ -2,7 +2,7 @@
   "files": [
     {
       "path": "REVIEW.md",
-      "description": "Repository review checklist: reporting bar, cross-layer state, runtime failure handling, performance, portability, and patches/ rules"
+      "description": "Repository review checklist: what to report, checks past the diff, correctness, runtime failures, performance, portability, reuse, patches/ and docs"
     },
     {
       "path": "patches/README.md",
