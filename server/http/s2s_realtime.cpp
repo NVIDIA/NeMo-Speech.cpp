@@ -914,6 +914,10 @@ handle_s2s_realtime(
         const auto kind = socket.read(message);
         if (kind == httplib::ws::ReadResult::Fail)
             break;
+        // Only after a WebSocket read timeout set on this socket; the
+        // connection is open and `message` still holds the last frame.
+        if (kind == httplib::ws::ReadResult::Timeout)
+            continue;
         try {
             const bool keep_running = kind == httplib::ws::ReadResult::Binary
                                           ? session.handle_binary(message)
