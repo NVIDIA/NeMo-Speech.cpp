@@ -136,8 +136,7 @@ inline void
 bound_word_frames(std::vector<WordTiming>& words, int64_t frame_limit) {
     if (frame_limit <= 0)
         return;
-    for (auto& word : words)
-        bound_word_frame(word, frame_limit);
+    for (auto& word : words) bound_word_frame(word, frame_limit);
 }
 
 inline void
