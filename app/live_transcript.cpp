@@ -188,6 +188,22 @@ LiveDiarizationBuffer::attach_late_punctuation(const std::string& punctuation) {
     return true;
 }
 
+bool
+LiveDiarizationBuffer::attach_late_languages(const std::vector<std::string>& languages) {
+    if (pending_.empty() || languages.empty())
+        return false;
+    auto& alternative = pending_.back().alternatives.front();
+    for (const auto& language : languages)
+        if (std::find(
+                alternative.language_codes.begin(), alternative.language_codes.end(), language) ==
+            alternative.language_codes.end())
+            alternative.language_codes.push_back(language);
+    for (auto word = alternative.words.rbegin();
+         word != alternative.words.rend() && word->language_code.empty(); ++word)
+        word->language_code = languages.front();
+    return true;
+}
+
 void
 LiveDiarizationBuffer::push(Result result) {
     if (!result.alternatives.empty() && !result.alternatives.front().transcript.empty())

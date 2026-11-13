@@ -67,6 +67,8 @@ struct StreamingUpdate {
     // Punctuation for the previous final (Decoder::take_late_punctuation);
     // not part of this update's text.
     std::string late_punctuation;
+    // Languages for the previous final: tags decoded after its endpoint.
+    std::vector<std::string> late_language_codes;
 };
 
 // Runner methods are single-threaded. Independent runners may execute
@@ -316,6 +318,8 @@ class CacheStreamRunner final : public AsrRunner {
     int prompt_index_ = -1;
     // Language codes stripped from transcript tags and exposed in results.
     std::vector<std::string> detected_languages_;
+    // Tags decoded before the first word of an utterance; they label the previous one.
+    std::vector<std::string> late_languages_;
 
     // Cache-aware encoder shape copied from the model at construction.
     EncoderConfig enc_cfg_;

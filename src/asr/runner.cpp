@@ -11,10 +11,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <regex>
 #include <stdexcept>
+#include <utility>
 
 #include "greedy_ctc_decoder.h"
+#include "language_tags.h"
 #include "recognizer.h"
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
 #include "flashlight_decoder.h"
@@ -23,43 +24,6 @@
 namespace nemo_speech::asr {
 
 namespace {
-// Removes <lang> tags and returns their language codes.
-std::vector<std::string>
-extract_lang_tags(std::string& text) {
-    static const std::regex tag_re(R"(<([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?)>)");
-    std::vector<std::string> langs;
-    for (std::sregex_iterator it(text.begin(), text.end(), tag_re), end; it != end; ++it) {
-        const std::string code = (*it)[1].str();
-        if (std::find(langs.begin(), langs.end(), code) == langs.end())
-            langs.push_back(code);
-    }
-    if (!langs.empty()) {
-        text = std::regex_replace(text, tag_re, "");
-        text = std::regex_replace(text, std::regex(R"( {2,})"), " ");
-        const size_t a = text.find_first_not_of(' ');
-        const size_t b = text.find_last_not_of(' ');
-        text = (a == std::string::npos) ? std::string() : text.substr(a, b - a + 1);
-    }
-    return langs;
-}
-
-void
-extract_appended_lang_tags(
-    std::string& text, size_t old_size, std::vector<std::string>& detected_languages) {
-    constexpr size_t kMaxLanguageTagBytes = 10;
-    const size_t scan_from = old_size > kMaxLanguageTagBytes ? old_size - kMaxLanguageTagBytes : 0;
-    std::string appended = text.substr(scan_from);
-    if (extract_lang_tags(appended).empty())
-        return;
-
-    for (auto& code : extract_lang_tags(text)) {
-        if (std::find(detected_languages.begin(), detected_languages.end(), code) ==
-            detected_languages.end()) {
-            detected_languages.push_back(std::move(code));
-        }
-    }
-}
-
 // NeMo per_feature normalization (per mel bin across frames). Bit-identical
 // to MelSpectrogramExtractor's internal normalize=true path (fe.cpp), so a
 // no-mask window matches the non-VAD infer_ctc output exactly. Used by the
@@ -795,7 +759,7 @@ OfflineRunner::finalize() {
     update.transcript_so_far = decoder->final_transcript();
     if (update.transcript_so_far.empty())
         update.transcript_so_far = detokenize_sentencepiece(tokens, decoder->vocab());
-    detected_languages_ = extract_lang_tags(update.transcript_so_far);
+    detected_languages_ = extract_language_tags(update.transcript_so_far);
     if (opts_.enable_word_time_offsets)
         update.words = decoder->word_timings();
     update.confidence = decoder->confidence();
@@ -967,7 +931,8 @@ CacheStreamRunner::process_one_chunk() {
                 detected_languages_.clear();
             const size_t old_size = transcript_.size();
             append_sentencepiece_tokens(transcript_, ids, head_->vocab());
-            extract_appended_lang_tags(transcript_, old_size, detected_languages_);
+            extract_appended_language_tags(
+                transcript_, old_size, detected_languages_, late_languages_);
         }
     }
 
@@ -1078,6 +1043,7 @@ CacheStreamRunner::step() {
         update.words = head_->word_timings();
     if (head_)
         update.late_punctuation = head_->take_late_punctuation();
+    update.late_language_codes = std::exchange(late_languages_, {});
     bound_update_words(update, real_frame_limit());
     trim_buffers();
     return update;
@@ -1202,6 +1168,7 @@ CacheStreamRunner::finalize() {
     auto drained = step();  // process any whole chunks first.
     update.new_token_ids = std::move(drained.new_token_ids);
     update.late_punctuation = std::move(drained.late_punctuation);
+    update.late_language_codes = std::move(drained.late_language_codes);
 
     const int n_mels = model_->fe_config().n_mels;
     const int sub = enc_cfg_.subsampling_factor;
@@ -1242,6 +1209,10 @@ CacheStreamRunner::finalize() {
         opts_.max_alternatives);
     if (head_)
         update.late_punctuation += head_->take_late_punctuation(/*end_of_stream=*/true);
+    for (auto& code : std::exchange(late_languages_, {}))
+        if (std::find(update.late_language_codes.begin(), update.late_language_codes.end(), code) ==
+            update.late_language_codes.end())
+            update.late_language_codes.push_back(std::move(code));
     bound_update_words(update, real_frame_limit());
     return update;
 }
@@ -1278,6 +1249,7 @@ CacheStreamRunner::reset() {
     transcript_.clear();
     last_step_new_tokens_.clear();
     detected_languages_.clear();
+    late_languages_.clear();
 }
 
 int

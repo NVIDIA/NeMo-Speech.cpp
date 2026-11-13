@@ -62,8 +62,9 @@ curl -X POST http://127.0.0.1:8080/v1/audio/transcriptions \
 ```
 
 Response (`json`): `{"text": "..."}`. `verbose_json` adds `task`, `language`,
-`duration`, and `words[]` (`word`, `start`, `end`, `confidence`, and `speaker`
-when diarization is on). SRT and WebVTT responses use the same readable,
+`duration`, and `words[]` (`word`, `start`, `end`, `confidence`, `speaker`
+when diarization is on, and `language` when the model detected the word's
+language). SRT and WebVTT responses use the same readable,
 punctuation-aware cue grouping as the file CLI.
 
 Word timestamps cover every language. As in NeMo's aligner, a Chinese or Japanese transcript is timed per
@@ -211,6 +212,18 @@ Server events: `session.created`, `session.updated`,
 complete audio only (SALM; `/v1/models` reports `"streaming": false`) send one
 `error` with code `streaming_unsupported` on connect and close the socket with
 status 1003; use `POST /v1/audio/transcriptions` instead.
+
+With `"language": "auto"`, a model that detects languages (Nemotron 3.5)
+writes a language tag after each sentence's final punctuation:
+
+- `.completed` has `language` (for example `"fr-FR"`) when the utterance
+  contains a tag, and each of its `words` has `language` when a tag follows
+  that word in the utterance.
+- The tag can come after the endpoint, when the final is already sent. The next
+  `.delta` or `.completed` event then has `previous_language`: the language of
+  the final sent before it.
+- `.delta` events do not have `language`, because the tag comes at the end of
+  the sentence.
 
 For backward compatibility, `/v1/realtime` serves this transcription protocol
 when VoiceChat is not loaded. Use the explicit audio-namespaced path for new

@@ -159,6 +159,13 @@ main() {
             "remap: 3 spoken collapse onto 1 written span");
     }
     {
+        // Rewritten words keep the language of the words they come from.
+        std::vector<WordTiming> w = {
+            {"vingt", 10, 18, 1.f, "fr-FR"}, {"trois", 20, 28, 1.f, "fr-FR"}};
+        update_word_timings(w, "Token:\t0\tvingt trois\t0,10\t0,0\nWord:\t0\t23\t0\n");
+        check(w.size() == 1 && w[0].language == "fr-FR", "remap: a rewrite keeps the language");
+    }
+    {
         // Unchanged words stay 1:1 with their own spans.
         std::vector<WordTiming> w = {{"the", 0, 5, 1.f}, {"meeting", 6, 15, 1.f}};
         update_word_timings(

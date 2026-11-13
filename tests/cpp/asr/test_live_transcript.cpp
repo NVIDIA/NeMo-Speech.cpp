@@ -447,13 +447,20 @@ test_late_punctuation_attaches_to_previous_final() {
     LiveTranscriptPresenter presenter(true);
     auto retag = [](Result&) {};
     check(!buffer.attach_late_punctuation("."), "late punctuation needs a buffered final");
+    check(!buffer.attach_late_languages({"fr-FR"}), "late languages need a buffered final");
     buffer.push(final_result(alternative("Ready", {word("Ready", 0, 300, 1)}), 1));
     check(buffer.attach_late_punctuation("?"), "late punctuation attaches to a buffered final");
+    check(!buffer.attach_late_languages({}), "no late languages to attach");
+    check(buffer.attach_late_languages({"fr-FR"}), "late languages attach to a buffered final");
     auto ready = buffer.update(2, retag);
     check(
         ready.size() == 1 && ready[0].alternatives[0].transcript == "Ready?" &&
             ready[0].alternatives[0].words[0].word == "Ready?",
         "late punctuation updates the buffered text and last word");
+    check(
+        ready.size() == 1 && ready[0].alternatives[0].language_codes[0] == "fr-FR" &&
+            ready[0].alternatives[0].words[0].language_code == "fr-FR",
+        "late languages label the buffered final");
 
     for (const auto& result : ready) presenter.present_final(result);
     presenter.present_final(final_result(alternative("Go", {word("Go", 900, 1100, 1)}), 2));

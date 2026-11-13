@@ -146,6 +146,9 @@ struct Result {  // proto: Streaming/SpeechRecognitionResult
     // Streaming only: sentence punctuation emitted after the previous final's
     // endpoint. Append it to that final; it is not part of this result's text.
     std::string late_punctuation;
+    // Streaming only: languages the model tagged after the previous final's
+    // endpoint. They label that final; they are not in this result's language_codes.
+    std::vector<std::string> late_language_codes;
     // Speech-LLM details (null for other backends).
     std::shared_ptr<const SpeechLmDetails> speechlm;
 };
