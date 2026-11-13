@@ -22,9 +22,9 @@ are deprecated spellings of `NEMO_SPEECH_BUILD_NMT` and `NEMO_SPEECH_BUILD_GRPC`
 | Variable | Default | Effect |
 |---|---|---|
 | `GGML_CUDA_GRAPH_EVICT_AFTER_MS` | `10000`; `0` once a server loads TTS, and for VoiceChat | Drop CUDA graphs idle for this long; `0` keeps them. Read when a CUDA backend is created. |
-| `GGML_CUDA_GRAPH_REINSTANTIATE_AFTER_MS` | `250` on integrated GPUs, `0` on discrete GPUs | After this long without ggml work on the GPU, instantiate cached CUDA graphs again before they run. Prevents Jetson Thor faults (Xid 13) and wrong results after idle power gating. `0` turns it off. |
 | `GGML_SKINNY_Q8=0` | enabled | Disable the skinny Q8_0 GEMM for block Q8_0 weights. Planar Q8 weights always use it. |
 | `GGML_SKINNY_Q8_INPLACE=0` | in place; `0` when ASR and NMT share a process | Keep repacked skinny-Q8 weights in a separate buffer. |
+| `NEMO_SPEECH_RELPOS_MAX_Q` | `512` | Max query length `q_len` (encoder frames) that uses the fused CUDA relative-position attention kernel; longer sequences take the unfused cuBLAS GEMM path. `0` forces unfused for all lengths; `< 0` (e.g. `-1`) forces always-fused. |
 
 The SALM engine reads no environment variables; its settings are `asr.salm.*` keys (see
 [SALM configuration](../salm/configuration.md)).
@@ -37,6 +37,7 @@ Upstream switches that are useful for bisecting a CUDA problem:
 
 - `NEMO_SPEECH_MODEL_DIR`, `NEMO_SPEECH_MODEL_INDEX`, `NEMO_SPEECH_HF_BASE_URL`: the CLI model store.
 - `NEMO_SPEECH_<CONFIG_KEY>`: overrides one configuration key.
+- `NEMO_SPEECH_MAX_OFFLINE_SEC`: maximum audio duration (seconds, default `90`) per `OfflineRunner` encoder pass, clamped against `pos_emb_max_len`. Longer recordings split at quiet points into stateful segments; raise (e.g. `400`) to restore full-budget passes at higher VRAM cost.
 - `S2S_*`: VoiceChat tuning; see [VoiceChat configuration](../s2s/configuration.md).
 - `MAGPIETTS_LOGIT_DUMP` and `MAGPIETTS_FORCE_CODES`: file paths used for MagpieTTS parity testing.
 - `EDGE_SHIM_TRACE_SHAPES`: logs every call in the cuBLAS shim.

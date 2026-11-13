@@ -87,9 +87,7 @@ class GreedyCtcDecoder : public Decoder {
     void set_compute_timestamps(bool on) override { compute_ts_ = on; }
     const std::vector<WordTiming>& word_timings() const override { return words_; }
     void bound_timings(int64_t frame_limit) override {
-        bound_word_frames(words_, frame_limit);
-        if (cur_open_)
-            bound_word_frame(cur_, frame_limit);
+        bound_decoder_timings(words_, cur_, cur_open_, frame_limit);
     }
     void finalize() override;  // flush the trailing in-progress word
     int64_t last_emit_frame() const override { return last_emit_frame_; }
