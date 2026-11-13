@@ -12,6 +12,7 @@
 #include <ggml.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -244,7 +245,18 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // ggml_backend_sched_split_graph aborts with no backend able to take the
     // node. use_gpu=true guarantees the GPU backend exists (BackendManager
     // throws otherwise), and the scheduler places the op there.
-    const bool use_fused = session->params.use_gpu;
+    static const int64_t fused_max_q = [] {
+        if (const char* s = std::getenv("NEMO_SPEECH_RELPOS_MAX_Q")) {
+            char* end = nullptr;
+            const long v = std::strtol(s, &end, 10);
+            if (end != s) {
+                return static_cast<int64_t>(v);
+            }
+        }
+        return static_cast<int64_t>(512);
+    }();
+    const int64_t q_len = input_tensor.tensor->ne[1];
+    const bool use_fused = session->params.use_gpu && (fused_max_q < 0 || q_len <= fused_max_q);
     if (use_fused) {
         // Canonical contiguous [d_k, len, n_head, batch] operands. Bias add and
         // rel-shift happen inside the kernel, so q_can is passed pre-bias.
