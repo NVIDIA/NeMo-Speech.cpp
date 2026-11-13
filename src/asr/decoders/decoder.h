@@ -125,13 +125,19 @@ real_encoder_frames(int64_t mel_frames, int subsampling_factor) {
 // synthetic zero frames past the end of the audio. Tokens emitted there keep
 // their text and move onto the last real frame; order and end > start hold.
 inline void
+bound_word_frame(WordTiming& word, int64_t frame_limit) {
+    if (frame_limit <= 0)
+        return;
+    word.start_frame = std::clamp<int64_t>(word.start_frame, 0, frame_limit - 1);
+    word.end_frame = std::clamp<int64_t>(word.end_frame, word.start_frame + 1, frame_limit);
+}
+
+inline void
 bound_word_frames(std::vector<WordTiming>& words, int64_t frame_limit) {
     if (frame_limit <= 0)
         return;
-    for (auto& word : words) {
-        word.start_frame = std::clamp<int64_t>(word.start_frame, 0, frame_limit - 1);
-        word.end_frame = std::clamp<int64_t>(word.end_frame, word.start_frame + 1, frame_limit);
-    }
+    for (auto& word : words)
+        bound_word_frame(word, frame_limit);
 }
 
 // SentencePiece word-boundary marker U+2581 ('▁') = 0xE2 0x96 0x81. A piece
@@ -258,6 +264,9 @@ class Decoder {
         static const std::vector<WordTiming> kEmpty;
         return kEmpty;
     }
+    // Clamp any word timestamps emitted so far (including an open word) to
+    // frame_limit, so padded-tail frames from one segment do not overlap the next.
+    virtual void bound_timings(int64_t /*frame_limit*/) {}
 
     // Additional hypotheses beyond the top result, best-first and capped at
     // max_alternatives - 1. Greedy decoders return none.

@@ -249,14 +249,15 @@ RelPositionMultiHeadAttention::build_graph_masked(
         if (const char* s = std::getenv("NEMO_SPEECH_RELPOS_MAX_Q")) {
             char* end = nullptr;
             const long v = std::strtol(s, &end, 10);
-            if (end != s && v >= 0) {
+            if (end != s) {
                 return static_cast<int64_t>(v);
             }
         }
         return static_cast<int64_t>(512);
     }();
     const int64_t q_len = input_tensor.tensor->ne[1];
-    const bool use_fused = session->params.use_gpu && q_len <= fused_max_q;
+    const bool use_fused =
+        session->params.use_gpu && (fused_max_q < 0 || q_len <= fused_max_q);
     if (use_fused) {
         // Canonical contiguous [d_k, len, n_head, batch] operands. Bias add and
         // rel-shift happen inside the kernel, so q_can is passed pre-bias.

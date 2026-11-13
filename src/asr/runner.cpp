@@ -742,48 +742,43 @@ OfflineRunner::finalize() {
     // Encoder frames past the real audio (bucket padding and the final
     // centered frame) can still emit; bound words to the real frames.
     int64_t frame_limit = 0;
-    const auto real_seg_frames = [&](size_t off, size_t len, int64_t frame_offset, int T) -> int {
-        if (off >= real_samples || T <= 0)
-            return 0;
+    const auto note_real_frames = [&](size_t off, size_t len, int64_t frame_offset, bool has_next) {
+        if (off >= real_samples)
+            return;
         const size_t real_len = std::min(len, real_samples - off);
         const auto mel = static_cast<int64_t>(real_len) / model_->fe().hop_length();
-        int64_t real_T =
-            real_encoder_frames(std::max<int64_t>(1, mel), model_->subsampling_factor());
-        if (off + real_len < real_samples) {
-            const int64_t next_offset = seg_frame_offset(off + real_len);
-            real_T = std::min(real_T, std::max<int64_t>(1, next_offset - frame_offset));
+        frame_limit = frame_offset +
+                      real_encoder_frames(std::max<int64_t>(1, mel), model_->subsampling_factor());
+        if (opts_.enable_word_time_offsets && has_next && off + real_len < real_samples) {
+            const int64_t next_offset =
+                std::max<int64_t>(frame_offset + 1, seg_frame_offset(off + real_len));
+            decoder->bound_timings(next_offset);
         }
-        return static_cast<int>(std::clamp<int64_t>(real_T, 0, T));
-    };
-    const auto note_real_frames = [&](size_t off, int T_eff, int64_t frame_offset) {
-        if (off >= real_samples || T_eff <= 0)
-            return;
-        frame_limit = frame_offset + T_eff;
     };
     if (model_->head_kind() == HeadKind::Ctc) {
         auto* ctc = static_cast<CtcModel*>(model_);
         decoder = ctc_decoder_.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
-        for (const auto& [off, len] : segments) {
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto [off, len] = segments[i];
             const int64_t frame_offset = seg_frame_offset(off);
+            const bool has_next = (i + 1 < segments.size());
             std::vector<int> seg_tokens;
             if (auto* greedy = dynamic_cast<GreedyCtcDecoder*>(decoder)) {
                 std::vector<int32_t> best_ids;
                 std::vector<float> best_probs;
                 int T = 0;
                 ctc->infer_ctc_greedy(audio_.data() + off, len, best_ids, best_probs, T);
-                const int T_eff = real_seg_frames(off, len, frame_offset, T);
                 seg_tokens =
-                    greedy->step_compact(best_ids.data(), best_probs.data(), T_eff, frame_offset);
-                note_real_frames(off, T_eff, frame_offset);
+                    greedy->step_compact(best_ids.data(), best_probs.data(), T, frame_offset);
+                note_real_frames(off, len, frame_offset, has_next);
             } else {
                 std::vector<float> log_probs;
                 int T = 0, C = 0;
                 ctc->infer_ctc(audio_.data() + off, len, log_probs, T, C);
-                const int T_eff = real_seg_frames(off, len, frame_offset, T);
-                seg_tokens = decoder->step(log_probs.data(), C, T_eff, frame_offset);
-                note_real_frames(off, T_eff, frame_offset);
+                seg_tokens = decoder->step(log_probs.data(), C, T, frame_offset);
+                note_real_frames(off, len, frame_offset, has_next);
             }
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
         }
@@ -795,16 +790,17 @@ OfflineRunner::finalize() {
         decoder->set_request_options(opts_);
         const auto decode_begin = std::chrono::steady_clock::now();
         int64_t total_frames = 0;
-        for (const auto& [off, len] : segments) {
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto [off, len] = segments[i];
             const int64_t frame_offset = seg_frame_offset(off);
+            const bool has_next = (i + 1 < segments.size());
             std::vector<float> enc;
             int T = 0;
             transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
-            const int T_eff = real_seg_frames(off, len, frame_offset, T);
             auto seg_tokens =
-                decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T_eff, frame_offset);
-            note_real_frames(off, T_eff, frame_offset);
-            total_frames += T_eff;
+                decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+            note_real_frames(off, len, frame_offset, has_next);
+            total_frames += T;
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
         }
         if (std::getenv("NEMO_SPEECH_TIMING")) {
