@@ -111,10 +111,11 @@ command_health(int argc, char** argv) {
             const auto retry_time = std::chrono::steady_clock::now();
             if (retry_time >= deadline)
                 break;
-            std::this_thread::sleep_for(std::min(
-                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    std::chrono::milliseconds(250)),
-                deadline - retry_time));
+            std::this_thread::sleep_for(
+                std::min(
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::milliseconds(250)),
+                    deadline - retry_time));
         } while (true);
         return print_cli_error(
             "health", "not ready (" + last_error + ")", kCliExitRuntime, "not_ready");

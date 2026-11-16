@@ -45,6 +45,7 @@ Two input sources:
 Both sources funnel through one emit routine keyed by the original silero
 state_dict tensor names.
 """
+
 import struct
 import sys
 from pathlib import Path

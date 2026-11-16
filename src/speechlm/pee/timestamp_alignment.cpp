@@ -830,8 +830,10 @@ speaker_mapping(
             double similarity =
                 blas_dot(&a[s * C], &b[c * C], C) / std::max(1e-8, norm_a * norm_b[c]);
             similarity -=
-                0.1 * std::abs(std::log(
-                          static_cast<double>(total_a + 1) / static_cast<double>(total_b[c] + 1)));
+                0.1 *
+                std::abs(
+                    std::log(
+                        static_cast<double>(total_a + 1) / static_cast<double>(total_b[c] + 1)));
             cost[s * S + c] = -similarity;
         }
     }
@@ -1149,7 +1151,7 @@ align_record(
         positions.clear();
         for (int t = 0; t < frames; ++t) {
             const float activity = !inputs.speaker_probs ? 1.0f
-                                   : column < 0          ? 0.0f
+                                   : column < 0 ? 0.0f
                                                 : speaker[static_cast<size_t>(t) * S + column];
             if (activity >= 0.01f)
                 positions.push_back(t);
