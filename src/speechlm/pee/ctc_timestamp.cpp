@@ -580,9 +580,10 @@ struct CtcTimestampModel::Impl {
         for (size_t first = 0; first < tiles.size();) {
             const Tile& t0 = tiles[first];
             const int f_pad = t0.f_pad, k_pad = t0.k_pad;
-            const int cap = pow2_at_most(std::max<int64_t>(
-                1, std::min<int64_t>(
-                       kFramesPerCall / f_pad, kLogitsPerCall / (int64_t(f_pad) * k_pad))));
+            const int cap = pow2_at_most(
+                std::max<int64_t>(
+                    1, std::min<int64_t>(
+                           kFramesPerCall / f_pad, kLogitsPerCall / (int64_t(f_pad) * k_pad))));
             size_t last = first;
             while (last < tiles.size() && tiles[last].chunk == t0.chunk &&
                    tiles[last].f_pad == f_pad && tiles[last].k_pad == k_pad &&

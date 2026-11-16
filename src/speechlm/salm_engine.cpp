@@ -1174,8 +1174,9 @@ struct SalmEngine::Impl {
                 ts->probs80 = std::move(out.spk_probs);
                 ts->probs10 = std::move(out.spk_probs10);
                 ts->frames = out.n_frames;
-                ts->probs10.resize(std::min(
-                    ts->probs10.size(), static_cast<size_t>(utts[i].t_mel) * pc.num_speakers));
+                ts->probs10.resize(
+                    std::min(
+                        ts->probs10.size(), static_cast<size_t>(utts[i].t_mel) * pc.num_speakers));
                 enc[i].timestamps = std::move(ts);
             }
         }

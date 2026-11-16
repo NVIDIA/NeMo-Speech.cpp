@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Convert VoiceChat perception and RNNT tensors to one GGUF artifact.\n\nThe output uses the ASR tensor schema and includes the S2S projection layer.\n"""
+
 from __future__ import annotations
 
 import argparse

@@ -927,9 +927,9 @@ ltf_chain_select(const magpietts_lt_fused_weights& w, char* reason, size_t reaso
     if (ltf_chain_tier_usable<ltf_chain_tier_large>(
             reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_large>), sms, fits)) {
         grid = ltf_chain_tier_large::grid;
-    } else if (ltf_chain_tier_usable<ltf_chain_tier_small>(
-                   reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_small>), sms,
-                   fits)) {
+    } else if (
+        ltf_chain_tier_usable<ltf_chain_tier_small>(
+            reinterpret_cast<const void*>(ltf_chain_kernel<ltf_chain_tier_small>), sms, fits)) {
         grid = ltf_chain_tier_small::grid;
     } else {
         // Below min_sms, only a larger GPU helps. Above it, the model shape or GPU resources fail.

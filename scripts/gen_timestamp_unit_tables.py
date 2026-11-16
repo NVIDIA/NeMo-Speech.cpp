@@ -9,6 +9,7 @@ Run with Python 3.13 (Unicode 15.1, as NeMo's documented environment):
 
   python3.13 scripts/gen_timestamp_unit_tables.py > src/speechlm/pee/timestamp_unit_tables.inc
 """
+
 import sys
 import unicodedata
 

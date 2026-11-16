@@ -24,9 +24,8 @@ from safetensors.torch import save_file
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from conversion.asr import _pick_dtype
+from conversion.asr import _pick_dtype, reshape_for_emission
 from conversion.asr import convert as convert_asr
-from conversion.asr import reshape_for_emission
 from conversion.diarization import is_high_resolution_v3
 from conversion.diarization import remap as remap_diarization
 from conversion.registry import (
