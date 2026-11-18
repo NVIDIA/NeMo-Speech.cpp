@@ -1,0 +1,136 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: ggml: argmax over BF16-rounded values
+
+ggml_argmax_bf16 takes the argmax of each row after rounding the values to
+BF16 (round to nearest even), and the lowest index among equal values: the
+result of an argmax over the same values held in a BF16 tensor. A decoder
+whose reference implementation computes its logits in BF16 picks the same
+tokens with it as that implementation. The CPU and CUDA backends implement
+it; ggml_argmax is unchanged.
+
+Upstream: stays here (greedy decoding of BF16 speech-LLM checkpoints).
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index c13b47c54be26e5f8d04de165022121e943bbafe..2c5cabbe65678985be0d81531d0649ed550c72c2 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1085,6 +1085,11 @@ extern "C" {
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a);
+ 
++    // argmax along rows of the values rounded to BF16 (round to nearest even); equal values give the lowest index
++    GGML_API struct ggml_tensor * ggml_argmax_bf16(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a);
++
+     // count number of equal elements in a and b
+     GGML_API struct ggml_tensor * ggml_count_equal(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 53555e3cede08cef22792219657ba5bc00731d42..83c61c6f89bf9fbec834fef1efd31f69255f8751 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -1586,11 +1586,24 @@ static void ggml_compute_forward_argmax_f32(
+     const size_t nb01 = src0->nb[1];
+     const size_t nb0 = dst->nb[0];
+ 
++    const bool bf16 = ggml_get_op_params_i32(dst, 0) != 0; // ggml_argmax_bf16
++
+     for (int64_t i1 = 0; i1 < ne01; i1++) {
+         float * src = (float *) ((char *) src0->data + i1*nb01);
+         int32_t * dst_ = (int32_t *) ((char *)  dst->data + i1*nb0);
+         int v = 0;
+-        ggml_vec_argmax_f32(ne00, &v, src);
++        if (bf16) {
++            float max = -INFINITY;
++            for (int64_t i0 = 0; i0 < ne00; i0++) {
++                const float x = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(src[i0]));
++                if (x > max) { // the first of equal values stays
++                    max = x;
++                    v = (int) i0;
++                }
++            }
++        } else {
++            ggml_vec_argmax_f32(ne00, &v, src);
++        }
+         dst_[0] = v;
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/argmax.cu b/ggml/src/ggml-cuda/argmax.cu
+index 51967c667cfd88a8d9d81ddbf827bce402d65761..678b9fed47bad2b484c32b8930002af67b6ad834 100644
+--- a/ggml/src/ggml-cuda/argmax.cu
++++ b/ggml/src/ggml-cuda/argmax.cu
+@@ -5,6 +5,14 @@
+ #include "common.cuh"
+ #include "sum.cuh"
+ 
++// x rounded to BF16, round to nearest even (the bits of a float that a BF16 holds exactly)
++static __device__ __forceinline__ float argmax_round_bf16(const float x) {
++    const uint32_t u = __float_as_uint(x);
++    return __uint_as_float((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000u);
++}
++
++// bf16 (ggml_argmax_bf16): the values are compared after rounding to BF16, and equal values give the lowest column
++template <bool bf16>
+ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __restrict__ dst, const int64_t ncols) {
+     const int64_t row = blockIdx.x;
+ 
+@@ -13,7 +21,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+     const float * rowx = x + row * ncols;
+ 
+     for (int32_t col = threadIdx.x; col < ncols; col += blockDim.x) {
+-        const float val = rowx[col];
++        const float val = bf16 ? argmax_round_bf16(rowx[col]) : rowx[col];
+         if (val > maxval) {
+             maxval = val;
+             argmax = col;
+@@ -24,7 +32,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+         const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
+         const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+-        if (val > maxval) {
++        if (val > maxval || (bf16 && val == maxval && col < argmax)) {
+             maxval = val;
+             argmax = col;
+         }
+@@ -53,7 +61,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
+             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+                 const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
+                 const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+-                if (val > maxval) {
++                if (val > maxval || (bf16 && val == maxval && col < argmax)) {
+                     maxval = val;
+                     argmax = col;
+                 }
+@@ -87,5 +95,9 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const dim3 blocks_dim(num_threads, 1, 1);
+     const dim3 blocks_num(num_blocks, 1, 1);
+ 
+-    argmax_f32<<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
++    if (ggml_get_op_params_i32(dst, 0) != 0) {
++        argmax_f32<true><<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
++    } else {
++        argmax_f32<false><<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
++    }
+ }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index a2c11d254728236205cec60d2092d9849e43a7fc..d08015cfbbad955d712e8476dff4c711d89ad0ac 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -2561,6 +2561,16 @@ struct ggml_tensor * ggml_argmax(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_argmax_bf16(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a) {
++    struct ggml_tensor * result = ggml_argmax(ctx, a);
++
++    ggml_set_op_params_i32(result, 0, 1); // the backends read it: values rounded to BF16, lowest index among equals
++
++    return result;
++}
++
+ // ggml_count_equal
+ 
+ struct ggml_tensor * ggml_count_equal(

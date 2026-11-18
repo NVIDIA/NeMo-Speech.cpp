@@ -230,6 +230,35 @@ test_budget() {
         expect(near_silent(sparse.data(), sparse.size()), "near_silent(one 32-LSB sample)");
         expect(!near_silent(loud.data(), loud.size()), "near_silent(one 33-LSB sample)");
     }
+    // greedy pick: logits compared after rounding to BF16 (steps of 1 between 128 and 256, ties to
+    // even), the lowest token id among equal values
+    {
+        const float inf = std::numeric_limits<float>::infinity();
+        struct Case {
+            std::vector<float> logits;
+            int want;
+        };
+        const Case cases[] = {
+            {{199.6f, 200.4f}, 0},          // both 200: the lower id, not the larger logit
+            {{200.4f, 200.6f}, 1},          // 200 and 201
+            {{200.4f, 3.0f, 199.6f}, 0},    // equal values apart
+            {{201.0f, 200.5f}, 0},          // 200.5 is a tie between 200 and 201: to even, 200
+            {{201.4f, 201.5f}, 1},          // 201.5 to even: 202
+            {{202.0f, 201.5f, 202.4f}, 0},  // all 202
+            {{-200.4f, -199.6f}, 0},        // both -200
+            {{1.0f, 1.001f}, 0},            // steps of 1/128 near 1: both 1.0
+            {{1.0f, 1.004f}, 1},            // 1.004 rounds to 1 + 1/128
+            {{-inf, 3.0f, -inf, 3.0f}, 1},  // masked tokens
+            {{-inf, -inf}, 0},
+        };
+        for (const Case& c : cases) {
+            const int got = greedy_pick(c.logits.data(), static_cast<int>(c.logits.size()));
+            expect(
+                got == c.want, "greedy_pick case of " + std::to_string(c.logits.size()) +
+                                   " logits starting " + std::to_string(c.logits[0]) + ": got " +
+                                   std::to_string(got) + ", want " + std::to_string(c.want));
+        }
+    }
 }
 
 void
