@@ -103,6 +103,10 @@ class AsrWorkload : public Workload {
         const std::string reference = model_.empty() ? config_.model.path : model_;
         if (config_.salm.encoder_path.empty() || !reference.empty())
             config_.model.path = resolve_model_file(reference, "asr", "ASR model").string();
+        if (!config_.salm.dflash_path.empty())
+            config_.salm.dflash_path =
+                resolve_model_file(config_.salm.dflash_path, "draft", "DFlash2 draft model")
+                    .string();
         config_.batching.enabled = max_concurrency > 1;
         config_.batching.max_batch_size =
             std::max(config_.batching.max_batch_size, max_concurrency);

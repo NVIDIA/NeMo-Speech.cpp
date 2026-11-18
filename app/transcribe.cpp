@@ -745,6 +745,10 @@ command_transcribe(int argc, char** argv) {
         // speaker branch.
         asr::resolve_salm_encoder(config);
         const bool speech_llm = !config.salm.encoder_path.empty();
+        if (!config.salm.dflash_path.empty())
+            config.salm.dflash_path =
+                resolve_model_file(config.salm.dflash_path, "draft", "DFlash2 draft model")
+                    .string();
         if (!options.instruction.empty() && !speech_llm)
             throw std::invalid_argument("--instruction needs a speech-LLM (SALM) model");
         // --translate-to: a speech-LLM translates the speech itself unless an NMT model is named.
