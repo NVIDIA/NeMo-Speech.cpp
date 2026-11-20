@@ -647,6 +647,7 @@ MagpieModel::operator=(MagpieModel&& other) noexcept {
         backend = other.backend;
         buffer = other.buffer;
         cuda_unified_memory = other.cuda_unified_memory;
+        weights_owner = std::move(other.weights_owner);
         text_embedding = other.text_embedding;
         audio_embeddings = std::move(other.audio_embeddings);
         baked_context = other.baked_context;
@@ -685,8 +686,64 @@ MagpieModel::load(
     return true;
 }
 
+static void
+magpietts_prioritize_backend(ggml_backend_t backend) {
+#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
+    if (backend && ggml_backend_is_cuda(backend)) {
+        // The decoder/local-transformer stream is the latency-critical path; run it at the
+        // highest CUDA stream priority so the concurrent NanoCodec worker (priority -2) and
+        // default-priority side streams do not delay its small kernels.
+        constexpr int kHighestPriority = -100;  // clamped to the device range by ggml
+        ggml_backend_cuda_set_stream_priority(backend, kHighestPriority);
+    }
+#else
+    (void)backend;
+#endif
+}
+
+bool
+MagpieModel::shareWeights(std::shared_ptr<const MagpieModel> owner) {
+    reset();
+    if (!owner || !owner->loaded()) {
+        return false;
+    }
+    backend = ggml_backend_dev_init(ggml_backend_get_device(owner->backend), nullptr);
+    if (!backend) {
+        fprintf(stderr, "failed to initialize ggml backend for shared MagpieTTS weights\n");
+        return false;
+    }
+    magpietts_prioritize_backend(backend);
+    hparams = owner->hparams;
+    tokenizer_profile = owner->tokenizer_profile;
+    nemo_version = owner->nemo_version;
+    gguf = owner->gguf;
+    ctx = owner->ctx;
+    buffer = owner->buffer;
+    cuda_unified_memory = owner->cuda_unified_memory;
+    text_embedding = owner->text_embedding;
+    audio_embeddings = owner->audio_embeddings;
+    baked_context = owner->baked_context;
+    final_proj_w = owner->final_proj_w;
+    final_proj_b = owner->final_proj_b;
+    lt_in_w = owner->lt_in_w;
+    lt_in_b = owner->lt_in_b;
+    lt_out_w = owner->lt_out_w;
+    lt_out_b = owner->lt_out_b;
+    encoder = owner->encoder;
+    decoder = owner->decoder;
+    local = owner->local;
+    weights_owner = std::move(owner);
+    return true;
+}
+
 void
 MagpieModel::reset() {
+    if (weights_owner) {  // borrowed: the owner frees them
+        buffer = nullptr;
+        gguf = nullptr;
+        ctx = nullptr;
+        weights_owner.reset();
+    }
     if (buffer) {
         ggml_backend_buffer_free(buffer);
         buffer = nullptr;
@@ -880,15 +937,7 @@ magpietts_model_load_impl(
     if (!model.backend) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
-#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
-    if (model.backend && ggml_backend_is_cuda(model.backend)) {
-        // The decoder/local-transformer stream is the latency-critical path; run it at the
-        // highest CUDA stream priority so the concurrent NanoCodec worker (priority -2) and
-        // default-priority side streams do not delay its small kernels.
-        constexpr int kHighestPriority = -100;  // clamped to the device range by ggml
-        ggml_backend_cuda_set_stream_priority(model.backend, kHighestPriority);
-    }
-#endif
+    magpietts_prioritize_backend(model.backend);
     if (!model.backend) {
         fprintf(stderr, "failed to initialize ggml backend\n");
         return false;

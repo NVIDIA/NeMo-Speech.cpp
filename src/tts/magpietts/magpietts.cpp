@@ -344,14 +344,36 @@ class MagpieStreamingWorkspace {
 
 class MagpieStreamingRuntime::Impl {
    public:
-    MagpieModel magpie;
+    std::shared_ptr<MagpieModel> magpie;
     nc::NanoCodecModel codec;
     std::unique_ptr<MagpieStreamingWorkspace> workspace;
 };
 
 namespace {
 GgmlLogFilter magpie_ggml_logs;
+
+// Magpie weights loaded in this process, keyed by file and placement. Runtimes that load the
+// same model borrow one copy (MagpieModel::shareWeights) instead of uploading it again.
+std::mutex shared_weights_mutex;
+std::map<std::string, std::weak_ptr<MagpieModel>> shared_weights;
+
+std::shared_ptr<MagpieModel>
+load_magpie_shared(
+    const std::string& fname, magpietts_uma_mode uma_mode, bool force_cpu, bool verbose) {
+    const std::string key =
+        fname + "|" + std::to_string((int)uma_mode) + "|" + (force_cpu ? "cpu" : "auto");
+    std::lock_guard<std::mutex> lock(shared_weights_mutex);
+    auto model = std::make_shared<MagpieModel>();
+    if (auto owner = shared_weights[key].lock()) {
+        return model->shareWeights(std::move(owner)) ? model : nullptr;
+    }
+    if (!model->load(fname, uma_mode, force_cpu, verbose)) {
+        return nullptr;
+    }
+    shared_weights[key] = model;
+    return model;
 }
+}  // namespace
 
 MagpieStreamingRuntime::MagpieStreamingRuntime() : impl_(std::make_unique<Impl>()) {}
 
@@ -364,14 +386,15 @@ MagpieStreamingRuntime::load(
     magpie_ggml_logs.set_verbose(verbose);
     ggml_log_set(GgmlLogFilter::callback, &magpie_ggml_logs);
     impl_->workspace.reset();
-    if (!impl_->magpie.load(magpie_model, uma_mode, magpie_cpu, verbose)) {
+    impl_->magpie = load_magpie_shared(magpie_model, uma_mode, magpie_cpu, verbose);
+    if (!impl_->magpie) {
         return false;
     }
     if (!impl_->codec.load(codec_model, codec_cpu, verbose)) {
         impl_->magpie.reset();
         return false;
     }
-    impl_->workspace = std::make_unique<MagpieStreamingWorkspace>(impl_->magpie, impl_->codec);
+    impl_->workspace = std::make_unique<MagpieStreamingWorkspace>(*impl_->magpie, impl_->codec);
     return true;
 }
 
@@ -382,24 +405,24 @@ MagpieStreamingRuntime::sampleRate() const {
 
 int
 MagpieStreamingRuntime::speakerCount() const {
-    return impl_ ? impl_->magpie.hparams.baked_speakers : 0;
+    return impl_ && impl_->magpie ? impl_->magpie->hparams.baked_speakers : 0;
 }
 
 std::vector<std::string>
 MagpieStreamingRuntime::speakerNames() const {
     std::vector<std::string> out;
-    if (!impl_ || !impl_->magpie.gguf) {
+    if (!impl_ || !impl_->magpie || !impl_->magpie->gguf) {
         return out;
     }
-    const int64_t id = gguf_find_key(impl_->magpie.gguf, "magpietts.speaker_names");
-    if (id < 0 || gguf_get_kv_type(impl_->magpie.gguf, id) != GGUF_TYPE_ARRAY ||
-        gguf_get_arr_type(impl_->magpie.gguf, id) != GGUF_TYPE_STRING) {
+    const int64_t id = gguf_find_key(impl_->magpie->gguf, "magpietts.speaker_names");
+    if (id < 0 || gguf_get_kv_type(impl_->magpie->gguf, id) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(impl_->magpie->gguf, id) != GGUF_TYPE_STRING) {
         return out;
     }
-    const size_t n = gguf_get_arr_n(impl_->magpie.gguf, id);
+    const size_t n = gguf_get_arr_n(impl_->magpie->gguf, id);
     out.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        const char* value = gguf_get_arr_str(impl_->magpie.gguf, id, i);
+        const char* value = gguf_get_arr_str(impl_->magpie->gguf, id, i);
         if (value && value[0]) {
             out.emplace_back(value);
         }
@@ -410,12 +433,12 @@ MagpieStreamingRuntime::speakerNames() const {
 const std::string&
 MagpieStreamingRuntime::tokenizerProfile() const {
     static const std::string empty;
-    return impl_ ? impl_->magpie.tokenizer_profile : empty;
+    return impl_ && impl_->magpie ? impl_->magpie->tokenizer_profile : empty;
 }
 
 int
 MagpieStreamingRuntime::textVocabSize() const {
-    return impl_ ? impl_->magpie.hparams.text_vocab_size : 0;
+    return impl_ && impl_->magpie ? impl_->magpie->hparams.text_vocab_size : 0;
 }
 
 void
@@ -2079,17 +2102,17 @@ MagpieStreamingRuntime::synthesize(
     magpie_stream_params& params, const std::vector<std::vector<int32_t>>& token_chunks,
     const magpie_pcm_callback& pcm_callback, stream_run_metrics& metrics, const char* run_label,
     bool write_codes) {
-    if (!impl_) {
+    if (!impl_ || !impl_->magpie) {
         return false;
     }
     stream_audio_outputs outputs;
     outputs.sample_rate = impl_->codec.sampleRate();
     outputs.pcm_callback = pcm_callback;
     if (!impl_->workspace) {
-        impl_->workspace = std::make_unique<MagpieStreamingWorkspace>(impl_->magpie, impl_->codec);
+        impl_->workspace = std::make_unique<MagpieStreamingWorkspace>(*impl_->magpie, impl_->codec);
     }
     return stream_magpie_to_audio(
-        impl_->magpie, impl_->codec, *impl_->workspace, params, token_chunks, outputs, metrics,
+        *impl_->magpie, impl_->codec, *impl_->workspace, params, token_chunks, outputs, metrics,
         run_label, write_codes);
 }
 
