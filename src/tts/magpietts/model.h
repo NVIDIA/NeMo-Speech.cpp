@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <utility>
@@ -270,6 +271,10 @@ class MagpieModel {
     bool load(
         const std::string& fname, magpietts_uma_mode uma_mode = MAGPIETTS_UMA_AUTO,
         bool force_cpu = false, bool verbose = false);
+    // Borrow owner's weights (gguf, ctx, buffer, tensors) and open a fresh backend on the same
+    // device, so several runtimes in one process keep a single copy of the weights on the GPU.
+    // Only the weights are shared: each borrower computes on its own backend (own CUDA stream).
+    bool shareWeights(std::shared_ptr<const MagpieModel> owner);
     void reset();
     bool loaded() const { return gguf != nullptr && ctx != nullptr && backend != nullptr; }
 
@@ -282,6 +287,7 @@ class MagpieModel {
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     bool cuda_unified_memory = false;
+    std::shared_ptr<const MagpieModel> weights_owner;  // set when the weights are borrowed
 
     ggml_tensor* text_embedding = nullptr;
     std::vector<ggml_tensor*> audio_embeddings;
