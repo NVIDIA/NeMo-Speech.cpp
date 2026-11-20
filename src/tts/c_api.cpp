@@ -220,6 +220,9 @@ synthesizer_config_of(const nemo_speech_tts_synthesizer_config* c) {
         if (HAS_FIELD(model, nemo_speech_tts_model_config, text_normalizer_model_dir)) {
             cfg.text_normalizer_model_dir = str_or_empty(model->text_normalizer_model_dir);
         }
+        if (HAS_FIELD(model, nemo_speech_tts_model_config, latin_as_english)) {
+            cfg.tokenizer.latin_as_english = model->latin_as_english;
+        }
     }
     if (HAS_FIELD(c, nemo_speech_tts_synthesizer_config, default_language_code))
         cfg.default_language_code = str_or_empty(c->default_language_code);

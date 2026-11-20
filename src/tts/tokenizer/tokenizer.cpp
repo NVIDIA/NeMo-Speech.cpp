@@ -752,6 +752,9 @@ class MagpieNativeTokenizer::Impl {
             case tokenizer_kind::ipa:
                 return tokenize_ipa(p);
             case tokenizer_kind::byt5:
+                if (config_.latin_as_english && p.language == "ko") {
+                    return run_byt5_latin_as_english(p, english_ipa_tokenizer());
+                }
                 return run_byt5_native(p);
             case tokenizer_kind::hindi_chars:
                 return run_hindi_native(p);
@@ -819,6 +822,27 @@ class MagpieNativeTokenizer::Impl {
             result.chunks.push_back(std::move(ch));
         }
         return result;
+    }
+
+    // English IPA tokenizer for latin_as_english (same instance the "en" path uses).
+    const ipa_tokenizer& english_ipa_tokenizer() const {
+        const tokenizer_entry& en = profile_.entry_for_language("en");
+        if (en.kind != tokenizer_kind::ipa) {
+            throw std::runtime_error("latin_as_english requires an English IPA tokenizer profile");
+        }
+        params q;
+        q.model = model_dir_;
+        q.language = "en";
+        q.tokenizer_name = en.name;
+        q.locale = en.locale;
+        q.grapheme_case = en.grapheme_case;
+        q.grapheme_prefix = en.grapheme_prefix;
+        q.phoneme_dict = en.phoneme_dict;
+        q.heteronyms = en.heteronyms;
+        q.offset = en.offset;
+        q.apostrophe = en.apostrophe;
+        q.pad_with_space = en.pad_with_space;
+        return ipa_tokenizer_for("en", ipa_config_for_params(q));
     }
 
     const ipa_tokenizer& ipa_tokenizer_for(
