@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace nemo_speech::speechlm::policy {
 
@@ -350,6 +351,24 @@ duration_limit_error(double seconds, double limit) {
     char buffer[128];
     std::snprintf(buffer, sizeof buffer, "audio is %.1f s, the limit is %.0f s", seconds, limit);
     return std::string(buffer);
+}
+
+int
+greedy_pick(const float* logits, int n) {
+    int best = 0;
+    float top = -INFINITY;
+    for (int i = 0; i < n; i++) {
+        uint32_t bits;
+        std::memcpy(&bits, &logits[i], sizeof(bits));
+        bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000u;  // to BF16, nearest even
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (value > top) {  // the first of equal values stays
+            top = value;
+            best = i;
+        }
+    }
+    return best;
 }
 
 bool

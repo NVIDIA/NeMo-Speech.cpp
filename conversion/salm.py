@@ -21,6 +21,11 @@ llama.cpp rounds every block to three of its four levels, so the converter check
 The speech encoder (conversion/pee.py) is F16 ("none" writes the decoder alone, for a second profile of a checkpoint
 whose encoder file exists) and the CTC timestamp head (conversion/ctc_timestamp.py) comes from the checkpoint when it
 carries one (ctc_timestamp.*).
+
+A checkpoint quantized with ModelOpt (hf_quant_config.json; NVFP4 and FP8 layers, Hugging Face NemotronH tensor
+names) keeps its weights: it converts to `nvfp4` only, the decoder straight from llama.cpp's converter without
+llama-quantize. NVFP4 tensors keep their blocks and scales, FP8 tensors become their BF16 values and a per-tensor
+scale (salm_decoder_hf.py), and the encoder file defaults to F32, which holds the FP8 encoder linears exactly.
 """
 
 from __future__ import annotations
@@ -49,8 +54,10 @@ DENSE_TYPE = {
 }  # the dense linears of each profile
 Q2_KEPT_MOE_LAYERS = 5  # q2_0: the last MoE layers whose routed experts stay IQ4_NL
 Q2_0_BLOCK_BYTES = 18  # FP16 scale and 64 2-bit codes
-ENCODER_TYPES = ("f16", "none")
+ENCODER_TYPES = ("f16", "f32", "none")
 DEFAULT_ENCODER = "f16"
+QUANTIZED_ENCODER = "f32"  # the default for a ModelOpt checkpoint: its FP8 encoder linears exactly
+MODELOPT_ALGOS = {"NVFP4", "FP8"}  # the ModelOpt layer formats a checkpoint may use
 ENCODER_FILE_KEY = "nemo_speech.speech_model"  # the encoder file the decoder names
 CHECKPOINT_ID_KEY = "nemo_speech.checkpoint_id"
 EXPERT_TENSORS = "ffn_(up|down|gate)_exps"
@@ -74,6 +81,30 @@ def backbone_config(source: Path) -> dict:
     if isinstance(config.get("llm_config"), dict):
         return config["llm_config"]
     raise RuntimeError(f"{source}: no llm_backbone/config.json and no llm_config in config.json")
+
+
+def modelopt_quantization(source: Path) -> dict | None:
+    """The `quantization` section of a ModelOpt checkpoint's hf_quant_config.json, or None for an unquantized one.
+    Raises for layer formats other than NVFP4 and FP8 or a quantized KV cache."""
+    path = source / "hf_quant_config.json"
+    if not path.is_file():
+        return None
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if (config.get("producer") or {}).get("name", "").lower() != "modelopt":
+        raise RuntimeError(f"{path}: not a ModelOpt quantization config")
+    quantization = config.get("quantization") or {}
+    algos = {
+        layer.get("quant_algo")
+        for layer in (quantization.get("quantized_layers") or {}).values()
+        if isinstance(layer, dict)
+    } or {quantization.get("quant_algo")}
+    if not algos <= MODELOPT_ALGOS:
+        raise RuntimeError(
+            f"{path}: unsupported ModelOpt formats {sorted(str(a) for a in algos - MODELOPT_ALGOS)}"
+        )
+    if quantization.get("kv_cache_quant_algo"):
+        raise RuntimeError(f"{path}: a quantized KV cache is not supported")
+    return quantization
 
 
 def kept_expert_layers(profile: str, config: dict) -> list[int]:
@@ -116,8 +147,12 @@ def stage(source: Path, staging: Path, weights: bool = True) -> None:
     (staging / "tokenizer_config.json").write_text(
         json.dumps(tokenizer_config, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    if (source / "generation_config.json").is_file():
-        shutil.copyfile(source / "generation_config.json", staging / "generation_config.json")
+    for name in (
+        "generation_config.json",
+        "hf_quant_config.json",
+    ):  # the converter reads ModelOpt's config
+        if (source / name).is_file():
+            shutil.copyfile(source / name, staging / name)
 
     if not weights:
         return
@@ -141,14 +176,22 @@ def convert(
 ) -> None:
     profile = normalize_profile(profile)
     dense = DENSE_TYPE[profile]
-    encoder = encoder_type(profile, encoder)
+    quantized = modelopt_quantization(source) is not None
+    if quantized and profile != "nvfp4":
+        raise ValueError(
+            f"{source} is quantized with ModelOpt and converts to --outtype nvfp4 only, keeping its weights; "
+            f"convert {profile} from the BF16 checkpoint"
+        )
+    encoder = encoder_type(profile, encoder, quantized)
     if encoder not in ENCODER_TYPES:
-        raise ValueError("salm encoder type must be " + " or ".join(ENCODER_TYPES))
+        raise ValueError("salm encoder type must be " + ", ".join(ENCODER_TYPES))
     name = checkpoint_name or source.name
     repository = Path(__file__).resolve().parent.parent
     llama = ensure_llama_checkout(llama_cpp or repository / "llama.cpp", repository)
     quantize = None
-    if not dry_run:  # before the long conversion, so a missing quantizer fails fast
+    if (
+        not dry_run and not quantized
+    ):  # before the long conversion, so a missing quantizer fails fast
         quantize = ensure_quantizer(
             llama, quantizer, profile=profile, repo_root=repository, auto_build=auto_build_quantizer
         )
@@ -186,31 +229,46 @@ def convert(
     staging = work / "hf"
     print(f"[convert-salm] staging the decoder of {source}")
     stage(source, staging)
-    bf16 = work / "decoder-bf16.gguf"
-    print(f"[convert-salm] decoder -> BF16 GGUF {bf16}")
-    keys = decoder_keys(name, identity)
-    subprocess.run(
-        [
-            sys.executable,
-            str(Path(__file__).with_name("salm_decoder_hf.py")),
-            str(llama),
-            str(staging),
-            "--outfile",
-            str(bf16),
-            "--outtype",
-            "bf16",
-            "--model-name",
-            f"{name} {profile.upper()}",
-            *[arg for key in keys for arg in ("--nemo-speech-key", key)],
-            *(["--dry-run"] if dry_run else []),
-        ],
-        check=True,
+    # a ModelOpt checkpoint's decoder comes straight from the converter (its weights are already quantized)
+    decoder = (
+        outfile.with_name(outfile.name + ".writing") if quantized else work / "decoder-bf16.gguf"
     )
+    print(
+        f"[convert-salm] decoder -> {'GGUF with the checkpoint weights' if quantized else 'BF16 GGUF'} {decoder}"
+    )
+    paired = encoder if encoder != "none" else (QUANTIZED_ENCODER if quantized else DEFAULT_ENCODER)
+    keys = decoder_keys(name, identity, paired)
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("salm_decoder_hf.py")),
+        str(llama),
+        str(staging),
+        "--outfile",
+        str(decoder),
+        "--outtype",
+        "bf16",
+        "--model-name",
+        f"{name} {profile.upper()}",
+        *[arg for key in keys for arg in ("--nemo-speech-key", key)],
+        *(["--dry-run"] if dry_run else []),
+    ]
+    try:
+        subprocess.run(command, check=True)
+    except BaseException:
+        if quantized:
+            decoder.unlink(missing_ok=True)
+        raise
     if dry_run:  # tensor mapping checked, nothing written
         shutil.rmtree(work, ignore_errors=True)
         return
+    if quantized:
+        decoder.replace(outfile)
+        shutil.rmtree(work, ignore_errors=True)
+        if speech:
+            print(f"[convert-salm] {outfile.name} and its encoder file {speech.name}")
+        return
     quantize_decoder(
-        bf16,
+        decoder,
         outfile,
         profile,
         quantize,
@@ -228,10 +286,13 @@ def encoder_file_name(name: str, encoder: str = DEFAULT_ENCODER) -> str:
     return f"{name}-Encoder-{encoder.upper()}.gguf"
 
 
-def decoder_keys(name: str, identity: str) -> list[str]:
+def decoder_keys(name: str, identity: str, encoder: str = DEFAULT_ENCODER) -> list[str]:
     """The decoder's nemo_speech keys: the checkpoint id and the encoder file it pairs with, also when this run
     writes no encoder file (--salm-encoder none reuses the checkpoint's existing one)."""
-    return [f"{CHECKPOINT_ID_KEY}={identity}", f"{ENCODER_FILE_KEY}={encoder_file_name(name)}"]
+    return [
+        f"{CHECKPOINT_ID_KEY}={identity}",
+        f"{ENCODER_FILE_KEY}={encoder_file_name(name, encoder)}",
+    ]
 
 
 def checkpoint_id(source: Path) -> str:
@@ -264,10 +325,11 @@ def ctc_checkpoint(source: Path) -> Path | None:
     return None
 
 
-def encoder_type(profile: str, encoder: str | None = None) -> str:
-    """The encoder's type: F16 (every profile shares one encoder file), or "none"."""
+def encoder_type(profile: str, encoder: str | None = None, quantized: bool = False) -> str:
+    """The encoder's type: F16 (every profile shares one encoder file), F32 by default for a ModelOpt checkpoint
+    (its FP8 encoder linears exactly), or "none"."""
     normalize_profile(profile)
-    return (encoder or DEFAULT_ENCODER).lower()
+    return (encoder or (QUANTIZED_ENCODER if quantized else DEFAULT_ENCODER)).lower()
 
 
 def tensor_rules(

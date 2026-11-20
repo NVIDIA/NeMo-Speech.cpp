@@ -73,6 +73,68 @@
       ]
     },
     {
+      "repo": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+      "aliases": ["nemotron-transcribe"],
+      "revision": "6a0b4021f8a4d09d2cbc48ef27193564b0c21510",
+      "license": "OpenMDW-1.1",
+      "license_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+      "artifacts": [
+        {
+          "role": "asr",
+          "type": "file",
+          "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-IQ4_NL.gguf",
+          "size": 20352805856,
+          "sha256": "001bea92194596abe971528cf903efe2970f766ac809e4b46381d8567e2dfa30"
+        },
+        {
+          "role": "asr_encoder",
+          "type": "file",
+          "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf",
+          "size": 1670410080,
+          "sha256": "98b97e3b591a268229762fed39b7cbb26a322aa89a15f0bbee49d340bbdf6fe1"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+      "aliases": ["nemotron-transcribe-nvfp4"],
+      "revision": "6a0b4021f8a4d09d2cbc48ef27193564b0c21510",
+      "license": "OpenMDW-1.1",
+      "license_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+      "artifacts": [
+        {
+          "role": "asr",
+          "type": "file",
+          "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4.gguf",
+          "size": 22765076480,
+          "sha256": "eb8c9b338003347b527fbe2e249d4ca6fe9bccac289b6105e55b6a6b08a9c4c6"
+        },
+        {
+          "role": "asr_encoder",
+          "type": "file",
+          "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf",
+          "size": 1670410080,
+          "sha256": "98b97e3b591a268229762fed39b7cbb26a322aa89a15f0bbee49d340bbdf6fe1"
+        }
+      ]
+    },
+    {
+      "repo": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+      "aliases": ["nemotron-transcribe-dflash2"],
+      "revision": "6a0b4021f8a4d09d2cbc48ef27193564b0c21510",
+      "license": "OpenMDW-1.1",
+      "license_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+      "artifacts": [
+        {
+          "role": "draft",
+          "type": "file",
+          "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-DFlash2-BF16.gguf",
+          "size": 1149497536,
+          "sha256": "a08e8da4053111d9743fe5c8a137e60d0fd743e84e0793cef65fd2588da8c5ce"
+        }
+      ]
+    },
+    {
       "repo": "nvidia/Nemotron-3-Diarization",
       "aliases": ["nemotron-3-diarization", "nemotron-diar"],
       "revision": "f667ed73aee57d40cc39428eb768b4fd87a0a29e",

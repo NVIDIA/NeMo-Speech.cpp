@@ -445,6 +445,11 @@ run_server(int argc, char** argv) {
                           nemo_speech::asr::resolve_salm_encoder(asr_config);
                           return asr_config.salm.encoder_path;
                       }).empty();
+    if (start_asr && !asr_config.salm.dflash_path.empty())
+        asr_config.salm.dflash_path = resolve("DFlash2 draft model", [&] {
+            return optional_model(
+                asr_config.salm.dflash_path, "draft", "DFlash2 draft model", true);
+        });
     if (asr_enabled != 0 && (asr_requested || !asr_path.empty())) {
         asr_config.vad.model_path = resolve("VAD model", [&] {
             return optional_model(

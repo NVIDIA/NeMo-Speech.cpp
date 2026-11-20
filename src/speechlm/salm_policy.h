@@ -39,6 +39,11 @@ inline constexpr int kMaxOutputTokens = 21664;       // largest output budget
 inline constexpr double kMaxDurationSeconds = 3600;  // longest accepted audio
 inline constexpr double kGreedyTemperature = 1e-5;   // temperatures below this decode greedily
 
+// The token greedy decoding picks: the largest logit after rounding the logits to BF16 (round to
+// nearest even), and the lowest token id among equal values. The checkpoint's reference
+// implementation computes its logits in BF16, so this is the token its argmax gives.
+int greedy_pick(const float* logits, int n);
+
 // An invalid request (HTTP 400). `param` names the offending public field (chat route), or is
 // empty.
 class PolicyError : public std::invalid_argument {

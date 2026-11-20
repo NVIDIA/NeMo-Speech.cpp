@@ -80,6 +80,14 @@ The encoder file is the same for every `--outtype` (F16 encoder and F32 CTC head
 checkpoint, so decoders of several types share one. `--salm-encoder none` writes only the decoder, for a second
 `--outtype` of a checkpoint whose encoder file exists; `--architecture pee` converts only the speech encoder.
 
+A checkpoint quantized with ModelOpt (it carries `hf_quant_config.json`, with NVFP4 and FP8 layers) keeps its
+weights: it converts to `--outtype nvfp4` only, and the other types convert from the BF16 checkpoint. The decoder's
+NVFP4 tensors keep their 4-bit values and scales, and each FP8 tensor keeps its 8-bit values (stored as BF16, which
+holds them exactly) with its scale, which the runtime applies after the matrix multiply; the MTP head's FP8 tensors are
+written dequantized, as BF16. The encoder file defaults to
+F32 (`<checkpoint>-Encoder-F32.gguf`), which holds the FP8 encoder weights exactly; `--salm-encoder f16` writes the
+smaller F16 one.
+
 The conversion stages the checkpoint's decoder for llama.cpp's NemotronH converter (the pinned `llama.cpp`
 submodule), writes a BF16 intermediate next to the output (the size of the BF16 decoder) and then quantizes it
 with the patched `llama-quantize`, built once on first use like the S2S converter's. `--dry-run` checks the tensor

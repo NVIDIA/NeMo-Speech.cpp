@@ -65,9 +65,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--salm-encoder",
-        choices=("f16", "none"),
-        help="speech-LLM: f16 (default) writes the encoder file next to the decoder "
-        "(<checkpoint>-Encoder-F16.gguf); none: the decoder only (its encoder file exists)",
+        choices=("f16", "f32", "none"),
+        help="speech-LLM: the encoder file next to the decoder (<checkpoint>-Encoder-F16.gguf): f16 (default), f32 "
+        "(the default for a ModelOpt checkpoint, its FP8 encoder weights exactly); none: the decoder only (its "
+        "encoder file exists)",
     )
     parser.add_argument(
         "--salm-target",
