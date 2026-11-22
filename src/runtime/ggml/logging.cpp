@@ -50,7 +50,12 @@ log_internal(
 
 }  // namespace ggml_runtime
 
-// Global-namespace; called from llama_file and other global helpers.
+// Global-namespace; called from llama_file and other global helpers. Weak: a library that also
+// links llama.cpp statically (GGML_STATIC) takes llama-impl.cpp's identical format() instead of
+// failing on a duplicate definition.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
 std::string
 format(const char* fmt, ...) {
     va_list ap;
