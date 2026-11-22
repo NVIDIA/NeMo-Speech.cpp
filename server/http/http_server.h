@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "chat_api.h"
 
@@ -35,6 +36,9 @@ struct ServerConfig {
     bool realtime_s2s_output_text_events = false;
     // Chat API limits (http.chat.*).
     chat::ApiConfig chat;
+    // Names a request's `model` may also use for the ASR model besides its listed id: the name
+    // or path it was started with and its file name (serve fills them in).
+    std::vector<std::string> asr_model_names;
 };
 
 class Server {

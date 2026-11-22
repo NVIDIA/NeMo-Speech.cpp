@@ -1347,6 +1347,20 @@ resolve_indexed_model_directory(
     return resolve(reference, role, description, true);
 }
 
+std::vector<std::string>
+indexed_model_names(const std::string& reference) {
+    try {
+        const Index index = load_index();
+        const Model& model = find_model(index, reference);
+        std::vector<std::string> names{model.repo};
+        names.insert(names.end(), model.aliases.begin(), model.aliases.end());
+        return names;
+    }
+    catch (const std::exception&) {
+        return {};
+    }
+}
+
 std::vector<PulledModelArtifact>
 pull_indexed_model(const std::string& repo) {
     const Index index = load_index();

@@ -21,6 +21,7 @@
 #include "engine_registry.h"
 #include "http_server.h"
 #include "json.h"
+#include "model_store.h"
 #include "model_utils.h"
 #include "parameter_parser.h"
 #if defined(NEMO_SPEECH_CLI_TTS)
@@ -436,6 +437,16 @@ run_server(int argc, char** argv) {
         if (device_set)
             asr_config.backend.gpu = gpu;
         asr_config.model.path = asr_path;
+        // a request's `model` may also name the model as it was started (path, or indexed name and
+        // then also its repository ID and other aliases) or by its file name, with or without the
+        // extension
+        if (!asr_path.empty()) {
+            const std::filesystem::path file(asr_path);
+            server_config.asr_model_names = indexed_model_names(asr_reference);
+            server_config.asr_model_names.insert(
+                server_config.asr_model_names.end(),
+                {asr_reference, file.filename().string(), file.stem().string()});
+        }
     }
     // A speech-LLM decoder names its encoder file (GGUF headers only), so SALM is known here,
     // before any model load, also from the decoder alone.

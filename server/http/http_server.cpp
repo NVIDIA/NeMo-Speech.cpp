@@ -141,14 +141,19 @@ form_value(
 }
 
 // `model` of the ASR upload routes, as the chat API takes it: omitted or empty is the loaded
-// model, otherwise one of `served` (the ids GET /v1/models lists for the route and the chat API's
-// served id); any other id answers 404 unknown_model. True when the request was refused.
+// model, otherwise one of `served` (the ids GET /v1/models lists for the route, the chat API's
+// served id and the names the ASR model was started with); any other id answers 404
+// unknown_model. An id with leading dots also matches without them (0.3.0 listed some ASR ids
+// with one). True when the request was refused.
 bool
 refuse_unknown_model(
     const httplib::Request& request, httplib::Response& response,
     const std::vector<std::string>& served) {
     const std::string model = form_value(request, "model");
-    if (model.empty() || std::find(served.begin(), served.end(), model) != served.end())
+    const size_t first = model.find_first_not_of('.');
+    const std::string undotted = first == std::string::npos ? model : model.substr(first);
+    if (model.empty() || std::find(served.begin(), served.end(), model) != served.end() ||
+        std::find(served.begin(), served.end(), undotted) != served.end())
         return false;
     Value root(Value::Object{});
     Value error(Value::Object{});
@@ -385,6 +390,15 @@ struct Server::Impl {
     socket_t listen_socket = INVALID_SOCKET;  // recorded when httplib creates it
     std::atomic<uint64_t> request_id{1};
     TtsPreemptionCoordinator tts_preemption;
+
+    // `served` and the ids a request's `model` may use for the ASR model: its listed id and the
+    // names it was started with
+    std::vector<std::string> asr_ids(
+        const std::string& model_name, std::vector<std::string> served) const {
+        served.push_back(model_name);
+        served.insert(served.end(), config.asr_model_names.begin(), config.asr_model_names.end());
+        return served;
+    }
 
     Impl(EngineRegistry& engines, ServerConfig config)
         : models(engines), config(std::move(config)) {
@@ -705,7 +719,8 @@ struct Server::Impl {
                 auto recognizer = this->models.asr();
                 if (refuse_unknown_model(
                         request, response,
-                        {recognizer->model_name(), this->config.chat.limits.model_name}))
+                        this->asr_ids(
+                            recognizer->model_name(), {this->config.chat.limits.model_name})))
                     return;
                 const auto result = recognizer->recognize(
                     audio.samples.data(), audio.samples.size(), options, language,
@@ -830,7 +845,7 @@ struct Server::Impl {
                 std::vector<std::string> served = {
                     "speech-translation", this->config.chat.limits.model_name};
                 try {
-                    served.push_back(this->models.asr()->model_name());
+                    served = this->asr_ids(this->models.asr()->model_name(), served);
                 }
                 catch (const std::exception&) {
                 }

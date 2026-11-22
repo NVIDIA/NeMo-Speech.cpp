@@ -42,7 +42,7 @@ uses the `/v1/audio/transcriptions/realtime` WebSocket described below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | loaded ASR model | omitted or empty: the loaded ASR model; otherwise its id from `GET /v1/models` (or the chat API's served id), and any other id is a 404 `unknown_model` |
+| `model` | string | loaded ASR model | omitted or empty: the loaded ASR model; otherwise its id from `GET /v1/models`, the chat API's served id, or the name `serve` loaded it by (indexed name, repository ID or path) or its file name; any other id is a 404 `unknown_model` |
 | `file` | WAV upload | required | audio to transcribe |
 | `language` | string | model default | language code; prompt-conditioned models select their language prompt |
 | `response_format` | string | `json` | `json`, `verbose_json` (adds words/timestamps), `text`, `srt`, or `vtt` |
