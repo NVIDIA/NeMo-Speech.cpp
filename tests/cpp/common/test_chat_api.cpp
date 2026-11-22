@@ -647,6 +647,16 @@ test_validation() {
         CHECK(
             post(aliased, body).response.status == 200, "the recognizer's /v1/models id is served");
         CHECK(post(aliased, chat_body()).response.status == 200, "the configured name also is");
+        b.model_names = {"asr-short-name"};
+        chat::Api renamed(limits(), b);
+        for (const char* name : {"asr-model-id", ".asr-model-id", "asr-short-name"}) {
+            body = chat_body();
+            body.replace(body.find(kModel), kModel.size(), name);
+            CHECK(post(renamed, body).response.status == 200, name);
+        }
+        body = chat_body();
+        body.replace(body.find(kModel), kModel.size(), "asr-other");
+        CHECK(post(renamed, body).response.status == 404, "an unknown name");
     }
     EXPECT_ERROR(
         post(api, chat_body("", with_text("Transcribe <|audio|> now."))), 400, "invalid_request",

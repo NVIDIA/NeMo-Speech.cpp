@@ -150,10 +150,7 @@ refuse_unknown_model(
     const httplib::Request& request, httplib::Response& response,
     const std::vector<std::string>& served) {
     const std::string model = form_value(request, "model");
-    const size_t first = model.find_first_not_of('.');
-    const std::string undotted = first == std::string::npos ? model : model.substr(first);
-    if (model.empty() || std::find(served.begin(), served.end(), model) != served.end() ||
-        std::find(served.begin(), served.end(), undotted) != served.end())
+    if (model.empty() || chat::names_model(served, model))
         return false;
     Value root(Value::Object{});
     Value error(Value::Object{});
@@ -1349,7 +1346,9 @@ struct Server::Impl {
             server->WebSocket("/realtime", std::move(realtime_s2s), select_s2s_subprotocol);
         }
 #endif
-        chat::install(*server, models, this->config.chat);
+        chat::ApiConfig chat_config = this->config.chat;
+        chat_config.model_names = this->config.asr_model_names;
+        chat::install(*server, models, chat_config);
     }
 };
 

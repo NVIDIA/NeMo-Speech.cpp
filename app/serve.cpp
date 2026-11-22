@@ -442,7 +442,7 @@ run_server(int argc, char** argv) {
         // extension
         if (!asr_path.empty()) {
             const std::filesystem::path file(asr_path);
-            server_config.asr_model_names = indexed_model_names(asr_reference);
+            server_config.asr_model_names = indexed_model_names(asr_reference, "asr");
             server_config.asr_model_names.insert(
                 server_config.asr_model_names.end(),
                 {asr_reference, file.filename().string(), file.stem().string()});

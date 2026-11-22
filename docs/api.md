@@ -79,7 +79,7 @@ optional instruction travel as one user message:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | required | the id listed by `GET /v1/models` |
+| `model` | string | required | the id listed by `GET /v1/models`, `http.chat.model-name`, or the name `serve` loaded the model by (indexed name, repository ID or path) or its file name |
 | `messages` | array | required | exactly one `user` message whose `content` holds one `input_audio` part and at most one `text` part (the instruction) |
 | `language` | string | none | language hint, added to the default instruction as "The speech is in <language>." for the codes the model knows (`en`, `fr`, `zh`, `tl`, ...); a `text` instruction is used as written. Echoed in the response (`und` when omitted) |
 | `timestamp_granularities` | array | none | `"word"` and/or `"segment"`: word timestamps, subtitle cues and speakers in the response, in any language (Chinese, Japanese and Thai per character, see transcriptions); needs the CTC timestamp adapter |

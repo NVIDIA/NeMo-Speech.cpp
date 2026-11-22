@@ -19,9 +19,10 @@ std::filesystem::path resolve_indexed_model_directory(
     const std::string& reference, const std::string& role, const std::string& description);
 
 std::vector<PulledModelArtifact> pull_indexed_model(const std::string& repo);
-// The repository ID and aliases of the index entry `reference` names; none when it names no entry
-// (a local path) or there is no index.
-std::vector<std::string> indexed_model_names(const std::string& reference);
+// The repository ID and aliases of the index entry `reference` names, or of the index's default
+// model for `role` when `reference` is empty; none when it names no entry (a local path) or there
+// is no index.
+std::vector<std::string> indexed_model_names(const std::string& reference, const std::string& role);
 std::string indexed_models_json();
 std::string indexed_models_text();
 std::filesystem::path model_downloader_executable();

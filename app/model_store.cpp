@@ -1348,10 +1348,17 @@ resolve_indexed_model_directory(
 }
 
 std::vector<std::string>
-indexed_model_names(const std::string& reference) {
+indexed_model_names(const std::string& reference, const std::string& role) {
     try {
         const Index index = load_index();
-        const Model& model = find_model(index, reference);
+        std::string repo = reference;
+        if (repo.empty()) {
+            const auto found = index.defaults.find(role);
+            if (found == index.defaults.end())
+                return {};
+            repo = found->second;
+        }
+        const Model& model = find_model(index, repo);
         std::vector<std::string> names{model.repo};
         names.insert(names.end(), model.aliases.begin(), model.aliases.end());
         return names;
