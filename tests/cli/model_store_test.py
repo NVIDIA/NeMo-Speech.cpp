@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import struct
 import subprocess
 import sys
 import tarfile
@@ -19,7 +20,20 @@ import urllib.parse
 PAYLOAD = b"NeMo-Speech.cpp model-store fixture\n"
 CODEC_PAYLOAD = b"NeMo-Speech.cpp codec fixture\n"
 TTS_PAYLOAD = b"NeMo-Speech.cpp TTS fixture\n"
-SALM_PAYLOAD = b"NeMo-Speech.cpp speech-LLM decoder fixture\n"
+
+
+def gguf_naming(key: str, value: str) -> bytes:
+    """A GGUF v3 file with no tensors and one string key: a speech-LLM decoder header for key
+    nemo_speech.speech_model, which names the encoder file."""
+
+    def text(item: str) -> bytes:
+        return struct.pack("<Q", len(item.encode())) + item.encode()
+
+    header = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + text(key) + struct.pack("<I", 8) + text(value)
+    return header + b"\0" * (-len(header) % 32)
+
+
+SALM_PAYLOAD = gguf_naming("nemo_speech.speech_model", "tiny-salm-encoder.gguf")
 SALM_SMALL_PAYLOAD = b"NeMo-Speech.cpp smaller speech-LLM decoder fixture\n"
 SALM_ENCODER_PAYLOAD = b"NeMo-Speech.cpp speech-LLM encoder fixture\n"
 SALM_DRAFT_PAYLOAD = b"NeMo-Speech.cpp speech-LLM draft fixture\n"
@@ -419,6 +433,55 @@ def main() -> None:
                 assert (
                     resolved_directory / "tiny-salm-encoder.gguf"
                 ).read_bytes() == SALM_ENCODER_PAYLOAD
+
+            # A draft model downloads only when the command can run and drafts: not for streaming,
+            # which a speech-LLM rejects, and not with mtp_draft 0.
+            if "unknown command" not in resolved.stderr:
+                draft_cache = root / "draft-cache"
+                draft_environment = {**environment, "NEMO_SPEECH_MODEL_DIR": str(draft_cache)}
+                drafts_before = ArtifactHandler.request_counts.get("tiny-salm-draft.gguf", 0)
+                rejected = run(
+                    binary,
+                    draft_environment,
+                    "transcribe",
+                    str(audio),
+                    "--model",
+                    "tiny-salm",
+                    "--stream",
+                    "--asr.salm.dflash_path",
+                    "tiny-salm-draft",
+                )
+                assert rejected.returncode != 0
+                assert "SALM supports complete audio only" in rejected.stderr, rejected.stderr
+                undrafted = run(
+                    binary,
+                    draft_environment,
+                    "transcribe",
+                    str(audio),
+                    "--model",
+                    "tiny-salm",
+                    "--asr.salm.mtp_draft",
+                    "0",
+                    "--asr.salm.dflash_path",
+                    "tiny-salm-draft",
+                )
+                assert "DFlash2 draft model" not in undrafted.stderr, undrafted.stderr
+                assert (
+                    ArtifactHandler.request_counts.get("tiny-salm-draft.gguf", 0) == drafts_before
+                )
+                assert not list(draft_cache.rglob("tiny-salm-draft.gguf"))
+                drafted = run(
+                    binary,
+                    draft_environment,
+                    "transcribe",
+                    str(audio),
+                    "--model",
+                    "tiny-salm",
+                    "--asr.salm.dflash_path",
+                    "tiny-salm-draft",
+                )
+                assert drafted.returncode != 0  # the fixture decoder has no weights
+                assert list(draft_cache.rglob("tiny-salm-draft.gguf")), drafted.stderr
 
             # A later entry of a repository needs an alias.
             shared_index = json.loads(index.read_text(encoding="utf-8"))
