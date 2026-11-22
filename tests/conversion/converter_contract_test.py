@@ -61,6 +61,7 @@ from conversion.salm import encoder_type as salm_encoder_type
 from conversion.salm import kept_expert_layers as salm_kept_expert_layers
 from conversion.salm import modelopt_quantization as salm_modelopt_quantization
 from conversion.salm import q2_0_uses_top_level as salm_q2_0_uses_top_level
+from conversion.salm import reused_encoder as salm_reused_encoder
 from conversion.salm import stage as stage_salm
 from conversion.salm import tensor_rules as salm_tensor_rules
 from conversion.source import extract_archive
@@ -349,6 +350,18 @@ class ConverterContractTest(unittest.TestCase):
             salm_encoder_file_name("example-salm", "f16"),
             "example-salm-Encoder-F16.gguf",
         )
+        # --salm-encoder none names the encoder file next to the output: the one there, or else the default
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(salm_reused_encoder(root, "example-salm"), "f16")
+            self.assertEqual(salm_reused_encoder(root, "example-salm", quantized=True), "f32")
+            (root / "example-salm-Encoder-F32.gguf").touch()
+            self.assertEqual(salm_reused_encoder(root, "example-salm"), "f32")
+            (root / "example-salm-Encoder-F16.gguf").touch()
+            self.assertEqual(salm_reused_encoder(root, "example-salm"), "f16")
+            self.assertEqual(salm_reused_encoder(root, "example-salm", quantized=True), "f32")
+            (root / "example-salm-Encoder-F32.gguf").unlink()
+            self.assertEqual(salm_reused_encoder(root, "example-salm", quantized=True), "f16")
         # every decoder names its encoder file, also one converted with --salm-encoder none
         self.assertEqual(
             salm_decoder_keys("example-salm", "0123"),
@@ -433,6 +446,22 @@ class ConverterContractTest(unittest.TestCase):
             fp8 = sd["encoder.asr_encoder.layers.0.attn.out_proj.weight"]
             self.assertEqual(fp8.dtype, torch.float32)
             self.assertTrue(torch.equal(fp8, weight.float() * torch.tensor(0.0071)))
+            # the scale may sit in another shard than its weight
+            (root / "perception.safetensors").unlink()
+            save_file(
+                {k: v for k, v in tensors.items() if not k.endswith("_scale")},
+                str(root / "model-00001-of-00002.safetensors"),
+            )
+            save_file(
+                {k: v for k, v in tensors.items() if k.endswith("_scale")},
+                str(root / "model-00002-of-00002.safetensors"),
+            )
+            _, sharded = _load_salm_perception(root)
+            self.assertEqual(sorted(sharded), sorted(sd))
+            for key, tensor in sd.items():
+                self.assertTrue(torch.equal(sharded[key], tensor))
+            for shard in root.glob("*.safetensors"):
+                shard.unlink()
             # an FP8 weight without its scale is refused
             del tensors[f"{prefix}.weight_scale"]
             save_file(tensors, str(root / "perception.safetensors"))

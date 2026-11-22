@@ -48,7 +48,8 @@ nemo-speech serve --asr-model $MODEL \
 ## What the files are
 
 A model is two GGUF files in one directory: the language-model decoder, which is the model you pass, and the encoder
-file it names (`<checkpoint>-Encoder-F16.gguf`): the speech encoder with its speaker branch, and the CTC timestamp head
+file it names (`<checkpoint>-Encoder-F16.gguf`, or `-Encoder-F32.gguf` by default from a ModelOpt checkpoint;
+`--salm-encoder` at conversion sets it): the speech encoder with its speaker branch, and the CTC timestamp head
 (word timestamps and speaker labels). Decoders of every precision share one encoder file, and a decoder refuses an
 encoder file of another checkpoint. The DFlash2 draft model is a separate optional file.
 [Model conversion](../model-conversion.md#speech-llm-salm) makes the files from a checkpoint. `--salm-encoder` (or

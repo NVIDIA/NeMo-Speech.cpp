@@ -6,7 +6,8 @@ BF16 (round to nearest even), and the lowest index among equal values: the
 result of an argmax over the same values held in a BF16 tensor. A decoder
 whose reference implementation computes its logits in BF16 picks the same
 tokens with it as that implementation. The CPU and CUDA backends implement
-it; ggml_argmax is unchanged.
+it; Vulkan and Metal reject it in supports_op, so it runs on the CPU there.
+ggml_argmax is unchanged.
 
 Upstream: stays here (greedy decoding of BF16 speech-LLM checkpoints).
 
@@ -113,6 +114,35 @@ index 51967c667cfd88a8d9d81ddbf827bce402d65761..678b9fed47bad2b484c32b8930002af6
 +        argmax_f32<false><<<blocks_num, blocks_dim, 0, stream>>>(src0_d, dst_d, ne00);
 +    }
  }
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 81ea7f9d7a97f10456c5427a18cb261b1315a7d9..8327c9aadf2dc2a4c4d1cc406a741b09616a6e92 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1674,7 +1674,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                 op->src[1]->type == GGML_TYPE_I32 &&
+                 op->type == GGML_TYPE_I64;
+         case GGML_OP_ARGMAX:
+-            return has_simdgroup_reduction;
++            // ggml_argmax_bf16 (op_params[0]) is not implemented here; it runs on the CPU
++            return has_simdgroup_reduction && ggml_get_op_params_i32(op, 0) == 0;
+         case GGML_OP_NORM:
+         case GGML_OP_RMS_NORM:
+             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 1720657cf46c40f9b802bbae8d2d3095dc3489d1..f5d4a9746cd0c06570f0f1af58c00a4e0a92fb1e 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15513,7 +15513,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 return true;
+             }
+         case GGML_OP_ARGMAX:
+-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
++            // ggml_argmax_bf16 (op_params[0]) is not implemented here; it runs on the CPU
++            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
++                && ggml_get_op_params_i32(op, 0) == 0;
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
+                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index a2c11d254728236205cec60d2092d9849e43a7fc..d08015cfbbad955d712e8476dff4c711d89ad0ac 100644
 --- a/ggml/src/ggml.c

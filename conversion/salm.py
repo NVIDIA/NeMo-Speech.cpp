@@ -19,8 +19,8 @@ Otherwise embeddings, the output head and the norms stay BF16/F32. Q2_0 needs th
 llama.cpp rounds every block to three of its four levels, so the converter checks its output for the fourth.
 
 The speech encoder (conversion/pee.py) is F16 ("none" writes the decoder alone, for a second profile of a checkpoint
-whose encoder file exists) and the CTC timestamp head (conversion/ctc_timestamp.py) comes from the checkpoint when it
-carries one (ctc_timestamp.*).
+whose encoder file exists, and names that file) and the CTC timestamp head (conversion/ctc_timestamp.py) comes from
+the checkpoint when it carries one (ctc_timestamp.*).
 
 A checkpoint quantized with ModelOpt (hf_quant_config.json; NVFP4 and FP8 layers, Hugging Face NemotronH tensor
 names) keeps its weights: it converts to `nvfp4` only, the decoder straight from llama.cpp's converter without
@@ -236,7 +236,13 @@ def convert(
     print(
         f"[convert-salm] decoder -> {'GGUF with the checkpoint weights' if quantized else 'BF16 GGUF'} {decoder}"
     )
-    paired = encoder if encoder != "none" else (QUANTIZED_ENCODER if quantized else DEFAULT_ENCODER)
+    paired = encoder if encoder != "none" else reused_encoder(outfile.parent, name, quantized)
+    if encoder == "none":
+        reused = outfile.with_name(encoder_file_name(name, paired))
+        print(
+            f"[convert-salm] the decoder names the encoder file {reused.name}"
+            + ("" if reused.is_file() else " (not next to the output yet)")
+        )
     keys = decoder_keys(name, identity, paired)
     command = [
         sys.executable,
@@ -284,6 +290,18 @@ def convert(
 def encoder_file_name(name: str, encoder: str = DEFAULT_ENCODER) -> str:
     """The encoder file's name: the checkpoint's name and the encoder type, the same for every decoder."""
     return f"{name}-Encoder-{encoder.upper()}.gguf"
+
+
+def reused_encoder(directory: Path, name: str, quantized: bool = False) -> str:
+    """--salm-encoder none: the type of the encoder file the decoder pairs with, the checkpoint's encoder file in
+    directory when there is one of a single type, otherwise the checkpoint's default (F32 for a ModelOpt checkpoint,
+    F16 for the others)."""
+    found = [
+        kind for kind in ("f16", "f32") if (directory / encoder_file_name(name, kind)).is_file()
+    ]
+    if len(found) == 1:
+        return found[0]
+    return QUANTIZED_ENCODER if quantized else DEFAULT_ENCODER
 
 
 def decoder_keys(name: str, identity: str, encoder: str = DEFAULT_ENCODER) -> list[str]:

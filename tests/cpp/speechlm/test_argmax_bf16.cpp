@@ -5,7 +5,8 @@
 // tokens with the op on the device, the upstream path with greedy_pick on the host, and both must
 // give the same token. Rows of vocabulary width and narrower, with equal values after the BF16
 // rounding placed so that a plain argmax, or an argmax that does not take the lowest index, gives
-// another column. Runs on the CPU backend and, when there is one, the GPU backend.
+// another column. Runs on the CPU backend and on the GPU backend when there is one that supports
+// the op (CUDA; Vulkan and Metal reject it, so the scheduler runs it on the CPU there).
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -78,6 +79,16 @@ run(ggml_backend_t backend, const std::vector<float>& x, int64_t cols, int64_t r
     return out;
 }
 
+bool
+supports_argmax_bf16(ggml_backend_t backend) {
+    ggml_init_params params{ggml_tensor_overhead() * 2, nullptr, true};
+    ggml_context* ctx = ggml_init(params);
+    const bool ok = ggml_backend_supports_op(
+        backend, ggml_argmax_bf16(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 1)));
+    ggml_free(ctx);
+    return ok;
+}
+
 }  // namespace
 
 int
@@ -85,8 +96,19 @@ main() {
     ggml_backend_t backends[2] = {
         ggml_backend_cpu_init(), ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)};
     const char* names[2] = {"CPU", "GPU"};
-    if (!backends[1])
+    if (!backends[1]) {
         std::fprintf(stderr, "no GPU backend available; CPU only\n");
+    } else if (!supports_argmax_bf16(backends[1])) {
+        std::fprintf(
+            stderr, "%s does not support ggml_argmax_bf16 (it runs on the CPU there); CPU only\n",
+            ggml_backend_name(backends[1]));
+        ggml_backend_free(backends[1]);
+        backends[1] = nullptr;
+    }
+    if (!supports_argmax_bf16(backends[0])) {
+        std::fprintf(stderr, "FAIL: the CPU backend does not support ggml_argmax_bf16\n");
+        return 1;
+    }
 
     int failures = 0;
     const int64_t widths[] = {131072, 4097, 1000, 70, 3};  // the vocabulary, and under one block
