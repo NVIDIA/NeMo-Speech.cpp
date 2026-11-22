@@ -42,7 +42,7 @@ uses the `/v1/audio/transcriptions/realtime` WebSocket described below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | loaded ASR model | omitted or empty: the loaded ASR model; otherwise its id from `GET /v1/models` (or the chat API's served id), and any other id is a 404 `unknown_model` |
+| `model` | string | loaded ASR model | omitted or empty: the loaded ASR model; otherwise its id from `GET /v1/models`, the chat API's served id, or the name `serve` loaded it by (indexed name, repository ID or path) or its file name; any other id is a 404 `unknown_model` |
 | `file` | WAV upload | required | audio to transcribe |
 | `language` | string | model default | language code; prompt-conditioned models select their language prompt |
 | `response_format` | string | `json` | `json`, `verbose_json` (adds words/timestamps), `text`, `srt`, or `vtt` |
@@ -79,7 +79,7 @@ optional instruction travel as one user message:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | required | the id listed by `GET /v1/models` |
+| `model` | string | required | the id listed by `GET /v1/models`, `http.chat.model-name`, or the name `serve` loaded the model by (indexed name, repository ID or path) or its file name |
 | `messages` | array | required | exactly one `user` message whose `content` holds one `input_audio` part and at most one `text` part (the instruction) |
 | `language` | string | none | language hint, added to the default instruction as "The speech is in <language>." for the codes the model knows (`en`, `fr`, `zh`, `tl`, ...); a `text` instruction is used as written. Echoed in the response (`und` when omitted) |
 | `timestamp_granularities` | array | none | `"word"` and/or `"segment"`: word timestamps, subtitle cues and speakers in the response, in any language (Chinese, Japanese and Thai per character, see transcriptions); needs the CTC timestamp adapter |

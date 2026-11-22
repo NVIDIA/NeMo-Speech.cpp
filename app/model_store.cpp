@@ -306,6 +306,17 @@ looks_like_repo(const std::string& reference) {
     }
 }
 
+const Model&
+find_model(const Index& index, const std::string& repo) {
+    for (const auto& model : index.models) {
+        if (model.repo == repo ||
+            std::find(model.aliases.begin(), model.aliases.end(), repo) != model.aliases.end())
+            return model;
+    }
+    throw MissingModelError(
+        "unknown model repository: " + repo + " (run 'nemo-speech model list')");
+}
+
 Index
 load_index() {
     Value root = Value::parse(read_text_file(index_path()));
@@ -349,8 +360,10 @@ load_index() {
             artifact.range_end =
                 artifact_value.find("range_end") ? integer(artifact_value, "range_end") : 0;
             artifact.stop_before = artifact_value.string_or("stop_before");
+            // asr_encoder: a speech-LLM decoder's encoder file, downloaded next to it; draft: a
+            // speech-LLM draft model (asr.salm.dflash_path).
             static const std::set<std::string> allowed_roles = {
-                "asr", "diarization", "tts", "codec", "tokenizer"};
+                "asr", "asr_encoder", "draft", "diarization", "tts", "codec", "tokenizer"};
             if (allowed_roles.find(artifact.role) == allowed_roles.end())
                 throw std::runtime_error("unsupported artifact role in model index");
             if (!artifact.revision.empty())
@@ -432,9 +445,13 @@ load_index() {
             throw std::runtime_error("model has no artifacts in model index: " + model.repo);
         index.models.push_back(std::move(model));
     }
+    // Entries may share a repository (the decoders of one GGUF repository): its ID selects the
+    // first entry, and each later one is selected by aliases of its own.
     std::set<std::string> identifiers;
+    std::set<std::string> repos;
     for (const auto& model : index.models) {
-        if (!identifiers.insert(model.repo).second)
+        if (repos.insert(model.repo).second ? !identifiers.insert(model.repo).second
+                                            : model.aliases.empty())
             throw std::runtime_error("duplicate repository in model index: " + model.repo);
         for (const auto& alias : model.aliases)
             if (!identifiers.insert(alias).second)
@@ -444,12 +461,7 @@ load_index() {
         if (identifiers.find(item.second) == identifiers.end())
             throw std::runtime_error(
                 "model index default references an unknown model: " + item.second);
-        const Model* model = nullptr;
-        for (const auto& candidate : index.models)
-            if (candidate.repo == item.second ||
-                std::find(candidate.aliases.begin(), candidate.aliases.end(), item.second) !=
-                    candidate.aliases.end())
-                model = &candidate;
+        const Model* model = &find_model(index, item.second);
         const bool provides_role = std::any_of(
             model->artifacts.begin(), model->artifacts.end(),
             [&](const Artifact& artifact) { return artifact.role == item.first; });
@@ -462,17 +474,6 @@ load_index() {
                 throw std::runtime_error(
                     "model index companion references an unknown model: " + companion);
     return index;
-}
-
-const Model&
-find_model(const Index& index, const std::string& repo) {
-    for (const auto& model : index.models) {
-        if (model.repo == repo ||
-            std::find(model.aliases.begin(), model.aliases.end(), repo) != model.aliases.end())
-            return model;
-    }
-    throw MissingModelError(
-        "unknown model repository: " + repo + " (run 'nemo-speech model list')");
 }
 
 const Artifact&
@@ -498,6 +499,10 @@ commands_for(const Model& model) {
             add("transcribe");
             add("bench");
             add("serve");
+        } else if (artifact.role == "draft") {
+            add("transcribe --asr.salm.dflash_path");
+            add("bench --asr.salm.dflash_path");
+            add("serve --asr.salm.dflash_path");
         } else if (artifact.role == "diarization") {
             add("diarize");
             add("transcribe --diarize");
@@ -1306,9 +1311,9 @@ resolve(
     }
     const Model* model = nullptr;
     for (const auto& candidate : index.models)
-        if (candidate.repo == repo ||
-            std::find(candidate.aliases.begin(), candidate.aliases.end(), repo) !=
-                candidate.aliases.end())
+        if (!model && (candidate.repo == repo ||
+                       std::find(candidate.aliases.begin(), candidate.aliases.end(), repo) !=
+                           candidate.aliases.end()))
             model = &candidate;
     if (!model) {
         if (reference.empty() || looks_like_repo(reference))
@@ -1319,7 +1324,13 @@ resolve(
             description + (directory ? " directory does not exist: " : " file does not exist: ") +
             reference);
     }
-    return materialize(*model, find_artifact(*model, role, directory)).path;
+    const Artifact& artifact = find_artifact(*model, role, directory);
+    // A speech-LLM decoder loads the encoder file it names from its own directory.
+    if (role == "asr")
+        for (const auto& encoder : model->artifacts)
+            if (encoder.role == "asr_encoder")
+                materialize(*model, encoder);
+    return materialize(*model, artifact).path;
 }
 
 }  // namespace
@@ -1336,14 +1347,35 @@ resolve_indexed_model_directory(
     return resolve(reference, role, description, true);
 }
 
+std::vector<std::string>
+indexed_model_names(const std::string& reference, const std::string& role) {
+    try {
+        const Index index = load_index();
+        std::string repo = reference;
+        if (repo.empty()) {
+            const auto found = index.defaults.find(role);
+            if (found == index.defaults.end())
+                return {};
+            repo = found->second;
+        }
+        const Model& model = find_model(index, repo);
+        std::vector<std::string> names{model.repo};
+        names.insert(names.end(), model.aliases.begin(), model.aliases.end());
+        return names;
+    }
+    catch (const std::exception&) {
+        return {};
+    }
+}
+
 std::vector<PulledModelArtifact>
 pull_indexed_model(const std::string& repo) {
     const Index index = load_index();
     std::vector<PulledModelArtifact> result;
-    std::set<std::string> visited;
+    std::set<const Model*> visited;
     std::function<void(const std::string&)> pull = [&](const std::string& current_repo) {
         const Model& model = find_model(index, current_repo);
-        if (!visited.insert(model.repo).second)
+        if (!visited.insert(&model).second)
             return;
         for (const auto& artifact : model.artifacts) result.push_back(materialize(model, artifact));
         for (const auto& companion : model.companions) pull(companion);
@@ -1432,7 +1464,16 @@ indexed_models_text() {
            << "ASR — transcribe, bench, serve\n";
     for (const auto& model : index.models)
         if (has_role(model, "asr"))
+            print_model(model, has_role(model, "asr_encoder") ? "decoder + encoder" : "");
+
+    bool drafts = false;
+    for (const auto& model : index.models)
+        if (has_role(model, "draft")) {
+            if (!drafts)
+                output << "\nSpeech-LLM draft models — --asr.salm.dflash_path\n";
+            drafts = true;
             print_model(model, "");
+        }
 
     output << "\nDiarization — diarize, transcribe --diarize, serve\n";
     for (const auto& model : index.models)

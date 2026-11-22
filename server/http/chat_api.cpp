@@ -46,6 +46,14 @@
 
 namespace nemo_speech::http::chat {
 
+bool
+names_model(const std::vector<std::string>& names, const std::string& requested) {
+    const size_t first = requested.find_first_not_of('.');
+    const std::string undotted = first == std::string::npos ? requested : requested.substr(first);
+    return std::find(names.begin(), names.end(), requested) != names.end() ||
+           std::find(names.begin(), names.end(), undotted) != names.end();
+}
+
 #if defined(NEMO_SPEECH_REGISTRY_ASR)
 namespace {
 
@@ -1902,9 +1910,12 @@ Api::post(const HeaderLookup& headers, const BodyReader& read_body, const Client
             if ((*text)->size() > 262144)
                 throw bad_request(what + " exceeds the configured limit of 262144 bytes", param);
         }
+        std::vector<std::string> names = s.backend.model_names;
+        if (s.backend.model_alias)
+            names.push_back(s.backend.model_alias());
         const bool served =
             (!s.limits.model_name.empty() && request.model == s.limits.model_name) ||
-            (s.backend.model_alias && request.model == s.backend.model_alias());
+            names_model(names, request.model);
         if (!served || !s.backend.recognize)
             throw ApiError{404, "unknown_model", "requested model is not available", {}};
         if (deferred)
@@ -2126,6 +2137,7 @@ install(httplib::Server& server, EngineRegistry& engines, const ApiConfig& confi
             return std::string();
         }
     };
+    backend.model_names = config.model_names;
     auto api = std::make_shared<Api>(config.limits, std::move(backend));
 
     const auto send = [](const HttpResponse& from, httplib::Response& to) {

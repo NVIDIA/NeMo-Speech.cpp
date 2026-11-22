@@ -1364,7 +1364,11 @@ AsrModel::load(
         } else {
             throw std::runtime_error("Unknown asr.head_type='" + h + "'");
         }
+        // some published GGUFs carry a leading dot in general.name (".nemotron-...gguf")
         c.model_name = loader.get_str("general.name", "asr");
+        c.model_name.erase(0, c.model_name.find_first_not_of('.'));
+        if (c.model_name.empty())
+            c.model_name = "asr";
     } else if (arch == "parakeet-ctc" || arch.empty()) {
         head = HeadKind::Ctc;
         c.ns = "parakeet-ctc";

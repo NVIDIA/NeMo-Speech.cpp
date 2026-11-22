@@ -21,7 +21,10 @@ python3 convert_model.py checkpoints/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B --ar
     --outtype nvfp4 --outfile models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4.gguf
 ```
 
-The example writes the NVFP4 decoder; for another precision, change `--outtype` and the file name. Every entrypoint
+The example writes the NVFP4 decoder; for another precision, change `--outtype` and the file name. The
+[NVFP4 checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4) also converts, with
+`--outtype nvfp4` only: its decoder and encoder keep the checkpoint's own quantized weights
+([Model conversion](../model-conversion.md#speech-llm-salm)). Every entrypoint
 takes the path of the decoder you converted:
 
 ```bash
@@ -45,7 +48,8 @@ nemo-speech serve --asr-model $MODEL \
 ## What the files are
 
 A model is two GGUF files in one directory: the language-model decoder, which is the model you pass, and the encoder
-file it names (`<checkpoint>-Encoder-F16.gguf`): the speech encoder with its speaker branch, and the CTC timestamp head
+file it names (`<checkpoint>-Encoder-F16.gguf`, or `-Encoder-F32.gguf` by default from a ModelOpt checkpoint;
+`--salm-encoder` at conversion sets it): the speech encoder with its speaker branch, and the CTC timestamp head
 (word timestamps and speaker labels). Decoders of every precision share one encoder file, and a decoder refuses an
 encoder file of another checkpoint. The DFlash2 draft model is a separate optional file.
 [Model conversion](../model-conversion.md#speech-llm-salm) makes the files from a checkpoint. `--salm-encoder` (or

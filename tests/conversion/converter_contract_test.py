@@ -54,11 +54,14 @@ from conversion.s2s_components.voicechat_source import (
 )
 from conversion.salm import DENSE_TYPE as SALM_DENSE_TYPE
 from conversion.salm import checkpoint_id as salm_checkpoint_id
+from conversion.salm import convert as convert_salm
 from conversion.salm import decoder_keys as salm_decoder_keys
 from conversion.salm import encoder_file_name as salm_encoder_file_name
 from conversion.salm import encoder_type as salm_encoder_type
 from conversion.salm import kept_expert_layers as salm_kept_expert_layers
+from conversion.salm import modelopt_quantization as salm_modelopt_quantization
 from conversion.salm import q2_0_uses_top_level as salm_q2_0_uses_top_level
+from conversion.salm import reused_encoder as salm_reused_encoder
 from conversion.salm import stage as stage_salm
 from conversion.salm import tensor_rules as salm_tensor_rules
 from conversion.source import extract_archive
@@ -340,10 +343,25 @@ class ConverterContractTest(unittest.TestCase):
         self.assertEqual(salm_encoder_type("nvfp4"), "f16")
         self.assertEqual(salm_encoder_type("iq4_nl"), "f16")
         self.assertEqual(salm_encoder_type("iq4_nl", "none"), "none")
+        # a ModelOpt checkpoint's encoder file defaults to F32 (its FP8 linears exactly)
+        self.assertEqual(salm_encoder_type("nvfp4", quantized=True), "f32")
+        self.assertEqual(salm_encoder_type("nvfp4", "f16", quantized=True), "f16")
         self.assertEqual(
             salm_encoder_file_name("example-salm", "f16"),
             "example-salm-Encoder-F16.gguf",
         )
+        # --salm-encoder none names the encoder file next to the output: the one there, or else the default
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(salm_reused_encoder(root, "example-salm"), "f16")
+            self.assertEqual(salm_reused_encoder(root, "example-salm", quantized=True), "f32")
+            (root / "example-salm-Encoder-F32.gguf").touch()
+            self.assertEqual(salm_reused_encoder(root, "example-salm"), "f32")
+            (root / "example-salm-Encoder-F16.gguf").touch()
+            self.assertEqual(salm_reused_encoder(root, "example-salm"), "f16")
+            self.assertEqual(salm_reused_encoder(root, "example-salm", quantized=True), "f32")
+            (root / "example-salm-Encoder-F32.gguf").unlink()
+            self.assertEqual(salm_reused_encoder(root, "example-salm", quantized=True), "f16")
         # every decoder names its encoder file, also one converted with --salm-encoder none
         self.assertEqual(
             salm_decoder_keys("example-salm", "0123"),
@@ -352,6 +370,103 @@ class ConverterContractTest(unittest.TestCase):
                 "nemo_speech.speech_model=example-salm-Encoder-F16.gguf",
             ],
         )
+
+    def test_salm_modelopt_checkpoint(self) -> None:
+        def quant_config(root, layers, producer="modelopt", kv=None):
+            (root / "hf_quant_config.json").write_text(
+                json.dumps(
+                    {
+                        "producer": {"name": producer},
+                        "quantization": {
+                            "quant_algo": "MIXED_PRECISION",
+                            "kv_cache_quant_algo": kv,
+                            "quantized_layers": {
+                                name: {"quant_algo": algo} for name, algo in layers.items()
+                            },
+                        },
+                    }
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIsNone(salm_modelopt_quantization(root))  # BF16 checkpoint
+            quant_config(
+                root,
+                {
+                    "backbone.layers.1.mixer.experts": "NVFP4",
+                    "backbone.layers.0.mixer.in_proj": "FP8",
+                },
+            )
+            self.assertEqual(
+                salm_modelopt_quantization(root)["quantized_layers"][
+                    "backbone.layers.0.mixer.in_proj"
+                ],
+                {"quant_algo": "FP8"},
+            )
+            # it keeps its weights: --outtype nvfp4 only (checked before any conversion work)
+            with self.assertRaisesRegex(ValueError, "nvfp4 only"):
+                convert_salm(root, root / "out.gguf", "iq4_nl")
+            quant_config(root, {"backbone.layers.1.mixer.experts": "W4A8_AWQ"})
+            with self.assertRaisesRegex(RuntimeError, "W4A8_AWQ"):
+                salm_modelopt_quantization(root)
+            quant_config(root, {"backbone.layers.1.mixer.experts": "NVFP4"}, kv="FP8")
+            with self.assertRaisesRegex(RuntimeError, "KV cache"):
+                salm_modelopt_quantization(root)
+            quant_config(root, {}, producer="other")
+            with self.assertRaises(RuntimeError):
+                salm_modelopt_quantization(root)
+        # the decoder names the encoder file it pairs with
+        self.assertEqual(
+            salm_decoder_keys("example-salm", "0123", "f32")[1],
+            "nemo_speech.speech_model=example-salm-Encoder-F32.gguf",
+        )
+
+    def test_salm_encoder_fp8_weights(self) -> None:
+        from conversion.pee import _load_salm_perception
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text(json.dumps({"pe_encoder_config": {"d_model": 4}}))
+            values = torch.tensor([[0.5, -1.25, 448.0, 0.0], [-0.0, 2.0**-9, 3.0, -6.5]])
+            weight = values.to(torch.float8_e4m3fn)
+            prefix = "perception.encoder.asr_encoder.layers.0.attn.out_proj"
+            tensors = {
+                f"{prefix}.weight": weight,
+                f"{prefix}.weight_scale": torch.tensor(0.0071),
+                f"{prefix}.input_scale": torch.tensor(0.5),
+                "perception.proj.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+            }
+            save_file(tensors, str(root / "perception.safetensors"))
+            cfg, sd = _load_salm_perception(root)
+            self.assertEqual(cfg, {"d_model": 4})
+            self.assertEqual(
+                sorted(sd), ["encoder.asr_encoder.layers.0.attn.out_proj.weight", "proj.weight"]
+            )
+            fp8 = sd["encoder.asr_encoder.layers.0.attn.out_proj.weight"]
+            self.assertEqual(fp8.dtype, torch.float32)
+            self.assertTrue(torch.equal(fp8, weight.float() * torch.tensor(0.0071)))
+            # the scale may sit in another shard than its weight
+            (root / "perception.safetensors").unlink()
+            save_file(
+                {k: v for k, v in tensors.items() if not k.endswith("_scale")},
+                str(root / "model-00001-of-00002.safetensors"),
+            )
+            save_file(
+                {k: v for k, v in tensors.items() if k.endswith("_scale")},
+                str(root / "model-00002-of-00002.safetensors"),
+            )
+            _, sharded = _load_salm_perception(root)
+            self.assertEqual(sorted(sharded), sorted(sd))
+            for key, tensor in sd.items():
+                self.assertTrue(torch.equal(sharded[key], tensor))
+            for shard in root.glob("*.safetensors"):
+                shard.unlink()
+            # an FP8 weight without its scale is refused
+            del tensors[f"{prefix}.weight_scale"]
+            save_file(tensors, str(root / "perception.safetensors"))
+            with self.assertRaisesRegex(RuntimeError, "weight_scale"):
+                _load_salm_perception(root)
 
     def test_salm_checkpoint_id(self) -> None:
         import numpy as np
@@ -458,9 +573,14 @@ class ConverterContractTest(unittest.TestCase):
                 )
             )
             (source / "model.safetensors").write_bytes(b"weights")
+            (source / "hf_quant_config.json").write_text('{"producer": {"name": "modelopt"}}')
             staging = root / "staged"
             stage_salm(source, staging)
             self.assertEqual(json.loads((staging / "config.json").read_text()), backbone)
+            # llama.cpp's converter reads a ModelOpt checkpoint's quantization from the staged dir
+            self.assertEqual(
+                (staging / "hf_quant_config.json").read_text(), '{"producer": {"name": "modelopt"}}'
+            )
             tokens = json.loads((staging / "tokenizer.json").read_text())["added_tokens"]
             self.assertEqual([t["content"] for t in tokens], ["<|im_end|>"])
             tokenizer_config = json.loads((staging / "tokenizer_config.json").read_text())

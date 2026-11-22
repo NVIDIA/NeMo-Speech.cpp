@@ -41,3 +41,5 @@ llama-dflash2-drafting-in-the-batched-serving-path.patch
 llama-mtp-verify-steps-flagged-by-the-caller.patch
 ggml-fit-q2_0-block-scales-to-the-weights-and-the-importance-matrix.patch
 ggml-cuda-re-instantiate-cuda-graphs-that-sat-idle-on-integrated-gpus.patch
+ggml-argmax-over-bf16-rounded-values.patch
+llama-bf16-rounded-argmax-for-batched-greedy-picks.patch

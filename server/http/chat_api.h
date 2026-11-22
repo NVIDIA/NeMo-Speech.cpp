@@ -42,8 +42,15 @@ struct Limits {
     }
 };
 
+// Whether a request's `model` is one of `names`, exactly or without leading dots (0.3.0 listed
+// some ASR model ids with one).
+bool names_model(const std::vector<std::string>& names, const std::string& requested);
+
 struct ApiConfig {
     Limits limits;
+    // Other names of the loaded ASR model a request may use (serve: the name it was started by and
+    // its file name); not a setting.
+    std::vector<std::string> model_names;
 
     void Register(common::ParameterParser& p) { p.Register("chat", limits); }
 };
@@ -83,8 +90,9 @@ struct Backend {
     std::function<bool()> supports_instructions;
     std::function<std::string()> request_id;  // default "asr_<pid>_<millis>_<counter>"
     std::function<uint64_t()> unix_seconds;   // default the wall clock
-    // The `model` accepted: the recognizer's id, which GET /v1/models lists.
+    // The `model` accepted: the recognizer's id, which GET /v1/models lists, and its other names.
     std::function<std::string()> model_alias;
+    std::vector<std::string> model_names;
 };
 
 class Api {

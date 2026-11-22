@@ -1,0 +1,53 @@
+From: Prabhsimran Singh <prabhsimrans@nvidia.com>
+Subject: llama: BF16-rounded argmax for batched greedy picks
+
+llama_serving_params.bf16_argmax makes the batched greedy argmax and the
+chained MTP drafts use ggml_argmax_bf16: the logits are compared after
+rounding to BF16, and the lowest token id wins among equal values.
+NeMo-Speech.cpp's speech-LLM engine sets it, so that greedy decoding picks
+the tokens of the checkpoint's reference implementation, which computes its
+logits in BF16. Off (the default) keeps ggml_argmax.
+
+Upstream: not planned (batched serving path).
+
+diff --git a/include/llama.h b/include/llama.h
+index 8dd80e0187a02fff196b1c6826031d195024ee5a..90012121a36894266dba5bc38958c35422f34e43 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -375,6 +375,10 @@ extern "C" {
+         uint32_t kv_reserve_cells;
+         // struct ggml_backend_cuda_serving (ggml-cuda.h) applied to the context's CUDA backends, or NULL.
+         const void * cuda_serving;
++        // Greedy sequences and chained MTP drafts take the argmax of the logits rounded to BF16, the lowest token id
++        // among equal values (ggml_argmax_bf16): the tokens a reference implementation with BF16 logits picks. Needs
++        // batched.
++        bool     bf16_argmax;
+     };
+ 
+     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 885879cfce6b79530c3d7bef33b09c1e201e3b25..45c95a19484fc254ac64a5e3a5c2d5b171e48168 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4123,7 +4123,7 @@ void llm_graph_context::build_sampling() const {
+             if (name[0] == '+') ++name;
+             return std::strcmp(name, "greedy") == 0;
+         };
+-        auto * ids = ggml_argmax(ctx0, logits);
++        auto * ids = cparams.serving.bf16_argmax ? ggml_argmax_bf16(ctx0, logits) : ggml_argmax(ctx0, logits);
+         ggml_set_name(ids, "batched_greedy_argmax");
+         ggml_set_output(ids);
+         ggml_build_forward_expand(gf, ids);
+diff --git a/src/models/nemotron-h-moe.cpp b/src/models/nemotron-h-moe.cpp
+index f3b9656df3c53003329dde25470df708d95ef199..da3b9fd2331e8885a703b9e1f9a8cdad61b66f12 100644
+--- a/src/models/nemotron-h-moe.cpp
++++ b/src/models/nemotron-h-moe.cpp
+@@ -206,7 +206,7 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
+     if (cparams.mtp_tok && cparams.mtp_tok_out >= 0) {
+         // chained drafting: argmax ids and the head's hidden rows stay on the device for the next draft; nothing is
+         // extracted to the host
+-        ggml_tensor * am = ggml_argmax(ctx0, cur);
++        ggml_tensor * am = cparams.serving.bf16_argmax ? ggml_argmax_bf16(ctx0, cur) : ggml_argmax(ctx0, cur);
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, am,
+             ggml_view_1d(ctx0, cparams.mtp_tok, am->ne[0], cparams.mtp_tok_out*ggml_element_size(cparams.mtp_tok))));
+         if (cparams.mtp_h_out) {

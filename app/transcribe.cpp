@@ -771,6 +771,12 @@ command_transcribe(int argc, char** argv) {
             throw std::invalid_argument(
                 std::string("SALM supports complete audio only; ") +
                 (options.live ? "--live" : "--stream") + " streaming recognition is unavailable");
+        // after the checks above, so a rejected command downloads nothing; the engine loads a draft
+        // model only for speculative decoding (mtp_draft > 0)
+        if (speech_llm && config.salm.mtp_draft > 0 && !config.salm.dflash_path.empty())
+            config.salm.dflash_path =
+                resolve_model_file(config.salm.dflash_path, "draft", "DFlash2 draft model")
+                    .string();
         if (!options.vad_model.empty() || !config.vad.model_path.empty())
             config.vad.model_path =
                 require_model_file(

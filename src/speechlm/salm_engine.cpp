@@ -147,17 +147,6 @@ piece(const llama_vocab* vocab, llama_token t) {
     return s;
 }
 
-int
-argmax(const float* logits, int n) {
-    int best = 0;
-    float bv = logits[0];
-    for (int i = 1; i < n; i++)
-        if (logits[i] > bv) {
-            bv = logits[i];
-            best = i;
-        }
-    return best;
-}
 
 // Scheduling constants of the batched path.
 // Distinct prompt prefixes kept computed in extra sequences; admitted requests copy their prefix.
@@ -263,9 +252,10 @@ struct SalmEngine::Impl {
     int emb_dev_turn = 0;
     std::vector<llama_pos>
         dft_pos;  // tok_batch positions shifted per slot for the MTP draft context
-    std::vector<llama_sampler*>
-        seq_samplers;  // chain attached to each slot: greedy (GPU argmax) or temperature sampling
-    std::vector<char> seq_greedy;  // seq_samplers[i] is a greedy chain
+    // chain attached to each slot: greedy (GPU argmax) or temperature sampling; null for a greedy
+    // slot of the upstream path (the host picks)
+    std::vector<llama_sampler*> seq_samplers;
+    std::vector<char> seq_greedy;  // slot i decodes greedily
     std::vector<llama_sampler_seq_config> seq_sampler_cfg;
 
     // Word-timestamp evidence of one request: the CTC head's output for its frames (on the
@@ -529,6 +519,7 @@ struct SalmEngine::Impl {
         if (fast) {
             cuda_decoder.fused = true;
             cp.serving.batched = true;
+            cp.serving.bf16_argmax = true;  // the device argmax follows policy::greedy_pick
             // rejected drafts roll back natively (pinned cells + ReplaySSM), no state snapshots
             cp.serving.mtp_replay = cfg.mtp_draft > 0 ? cfg.mtp_draft + 1 : 0;
             // the KV length is padded to multiples of 4096 cells so decode graphs are reused; the
@@ -542,13 +533,16 @@ struct SalmEngine::Impl {
         // Reserve every verification output for backend sampling, including MTP.
         cp.n_outputs_max_per_seq = std::max(1, cfg.mtp_draft + 1);
         cp.n_outputs_max = cp.n_seq_max * cp.n_outputs_max_per_seq;
-        // Sample on the backend through per-slot sampler chains (greedy: GPU argmax) instead of
-        // copying every sequence's logits to the host each step.
+        // The batched path samples on the backend through per-slot sampler chains (greedy: GPU
+        // argmax) instead of copying every sequence's logits to the host each step. On the
+        // upstream path a greedy sequence has no chain: the host picks its tokens from the logits
+        // (policy::greedy_pick), and only temperature sampling runs on the backend.
         for (int i = 0; i < cfg.max_sequences; i++) {
-            llama_sampler* chain = sampler_chain(0, std::nullopt);
+            llama_sampler* chain = fast ? sampler_chain(0, std::nullopt) : nullptr;
             seq_samplers.push_back(chain);
             seq_greedy.push_back(1);
-            seq_sampler_cfg.push_back({i, chain});
+            if (chain)
+                seq_sampler_cfg.push_back({i, chain});
         }
         cp.samplers = seq_sampler_cfg.data();
         cp.n_samplers = seq_sampler_cfg.size();
@@ -1502,7 +1496,8 @@ struct SalmEngine::Impl {
     }
 
     // Attach `chain` to sequence `seq`, owning it, and free the chain it replaces (an attached
-    // chain cannot be attached again, so every change builds a new one).
+    // chain cannot be attached again, so every change builds a new one). A null chain detaches:
+    // the sequence's logits go to the host.
     void attach_sampler(int seq, llama_sampler* chain, bool greedy) {
         if (!llama_set_sampler(ctx, seq, chain)) {
             llama_sampler_free(chain);
@@ -1519,7 +1514,8 @@ struct SalmEngine::Impl {
         const bool greedy = s->temperature < policy::kGreedyTemperature;
         if (greedy && seq_greedy[s->seq_id])
             return;
-        attach_sampler(s->seq_id, sampler_chain(s->temperature, s->seed), greedy);
+        attach_sampler(
+            s->seq_id, greedy && !fast ? nullptr : sampler_chain(s->temperature, s->seed), greedy);
     }
 
     // Greedy-pick the next token for each slot whose logits were requested.
@@ -1530,8 +1526,9 @@ struct SalmEngine::Impl {
         int32_t batch_idx;
     };
     // Tokens of several batch rows: pick_rows() reads the backend-sampled ids of `pick_idx` after
-    // one wait for the step; picked_at(i) is the token of pick_idx[i]. Upstream llama.cpp may leave
-    // a row unsampled (a sampler chain it could not offload): its logits are decoded on the host.
+    // one wait for the step; picked_at(i) is the token of pick_idx[i]. A row the backend did not
+    // sample (a greedy sequence of the upstream path, or a sampler chain upstream llama.cpp could
+    // not offload) is picked on the host from its logits.
     std::vector<int32_t> pick_idx;
     std::vector<llama_token> picked;
     void pick_rows() {
@@ -1553,7 +1550,7 @@ struct SalmEngine::Impl {
             if (!logits)
                 throw std::runtime_error(
                     "missing logits for batch entry " + std::to_string(pick_idx[i]));
-            picked[i] = argmax(logits, n_vocab);
+            picked[i] = policy::greedy_pick(logits, n_vocab);
         }
         return picked[i];
     }
@@ -1564,7 +1561,12 @@ struct SalmEngine::Impl {
         pick_idx.resize(n);
         for (size_t i = 0; i < n; ++i) pick_idx[i] = flagged[i].batch_idx;
         pick_rows();
-        for (size_t i = 0; i < n; ++i) flagged[i].slot->last = picked_at(i);
+        for (size_t i = 0; i < n; ++i) {
+            // a greedy sequence of the upstream path has no chain: the row holds no id of this step
+            if (!fast && seq_greedy[flagged[i].slot->seq_id])
+                picked[i] = LLAMA_TOKEN_NULL;
+            flagged[i].slot->last = picked_at(i);
+        }
     }
 
     // Commit the sampled token(s) of each slot in `sampled`: append text, detect end

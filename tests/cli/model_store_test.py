@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import struct
 import subprocess
 import sys
 import tarfile
@@ -19,6 +20,24 @@ import urllib.parse
 PAYLOAD = b"NeMo-Speech.cpp model-store fixture\n"
 CODEC_PAYLOAD = b"NeMo-Speech.cpp codec fixture\n"
 TTS_PAYLOAD = b"NeMo-Speech.cpp TTS fixture\n"
+
+
+def gguf_naming(key: str, value: str) -> bytes:
+    """A GGUF v3 file with no tensors and one string key: a speech-LLM decoder header for key
+    nemo_speech.speech_model, which names the encoder file."""
+
+    def text(item: str) -> bytes:
+        return struct.pack("<Q", len(item.encode())) + item.encode()
+
+    header = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + text(key) + struct.pack("<I", 8) + text(value)
+    return header + b"\0" * (-len(header) % 32)
+
+
+SALM_PAYLOAD = gguf_naming("nemo_speech.speech_model", "tiny-salm-encoder.gguf")
+SALM_SMALL_PAYLOAD = b"NeMo-Speech.cpp smaller speech-LLM decoder fixture\n"
+SALM_ENCODER_PAYLOAD = b"NeMo-Speech.cpp speech-LLM encoder fixture\n"
+SALM_DRAFT_PAYLOAD = b"NeMo-Speech.cpp speech-LLM draft fixture\n"
+SALM_REVISION = "6" * 40
 TOKENIZER_PAYLOAD = b"tokenizer configuration\n"
 UPDATED_TOKENIZER_PAYLOAD = b"updated tokenizer configuration\n"
 TTS_REVISION = "1" * 40
@@ -134,6 +153,17 @@ def file_artifact(role: str, filename: str, payload: bytes, sha256: str | None =
     }
 
 
+def salm_entry(alias: str, *artifacts: dict) -> dict:
+    return {
+        "repo": "acme/tiny-salm",
+        "aliases": [alias],
+        "revision": SALM_REVISION,
+        "license": "Test only",
+        "license_url": "https://example.invalid/license",
+        "artifacts": list(artifacts),
+    }
+
+
 def write_index(
     path: pathlib.Path,
     asr_sha256: str,
@@ -196,6 +226,26 @@ def write_index(
                         "license_url": "https://example.invalid/license",
                         "artifacts": [file_artifact("codec", "tiny-codec.gguf", CODEC_PAYLOAD)],
                     },
+                    # Three entries of one repository: two decoders that share an encoder file,
+                    # and a draft model.
+                    salm_entry(
+                        "tiny-salm",
+                        file_artifact("asr", "tiny-salm.gguf", SALM_PAYLOAD),
+                        file_artifact(
+                            "asr_encoder", "tiny-salm-encoder.gguf", SALM_ENCODER_PAYLOAD
+                        ),
+                    ),
+                    salm_entry(
+                        "tiny-salm-small",
+                        file_artifact("asr", "tiny-salm-small.gguf", SALM_SMALL_PAYLOAD),
+                        file_artifact(
+                            "asr_encoder", "tiny-salm-encoder.gguf", SALM_ENCODER_PAYLOAD
+                        ),
+                    ),
+                    salm_entry(
+                        "tiny-salm-draft",
+                        file_artifact("draft", "tiny-salm-draft.gguf", SALM_DRAFT_PAYLOAD),
+                    ),
                 ],
             }
         ),
@@ -228,6 +278,10 @@ def main() -> None:
             "tiny-tts.gguf": TTS_PAYLOAD,
             "tiny-tts.nemo": tokenizer_tar,
             "tiny-codec.gguf": CODEC_PAYLOAD,
+            "tiny-salm.gguf": SALM_PAYLOAD,
+            "tiny-salm-small.gguf": SALM_SMALL_PAYLOAD,
+            "tiny-salm-encoder.gguf": SALM_ENCODER_PAYLOAD,
+            "tiny-salm-draft.gguf": SALM_DRAFT_PAYLOAD,
         }
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ArtifactHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -248,6 +302,9 @@ def main() -> None:
             assert "TTS — synthesize, serve" in plain_listing.stdout
             assert "* tiny-asr" in plain_listing.stdout
             assert "repo: acme/tiny-asr" in plain_listing.stdout
+            assert "tiny-salm (decoder + encoder)" in plain_listing.stdout
+            assert "tiny-salm-small (decoder + encoder)" in plain_listing.stdout
+            assert "Speech-LLM draft models — --asr.salm.dflash_path" in plain_listing.stdout
 
             listed = run(binary, environment, "--json", "model", "list")
             assert listed.returncode == 0, listed.stderr
@@ -258,6 +315,13 @@ def main() -> None:
             assert listing["models"][0]["default_for"] == ["asr"]
             assert listing["models"][1]["commands"] == ["synthesize", "serve"]
             assert listing["models"][1]["default_for"] == ["tokenizer", "tts"]
+            assert listing["models"][3]["roles"] == ["asr", "asr_encoder"]
+            assert listing["models"][3]["commands"] == ["transcribe", "bench", "serve"]
+            assert listing["models"][5]["commands"] == [
+                "transcribe --asr.salm.dflash_path",
+                "bench --asr.salm.dflash_path",
+                "serve --asr.salm.dflash_path",
+            ]
 
             pulled = run(binary, environment, "--json", "pull", "tiny-asr")
             assert pulled.returncode == 0, pulled.stderr
@@ -328,6 +392,104 @@ def main() -> None:
             assert ArtifactHandler.request_counts["tiny-tts.gguf"] == 1
             assert ArtifactHandler.request_counts["tiny-tts.nemo"] == 2
             assert ArtifactHandler.request_counts["tiny-codec.gguf"] == 1
+
+            def salm_pull(name: str) -> list[tuple[str, str, bool]]:
+                result = run(binary, environment, "--json", "pull", name)
+                assert result.returncode == 0, result.stderr
+                return [
+                    (item["role"], pathlib.Path(item["path"]).name, item["cached"])
+                    for item in json.loads(result.stdout)["artifacts"]
+                ]
+
+            # Each alias selects its own decoder; the encoder file they share downloads once, into
+            # the repository's directory, and the repository ID selects the first entry.
+            assert salm_pull("tiny-salm-small") == [
+                ("asr", "tiny-salm-small.gguf", False),
+                ("asr_encoder", "tiny-salm-encoder.gguf", False),
+            ]
+            assert salm_pull("acme/tiny-salm") == [
+                ("asr", "tiny-salm.gguf", False),
+                ("asr_encoder", "tiny-salm-encoder.gguf", True),
+            ]
+            assert salm_pull("tiny-salm-draft") == [("draft", "tiny-salm-draft.gguf", False)]
+            assert ArtifactHandler.request_counts["tiny-salm-encoder.gguf"] == 1
+            salm_directory = cache / "acme" / "tiny-salm" / SALM_REVISION
+            assert (salm_directory / "tiny-salm-small.gguf").read_bytes() == SALM_SMALL_PAYLOAD
+
+            # Resolving the decoder for a command also brings its encoder file.
+            audio = pathlib.Path(__file__).resolve().parents[2] / "test_files/asr/wav/test/jfk.wav"
+            resolve_cache = root / "resolve-cache"
+            resolved = run(
+                binary,
+                {**environment, "NEMO_SPEECH_MODEL_DIR": str(resolve_cache)},
+                "transcribe",
+                str(audio),
+                "--model",
+                "tiny-salm",
+            )
+            if "unknown command" not in resolved.stderr:
+                resolved_directory = resolve_cache / "acme" / "tiny-salm" / SALM_REVISION
+                assert (resolved_directory / "tiny-salm.gguf").read_bytes() == SALM_PAYLOAD
+                assert (
+                    resolved_directory / "tiny-salm-encoder.gguf"
+                ).read_bytes() == SALM_ENCODER_PAYLOAD
+
+            # A draft model downloads only when the command can run and drafts: not for streaming,
+            # which a speech-LLM rejects, and not with mtp_draft 0.
+            if "unknown command" not in resolved.stderr:
+                draft_cache = root / "draft-cache"
+                draft_environment = {**environment, "NEMO_SPEECH_MODEL_DIR": str(draft_cache)}
+                drafts_before = ArtifactHandler.request_counts.get("tiny-salm-draft.gguf", 0)
+                rejected = run(
+                    binary,
+                    draft_environment,
+                    "transcribe",
+                    str(audio),
+                    "--model",
+                    "tiny-salm",
+                    "--stream",
+                    "--asr.salm.dflash_path",
+                    "tiny-salm-draft",
+                )
+                assert rejected.returncode != 0
+                assert "SALM supports complete audio only" in rejected.stderr, rejected.stderr
+                undrafted = run(
+                    binary,
+                    draft_environment,
+                    "transcribe",
+                    str(audio),
+                    "--model",
+                    "tiny-salm",
+                    "--asr.salm.mtp_draft",
+                    "0",
+                    "--asr.salm.dflash_path",
+                    "tiny-salm-draft",
+                )
+                assert "DFlash2 draft model" not in undrafted.stderr, undrafted.stderr
+                assert (
+                    ArtifactHandler.request_counts.get("tiny-salm-draft.gguf", 0) == drafts_before
+                )
+                assert not list(draft_cache.rglob("tiny-salm-draft.gguf"))
+                drafted = run(
+                    binary,
+                    draft_environment,
+                    "transcribe",
+                    str(audio),
+                    "--model",
+                    "tiny-salm",
+                    "--asr.salm.dflash_path",
+                    "tiny-salm-draft",
+                )
+                assert drafted.returncode != 0  # the fixture decoder has no weights
+                assert list(draft_cache.rglob("tiny-salm-draft.gguf")), drafted.stderr
+
+            # A later entry of a repository needs an alias.
+            shared_index = json.loads(index.read_text(encoding="utf-8"))
+            del shared_index["models"][4]["aliases"]
+            index.write_text(json.dumps(shared_index), encoding="utf-8")
+            shared = expect_json_error(run(binary, environment, "--json", "model", "list"), 1)
+            assert "duplicate repository in model index: acme/tiny-salm" in shared["message"]
+            write_index(index, hashlib.sha256(PAYLOAD).hexdigest(), tokenizer_tar)
 
             ranged_archive, ranges, selected = ranged_tokenizer_archive()
             ranged_index = json.loads(index.read_text(encoding="utf-8"))

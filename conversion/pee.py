@@ -29,6 +29,7 @@ holding ``perception.*``), in which case ``perception.proj`` is exported too.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import re
@@ -212,17 +213,36 @@ _SALM_PREFIX = "perception."
 
 
 def _load_salm_perception(path: Path) -> tuple[dict, dict]:
-    """PEE config and ``perception.*`` tensors (prefix stripped) from a SALM checkpoint dir."""
+    """PEE config and ``perception.*`` tensors (prefix stripped) from a SALM checkpoint dir. ModelOpt FP8 linears
+    (E4M3 weight and a per-tensor ``weight_scale``) are dequantized to F32, which holds the product exactly; their
+    scale tensors are dropped."""
+    import torch
     from safetensors import safe_open
 
     with (path / "config.json").open("r", encoding="utf-8") as f:
         cfg = dict(json.load(f)["pe_encoder_config"])
     sd: dict = {}
-    for shard in sorted(path.glob("*.safetensors")):
-        with safe_open(str(shard), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if key.startswith(_SALM_PREFIX) and "_extra_state" not in key:
-                    sd[key[len(_SALM_PREFIX) :]] = f.get_tensor(key)
+    with contextlib.ExitStack() as stack:
+        # every shard open at once: a weight's scale may be stored in another shard
+        files = {}
+        for shard in sorted(path.glob("*.safetensors")):
+            f = stack.enter_context(safe_open(str(shard), framework="pt", device="cpu"))
+            files.update((key, f) for key in f.keys())
+        for key in sorted(files):
+            if not key.startswith(_SALM_PREFIX) or "_extra_state" in key:
+                continue
+            if key.endswith((".weight_scale", ".input_scale", ".weight_scale_2")):
+                continue  # applied to their weight below
+            tensor = files[key].get_tensor(key)
+            scale_key = key.removesuffix(".weight") + ".weight_scale"
+            if tensor.dtype == torch.float8_e4m3fn:
+                scale = files[scale_key].get_tensor(scale_key) if scale_key in files else None
+                if scale is None or scale.numel() != 1:
+                    raise RuntimeError(f"{key}: an FP8 weight needs one per-tensor {scale_key}")
+                tensor = tensor.float() * scale.float()
+            elif scale_key in files:
+                raise RuntimeError(f"{key}: unsupported quantized encoder weight ({tensor.dtype})")
+            sd[key[len(_SALM_PREFIX) :]] = tensor
     if not sd:
         raise RuntimeError(f"no perception.* tensors found in {path}")
     return cfg, sd
