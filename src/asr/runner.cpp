@@ -30,11 +30,24 @@ extract_lang_tags(std::string& text) {
     std::vector<std::string> langs;
     for (std::sregex_iterator it(text.begin(), text.end(), tag_re), end; it != end; ++it) {
         const std::string code = (*it)[1].str();
+        std::string lower_code = code;
+        for (char& c : lower_code) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (lower_code == "unk") {
+            continue;
+        }
         if (std::find(langs.begin(), langs.end(), code) == langs.end())
             langs.push_back(code);
     }
     if (!langs.empty()) {
-        text = std::regex_replace(text, tag_re, "");
+        for (const auto& lang : langs) {
+            const std::string lang_tag = "<" + lang + ">";
+            size_t pos = 0;
+            while ((pos = text.find(lang_tag, pos)) != std::string::npos) {
+                text.erase(pos, lang_tag.length());
+            }
+        }
         text = std::regex_replace(text, std::regex(R"( {2,})"), " ");
         const size_t a = text.find_first_not_of(' ');
         const size_t b = text.find_last_not_of(' ');
