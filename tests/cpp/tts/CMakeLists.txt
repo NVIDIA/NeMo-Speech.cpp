@@ -87,6 +87,14 @@ if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
         COMMAND test_tokenizer_single_chars $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
 endif()
 
+add_executable(test_tokenizer_latin_as_english test_tokenizer_latin_as_english.cpp)
+target_link_libraries(test_tokenizer_latin_as_english PRIVATE nemo_speech_tts_tokenizer)
+if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
+    add_test(
+        NAME tokenizer_latin_as_english_v2607
+        COMMAND test_tokenizer_latin_as_english $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2607})
+endif()
+
 if(NEMO_SPEECH_TTS_WITH_ZH)
     add_executable(test_tokenizer_mandarin test_tokenizer_mandarin.cpp)
     target_link_libraries(

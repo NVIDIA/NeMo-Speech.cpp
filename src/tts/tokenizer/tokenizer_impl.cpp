@@ -1329,6 +1329,67 @@ run_byt5_native(const params& p) {
     return result;
 }
 
+static bool
+is_latin_letter(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+// End of the Latin run starting at `begin`: letters with embedded apostrophes/hyphens and single
+// spaces between letter groups ("Please hold the line", "Wi-Fi", "don't"). Trailing '/- are left
+// out.
+static size_t
+latin_run_end(const std::string& s, size_t begin) {
+    size_t end = begin;
+    while (end < s.size()) {
+        const unsigned char c = (unsigned char)s[end];
+        if (is_latin_letter(c) || c == '\'' || c == '-') {
+            ++end;
+        } else if (c == ' ' && end + 1 < s.size() && is_latin_letter((unsigned char)s[end + 1])) {
+            ++end;
+        } else {
+            break;
+        }
+    }
+    while (end > begin && (s[end - 1] == '\'' || s[end - 1] == '-')) {
+        --end;
+    }
+    return end;
+}
+
+// ByT5 (Korean) text with inline Latin runs: Latin runs go through the English IPA tokenizer,
+// everything else stays bytes. The aggregated vocabulary already holds both ranges and the model
+// has no language input, so a mixed token stream is well-formed; it reads the Latin as English.
+// Chunk layout mirrors run_byt5_native: ... bytes/IPA ..., </s> (offset+1), EOS.
+static tokenizer_result
+run_byt5_latin_as_english(const params& p, const ipa_tokenizer& english) {
+    tokenizer_result result;
+    result.language = p.language;
+    result.tokenizer_name = p.tokenizer_name;
+    result.eos_id = p.eos_id;
+    for (const std::string& sentence : tokenizer_input_units(p, p.text)) {
+        chunk ch;
+        ch.text = sentence;
+        size_t i = 0;
+        while (i < sentence.size()) {
+            const unsigned char c = (unsigned char)sentence[i];
+            if (is_latin_letter(c)) {
+                const size_t end = latin_run_end(sentence, i);
+                const std::vector<int> ids = english.encode(sentence.substr(i, end - i));
+                ch.tokens.insert(ch.tokens.end(), ids.begin(), ids.end());
+                i = end;
+            } else {
+                ch.tokens.push_back(p.offset + (int)c + 3);
+                ++i;
+            }
+        }
+        ch.tokens.push_back(p.offset + 1);
+        ch.tokens.push_back(result.eos_id);
+        pad_short_text_chunk_before_eos(ch, result.eos_id, p.offset);
+        result.chunks.push_back(std::move(ch));
+    }
+    return result;
+}
+
 static tokenizer_result
 run_hindi_native(const params& p) {
     const std::vector<std::string> tokens = hindi_tokens();

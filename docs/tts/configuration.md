@@ -145,6 +145,7 @@ All keys nest under `tts.`. Defaults shown; CLI alias listed where one exists.
 | `tts.codec-model` | - | - | NanoCodec decoder GGUF (required) |
 | `tts.tokenizer-model-dir` | - | - | extracted Magpie `.nemo` dir (required) |
 | `tts.tokenizer.sentence-limit.<lang>` | - | per language (`en` 45 ... `ja` 40) | sentence-chunking threshold in words (characters for `zh`/`ja`); subkeys `en`, `es`, `fr`, `vi`, `it`, `de`, `zh`, `hi`, `ja`, `ar`, `ko`, `pt` |
+| `tts.tokenizer.latin-as-english` | - | `false` | Korean text: tokenize inline Latin-letter runs (e.g. `API`, `Wi-Fi`) with the English IPA tokenizer instead of ByT5 bytes; C API field `nemo_speech_tts_model_config.latin_as_english` |
 | `tts.tn-model-dir` | - | - | enables Sparrowhawk TN with this grammar dir; requires `NEMO_SPEECH_WITH_NORM=ON` |
 | `tts.language-code` | - | `en-US` | default text language code |
 | `tts.voice-name` | - | - | default voice name or speaker index |

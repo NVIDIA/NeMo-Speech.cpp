@@ -669,18 +669,8 @@ class MagpieNativeTokenizer::Impl {
                 "native Magpie tokenizer is not available for language_code '" + language_code +
                 "'");
         }
-        p.tokenizer_name = selected->name;
-        p.locale = selected->locale;
-        p.grapheme_case = selected->grapheme_case;
-        p.grapheme_prefix = selected->grapheme_prefix;
-        p.ascii_letter_case = selected->ascii_letter_case;
-        p.phoneme_dict = selected->phoneme_dict;
-        p.heteronyms = selected->heteronyms;
-        p.offset = selected->offset;
+        apply_entry(p, *selected);
         p.eos_id = profile_.eos_id;
-        p.expected_vocab_size = selected->size;
-        p.apostrophe = selected->apostrophe;
-        p.pad_with_space = selected->pad_with_space;
         p.sentence_chunking = should_tokenize_by_sentence(text, p.language, config_.sentence_limit);
 
         tokenizer_result native = tokenize_native(p, *selected);
@@ -747,11 +737,29 @@ class MagpieNativeTokenizer::Impl {
         return true;
     }
 
+    // Copies one profile entry's tokenizer settings into request params.
+    static void apply_entry(params& p, const tokenizer_entry& entry) {
+        p.tokenizer_name = entry.name;
+        p.locale = entry.locale;
+        p.grapheme_case = entry.grapheme_case;
+        p.grapheme_prefix = entry.grapheme_prefix;
+        p.ascii_letter_case = entry.ascii_letter_case;
+        p.phoneme_dict = entry.phoneme_dict;
+        p.heteronyms = entry.heteronyms;
+        p.offset = entry.offset;
+        p.expected_vocab_size = entry.size;
+        p.apostrophe = entry.apostrophe;
+        p.pad_with_space = entry.pad_with_space;
+    }
+
     tokenizer_result tokenize_native(const params& p, const tokenizer_entry& entry) const {
         switch (entry.kind) {
             case tokenizer_kind::ipa:
                 return tokenize_ipa(p);
             case tokenizer_kind::byt5:
+                if (config_.latin_as_english && p.language == "ko") {
+                    return run_byt5_latin_as_english(p, english_ipa_tokenizer());
+                }
                 return run_byt5_native(p);
             case tokenizer_kind::hindi_chars:
                 return run_hindi_native(p);
@@ -819,6 +827,19 @@ class MagpieNativeTokenizer::Impl {
             result.chunks.push_back(std::move(ch));
         }
         return result;
+    }
+
+    // English IPA tokenizer for latin_as_english (same instance the "en" path uses).
+    const ipa_tokenizer& english_ipa_tokenizer() const {
+        const tokenizer_entry& en = profile_.entry_for_language("en");
+        if (en.kind != tokenizer_kind::ipa) {
+            throw std::runtime_error("latin_as_english requires an English IPA tokenizer profile");
+        }
+        params q;
+        q.model = model_dir_;
+        q.language = "en";
+        apply_entry(q, en);
+        return ipa_tokenizer_for("en", ipa_config_for_params(q));
     }
 
     const ipa_tokenizer& ipa_tokenizer_for(
