@@ -72,6 +72,8 @@ to_config(const nemo_speech_asr_recognizer_config* c) {
         const auto* b = c->backend;
         if (HAS_FIELD(b, nemo_speech_asr_backend_config, gpu))
             cfg.backend.gpu = b->gpu;
+        if (HAS_FIELD(b, nemo_speech_asr_backend_config, threads) && b->threads > 0)
+            cfg.backend.threads = b->threads;
     }
     if (HAS_FIELD(c, nemo_speech_asr_recognizer_config, model) && c->model) {
         const auto* m = c->model;

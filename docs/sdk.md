@@ -88,6 +88,7 @@ int transcribe(const float* samples, size_t count, int sample_rate) {
     nemo_speech_asr_backend_config backend{};
     backend.size = sizeof(backend);
     backend.gpu = 0;  // -1 for CPU
+    // backend.threads = 4;  // CPU backend threads; 0 = min(8, CPUs the process may use)
 
     nemo_speech_asr_model_config model{};
     model.size = sizeof(model);

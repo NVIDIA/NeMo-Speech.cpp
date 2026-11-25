@@ -91,7 +91,8 @@ target_include_directories(nemo_speech_asr_c PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_definitions(nemo_speech_asr_c PRIVATE NEMO_SPEECH_ASR_BUILD)
-# SOVERSION 2: nemo_speech_asr_salm_config grew (n_cpu_moe, batched)
+# SOVERSION 2: nemo_speech_asr_salm_config grew (n_cpu_moe, batched); since then
+# nemo_speech_asr_backend_config grew too (reserved, threads), append-only, same SOVERSION
 set_target_properties(nemo_speech_asr_c PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON

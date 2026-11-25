@@ -63,6 +63,10 @@ typedef enum nemo_speech_asr_decoder_kind {
 typedef struct nemo_speech_asr_backend_config {
     size_t size;
     int32_t gpu;  // -1 = CPU
+    // Unused. Fills what was tail padding on 64-bit targets, so `size` from a caller built
+    // before `threads` existed never covers it.
+    int32_t reserved;
+    int32_t threads;  // CPU backend threads; 0 = min(8, usable CPUs)
 } nemo_speech_asr_backend_config;
 
 typedef struct nemo_speech_asr_model_config {

@@ -7,9 +7,9 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
+#include "cpu_threads.h"
 #include "magpietts.h"
 #include "model_logging.h"
 #include "token_utils.h"
@@ -170,13 +170,7 @@ class MagpieTtsRuntime::Impl {
         params.warmup_tokens = tokens;
         params.warmup_token_chunks = token_chunks;
         params.speaker = options.speaker >= 0 ? options.speaker : config_.speaker;
-        if (config_.threads > 0) {
-            params.threads = config_.threads;
-        } else {
-            // More busy-waiting CPU workers than hardware threads slows the graphs down.
-            const unsigned hw = std::thread::hardware_concurrency();
-            params.threads = hw > 0 ? std::min(8, static_cast<int>(hw)) : 8;
-        }
+        params.threads = config_.threads > 0 ? config_.threads : common::default_cpu_threads();
         params.codec_threads = config_.codec_threads > 0 ? config_.codec_threads : params.threads;
         params.seed = options.seed >= 0 ? options.seed : config_.seed;
         params.steps = options.steps > 0 ? options.steps : config_.steps;
