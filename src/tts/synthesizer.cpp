@@ -258,7 +258,7 @@ Synthesizer::synthesize(const SynthesisRequest& request, const PcmCallback& call
 SynthesisResult
 Synthesizer::synthesize_tokens(
     const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,
-    int output_sample_rate, const PcmCallback& callback) {
+    int output_sample_rate, const PcmCallback& callback, const std::string& voice_name) {
     if (tokens.empty())
         throw std::invalid_argument("text token list is empty");
     const int output_rate = output_sample_rate == 0 ? sample_rate() : output_sample_rate;
@@ -271,8 +271,9 @@ Synthesizer::synthesize_tokens(
     prepared.tokens = tokens;
     prepared.token_chunks.push_back(tokens);
     prepared.options = options;
+    // Same rule as prepare(): an empty name resolves to the default speaker.
     if (prepared.options.speaker < 0)
-        prepared.options.speaker = impl_->default_speaker;
+        prepared.options.speaker = resolve_speaker(voice_name);
     if (prepared.options.speaker < 0 || prepared.options.speaker >= speaker_count())
         throw std::invalid_argument("speaker is outside the model speaker range");
     prepared.metadata.processed_text = join(tokens, " ");

@@ -5,8 +5,9 @@
  *
  *   tts_c_smoke
  *       link/symbol/header check only (prints version)
- *   tts_c_smoke --tokens MAGPIE.gguf CODEC.gguf TOKENS
- *       synthesize comma-separated Magpie text token IDs
+ *   tts_c_smoke --tokens MAGPIE.gguf CODEC.gguf TOKENS [SPEAKER_INDEX]
+ *       synthesize comma-separated Magpie text token IDs; with SPEAKER_INDEX,
+ *       also check that voice_name selects the same speaker as the speaker field
  *   tts_c_smoke --text MAGPIE.gguf CODEC.gguf TOKENIZER_DIR TEXT [LANG]
  *       tokenize raw text and synthesize it
  */
@@ -22,6 +23,7 @@
 struct pcm_sink {
     size_t bytes;
     size_t chunks;
+    uint64_t hash;  // FNV-1a over the PCM bytes
 };
 
 static bool
@@ -29,6 +31,7 @@ count_pcm(const uint8_t* pcm, size_t n_bytes, void* user_data) {
     struct pcm_sink* sink = (struct pcm_sink*)user_data;
     if (!pcm && n_bytes)
         return false;
+    for (size_t i = 0; i < n_bytes; ++i) sink->hash = (sink->hash ^ pcm[i]) * 1099511628211ULL;
     sink->bytes += n_bytes;
     sink->chunks += 1;
     return true;
@@ -38,7 +41,7 @@ static void
 usage(const char* prog) {
     fprintf(stderr, "usage:\n");
     fprintf(stderr, "  %s\n", prog);
-    fprintf(stderr, "  %s --tokens MAGPIE.gguf CODEC.gguf TOKENS\n", prog);
+    fprintf(stderr, "  %s --tokens MAGPIE.gguf CODEC.gguf TOKENS [SPEAKER_INDEX]\n", prog);
     fprintf(stderr, "  %s --text MAGPIE.gguf CODEC.gguf TOKENIZER_DIR TEXT [LANG]\n", prog);
 }
 
@@ -152,11 +155,12 @@ main(int argc, char** argv) {
         stats = nemo_speech_tts_synthesis_stats_default();
         sink.bytes = 0;
         sink.chunks = 0;
+        sink.hash = 0;
         st = nemo_speech_tts_synthesize_tokens(
             synth, &opt, tokens, token_count, count_pcm, &sink, &stats);
-        free(tokens);
         if (st != NEMO_SPEECH_TTS_OK) {
             fprintf(stderr, "synthesize_tokens failed: %s\n", nemo_speech_tts_last_error());
+            free(tokens);
             nemo_speech_tts_destroy(synth);
             return 1;
         }
@@ -165,6 +169,38 @@ main(int argc, char** argv) {
             "samples=%llu e2e_rtfx=%.2f\n",
             token_count, sink.bytes, sink.chunks, stats.sample_rate, stats.generated_frames,
             (unsigned long long)stats.samples_written, stats.e2e_rtfx);
+        if (argc > 5) {
+            // voice_name with speaker < 0 must pick the same speaker as the speaker field.
+            struct pcm_sink by_name = {0, 0, 0};
+            struct pcm_sink by_index = {0, 0, 0};
+            opt.seed = 1234;
+            opt.voice_name = argv[5];
+            st = nemo_speech_tts_synthesize_tokens(
+                synth, &opt, tokens, token_count, count_pcm, &by_name, NULL);
+            opt.voice_name = NULL;
+            opt.speaker = atoi(argv[5]);
+            if (st == NEMO_SPEECH_TTS_OK)
+                st = nemo_speech_tts_synthesize_tokens(
+                    synth, &opt, tokens, token_count, count_pcm, &by_index, NULL);
+            if (st != NEMO_SPEECH_TTS_OK) {
+                fprintf(stderr, "synthesize_tokens failed: %s\n", nemo_speech_tts_last_error());
+                free(tokens);
+                nemo_speech_tts_destroy(synth);
+                return 1;
+            }
+            printf(
+                "voice_name=%s: pcm_bytes=%zu hash=%016llx | speaker=%d: pcm_bytes=%zu "
+                "hash=%016llx\n",
+                argv[5], by_name.bytes, (unsigned long long)by_name.hash, opt.speaker,
+                by_index.bytes, (unsigned long long)by_index.hash);
+            if (by_name.bytes != by_index.bytes || by_name.hash != by_index.hash) {
+                fprintf(stderr, "voice_name did not select the requested speaker\n");
+                free(tokens);
+                nemo_speech_tts_destroy(synth);
+                return 1;
+            }
+        }
+        free(tokens);
         nemo_speech_tts_destroy(synth);
         printf("[C ABI smoke OK]\n");
         return sink.bytes > 0 ? 0 : 1;
@@ -191,6 +227,7 @@ main(int argc, char** argv) {
         stats = nemo_speech_tts_synthesis_stats_default();
         sink.bytes = 0;
         sink.chunks = 0;
+        sink.hash = 0;
         st = nemo_speech_tts_synthesize_text(synth, &opt, text, count_pcm, &sink, &stats);
         if (st != NEMO_SPEECH_TTS_OK) {
             fprintf(stderr, "synthesize_text failed: %s\n", nemo_speech_tts_last_error());
