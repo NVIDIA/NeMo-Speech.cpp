@@ -669,18 +669,8 @@ class MagpieNativeTokenizer::Impl {
                 "native Magpie tokenizer is not available for language_code '" + language_code +
                 "'");
         }
-        p.tokenizer_name = selected->name;
-        p.locale = selected->locale;
-        p.grapheme_case = selected->grapheme_case;
-        p.grapheme_prefix = selected->grapheme_prefix;
-        p.ascii_letter_case = selected->ascii_letter_case;
-        p.phoneme_dict = selected->phoneme_dict;
-        p.heteronyms = selected->heteronyms;
-        p.offset = selected->offset;
+        apply_entry(p, *selected);
         p.eos_id = profile_.eos_id;
-        p.expected_vocab_size = selected->size;
-        p.apostrophe = selected->apostrophe;
-        p.pad_with_space = selected->pad_with_space;
         p.sentence_chunking = should_tokenize_by_sentence(text, p.language, config_.sentence_limit);
 
         tokenizer_result native = tokenize_native(p, *selected);
@@ -745,6 +735,21 @@ class MagpieNativeTokenizer::Impl {
 #endif
         }
         return true;
+    }
+
+    // Copies one profile entry's tokenizer settings into request params.
+    static void apply_entry(params& p, const tokenizer_entry& entry) {
+        p.tokenizer_name = entry.name;
+        p.locale = entry.locale;
+        p.grapheme_case = entry.grapheme_case;
+        p.grapheme_prefix = entry.grapheme_prefix;
+        p.ascii_letter_case = entry.ascii_letter_case;
+        p.phoneme_dict = entry.phoneme_dict;
+        p.heteronyms = entry.heteronyms;
+        p.offset = entry.offset;
+        p.expected_vocab_size = entry.size;
+        p.apostrophe = entry.apostrophe;
+        p.pad_with_space = entry.pad_with_space;
     }
 
     tokenizer_result tokenize_native(const params& p, const tokenizer_entry& entry) const {
@@ -833,15 +838,7 @@ class MagpieNativeTokenizer::Impl {
         params q;
         q.model = model_dir_;
         q.language = "en";
-        q.tokenizer_name = en.name;
-        q.locale = en.locale;
-        q.grapheme_case = en.grapheme_case;
-        q.grapheme_prefix = en.grapheme_prefix;
-        q.phoneme_dict = en.phoneme_dict;
-        q.heteronyms = en.heteronyms;
-        q.offset = en.offset;
-        q.apostrophe = en.apostrophe;
-        q.pad_with_space = en.pad_with_space;
+        apply_entry(q, en);
         return ipa_tokenizer_for("en", ipa_config_for_params(q));
     }
 

@@ -71,6 +71,7 @@ main(int argc, char** argv) {
     want.push_back(kKoEos);
     want.push_back(kEos);
     if (!expect(got == want, "mixed token stream")) {
+        ok = false;
         std::fprintf(stderr, "got (%zu):", got.size());
         for (int32_t t : got) std::fprintf(stderr, " %d", t);
         std::fprintf(stderr, "\nwant (%zu):", want.size());
