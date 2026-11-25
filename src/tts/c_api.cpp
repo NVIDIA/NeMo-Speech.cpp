@@ -525,8 +525,8 @@ nemo_speech_tts_synthesize_tokens(
         }
         const std::vector<int32_t> input(tokens, tokens + token_count);
         const tts_core::SynthesisResult result = synthesizer->synthesizer->synthesize_tokens(
-            input, to_options(options), output_rate_of(options),
-            make_callback(callback, user_data));
+            input, to_options(options), output_rate_of(options), make_callback(callback, user_data),
+            voice_of(options));
         if (result.cancelled) {
             set_last_error("synthesis cancelled");
             return NEMO_SPEECH_TTS_ERROR_CANCELLED;

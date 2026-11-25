@@ -74,7 +74,8 @@ class Synthesizer {
     SynthesisResult synthesize(const SynthesisRequest& request, const PcmCallback& callback = {});
     SynthesisResult synthesize_tokens(
         const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options = {},
-        int output_sample_rate = 0, const PcmCallback& callback = {});
+        int output_sample_rate = 0, const PcmCallback& callback = {},
+        const std::string& voice_name = {});
 
     // Initialize lazy runtime state through the normal synthesis path.
     SynthesisResult warmup(const std::string& text, int steps = -1);
