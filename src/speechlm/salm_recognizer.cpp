@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "audio_resampler.h"
+#include "cpu_threads.h"
 #include "errors.h"
 #include "salm_engine.h"
 #include "salm_guards.h"
@@ -60,12 +61,9 @@ engine_config(const asr::RecognizerConfig& c) {
     out.ctc_path = s.ctc_path;
     out.llm_path = c.model.path;
     out.gpu = c.backend.gpu;
-    // host-side decoder work: asr.backend.threads, as for the other models (0 = min(8, hardware
-    // threads))
-    const unsigned hw = std::thread::hardware_concurrency();
-    out.threads = c.backend.threads > 0 ? c.backend.threads
-                  : hw > 0              ? std::min(8, static_cast<int>(hw))
-                                        : 8;
+    // host-side decoder work: asr.backend.threads, as for the other models (0 = min(8, usable
+    // CPUs))
+    out.threads = c.backend.threads > 0 ? c.backend.threads : common::default_cpu_threads();
     out.max_sequences = s.max_sequences;
     out.n_ctx_per_sequence = s.n_ctx_per_sequence;
     out.max_context = s.max_context;

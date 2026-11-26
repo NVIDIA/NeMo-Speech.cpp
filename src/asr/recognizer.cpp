@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "cpu_threads.h"
 #include "gguf.h"
 #include "model.h"
 #include "silero_vad.h"
@@ -45,13 +46,7 @@ make_backend(const BackendConfig& backend) {
     p.use_gpu = (backend.gpu >= 0);
     p.gpu_device_idx = std::max(backend.gpu, 0);
     p.pe_bin_path = const_cast<char*>("");
-    if (backend.threads > 0) {
-        p.n_threads = backend.threads;
-    } else {
-        // More busy-waiting CPU workers than hardware threads slows the graph down.
-        const unsigned hw = std::thread::hardware_concurrency();
-        p.n_threads = hw > 0 ? std::min(8, static_cast<int>(hw)) : 8;
-    }
+    p.n_threads = backend.threads > 0 ? backend.threads : common::default_cpu_threads();
     return std::make_unique<ggml_runtime::BackendManager>(p);
 }
 
