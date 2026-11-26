@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <climits>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <string>
 
 #if defined(__linux__)
@@ -38,15 +38,22 @@ main() {
     using nemo_speech::common::cgroup_cpu_limit;
     using nemo_speech::common::default_cpu_threads;
 
-    const std::string path =
-        (std::filesystem::temp_directory_path() / "nemo_speech_test_cpu_max").string();
+    // A directory of this run only: create_directory fails on a name that exists, so runs do not
+    // share the fixture and nothing placed in the temporary directory beforehand is followed.
+    std::filesystem::path dir;
+    std::random_device random;
+    do {
+        dir = std::filesystem::temp_directory_path() /
+              ("nemo_speech_test_cpu_threads_" + std::to_string(random()));
+    } while (!std::filesystem::create_directory(dir));
+    const std::string path = (dir / "cpu.max").string();
     require(limit_of(path, "max 100000\n") == 0, "max is no limit");
     require(limit_of(path, "200000 100000\n") == 2, "two CPUs");
     require(limit_of(path, "250000 100000\n") == 3, "a fractional quota rounds up");
     require(limit_of(path, "0 100000\n") == 0, "a zero quota is no limit");
     require(limit_of(path, "9223372036854775807 1\n") == INT_MAX, "a huge quota does not wrap");
     require(limit_of(path, "") == 0, "an empty file is no limit");
-    std::remove(path.c_str());
+    std::filesystem::remove_all(dir);
     require(cgroup_cpu_limit(path.c_str()) == 0, "a missing file is no limit");
 
     const int threads = default_cpu_threads();

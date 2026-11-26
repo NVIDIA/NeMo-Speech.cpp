@@ -34,7 +34,9 @@ struct BackendConfig {
     int threads = 0;  // CPU backend threads; 0 = min(8, usable CPUs)
     void Register(common::ParameterParser& p) {
         p.Register("gpu", &gpu, "GPU device index (-1 = CPU)", {"--gpu", "-g"});
-        p.Register("threads", &threads, "CPU backend threads (0 = min(8, usable CPUs))");
+        p.Register(
+            "threads", &threads,
+            "CPU backend threads (0 = min(8, usable CPUs: Linux affinity and cgroup v2 quota))");
     }
 };
 

@@ -32,7 +32,7 @@ struct MagpieRuntimeConfig {
     std::string magpie_model;
     std::string codec_model;
     int speaker = 0;
-    int threads = 0;        // 0 = min(8, usable CPUs)
+    int threads = 0;        // 0 = min(8, usable CPUs: Linux affinity and cgroup v2 quota)
     int codec_threads = 0;  // 0 = threads
     int seed = -1;
     int steps = -1;

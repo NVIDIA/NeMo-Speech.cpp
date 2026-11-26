@@ -66,7 +66,9 @@ typedef struct nemo_speech_asr_backend_config {
     // Unused. Fills what was tail padding on 64-bit targets, so `size` from a caller built
     // before `threads` existed never covers it.
     int32_t reserved;
-    int32_t threads;  // CPU backend threads; 0 = min(8, usable CPUs)
+    // CPU backend threads; 0 = min(8, usable CPUs): on Linux the CPU affinity mask and the
+    // cgroup v2 quota (a cgroup v1 quota is not read), elsewhere the hardware thread count.
+    int32_t threads;
 } nemo_speech_asr_backend_config;
 
 typedef struct nemo_speech_asr_model_config {

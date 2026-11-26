@@ -88,7 +88,9 @@ int transcribe(const float* samples, size_t count, int sample_rate) {
     nemo_speech_asr_backend_config backend{};
     backend.size = sizeof(backend);
     backend.gpu = 0;  // -1 for CPU
-    // backend.threads = 4;  // CPU backend threads; 0 = min(8, CPUs the process may use)
+    // backend.threads = 4;  // CPU backend threads; 0 = min(8, usable CPUs). On Linux that
+    // follows the CPU affinity mask and the cgroup v2 quota (a cgroup v1 quota is not read);
+    // other platforms use the hardware thread count.
 
     nemo_speech_asr_model_config model{};
     model.size = sizeof(model);

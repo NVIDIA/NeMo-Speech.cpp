@@ -76,7 +76,9 @@ typedef struct nemo_speech_tts_model_config {
 typedef struct nemo_speech_tts_runtime_config {
     size_t size;
     int32_t speaker;
-    int32_t threads;        // CPU threads; 0 = min(8, usable CPUs)
+    // CPU threads; 0 = min(8, usable CPUs): on Linux the CPU affinity mask and the cgroup v2
+    // quota (a cgroup v1 quota is not read), elsewhere the hardware thread count.
+    int32_t threads;
     int32_t codec_threads;  // 0 = threads
     int32_t seed;
     int32_t steps;
